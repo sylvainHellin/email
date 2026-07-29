@@ -105,12 +105,14 @@ fn render_search_input(app: &App, frame: &mut Frame, area: Rect) {
     let input_focus = app.server_search_focus == SearchOverlayFocus::Input;
 
     let input_area = Rect { height: 1, ..area };
+    let cursor_reserve = if input_focus { 1 } else { 0 };
+    let avail = (input_area.width as usize)
+        .saturating_sub(2) // "> " prompt
+        .saturating_sub(cursor_reserve);
+    let value = super::util::scrolled_input_value(&app.server_search_query, avail);
     let mut spans = vec![
         Span::styled("> ", Style::default().fg(theme::active().accent_alt)),
-        Span::styled(
-            app.server_search_query.as_str(),
-            Style::default().fg(theme::active().text),
-        ),
+        Span::styled(value, Style::default().fg(theme::active().text)),
     ];
     if input_focus {
         spans.push(Span::styled(

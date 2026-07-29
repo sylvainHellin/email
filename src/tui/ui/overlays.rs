@@ -261,9 +261,11 @@ pub(super) fn render_dir_picker(picker: &DirPicker, frame: &mut Frame, area: Rec
                 .split(block_inner);
 
             // Query input
+            let avail = (chunks[0].width as usize).saturating_sub(3); // "> " + cursor
+            let value = super::util::scrolled_input_value(&picker.query, avail);
             let input_spans = vec![
                 Span::styled("> ", Style::default().fg(theme::active().success)),
-                Span::styled(&picker.query, Style::default().fg(theme::active().text)),
+                Span::styled(value, Style::default().fg(theme::active().text)),
                 Span::styled("\u{2588}", Style::default().fg(theme::active().success)),
             ];
             frame.render_widget(Paragraph::new(Line::from(input_spans)), chunks[0]);
@@ -436,9 +438,11 @@ pub(super) fn render_mailbox_picker(picker: &MailboxPicker, frame: &mut Frame, a
         .split(block_inner);
 
     // Query input
+    let avail = (chunks[0].width as usize).saturating_sub(3); // "> " + cursor
+    let value = super::util::scrolled_input_value(&picker.query, avail);
     let input_spans = vec![
         Span::styled("> ", Style::default().fg(theme::active().border_focused)),
-        Span::styled(&picker.query, Style::default().fg(theme::active().text)),
+        Span::styled(value, Style::default().fg(theme::active().text)),
         Span::styled("\u{2588}", Style::default().fg(theme::active().border_focused)),
     ];
     frame.render_widget(Paragraph::new(Line::from(input_spans)), chunks[0]);

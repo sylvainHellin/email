@@ -61,12 +61,14 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
 
     if let Some(search_rect) = search_area {
         let prefix = if app.search_includes_body { "\\" } else { "/" };
+        let cursor_reserve = if app.focus == Focus::Search { 1 } else { 0 };
+        let avail = (search_rect.width as usize)
+            .saturating_sub(super::util::display_width(prefix))
+            .saturating_sub(cursor_reserve);
+        let value = super::util::scrolled_input_value(&app.search_query, avail);
         let mut spans = vec![
             Span::styled(prefix, Style::default().fg(theme::active().accent)),
-            Span::styled(
-                app.search_query.as_str(),
-                Style::default().fg(theme::active().text),
-            ),
+            Span::styled(value, Style::default().fg(theme::active().text)),
         ];
         if app.focus == Focus::Search {
             spans.push(Span::styled(

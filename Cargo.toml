@@ -55,6 +55,7 @@ nucleo-matcher = "0.3"
 regex = "1"
 serde_json = "1"
 base64 = "0.22"
+unicode-width = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Only used to enable the `vendored` feature for static musl release builds
 # (see .github/workflows/release.yml). Not compiled in default builds.

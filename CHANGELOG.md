@@ -644,6 +644,20 @@ All notable changes to this project are documented in this file.
   `email config oauth2-login --account <name>` to re-acquire and cache
   tokens for each OAuth2 / Graph account.
 
+### Fixed
+- **Compose-wizard and search inputs now scroll horizontally to keep the
+  cursor visible (TKT-0046).** In the compose/"Edit recipients" overlay, the
+  To/Cc/Bcc/Subject lines used to render from the left with no scrolling, so
+  once a field grew past the field width (typically after one or two
+  recipients with display names) the caret and newly typed text walked off the
+  right edge — input still worked but was invisible. The active field now
+  scrolls so the end of the text (where the append-only caret sits) is always
+  on screen, with a leading `…` when content is hidden to the left. The same
+  width-aware `visible_window` helper fixes the email-list search line, the
+  server-search input, the Contacts fuzzy-search input, and the directory /
+  mailbox picker inputs. Slicing is Unicode display-width-aware (umlauts and
+  CJK no longer misalign or risk a panic).
+
 ## [0.8.0] - 2026-04-08
 
 ### Added

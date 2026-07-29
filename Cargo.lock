@@ -959,6 +959,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 0.8.23",
+ "unicode-width 0.2.0",
  "walkdir",
  "zeroize",
 ]

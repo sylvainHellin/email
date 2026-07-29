@@ -73,10 +73,14 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(theme::active().text_muted),
         )
     };
+    let cursor_reserve = super::util::display_width(cursor);
+    let avail = (search_area.width as usize)
+        .saturating_sub(2) // "/ " prompt
+        .saturating_sub(cursor_reserve);
     let query_text = if cv.query.is_empty() && !cv.searching {
         "type / to search".to_string()
     } else {
-        format!("{}{}", cv.query, cursor)
+        format!("{}{}", super::util::scrolled_input_value(&cv.query, avail), cursor)
     };
     let search_line = Line::from(vec![
         Span::styled("/ ", prompt_style),

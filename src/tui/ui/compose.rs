@@ -116,9 +116,21 @@ fn render_field(wizard: &ComposeWizard, frame: &mut Frame, area: Rect, field: Co
     };
 
     let label = format!("{:>7}: ", field.label());
+    // The label is ASCII, 9 display cells ("    To: " etc.). Reserve a cell for
+    // the cursor block on the focused field so text never overwrites it.
+    let label_width = super::util::display_width(&label);
+    let cursor_reserve = if is_focused { 1 } else { 0 };
+    let avail = (area.width as usize)
+        .saturating_sub(label_width)
+        .saturating_sub(cursor_reserve);
+
+    // Append-only editing model: the cursor is always at the end of the field,
+    // so scroll the window to keep the tail visible.
+    let value_text = super::util::scrolled_input_value(value, avail);
+
     let mut spans = vec![
         Span::styled(label, label_style),
-        Span::styled(value.as_str(), Style::default().fg(theme::active().text)),
+        Span::styled(value_text, Style::default().fg(theme::active().text)),
     ];
     if is_focused {
         spans.push(Span::styled(
