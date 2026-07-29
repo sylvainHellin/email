@@ -18,6 +18,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
 - [#TKT-0045 Reload drafts](docs/tickets/TKT-0045-reload-drafts.md) -- bug
+- [#TKT-0046 invisible contact edits](docs/tickets/TKT-0046-invisible-contact-edits.md) -- bug
 
 ## Later
 
