@@ -1,11 +1,9 @@
-//! Multi-view chrome (#0033): the bottom-left view switcher and the
-//! "coming soon" placeholder panes for the non-Mail views.
+//! Multi-view chrome (#0033): the bottom-left view switcher.
 //!
 //! The switcher reuses the activity-log bottom-slot pattern from
 //! [`super::sidebar::render_activity_log`]: a small bordered panel pinned to
-//! the bottom of the left column. Mail = the original TUI (rendered elsewhere);
-//! Contacts / Calendar render a centered placeholder until their content lands
-//! (Unit B / #0034).
+//! the bottom of the left column. Each view renders its own content elsewhere
+//! (`ui::list`/`ui::preview` for Mail, `ui::contacts`, `ui::calendar`).
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
@@ -15,7 +13,6 @@ use ratatui::Frame;
 
 use super::super::app::{App, View};
 use super::super::theme;
-use super::widgets::render_panel_shell;
 
 /// Height (rows) the view switcher panel needs, including its border.
 pub(super) const SWITCHER_HEIGHT: u16 = 3;
@@ -56,62 +53,4 @@ pub(super) fn render_view_switcher(app: &App, frame: &mut Frame, area: Rect) {
 
     let content = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     frame.render_widget(content, inner);
-}
-
-/// Render a "coming soon" placeholder pane for a non-Mail view, using the
-/// shared panel shell. Kept deliberately minimal until the real content lands.
-pub(super) fn render_placeholder(view: View, frame: &mut Frame, area: Rect) {
-    let Some(inner) =
-        render_panel_shell(frame, area, theme::active().border, theme::active().bg)
-    else {
-        return;
-    };
-
-    let (title, blurb) = match view {
-        View::Contacts => (
-            "Contacts",
-            "Your local contacts — list, search, compose, and share — land here soon.",
-        ),
-        View::Calendar => (
-            "Calendar",
-            "A local-first agenda built from your invitations lands here soon.",
-        ),
-        // Mail is never rendered as a placeholder; render nothing sensible.
-        View::Mail => ("Mail", ""),
-    };
-
-    // Vertically center the two lines within the pane.
-    let mid = inner.y + inner.height / 2;
-    if mid >= inner.y {
-        let title_area = Rect {
-            y: mid.saturating_sub(1),
-            height: 1,
-            ..inner
-        };
-        let blurb_area = Rect {
-            y: mid.saturating_add(1),
-            height: 1,
-            ..inner
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                title,
-                Style::default()
-                    .fg(theme::active().heading)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center),
-            title_area,
-        );
-        if blurb_area.y < inner.y + inner.height {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    blurb,
-                    Style::default().fg(theme::active().text_muted),
-                )))
-                .alignment(Alignment::Center),
-                blurb_area,
-            );
-        }
-    }
 }

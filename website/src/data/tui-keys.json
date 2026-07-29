@@ -85,6 +85,17 @@
     ]
   },
   {
+    "title": "CALENDAR",
+    "bindings": [
+      { "key": "j/k", "action": "Navigate events" },
+      { "key": "gg / G", "action": "Jump to top / bottom" },
+      { "key": "Enter / e", "action": "Open the invite email in $EDITOR" },
+      { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
+      { "key": "t", "action": "Show past events / upcoming only" },
+      { "key": "r", "action": "Refresh events from disk" }
+    ]
+  },
+  {
     "title": "HEADERS",
     "bindings": [
       { "key": "j/k", "action": "Scroll headers" }

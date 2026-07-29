@@ -1,4 +1,5 @@
 mod activity;
+mod calendar;
 mod compose;
 mod contacts;
 mod headers;
@@ -20,7 +21,7 @@ use super::app::{App, Overlay, View};
 /// The stacked regions of the herdr-style left column.
 struct LeftColumn {
     sidebar: ratatui::layout::Rect,
-    /// Email list (Mail view) or placeholder host (non-Mail, narrow tier).
+    /// Email list (Mail view) or content host (non-Mail, narrow tier).
     middle: ratatui::layout::Rect,
     /// Activity-log panel, present only when toggled on in the Mail view.
     activity: Option<ratatui::layout::Rect>,
@@ -96,7 +97,7 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         let left = split_left_column(app, left_col, sidebar_height);
 
         sidebar::render_sidebar(app, frame, left.sidebar);
-        // Middle slot: the email list in Mail view; empty in placeholder views
+        // Middle slot: the email list in Mail view; empty in the other views
         // (their content occupies the right column instead).
         if app.view == View::Mail {
             list::render_email_list(app, frame, left.middle);
@@ -107,7 +108,7 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         views::render_view_switcher(app, frame, left.switcher);
 
         // Right column: the mail preview panes, the Contacts view, or the
-        // (Calendar) placeholder.
+        // Calendar agenda.
         if app.view == View::Mail {
             let right_panels = Layout::default()
                 .direction(Direction::Vertical)
@@ -118,7 +119,7 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         } else if app.view == View::Contacts {
             contacts::render_contacts(app, frame, right_col);
         } else {
-            views::render_placeholder(app.view, frame, right_col);
+            calendar::render_calendar(app, frame, right_col);
         }
     } else if show_sidebar {
         let sidebar_height = (app.mailboxes.len() as u16) + 2;
@@ -130,7 +131,7 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         } else if app.view == View::Contacts {
             contacts::render_contacts(app, frame, left.middle);
         } else {
-            views::render_placeholder(app.view, frame, left.middle);
+            calendar::render_calendar(app, frame, left.middle);
         }
         if let Some(activity) = left.activity {
             sidebar::render_activity_log(app, frame, activity);
@@ -138,19 +139,9 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         views::render_view_switcher(app, frame, left.switcher);
     } else if app.view == View::Mail {
         list::render_email_list(app, frame, main_area);
-    } else if app.view == View::Contacts {
-        // Narrowest tier: Contacts fills the frame, switcher pinned below.
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(views::SWITCHER_HEIGHT),
-            ])
-            .split(main_area);
-        contacts::render_contacts(app, frame, rows[0]);
-        views::render_view_switcher(app, frame, rows[1]);
     } else {
-        // Narrowest tier: placeholder fills the frame, switcher pinned below.
+        // Narrowest tier: the active view's content fills the frame, switcher
+        // pinned below.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -158,7 +149,11 @@ pub fn view(app: &mut App, frame: &mut Frame) {
                 Constraint::Length(views::SWITCHER_HEIGHT),
             ])
             .split(main_area);
-        views::render_placeholder(app.view, frame, rows[0]);
+        if app.view == View::Contacts {
+            contacts::render_contacts(app, frame, rows[0]);
+        } else {
+            calendar::render_calendar(app, frame, rows[0]);
+        }
         views::render_view_switcher(app, frame, rows[1]);
     }
 

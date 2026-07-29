@@ -15,6 +15,26 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **Local calendar view in the TUI (#0034).** Switch to Calendar with
+  **`Space a`** for an **agenda over the invitations already on disk**: date,
+  title, and your RSVP state per row, with the shared **event card** (time,
+  location, organizer, your RSVP, per-attendee statuses, recurrence) in the
+  detail pane. Navigate with **`j`/`k`** (and `gg`/`G`), **`Enter`/`e`** opens
+  the invite email in `$EDITOR`, **`V`** RSVPs to a received invitation,
+  **`t`** toggles between upcoming-only and all events, and **`r`** re-reads
+  the account from disk. One row per event: the Sent/Inbox/Archive copies of an
+  invitation collapse by iCal UID (highest `SEQUENCE` wins), RSVP replies are
+  not listed as separate events, and an invitation with a matching `CANCEL`
+  message is struck through and tagged `cancelled` (and refuses `V`, since the
+  organizer already called it off). `.md` files that arrived as *email
+  attachments* are never agenda rows, so a crafted attachment cannot spoof,
+  displace or cancel a real invitation. The agenda is per-account and loads on
+  first switch.
+  **Caveat, stated in the pane itself:** this calendar is built *only* from
+  invitation emails, so **events you created directly in Outlook (never emailed
+  to you) are not shown** — they need the Graph sync backend (#0036). RSVPs
+  are still emailed to the organizer and are not written to your Exchange
+  calendar.
 - **Contacts view in the TUI (#0033).** Switch to Contacts with **`Space c`** for
   a read-only, herdr-style **list + fuzzy search + detail pane** over your
   local contacts index (the same index that backs compose autocomplete). Press

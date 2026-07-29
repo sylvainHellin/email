@@ -1760,6 +1760,27 @@ pub(super) fn handle_action(
             send_contact_as_vcard(app, terminal, &contact)?;
         }
 
+        Action::OpenEventSource { path } => {
+            // The agenda row carries an explicit path (the invite may live in
+            // any mailbox of the account), so this does not go through the
+            // mail cursor like `Action::EditCurrent`.
+            suspend_terminal(terminal)?;
+            let result = edit_file(&path);
+            resume_terminal(terminal)?;
+            match result {
+                Ok(()) => {
+                    // The `event:` block may have changed under us, so re-walk
+                    // to match disk. `refresh_calendar` sets its own status;
+                    // overwriting it here would hide the reloaded count behind
+                    // a bare "Returned from editor", so let that one stand.
+                    app.refresh_calendar();
+                }
+                Err(e) => {
+                    app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error)
+                }
+            }
+        }
+
         Action::ComposeWizardCancel => {
             app.close_overlay();
             app.focus = Focus::List;

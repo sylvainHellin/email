@@ -72,6 +72,8 @@ pub enum KeyCtx {
     ServerSearch,
     /// Contacts view list (#0033): read-only list + fuzzy search + detail.
     Contacts,
+    /// Calendar view agenda (#0034): local-first event list + detail card.
+    Calendar,
     /// Activity-log overlay.
     Activity,
     /// Help overlay.
@@ -87,6 +89,7 @@ impl KeyCtx {
             KeyCtx::List => "EMAIL LIST",
             KeyCtx::ServerSearch => "SERVER SEARCH",
             KeyCtx::Contacts => "CONTACTS",
+            KeyCtx::Calendar => "CALENDAR",
             KeyCtx::Headers => "HEADERS",
             KeyCtx::Preview => "BODY",
             KeyCtx::Activity => "ACTIVITY LOG",
@@ -101,6 +104,7 @@ impl KeyCtx {
         KeyCtx::List,
         KeyCtx::ServerSearch,
         KeyCtx::Contacts,
+        KeyCtx::Calendar,
         KeyCtx::Headers,
         KeyCtx::Preview,
         KeyCtx::Activity,
@@ -275,6 +279,15 @@ pub enum KeyAction {
     ContactsCompose,
     ContactsVcard,
     ContactsRefresh,
+    // -- Calendar view (#0034) -------------------------------------------
+    CalendarDown,
+    CalendarUp,
+    CalendarTop,
+    CalendarBottom,
+    CalendarOpenSource,
+    CalendarRsvp,
+    CalendarToggleScope,
+    CalendarRefresh,
     // -- Headers / Preview scroll ----------------------------------------
     HeadersDown,
     HeadersUp,
@@ -290,12 +303,13 @@ pub enum KeyAction {
 impl KeyAction {
     /// Whether this action is meaningful outside the Mail view (#0033).
     ///
-    /// The non-Mail placeholder views only expose the view-agnostic Global
-    /// surface: view switching (the Space leader + `Space m/c/a`), quit, help,
-    /// and the activity log. Mail-specific Global actions (mailbox/account jump,
+    /// The non-Mail views only expose the view-agnostic Global surface: view
+    /// switching (the Space leader + `Space m/c/a`), quit, help, and the
+    /// activity log. Mail-specific Global actions (mailbox/account jump,
     /// metadata/content search, focus cycling) are gated off so they cannot
-    /// fire while a placeholder view is active. `Manual` stays live because it
-    /// backs the Space leader toggle.
+    /// fire outside Mail — unless the active view's pane context rebinds that
+    /// key, in which case the pane binding wins (see `dispatch_normal_mode`).
+    /// `Manual` stays live because it backs the Space leader toggle.
     pub fn is_view_agnostic(self) -> bool {
         matches!(
             self,
@@ -477,6 +491,19 @@ pub static KEYMAP: &[KeyBinding] = &[
     b("", Chord::Char('n'), KeyCtx::Contacts, KeyAction::ContactsCompose, "", false),
     b("v", Chord::Char('v'), KeyCtx::Contacts, KeyAction::ContactsVcard, "Send contact as vCard", true),
     b("r", Chord::Char('r'), KeyCtx::Contacts, KeyAction::ContactsRefresh, "Refresh contact index", true),
+    // -- CALENDAR (#0034) -------------------------------------------------
+    // Local-first agenda over the invites on disk. Live only in the Calendar
+    // view; dispatched via the pane context like the Contacts list. `V` is the
+    // same RSVP mnemonic as the mail list / body panes (separate context row).
+    b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Calendar, KeyAction::CalendarDown, "Navigate events", true),
+    b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Calendar, KeyAction::CalendarUp, "", false),
+    row("", Chord::PrefixLeader('g'), None, KeyCtx::Calendar, Guard::None, KeyAction::Manual, "", false),
+    row("", Chord::Char('g'), Some('g'), KeyCtx::Calendar, Guard::None, KeyAction::CalendarTop, "", false),
+    b("gg / G", Chord::Char('G'), KeyCtx::Calendar, KeyAction::CalendarBottom, "Jump to top / bottom", false),
+    b("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::Calendar, KeyAction::CalendarOpenSource, "Open the invite email in $EDITOR", true),
+    b("V", Chord::Char('V'), KeyCtx::Calendar, KeyAction::CalendarRsvp, "RSVP to invitation (Accept/Tentative/Decline)", true),
+    b("t", Chord::Char('t'), KeyCtx::Calendar, KeyAction::CalendarToggleScope, "Show past events / upcoming only", true),
+    b("r", Chord::Char('r'), KeyCtx::Calendar, KeyAction::CalendarRefresh, "Refresh events from disk", true),
     // -- HEADERS ----------------------------------------------------------
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Headers, KeyAction::HeadersDown, "Scroll headers", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Headers, KeyAction::HeadersUp, "", false),
@@ -816,6 +843,12 @@ mod tests {
             Some(KeyAction::ListTop)
         );
         assert_eq!(resolve(KeyCtx::Global, key('m'), Some('g'), &allow), None);
+        // Same in the Calendar pane context (#0034), which owns `gg`/`G` too.
+        assert_eq!(resolve(KeyCtx::Calendar, key('g'), Some(' '), &allow), None);
+        assert_eq!(
+            resolve(KeyCtx::Calendar, key('g'), Some('g'), &allow),
+            Some(KeyAction::CalendarTop)
+        );
         // A bare Space with nothing pending arms the leader (Manual toggle).
         assert_eq!(
             resolve(KeyCtx::Global, key(' '), None, &allow),

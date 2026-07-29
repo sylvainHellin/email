@@ -3,9 +3,11 @@ id: 0034
 title: Local calendar view (iMIP-derived, agenda/list)
 type: feature
 priority: later
-status: open
+status: done
 created: 2026-07-11
 ---
+
+Shipped. Agenda list + shared event card over the iMIP files on disk, `KeyCtx::Calendar` keymap rows (`j/k`, `gg`/`G`, `Enter`/`e`, `V`, `t`, `r`), and a permanent in-pane caveat that Outlook-created events are invisible until #0036. Deduped by iCal UID (highest `(sequence, dtstamp)` wins, sidecar `.ics` authoritative); REPLY messages are not agenda rows; a matching `CANCEL` tags the row as cancelled (display only — the mutation semantics stay with #0031). Loaded synchronously on first switch: the walk measures ~100 ms on the largest local account.
 
 Local-first Calendar view. Design: [tui-restructure-views](../plans/tui-restructure-views.md) (Stage 3, D12). Depends on [#0033](0033-view-switcher-contacts-view.md) (View abstraction) and [#0027](0027-imip-receive-parse.md) (on-disk events from iMIP).
 

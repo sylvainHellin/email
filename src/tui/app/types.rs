@@ -629,9 +629,9 @@ pub enum Focus {
 }
 
 /// The active top-level view (#0033). `Mail` is the full email client (the
-/// original TUI); `Contacts` and `Calendar` are the new panes. Only `Mail`
-/// has state today; the others render placeholders (Contacts content lands in
-/// Unit B, Calendar in #0034).
+/// original TUI); `Contacts` (#0033) and `Calendar` (#0034) are the two
+/// content panes. Each owns its state (`MailView` / `ContactsView` /
+/// `CalendarView`) on `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
@@ -710,6 +710,67 @@ pub struct ContactsView {
     pub matches: Vec<String>,
     /// Cursor into `matches`.
     pub list_index: usize,
+}
+
+/// One agenda row of the Calendar view (#0034): a single logical event
+/// derived from the local iMIP files on disk.
+///
+/// Plain data (no borrows, `Send`) so the loader is unit-testable and could be
+/// moved off the UI thread later. `event` is the frontmatter block the shared
+/// event card (`ui::preview::event_card_lines`) renders; the derived fields
+/// carry what the agenda list itself needs.
+#[derive(Debug, Clone)]
+pub struct CalendarEvent {
+    /// The source `.md` email the event was read from (RSVP / open-in-editor).
+    pub path: PathBuf,
+    /// The `event:` frontmatter block, rendered by the shared event card.
+    pub event: crate::types::EventFrontmatter,
+    /// Email subject, used as the row title when the event has no `summary`.
+    pub subject: String,
+    /// UTC-normalised `YYYY-MM-DDTHH:MM:SS` sort key, empty when the start is
+    /// missing or unparseable (those rows sort last). Display stays local, the
+    /// sort key is always UTC -- same rule as `resolve_date` (#0024).
+    pub start_sort: String,
+    /// UTC-normalised end key (same format), empty when unknown. Used to keep
+    /// an in-progress event in the "upcoming" view until it actually ends; an
+    /// all-day event with no explicit end gets the start of the next local day.
+    pub end_sort: String,
+    /// Local, human-readable start (`YYYY-MM-DD HH:MM`, or the date alone for
+    /// all-day events). Empty when the start is unknown.
+    pub start_display: String,
+    /// True when the winning copy came from the Sent mailbox, i.e. we are the
+    /// organizer (no own-RSVP, and RSVP is refused).
+    pub is_organizer: bool,
+    /// True when a `METHOD:CANCEL` message for this UID exists on disk with a
+    /// sequence at least as high as this event's (#0034 display-only; the
+    /// cancellation *semantics* are #0031).
+    pub cancelled: bool,
+}
+
+/// State for the Calendar view (#0034).
+///
+/// Sibling of [`ContactsView`]: a read-only agenda over the events the local
+/// iMIP traffic already produced (received invites, our own sent invites),
+/// loaded lazily on the first switch to the view (`App::ensure_calendar_loaded`)
+/// and rebuilt by the manual refresh key. Scoped to the active account and
+/// reset on `switch_account`.
+///
+/// `events` holds every event found on disk, sorted by start instant with
+/// undated ones last; `visible` is the subset currently shown (upcoming only
+/// unless `show_past`), recomputed by `App::recompute_calendar_visible`.
+/// `list_index` indexes into `visible`, exactly like the mail list.
+#[derive(Debug, Clone, Default)]
+pub struct CalendarView {
+    /// True once the on-disk walk has been attempted. Gates the lazy load.
+    pub loaded: bool,
+    /// Every event found for the active account, sorted (undated last).
+    pub events: Vec<CalendarEvent>,
+    /// Indices into `events` forming the current agenda view.
+    pub visible: Vec<usize>,
+    /// Cursor into `visible`.
+    pub list_index: usize,
+    /// When true, past events are listed too (toggled with `t`).
+    pub show_past: bool,
 }
 
 /// Messages that drive state transitions (TEA pattern).
@@ -831,6 +892,12 @@ pub enum Action {
     /// Export a contact to a `.vcf` and attach it to a new draft (#0033).
     SendContactVcard {
         contact: crate::contacts::Contact,
+    },
+    /// Open the invite email an agenda row was derived from in `$EDITOR`
+    /// (#0034). Carries an explicit path: the event may live in any mailbox
+    /// of the active account, not just the one the mail list is showing.
+    OpenEventSource {
+        path: PathBuf,
     },
 }
 

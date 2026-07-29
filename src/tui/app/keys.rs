@@ -59,12 +59,12 @@ impl App {
         let guard_ok = |g: super::Guard| self.guard_satisfied(g);
 
         // The focused pane's context. Mail consults its focused pane; the
-        // Contacts view (#0033) has a single list context; the Calendar
-        // placeholder has no pane context (Global-only surface).
+        // Contacts view (#0033) and the Calendar view (#0034) each have a
+        // single list context.
         let pane_ctx = match self.view {
             super::View::Mail => self.pane_ctx(),
             super::View::Contacts => Some(super::KeyCtx::Contacts),
-            super::View::Calendar => None,
+            super::View::Calendar => Some(super::KeyCtx::Calendar),
         };
 
         // Global context first.
@@ -328,6 +328,56 @@ impl App {
             A::ContactsRefresh => {
                 self.pending_prefix = None;
                 self.refresh_contacts();
+            }
+            // -- Calendar view (#0034) ---------------------------------------
+            A::CalendarDown => {
+                self.pending_prefix = None;
+                let len = self.calendar_view.visible.len();
+                if len > 0 && self.calendar_view.list_index < len - 1 {
+                    self.calendar_view.list_index += 1;
+                }
+            }
+            A::CalendarUp => {
+                self.pending_prefix = None;
+                self.calendar_view.list_index =
+                    self.calendar_view.list_index.saturating_sub(1);
+            }
+            A::CalendarTop => {
+                // Reached only with `g` pending (the leader continuation).
+                self.calendar_view.list_index = 0;
+                self.pending_prefix = None;
+            }
+            A::CalendarBottom => {
+                self.pending_prefix = None;
+                self.calendar_view.list_index =
+                    self.calendar_view.visible.len().saturating_sub(1);
+            }
+            A::CalendarOpenSource => {
+                self.pending_prefix = None;
+                if let Some(event) = self.selected_event() {
+                    let path = event.path.clone();
+                    self.push_action(Action::OpenEventSource { path });
+                }
+            }
+            A::CalendarRsvp => {
+                self.pending_prefix = None;
+                self.open_rsvp_overlay_for_event();
+            }
+            A::CalendarToggleScope => {
+                self.pending_prefix = None;
+                self.calendar_view.show_past = !self.calendar_view.show_past;
+                self.calendar_view.list_index = 0;
+                self.recompute_calendar_visible();
+                let scope = if self.calendar_view.show_past {
+                    "all events"
+                } else {
+                    "upcoming events"
+                };
+                self.set_status(format!("Calendar: showing {scope}"));
+            }
+            A::CalendarRefresh => {
+                self.pending_prefix = None;
+                self.refresh_calendar();
             }
             // -- List / shared -----------------------------------------------
             _ => return self.execute_list(action, key),
@@ -1068,6 +1118,52 @@ impl App {
             .unwrap_or_else(|| email.subject.clone());
         self.overlay = Overlay::Rsvp(RsvpOverlay {
             path: email.path.clone(),
+            summary,
+            selected: 0,
+        });
+    }
+
+    /// Calendar-view sibling of [`Self::open_rsvp_overlay`] (#0034): the same
+    /// guards (not our own / must be a REQUEST), plus one the mail path cannot
+    /// need, since cancelled rows exist only here: RSVP'ing to a meeting the
+    /// organizer already cancelled would mail a reply about a dead event. Read
+    /// from the selected agenda row instead of the mail cursor; organizer-ness
+    /// comes from the row (the winning copy's mailbox), not the active mailbox.
+    fn open_rsvp_overlay_for_event(&mut self) {
+        let Some(event) = self.selected_event() else {
+            return;
+        };
+        if event.cancelled {
+            self.set_status(
+                "This event was cancelled by the organizer — nothing to RSVP".to_string(),
+            );
+            return;
+        }
+        if event.is_organizer {
+            self.set_status(
+                "You are the organizer of this invite — nothing to RSVP".to_string(),
+            );
+            return;
+        }
+        let is_request = event
+            .event
+            .method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("REQUEST"));
+        if !is_request {
+            self.set_status(
+                "Only received invitations (REQUEST) can be RSVP'd".to_string(),
+            );
+            return;
+        }
+        let summary = event
+            .event
+            .summary
+            .clone()
+            .unwrap_or_else(|| event.subject.clone());
+        let path = event.path.clone();
+        self.overlay = Overlay::Rsvp(RsvpOverlay {
+            path,
             summary,
             selected: 0,
         });
@@ -2476,7 +2572,7 @@ mod tests {
         assert_eq!(app.view, View::Contacts);
         assert_eq!(app.pending_prefix, None, "leader consumed by the switch");
 
-        // `Space a` -> Calendar (proving Space arms from a placeholder view).
+        // `Space a` -> Calendar (proving Space arms from a non-Mail view).
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         app.handle_key(KeyEvent::from(KeyCode::Char('a')));
         assert_eq!(app.view, View::Calendar);
@@ -2509,19 +2605,17 @@ mod tests {
         );
     }
 
-    /// `g` in Contacts arms only where continuations exist; in Calendar (no
-    /// g-continuations) it does not arm a dead leader.
+    /// `g` arms only where continuations exist. Both content views own
+    /// `gg`/`G` jumps, so `g` arms in each (Calendar gained them in #0034 --
+    /// this test previously asserted the opposite, when Calendar was a
+    /// placeholder with no pane context).
     #[test]
-    fn g_leader_does_not_arm_in_calendar() {
+    fn g_leader_arms_in_both_content_views() {
         let mut app = app_with_mailboxes();
         app.switch_view(View::Calendar);
         app.handle_key(KeyEvent::from(KeyCode::Char('g')));
-        assert_eq!(
-            app.pending_prefix, None,
-            "g must not arm a dead leader in Calendar (no continuations)"
-        );
+        assert_eq!(app.pending_prefix, Some('g'), "g arms in Calendar (#0034)");
 
-        // Contacts DOES have gg/G continuations, so g arms there.
         app.switch_view(View::Contacts);
         app.handle_key(KeyEvent::from(KeyCode::Char('g')));
         assert_eq!(app.pending_prefix, Some('g'), "g arms in Contacts");
@@ -2538,6 +2632,17 @@ mod tests {
         assert_eq!(app.view, View::Mail);
     }
 
+    /// ...and from the Calendar view, now that it owns a pane context (#0034):
+    /// the Global Space leader still resolves before the pane.
+    #[test]
+    fn space_leader_switches_view_from_calendar() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert_eq!(app.pending_prefix, Some(' '));
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert_eq!(app.view, View::Contacts);
+    }
+
     /// Switching to Mail restores the parked focus (the `MailView` proxy),
     /// mirroring the `AccountState` save/load pattern.
     #[test]
@@ -2545,15 +2650,16 @@ mod tests {
         let mut app = app_with_mailboxes();
         app.focus = Focus::Preview;
         app.switch_view(View::Contacts);
-        // Focus is irrelevant while in a placeholder view; on return it is
+        // Focus is irrelevant while in a non-Mail view; on return it is
         // restored from the parked mail-view snapshot.
         app.switch_view(View::Mail);
         assert_eq!(app.focus, Focus::Preview);
     }
 
-    /// Mail-specific keys must not fire while a placeholder view is active:
-    /// the Global mail surface (mailbox jump) is gated off, and pane contexts
-    /// are not consulted at all.
+    /// Mail-specific keys must not fire while a non-Mail view is active: the
+    /// Global mail surface (mailbox jump) is gated off, and the Mail pane
+    /// contexts are not consulted at all (`a` = archive is not rebound by
+    /// either content view).
     #[test]
     fn mail_keys_do_not_fire_in_contacts_or_calendar() {
         for view in [View::Contacts, View::Calendar] {
@@ -2565,8 +2671,8 @@ mod tests {
             app.handle_key(KeyEvent::from(KeyCode::Char('2')));
             assert_eq!(app.active_mailbox, before, "digit jump must not fire in {view:?}");
 
-            // A List-context key (archive) does nothing: no pane context is
-            // consulted outside Mail, and no overlay/action is produced.
+            // A List-context key (archive) does nothing: the Mail pane contexts
+            // are not consulted outside Mail, and it is not rebound there.
             app.handle_key(KeyEvent::from(KeyCode::Char('a')));
             assert!(matches!(app.overlay, Overlay::None));
             assert!(app.pending_actions.is_empty());
@@ -2574,21 +2680,23 @@ mod tests {
         }
     }
 
-    /// View-agnostic Global keys (help, quit) still work in placeholder views.
+    /// View-agnostic Global keys (help, quit) still work in the non-Mail views.
     #[test]
-    fn view_agnostic_keys_work_in_placeholder_views() {
-        let mut app = app_with_mailboxes();
-        app.switch_view(View::Contacts);
+    fn view_agnostic_keys_work_in_non_mail_views() {
+        for view in [View::Contacts, View::Calendar] {
+            let mut app = app_with_mailboxes();
+            app.switch_view(view);
 
-        // Help overlay toggles.
-        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
-        assert!(matches!(app.overlay, Overlay::Help));
-        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
-        assert!(matches!(app.overlay, Overlay::None));
+            // Help overlay toggles.
+            app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+            assert!(matches!(app.overlay, Overlay::Help), "? in {view:?}");
+            app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+            assert!(matches!(app.overlay, Overlay::None));
 
-        // Quit is honoured.
-        let msg = app.handle_key(KeyEvent::from(KeyCode::Char('q')));
-        assert!(matches!(msg, Some(Message::Quit)));
+            // Quit is honoured.
+            let msg = app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+            assert!(matches!(msg, Some(Message::Quit)), "q in {view:?}");
+        }
     }
 
     /// Digits 1-9 still jump mailboxes in the Mail view (no leader collision).
@@ -2729,5 +2837,251 @@ mod tests {
                 .all(|a| !matches!(a, Action::ComposeToContact { .. })),
             "n in Mail must be NewDraft, not ComposeToContact"
         );
+    }
+
+    // -- Calendar view (#0034) -------------------------------------------
+
+    fn cal_event(
+        summary: &str,
+        start: &str,
+        is_organizer: bool,
+        method: &str,
+    ) -> super::super::CalendarEvent {
+        super::super::CalendarEvent {
+            path: PathBuf::from(format!("/mail/inbox/{summary}.md")),
+            event: crate::types::EventFrontmatter {
+                uid: Some(format!("uid-{summary}")),
+                method: Some(method.to_string()),
+                sequence: 0,
+                summary: Some(summary.to_string()),
+                start: Some(start.to_string()),
+                end: None,
+                location: None,
+                organizer: Some("org@example.com".into()),
+                rsvp: "needs-action".into(),
+                recurrence: String::new(),
+                attendees: Vec::new(),
+            },
+            subject: format!("Invitation: {summary}"),
+            start_sort: start.to_string(),
+            end_sort: String::new(),
+            start_display: start.to_string(),
+            is_organizer,
+            cancelled: false,
+        }
+    }
+
+    /// Build an app already in the Calendar view with a seeded agenda. Events
+    /// are far-future so the default upcoming-only scope keeps them all.
+    fn app_in_calendar() -> App {
+        let mut app = app_with_mailboxes();
+        app.calendar_view.events = vec![
+            cal_event("Standup", "2099-08-01T09:00:00", false, "REQUEST"),
+            cal_event("Retro", "2099-08-02T09:00:00", true, "REQUEST"),
+            cal_event("Review", "2099-08-03T09:00:00", false, "REQUEST"),
+        ];
+        app.calendar_view.loaded = true;
+        app.view = View::Calendar;
+        app.recompute_calendar_visible();
+        app
+    }
+
+    /// Calendar navigation keys move the cursor and drive the selection.
+    #[test]
+    fn calendar_navigation_moves_cursor() {
+        let mut app = app_in_calendar();
+        assert_eq!(app.calendar_view.visible.len(), 3);
+        assert_eq!(app.calendar_view.list_index, 0);
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.calendar_view.list_index, 1);
+        assert_eq!(
+            app.selected_event().unwrap().event.summary.as_deref(),
+            Some("Retro")
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.calendar_view.list_index, 0);
+    }
+
+    /// `gg` / `G` jump to the ends of the agenda.
+    #[test]
+    fn calendar_top_bottom_jumps() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char('G')));
+        assert_eq!(app.calendar_view.list_index, 2);
+        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.pending_prefix, Some('g'));
+        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.calendar_view.list_index, 0);
+        assert_eq!(app.pending_prefix, None);
+    }
+
+    /// `V` on a received invite opens the RSVP overlay for that event's path.
+    #[test]
+    fn calendar_rsvp_opens_overlay_for_received_invite() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        let Overlay::Rsvp(overlay) = &app.overlay else {
+            panic!("V must open the RSVP overlay on a received invite");
+        };
+        assert_eq!(overlay.summary, "Standup");
+        assert_eq!(overlay.path, PathBuf::from("/mail/inbox/Standup.md"));
+    }
+
+    /// `V` on an invite we sent refuses with a hint (we are the organizer).
+    #[test]
+    fn calendar_rsvp_refused_for_organizer_event() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char('j'))); // Retro (organizer)
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("organizer")));
+    }
+
+    /// `V` on a cancelled row refuses: the organizer already called the
+    /// meeting off, so an RSVP would be mailed about a dead event.
+    #[test]
+    fn calendar_rsvp_refused_for_cancelled_event() {
+        let mut app = app_in_calendar();
+        app.calendar_view.events[0].cancelled = true;
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("cancelled")));
+    }
+
+    /// `V` on a non-REQUEST row refuses: only a received invitation can be
+    /// RSVP'd, the same guard the mail path applies.
+    #[test]
+    fn calendar_rsvp_refused_for_non_request_event() {
+        let mut app = app_in_calendar();
+        app.calendar_view.events[0].event.method = Some("PUBLISH".to_string());
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("REQUEST")));
+    }
+
+    /// With the RSVP overlay open, `t` selects Tentative rather than toggling
+    /// the Calendar scope: overlays intercept before normal-mode dispatch.
+    #[test]
+    fn calendar_rsvp_overlay_t_selects_tentative_not_scope_toggle() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        assert!(matches!(app.overlay, Overlay::Rsvp(_)));
+        let scope_before = app.calendar_view.show_past;
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        let Overlay::Rsvp(overlay) = &app.overlay else {
+            panic!("t must not close the RSVP overlay");
+        };
+        assert_eq!(overlay.selected, 1, "t selects Tentative");
+        assert_eq!(app.calendar_view.show_past, scope_before);
+    }
+
+    /// An in-progress meeting (started, not yet ended) stays in the upcoming
+    /// scope until its `end_sort` passes, rather than vanishing at its start.
+    #[test]
+    fn in_progress_meeting_stays_upcoming_until_it_ends() {
+        let mut app = app_with_mailboxes();
+        let now = chrono::Utc::now();
+        let fmt = |dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let mut running = cal_event(
+            "Running",
+            &fmt(now - chrono::Duration::minutes(30)),
+            false,
+            "REQUEST",
+        );
+        running.end_sort = fmt(now + chrono::Duration::minutes(30));
+        let mut finished = cal_event(
+            "Finished",
+            &fmt(now - chrono::Duration::hours(3)),
+            false,
+            "REQUEST",
+        );
+        finished.end_sort = fmt(now - chrono::Duration::hours(2));
+        app.calendar_view.events = vec![running, finished];
+        app.calendar_view.loaded = true;
+        app.recompute_calendar_visible();
+        let visible: Vec<&str> = app
+            .calendar_view
+            .visible
+            .iter()
+            .map(|&i| app.calendar_view.events[i].subject.as_str())
+            .collect();
+        assert_eq!(visible, vec!["Invitation: Running"]);
+    }
+
+    /// `Enter` queues opening the source invite email, carrying its path.
+    #[test]
+    fn calendar_enter_opens_the_source_invite() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        match app.pending_actions.pop_front() {
+            Some(Action::OpenEventSource { path }) => {
+                assert_eq!(path, PathBuf::from("/mail/inbox/Standup.md"));
+            }
+            other => panic!("expected OpenEventSource, got {other:?}"),
+        }
+    }
+
+    /// `t` toggles the upcoming-only scope; past events appear only when on.
+    #[test]
+    fn calendar_scope_toggle_reveals_past_events() {
+        let mut app = app_in_calendar();
+        app.calendar_view
+            .events
+            .push(cal_event("Old", "2000-01-01T09:00:00", false, "REQUEST"));
+        app.recompute_calendar_visible();
+        assert_eq!(app.calendar_view.visible.len(), 3, "past event hidden");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        assert!(app.calendar_view.show_past);
+        assert_eq!(app.calendar_view.visible.len(), 4);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.calendar_view.visible.len(), 3);
+    }
+
+    /// Calendar keys must not fire in Mail: `V` there is the mail-list RSVP
+    /// path (guarded on the cursor email being an invite), never the calendar
+    /// one, and `t` is not a Mail binding at all.
+    #[test]
+    fn calendar_keys_do_not_fire_in_mail() {
+        let mut app = app_with_mailboxes();
+        app.calendar_view.events =
+            vec![cal_event("Standup", "2099-08-01T09:00:00", false, "REQUEST")];
+        app.calendar_view.loaded = true;
+        app.recompute_calendar_visible();
+        assert_eq!(app.view, View::Mail);
+
+        // The cursor email is not an invite, so `V` hints instead of opening.
+        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // `t` (calendar scope toggle) does nothing in Mail.
+        let before = app.calendar_view.show_past;
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.calendar_view.show_past, before);
+        assert!(app.pending_actions.is_empty());
+    }
+
+    /// Mail-specific Global keys stay swallowed in Calendar even though it now
+    /// owns a pane context: digits do not jump mailboxes, `/` does not open the
+    /// metadata filter (Calendar rebinds neither).
+    #[test]
+    fn mail_global_keys_stay_swallowed_in_calendar() {
+        let mut app = app_in_calendar();
+        let before = app.active_mailbox;
+        app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(app.active_mailbox, before, "digit jump must not fire");
+        app.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        assert_ne!(app.focus, Focus::Search, "/ must not arm the mail filter");
+        assert_eq!(app.view, View::Calendar);
     }
 }

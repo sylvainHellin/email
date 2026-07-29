@@ -1,7 +1,9 @@
+mod calendar_view;
 mod keymap;
 mod keys;
 mod types;
 
+pub use calendar_view::load_events_for_account;
 pub use keymap::{
     dump_json, dump_markdown, help_sections, hint_bindings, prefix_continuations, resolve, Guard,
     KeyAction, KeyBinding, KeyCtx, KEYMAP,
@@ -16,9 +18,10 @@ use std::sync::Arc;
 pub struct App {
     pub focus: Focus,
     /// The active top-level view (#0033). `Mail` is the full email client;
-    /// `Contacts` / `Calendar` are placeholder panes for now. Key dispatch
-    /// and rendering branch on this; the mail-specific proxy fields below are
-    /// the active `MailView` projected flat (parked in `mail_view` on switch).
+    /// `Contacts` (#0033) and `Calendar` (#0034) are the two content panes.
+    /// Key dispatch and rendering branch on this; the mail-specific proxy
+    /// fields below are the active `MailView` projected flat (parked in
+    /// `mail_view` on switch).
     pub view: View,
     /// Parked mail-view state, restored when the user switches back to `Mail`
     /// (mirrors the `AccountState` proxy pattern; see `MailView`).
@@ -26,6 +29,9 @@ pub struct App {
     /// Contacts view state (#0033): read-only list + fuzzy search + detail
     /// pane over the local contacts index. Loaded lazily on first switch.
     pub contacts_view: ContactsView,
+    /// Calendar view state (#0034): a local-first agenda over the events the
+    /// iMIP traffic already produced. Loaded lazily on first switch.
+    pub calendar_view: CalendarView,
     pub running: bool,
     pub terminal_width: u16,
     pub terminal_height: u16,
@@ -153,6 +159,7 @@ impl App {
             view: View::Mail,
             mail_view: MailView::default(),
             contacts_view: ContactsView::default(),
+            calendar_view: CalendarView::default(),
             running: true,
             terminal_width: 0,
             terminal_height: 0,
@@ -239,6 +246,7 @@ impl App {
             view: View::Mail,
             mail_view: MailView::default(),
             contacts_view: ContactsView::default(),
+            calendar_view: CalendarView::default(),
             running: true,
             terminal_width: 0,
             terminal_height: 0,
@@ -358,9 +366,8 @@ impl App {
     /// state on the way out and restores it on the way back in (mirroring the
     /// account save/load pattern). No-op when already on `target`.
     ///
-    /// Only `Mail` owns view state today; `Contacts` / `Calendar` are
-    /// placeholder panes, so switching to them just records the active view
-    /// (their content — and any state — arrives in #0033 Unit B / #0034).
+    /// `Mail` and the two content views (`Contacts`, `Calendar`) each own their
+    /// state; switching into one lazily loads it on the first visit.
     pub fn switch_view(&mut self, target: View) {
         if target == self.view {
             return;
@@ -376,6 +383,9 @@ impl App {
         }
         if target == View::Contacts {
             self.ensure_contacts_loaded();
+        }
+        if target == View::Calendar {
+            self.ensure_calendar_loaded();
         }
     }
 
@@ -472,6 +482,98 @@ impl App {
         index.contacts.get(addr)
     }
 
+    // -- Calendar view (#0034) -------------------------------------------
+
+    /// Lazily build the active account's agenda the first time the Calendar
+    /// view is shown. The walk is the same one `mp calendar rebuild` performs
+    /// (measured at ~100 ms on the largest local account), so it runs
+    /// synchronously on the UI thread like the Contacts cache load.
+    pub fn ensure_calendar_loaded(&mut self) {
+        if self.calendar_view.loaded {
+            return;
+        }
+        self.calendar_view.events = match self.calendar_account_root() {
+            Some(root) => calendar_view::load_events_for_account(&root),
+            None => Vec::new(),
+        };
+        self.calendar_view.loaded = true;
+        self.calendar_view.list_index = 0;
+        self.recompute_calendar_visible();
+    }
+
+    /// The account root to walk for events, or `None` when no account is
+    /// configured. Guarded on a non-empty name because `account_dir("")` is the
+    /// shared `accounts/` parent -- walking it would mix every account's events
+    /// into one agenda.
+    fn calendar_account_root(&self) -> Option<PathBuf> {
+        let name = self.account_config.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some(crate::config::account_dir(name))
+    }
+
+    /// Drop the loaded agenda (events are per-account, so the view reloads
+    /// lazily for the newly-active account).
+    pub fn reset_calendar_view(&mut self) {
+        self.calendar_view = CalendarView::default();
+    }
+
+    /// Re-walk the account for events (manual refresh key).
+    pub fn refresh_calendar(&mut self) {
+        self.calendar_view.events = match self.calendar_account_root() {
+            Some(root) => calendar_view::load_events_for_account(&root),
+            None => Vec::new(),
+        };
+        self.calendar_view.loaded = true;
+        self.recompute_calendar_visible();
+        let count = self.calendar_view.visible.len();
+        self.set_status(format!("Calendar refreshed ({count} events)"));
+    }
+
+    /// Recompute the visible agenda rows for the current scope, clamping the
+    /// cursor. Upcoming-only by default: an event stays visible until its end
+    /// (or its start, when the end is unknown) is in the past. Undated events
+    /// are always listed — they cannot be placed on the timeline, so hiding
+    /// them would silently lose data.
+    pub fn recompute_calendar_visible(&mut self) {
+        let now = calendar_view::now_sort_key();
+        let show_past = self.calendar_view.show_past;
+        self.calendar_view.visible = self
+            .calendar_view
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| {
+                if show_past || ev.start_sort.is_empty() {
+                    return true;
+                }
+                let horizon = if ev.end_sort.is_empty() {
+                    &ev.start_sort
+                } else {
+                    &ev.end_sort
+                };
+                horizon.as_str() >= now.as_str()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let len = self.calendar_view.visible.len();
+        if len == 0 {
+            self.calendar_view.list_index = 0;
+        } else if self.calendar_view.list_index >= len {
+            self.calendar_view.list_index = len - 1;
+        }
+    }
+
+    /// The agenda row currently under the Calendar cursor, if any.
+    pub fn selected_event(&self) -> Option<&CalendarEvent> {
+        let idx = *self
+            .calendar_view
+            .visible
+            .get(self.calendar_view.list_index)?;
+        self.calendar_view.events.get(idx)
+    }
+
     pub fn active_kind(&self) -> MailboxKind {
         self.mailboxes
             .get(self.active_mailbox)
@@ -512,9 +614,11 @@ impl App {
                     Some(KeyCtx::Contacts)
                 }
             }
-            // Other non-Mail views (Calendar placeholder) have no pane; only the
-            // view-agnostic Global surface is live, so the hint bar shows Global
-            // (filtered to view-agnostic bindings in the renderer).
+            // Calendar view (#0034): the agenda list owns the hint bar.
+            Overlay::None if self.view == View::Calendar => Some(KeyCtx::Calendar),
+            // Any other non-Mail view has no pane; only the view-agnostic Global
+            // surface is live, so the hint bar shows Global (filtered to
+            // view-agnostic bindings in the renderer).
             Overlay::None if self.view != View::Mail => Some(KeyCtx::Global),
             Overlay::None => match self.focus {
                 Focus::Sidebar => Some(KeyCtx::Sidebar),
@@ -616,6 +720,12 @@ impl App {
         self.reset_contacts_view();
         if self.view == View::Contacts {
             self.ensure_contacts_loaded();
+        }
+        // Events are per-account too (#0034): drop them so the agenda reloads
+        // for the newly-active account.
+        self.reset_calendar_view();
+        if self.view == View::Calendar {
+            self.ensure_calendar_loaded();
         }
         let am = self.active_mailbox;
         if let Some(cached) = self.email_cache.get(am).and_then(|c| c.as_ref()) {

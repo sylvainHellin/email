@@ -21,9 +21,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Later
 
-> TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). Foundation (#0032) and the view switcher + Contacts view (#0033) have shipped; #0034 is the remaining view.
+> TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
-- [#0034 Local calendar view (iMIP-derived)](docs/tickets/0034-local-calendar-view.md) -- feature
 - [#0039 Durable pending_ops mutation queue](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3)_
 - [#0040 Drop files-as-truth; drafts local-only; wipe-and-resync cutover](docs/tickets/0040-drop-file-layer-cutover.md) -- refactor _(data layer, Stage 4)_
 - [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5)_

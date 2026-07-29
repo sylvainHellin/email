@@ -104,6 +104,7 @@ fn mode_label(app: &App, ctx: KeyCtx) -> String {
         KeyCtx::Preview => "BODY".to_string(),
         KeyCtx::ServerSearch => "SEARCH".to_string(),
         KeyCtx::Contacts => "CONTACTS".to_string(),
+        KeyCtx::Calendar => "CALENDAR".to_string(),
         KeyCtx::Activity => "ACTIVITY".to_string(),
         KeyCtx::Help => "HELP".to_string(),
     }
