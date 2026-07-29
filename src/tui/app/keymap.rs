@@ -31,12 +31,15 @@
 //!
 //! ## Leader / prefix model
 //!
-//! A binding may declare a single-key `prefix` (today only `g`, the historical
-//! invisible leader). The chord matcher only fires a prefixed binding when the
-//! matching prefix is pending; `handle_key` sets `App::g_pending` when a bare
-//! prefix key is seen (and the hint bar shows the pending continuations). This
-//! generalizes the former special-cased `gg` handling into first-class data so
-//! future leader combos (#0033) are table entries, not new branches.
+//! A binding may declare a single-key `prefix`. Two leaders exist: `Space`
+//! (the Global view switcher `Space m/c/a`, #0033) and `g` (the List-scoped
+//! `gg`/`G` jumps). The chord matcher only fires a prefixed binding when the
+//! matching prefix is pending; `handle_key` sets `App::pending_prefix` to the
+//! armed leader when a bare prefix key is seen (and the hint bar shows the
+//! pending continuations). The two leaders never cross-arm: a pending `Space`
+//! only fires `Space`-prefixed rows and a pending `g` only fires `g`-prefixed
+//! rows. This generalizes the former special-cased `gg` handling into
+//! first-class data.
 //!
 //! ## (B)-lite runtime dispatch
 //!
@@ -226,8 +229,8 @@ pub enum KeyAction {
     JumpMailbox,
     FocusForward,
     FocusBackward,
-    /// Leader `g m` / `g c` / `g a`: switch the top-level view. The executor
-    /// reads the continuation key to pick the target view (#0033).
+    /// Leader `Space m` / `Space c` / `Space a`: switch the top-level view. The
+    /// executor reads the continuation key to pick the target view (#0033).
     SwitchView,
     // -- Sidebar ----------------------------------------------------------
     SidebarDown,
@@ -288,11 +291,11 @@ impl KeyAction {
     /// Whether this action is meaningful outside the Mail view (#0033).
     ///
     /// The non-Mail placeholder views only expose the view-agnostic Global
-    /// surface: view switching (the `g` leader + `g m/c/a`), quit, help, and
-    /// the activity log. Mail-specific Global actions (mailbox/account jump,
+    /// surface: view switching (the Space leader + `Space m/c/a`), quit, help,
+    /// and the activity log. Mail-specific Global actions (mailbox/account jump,
     /// metadata/content search, focus cycling) are gated off so they cannot
     /// fire while a placeholder view is active. `Manual` stays live because it
-    /// backs the `g` leader toggle.
+    /// backs the Space leader toggle.
     pub fn is_view_agnostic(self) -> bool {
         matches!(
             self,
@@ -317,7 +320,8 @@ pub struct KeyBinding {
     /// The physical chord the runtime resolver matches (continuation key for
     /// prefixed bindings). [`Chord::Manual`] for hand-dispatched rows.
     pub chord: Chord,
-    /// Optional leader prefix that must be pressed first (today only `'g'`).
+    /// Optional leader prefix that must be pressed first (`' '` for the Space
+    /// view switcher, `'g'` for the List `gg`/`G` jumps).
     pub prefix: Option<char>,
     /// The context the binding is live in.
     pub ctx: KeyCtx,
@@ -402,13 +406,13 @@ pub static KEYMAP: &[KeyBinding] = &[
     b("L", Chord::Char('L'), KeyCtx::Global, KeyAction::OpenActivityOverlay, "Open activity log overlay", false),
     b("Ctrl+l", Chord::CtrlChar('l'), KeyCtx::Global, KeyAction::OpenLogFile, "Open log file in $EDITOR", false),
     b("Ctrl+e", Chord::CtrlChar('e'), KeyCtx::Global, KeyAction::OpenConfigFile, "Open config.toml in $EDITOR", false),
-    // View switcher leader (#0033): `g` opens the leader, then m/c/a picks a
-    // view. Global so it works from every pane and every view. Space is taken
-    // (list selection), so the `g` continuation is the collision-free choice.
-    row("", Chord::PrefixLeader('g'), None, KeyCtx::Global, Guard::None, KeyAction::Manual, "", false),
-    row("g m", Chord::Char('m'), Some('g'), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Mail view", true),
-    row("g c", Chord::Char('c'), Some('g'), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Contacts view", true),
-    row("g a", Chord::Char('a'), Some('g'), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Calendar view", true),
+    // View switcher leader (#0033, Space follow-up): Space opens the leader,
+    // then m/c/a picks a view. Global so it works from every pane and every
+    // view. Space was freed for this by moving list toggle-select to `v`.
+    row("", Chord::PrefixLeader(' '), None, KeyCtx::Global, Guard::None, KeyAction::Manual, "", false),
+    row("Space m", Chord::Char('m'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Mail view", true),
+    row("Space c", Chord::Char('c'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Contacts view", true),
+    row("Space a", Chord::Char('a'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Calendar view", true),
     // -- SIDEBAR ----------------------------------------------------------
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Sidebar, KeyAction::SidebarDown, "Navigate mailboxes", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Sidebar, KeyAction::SidebarUp, "", false),
@@ -421,7 +425,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     row("", Chord::PrefixLeader('g'), None, KeyCtx::List, Guard::NonEmptyList, KeyAction::Manual, "", false),
     row("", Chord::Char('g'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListTop, "", false),
     bg("gg / G", Chord::Char('G'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListBottom, "Jump to top / bottom", false),
-    bg("Space", Chord::Char(' '), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true),
+    bg("v", Chord::Char('v'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true),
     bg("Ctrl+a", Chord::CtrlChar('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SelectAllVisible, "Select all visible", false),
     bg("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::List, Guard::NonEmptyList, KeyAction::ClearSelection, "Clear selection", false),
     bg("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenEditor, "Open in editor", true),
@@ -701,7 +705,7 @@ mod tests {
             ])
             .collect();
         for &ctx in KeyCtx::HELP_ORDER {
-            for &pending in &[None, Some('g')] {
+            for &pending in &[None, Some('g'), Some(' ')] {
                 for &ev in &probes {
                     let mut hits = KEYMAP.iter().filter(|kb| {
                         kb.ctx == ctx
@@ -775,17 +779,47 @@ mod tests {
 
     #[test]
     fn leader_prefix_is_first_class_data() {
-        let g_combos: Vec<_> = KEYMAP.iter().filter(|kb| kb.prefix == Some('g')).collect();
-        assert!(
-            !g_combos.is_empty(),
-            "the g leader must be represented as prefixed data"
+        // Both leaders (g for list jumps, Space for the view switcher) are
+        // catalogued as prefixed continuation data plus a PrefixLeader row.
+        for leader in [' ', 'g'] {
+            let combos: Vec<_> =
+                KEYMAP.iter().filter(|kb| kb.prefix == Some(leader)).collect();
+            assert!(
+                !combos.is_empty(),
+                "leader {leader:?} must be represented as prefixed data"
+            );
+            assert!(
+                KEYMAP
+                    .iter()
+                    .any(|kb| matches!(kb.chord, Chord::PrefixLeader(p) if p == leader)),
+                "the bare {leader:?} leader must be a first-class chord row"
+            );
+        }
+    }
+
+    /// The two leaders never cross-arm: while Space is pending, the g
+    /// continuations do not fire, and vice versa. (The dispatch-time analogue
+    /// of the view-switcher-on-Space decision.)
+    #[test]
+    fn leaders_do_not_cross_arm() {
+        // Space pending -> the view-switch continuation `m` fires (Global),
+        // but the list `g` continuation does NOT.
+        assert_eq!(
+            resolve(KeyCtx::Global, key('m'), Some(' '), &allow),
+            Some(KeyAction::SwitchView)
         );
-        // The leader key itself is catalogued as a PrefixLeader chord.
-        assert!(
-            KEYMAP
-                .iter()
-                .any(|kb| matches!(kb.chord, Chord::PrefixLeader('g'))),
-            "the bare g leader must be a first-class chord row"
+        assert_eq!(resolve(KeyCtx::List, key('g'), Some(' '), &allow), None);
+        // g pending -> the list `g` continuation fires, but the Space view
+        // switch does NOT (its continuations require Space pending).
+        assert_eq!(
+            resolve(KeyCtx::List, key('g'), Some('g'), &allow),
+            Some(KeyAction::ListTop)
+        );
+        assert_eq!(resolve(KeyCtx::Global, key('m'), Some('g'), &allow), None);
+        // A bare Space with nothing pending arms the leader (Manual toggle).
+        assert_eq!(
+            resolve(KeyCtx::Global, key(' '), None, &allow),
+            Some(KeyAction::Manual)
         );
     }
 

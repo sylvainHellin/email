@@ -4,8 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **View switching moved to a `Space` leader; list toggle-select moved to `v`
+  (#0033 follow-up).** The TUI view switcher is now **`Space m`** (Mail),
+  **`Space c`** (Contacts), and **`Space a`** (Calendar) — replacing the earlier
+  `g m/c/a`. Pressing **`Space`** arms the leader from every view and every Mail
+  pane and shows the `m/c/a` continuations in the hint bar. To free `Space`,
+  **toggle email selection** in the list moved from `Space` to **`v`** (`Esc`
+  clear-selection and `Ctrl+a` select-all are unchanged). `g` stays a
+  list-scoped leader for `gg`/`G` only.
+
 ### Added
-- **Contacts view in the TUI (#0033).** Switch to Contacts with **`g c`** for
+- **Contacts view in the TUI (#0033).** Switch to Contacts with **`Space c`** for
   a read-only, herdr-style **list + fuzzy search + detail pane** over your
   local contacts index (the same index that backs compose autocomplete). Press
   **`/`** to incrementally fuzzy-filter the list, **`j`/`k`** (and `gg`/`G`) to
@@ -20,9 +30,9 @@ All notable changes to this project are documented in this file.
 - **Multi-view TUI foundation: view switcher (#0033).** The TUI is now a
   multi-view client. A herdr-style bottom-left **view switcher** (`mail |
   contacts | calendar` chips, active one highlighted) sits under the mailbox
-  sidebar, and the new `g` leader combos **`g m`** (Mail), **`g c`**
-  (Contacts), and **`g a`** (Calendar) switch between them from any pane and
-  any view. Mail is the full email client you already know; Contacts and
+  sidebar, and the new `Space` leader combos **`Space m`** (Mail),
+  **`Space c`** (Contacts), and **`Space a`** (Calendar) switch between them
+  from any pane and any view. Mail is the full email client you already know; Contacts and
   Calendar render clean placeholder panes for now (Contacts content and the
   local calendar land in follow-ups). Mail-specific keys are gated to the Mail
   view — only view switching, quit, help (`?`), and the activity log stay live

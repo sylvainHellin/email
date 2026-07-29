@@ -35,3 +35,7 @@ Scout: no view/screen abstraction exists; `App` is a flat ~90-field mail struct 
 ## Unblocks
 
 - Calendar view ([#0034](0034-local-calendar-view.md)) becomes a `View` arm + content, not another restructure.
+
+## Post-ship note
+
+The view leader moved from `g` to **Space** post-ship at user request (`Space m/c/a`); Space was freed by moving the email-list toggle-select from `Space` to `v`.

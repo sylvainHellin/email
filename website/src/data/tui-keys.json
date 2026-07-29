@@ -15,9 +15,9 @@
       { "key": "L", "action": "Open activity log overlay" },
       { "key": "Ctrl+l", "action": "Open log file in $EDITOR" },
       { "key": "Ctrl+e", "action": "Open config.toml in $EDITOR" },
-      { "key": "g m", "action": "Switch to Mail view" },
-      { "key": "g c", "action": "Switch to Contacts view" },
-      { "key": "g a", "action": "Switch to Calendar view" }
+      { "key": "Space m", "action": "Switch to Mail view" },
+      { "key": "Space c", "action": "Switch to Contacts view" },
+      { "key": "Space a", "action": "Switch to Calendar view" }
     ]
   },
   {
@@ -32,7 +32,7 @@
     "bindings": [
       { "key": "j/k", "action": "Navigate emails" },
       { "key": "gg / G", "action": "Jump to top / bottom" },
-      { "key": "Space", "action": "Toggle selection" },
+      { "key": "v", "action": "Toggle selection" },
       { "key": "Ctrl+a", "action": "Select all visible" },
       { "key": "Esc", "action": "Clear selection" },
       { "key": "Enter / e", "action": "Open in editor" },

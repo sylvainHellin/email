@@ -50,7 +50,12 @@ pub struct App {
     /// reassignment of `emails` must call `rebuild_visible`.
     pub visible: Vec<usize>,
     pub list_index: usize,
-    pub g_pending: bool,
+    /// The armed leader prefix, if any. Two leaders exist (#0033 follow-up):
+    /// `' '` (Space) arms the view switcher (`Space m/c/a`), `'g'` arms the
+    /// list-scoped `gg`/`G` jumps. `None` when no leader is pending. A pressed
+    /// continuation only fires the row whose `prefix` matches, so the two
+    /// leaders never cross-arm.
+    pub pending_prefix: Option<char>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
     pub selection: HashSet<PathBuf>,
@@ -160,7 +165,7 @@ impl App {
             emails: Arc::new(Vec::new()),
             visible: Vec::new(),
             list_index: 0,
-            g_pending: false,
+            pending_prefix: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: HashSet::new(),
@@ -246,7 +251,7 @@ impl App {
             emails: Arc::new(Vec::new()),
             visible: Vec::new(),
             list_index: 0,
-            g_pending: false,
+            pending_prefix: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: HashSet::new(),
@@ -361,7 +366,7 @@ impl App {
             return;
         }
         // Any pending leader chord is consumed by the switch.
-        self.g_pending = false;
+        self.pending_prefix = None;
         if self.view == View::Mail {
             self.save_to_mail_view();
         }
@@ -522,14 +527,11 @@ impl App {
         }
     }
 
-    /// The pending leader prefix, if any (today only `g`). Drives the hint
-    /// bar's continuation view.
+    /// The pending leader prefix, if any (`' '` for the Space view switcher,
+    /// `'g'` for the list `gg`/`G` jumps). Drives the hint bar's continuation
+    /// view.
     pub fn pending_prefix(&self) -> Option<char> {
-        if self.g_pending {
-            Some('g')
-        } else {
-            None
-        }
+        self.pending_prefix
     }
 
     pub fn active_dir(&self) -> Option<&PathBuf> {

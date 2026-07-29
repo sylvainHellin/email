@@ -12,7 +12,8 @@ use super::util::{desc_span, hint_span};
 /// badge plus the next valid keystrokes for the current context, all derived
 /// from `KEYMAP`. When a leader prefix (today `g`) is pending it shows that
 /// prefix's continuations instead, making the previously-invisible leader
-/// discoverable. Overlay contexts with their own inline chips (confirm,
+/// discoverable (Space -> the `m/c/a` view switch; `g` -> `gg`/`G`). Overlay
+/// contexts with their own inline chips (confirm,
 /// pickers, compose, ...) render no hint bar (`key_context()` returns `None`).
 pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
     let bg = theme::active().surface;
@@ -26,10 +27,11 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let pending = app.pending_prefix();
     let (badge, hints): (String, Vec<(&'static str, &'static str)>) = if let Some(p) = pending {
-        // Leader pending: show its continuations (e.g. `g` -> `gg`, `G`).
-        // Global leader continuations (e.g. the `g m/c/a` view switch, #0033)
-        // resolve before the pane context, so surface them alongside the
-        // pane's own continuations whenever we are not already in Global.
+        // Leader pending: show its continuations (Space -> `m/c/a`; `g` ->
+        // `gg`, `G`). Global leader continuations (the Space `m/c/a` view
+        // switch, #0033) resolve before the pane context, so surface them
+        // alongside the pane's own continuations whenever we are not already
+        // in Global.
         let mut conts: Vec<(&str, &str)> = prefix_continuations(ctx, p)
             .map(|kb| (kb.keys, kb.desc))
             .collect();
@@ -38,7 +40,10 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
                 conts.push((kb.keys, kb.desc));
             }
         }
-        (p.to_uppercase().to_string(), conts)
+        // The leader badge: a printable name for Space, otherwise the
+        // uppercased key (e.g. `g` -> `G`).
+        let badge = if p == ' ' { "SPACE".to_string() } else { p.to_uppercase().to_string() };
+        (badge, conts)
     } else {
         // Off-Mail, only the view-agnostic Global bindings actually fire
         // (mail-specific Global keys are swallowed by the dispatcher, #0033).

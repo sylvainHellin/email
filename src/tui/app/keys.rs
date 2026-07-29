@@ -55,7 +55,7 @@ impl App {
     /// Table-driven dispatch for the no-overlay surface. Returns the `Message`
     /// (only `Quit` today) or `None`.
     fn dispatch_normal_mode(&mut self, key: KeyEvent) -> Option<Message> {
-        let pending = if self.g_pending { Some('g') } else { None };
+        let pending = self.pending_prefix;
         let guard_ok = |g: super::Guard| self.guard_satisfied(g);
 
         // The focused pane's context. Mail consults its focused pane; the
@@ -79,7 +79,7 @@ impl App {
                     .and_then(|ctx| super::resolve(ctx, key, pending, &guard_ok))
                     .is_some();
                 if !pane_rebinds {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     return None;
                 }
             } else {
@@ -94,7 +94,7 @@ impl App {
         }
         // No live binding matched: clear any pending leader (an unrecognised
         // key aborts the chord), matching the old `_ => { g_pending = false }`.
-        self.g_pending = false;
+        self.pending_prefix = None;
         None
     }
 
@@ -134,53 +134,53 @@ impl App {
             // -- Global -------------------------------------------------------
             A::Quit => return Some(Message::Quit),
             A::ToggleHelp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.help_scroll = 0;
                 self.help_filter.clear();
                 self.help_filter_active = false;
                 self.overlay = Overlay::Help;
             }
             A::ToggleActivityLog => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.show_activity_log = !self.show_activity_log;
             }
             A::OpenActivityOverlay => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.activity_filter.clear();
                 self.activity_filter_active = false;
                 self.activity_scroll = 0;
                 self.overlay = Overlay::Activity;
             }
             A::OpenLogFile => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::OpenLogFile);
             }
             A::OpenConfigFile => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::OpenConfigFile);
             }
             A::FilterMetadata => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.focus = Focus::Search;
                 self.search_query.clear();
                 self.search_includes_body = false;
                 self.reload_from_cache();
             }
             A::SearchContent => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.focus = Focus::Search;
                 self.search_query.clear();
                 self.search_includes_body = true;
                 self.reload_from_cache();
             }
             A::SwitchAccount => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 let next = (self.active_account + 1) % self.accounts.len();
                 self.switch_account(next);
             }
             A::JumpAccount => {
                 // Ctrl+1..9 -> direct account jump (guarded to multi-account).
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let KeyCode::Char(c @ '1'..='9') = key.code {
                     let idx = (c as usize) - ('1' as usize);
                     if idx < self.accounts.len() {
@@ -189,7 +189,7 @@ impl App {
                 }
             }
             A::JumpMailbox => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let KeyCode::Char(c @ '1'..='9') = key.code {
                     let idx = (c as usize) - ('1' as usize);
                     if idx < self.mailboxes.len() {
@@ -200,7 +200,7 @@ impl App {
                 }
             }
             A::FocusForward => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if self.focus == Focus::Sidebar {
                     self.switch_mailbox(self.sidebar_index);
                 }
@@ -214,7 +214,7 @@ impl App {
                 };
             }
             A::FocusBackward => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::Headers,
                     Focus::Headers => Focus::Preview,
@@ -225,7 +225,7 @@ impl App {
                 };
             }
             A::SwitchView => {
-                // `g m/c/a`: the continuation key selects the target view.
+                // `Space m/c/a`: the continuation key selects the target view.
                 // `switch_view` clears the pending leader itself.
                 if let KeyCode::Char(c) = key.code {
                     if let Some(&target) =
@@ -234,83 +234,83 @@ impl App {
                         self.switch_view(target);
                     }
                 }
-                self.g_pending = false;
+                self.pending_prefix = None;
             }
             // -- Sidebar ------------------------------------------------------
             A::SidebarDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if self.sidebar_index < self.mailboxes.len().saturating_sub(1) {
                     self.sidebar_index += 1;
                 }
             }
             A::SidebarUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.sidebar_index = self.sidebar_index.saturating_sub(1);
             }
             A::SidebarSelect => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.switch_mailbox(self.sidebar_index);
                 self.focus = Focus::List;
             }
             // -- Headers ------------------------------------------------------
             A::HeadersDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.headers_scroll = self.headers_scroll.saturating_add(1);
             }
             A::HeadersUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.headers_scroll = self.headers_scroll.saturating_sub(1);
             }
             // -- Preview / body ----------------------------------------------
             A::PreviewDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.preview_scroll = self.preview_scroll.saturating_add(1);
             }
             A::PreviewUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.preview_scroll = self.preview_scroll.saturating_sub(1);
             }
             A::PreviewHalfDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.preview_scroll = self.preview_scroll.saturating_add(10);
             }
             A::PreviewHalfUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.preview_scroll = self.preview_scroll.saturating_sub(10);
             }
             A::PreviewToList => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.focus = Focus::List;
             }
             // -- Contacts view (#0033) ---------------------------------------
             A::ContactsDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 let len = self.contacts_view.matches.len();
                 if len > 0 && self.contacts_view.list_index < len - 1 {
                     self.contacts_view.list_index += 1;
                 }
             }
             A::ContactsUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.contacts_view.list_index =
                     self.contacts_view.list_index.saturating_sub(1);
             }
             A::ContactsTop => {
                 // Reached only with `g` pending (the leader continuation).
                 self.contacts_view.list_index = 0;
-                self.g_pending = false;
+                self.pending_prefix = None;
             }
             A::ContactsBottom => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.contacts_view.list_index =
                     self.contacts_view.matches.len().saturating_sub(1);
             }
             A::ContactsSearch => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.contacts_view.searching = true;
             }
             A::ContactsCompose => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(contact) = self.selected_contact() {
                     let to =
                         crate::send::format_recipient(&contact.display_name, &contact.address);
@@ -318,7 +318,7 @@ impl App {
                 }
             }
             A::ContactsVcard => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(contact) = self.selected_contact() {
                     self.push_action(Action::SendContactVcard {
                         contact: contact.clone(),
@@ -326,56 +326,57 @@ impl App {
                 }
             }
             A::ContactsRefresh => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.refresh_contacts();
             }
             // -- List / shared -----------------------------------------------
             _ => return self.execute_list(action, key),
         }
+
         None
     }
 
     /// List-context actions (and the shared attachment/browser/RSVP actions the
     /// list, headers, and preview panes all use). Split out to keep `execute`
     /// readable; it also owns the list-cursor scroll-reset bookkeeping.
-    fn execute_list(&mut self, action: super::KeyAction, _key: KeyEvent) -> Option<Message> {
+    fn execute_list(&mut self, action: super::KeyAction, key: KeyEvent) -> Option<Message> {
         use super::KeyAction as A;
         let old_index = self.list_index;
 
         match action {
             A::ListDown => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if self.list_index < self.visible.len() - 1 {
                     self.list_index += 1;
                 }
             }
             A::ListUp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.list_index = self.list_index.saturating_sub(1);
             }
             A::ListTop => {
                 // Reached only with `g` pending (the leader continuation).
                 self.list_index = 0;
-                self.g_pending = false;
+                self.pending_prefix = None;
             }
             A::ListBottom => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.list_index = self.visible.len().saturating_sub(1);
             }
             A::OpenEditor => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::EditCurrent);
             }
             A::Reply => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::Reply(false));
             }
             A::ReplyAll => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::Reply(true));
             }
             A::Forward => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(path) = self.selected_email_path() {
                     self.push_action(Action::OpenComposeWizard(ComposeMode::Forward {
                         source_path: path,
@@ -385,7 +386,7 @@ impl App {
             A::EditRecipients => {
                 // Only meaningful in Drafts; outside Drafts keep the old status
                 // hint (the guard is advisory, resolved everywhere).
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
                     if let Some(path) = self.selected_email_path() {
                         self.push_action(Action::OpenComposeWizard(ComposeMode::EditDraft {
@@ -399,11 +400,11 @@ impl App {
                 }
             }
             A::SelectAllVisible => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.selection = self.visible_emails().map(|e| e.path.clone()).collect();
             }
             A::Archive => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     let count = self.selection.len();
                     self.overlay = Overlay::Confirm(ConfirmDialog {
@@ -420,7 +421,7 @@ impl App {
                 }
             }
             A::Delete => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     let count = self.selection.len();
                     self.overlay = Overlay::Confirm(ConfirmDialog {
@@ -437,7 +438,7 @@ impl App {
                 }
             }
             A::Approve => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     let count = self.selection.len();
                     self.overlay = Overlay::Confirm(ConfirmDialog {
@@ -450,7 +451,7 @@ impl App {
                 }
             }
             A::MarkDraft => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     let count = self.selection.len();
                     self.overlay = Overlay::Confirm(ConfirmDialog {
@@ -463,7 +464,7 @@ impl App {
                 }
             }
             A::Send => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(email) = self.selected_email() {
                     self.overlay = Overlay::Confirm(ConfirmDialog {
                         title: "Send this email?".to_string(),
@@ -473,7 +474,7 @@ impl App {
                 }
             }
             A::SendAll => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.overlay = Overlay::Confirm(ConfirmDialog {
                     title: "Send all approved emails?".to_string(),
                     detail: format!("In {}", self.active_label()),
@@ -481,11 +482,11 @@ impl App {
                 });
             }
             A::CopyPath => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::CopyPath);
             }
             A::ToggleRead => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     let paths: Vec<PathBuf> = self.selection.iter().cloned().collect();
                     self.push_action(Action::BatchToggleRead(paths));
@@ -494,27 +495,27 @@ impl App {
                 }
             }
             A::MovePicker => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.open_mailbox_picker();
             }
             A::Rsvp => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.open_rsvp_overlay();
             }
             A::NewDraft => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::OpenComposeWizard(ComposeMode::New));
             }
             A::QuickSync => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::Fetch);
             }
             A::FullSync => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.push_action(Action::Sync);
             }
             A::ServerSearch => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.server_search_query.clear();
                 self.server_search_results.clear();
                 self.server_search_index = 0;
@@ -526,15 +527,15 @@ impl App {
                 self.overlay = Overlay::Search;
             }
             A::OpenAttachment => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.open_attachment_picker(AttachmentPickerMode::Open);
             }
             A::SaveAttachment => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.open_attachment_picker(AttachmentPickerMode::Save);
             }
             A::OpenInBrowser => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(email) = self.selected_email() {
                     let html_path = email.path.with_extension("html");
                     if html_path.exists() {
@@ -545,7 +546,7 @@ impl App {
                 }
             }
             A::ToggleSelect => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if let Some(path) = self.selected_email_path() {
                     if self.selection.contains(&path) {
                         self.selection.remove(&path);
@@ -558,20 +559,27 @@ impl App {
                 }
             }
             A::ClearSelection => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 if !self.selection.is_empty() {
                     self.selection.clear();
                 }
             }
-            // The leader key itself: begin/toggle the pending `g` chord. This is
-            // the only action that intentionally leaves `g_pending` set.
+            // The leader key itself: begin/toggle the pending leader chord.
+            // This is the only action that intentionally leaves a leader armed.
+            // Two leaders exist (#0033 follow-up): Space (view switcher) and
+            // `g` (list `gg`/`G`); the pressed key identifies which one.
             A::Manual => {
-                // A::Manual reaches here only for the `g` PrefixLeader row.
-                self.g_pending = !self.g_pending;
+                if let KeyCode::Char(leader) = key.code {
+                    self.pending_prefix = if self.pending_prefix == Some(leader) {
+                        None
+                    } else {
+                        Some(leader)
+                    };
+                }
             }
             // Any pane-only action mistakenly routed here is a no-op.
             _ => {
-                self.g_pending = false;
+                self.pending_prefix = None;
             }
         }
 
@@ -711,18 +719,18 @@ impl App {
                 }
             }
             KeyCode::Char('g') => {
-                if self.g_pending {
+                if self.pending_prefix == Some('g') {
                     self.server_search_index = 0;
                     self.server_search_scroll = 0;
                     self.server_search_headers_scroll = 0;
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                 } else {
-                    self.g_pending = true;
+                    self.pending_prefix = Some('g');
                 }
                 return None;
             }
             KeyCode::Char('G') => {
-                self.g_pending = false;
+                self.pending_prefix = None;
                 self.server_search_index = len.saturating_sub(1);
                 self.server_search_scroll = 0;
                 self.server_search_headers_scroll = 0;
@@ -765,7 +773,7 @@ impl App {
             }
             _ => {}
         }
-        self.g_pending = false;
+        self.pending_prefix = None;
         None
     }
 
@@ -801,49 +809,49 @@ impl App {
         } else {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_scroll = self.activity_scroll.saturating_add(1);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_scroll = self.activity_scroll.saturating_sub(1);
                 }
                 KeyCode::Char('g') => {
-                    if self.g_pending {
+                    if self.pending_prefix == Some('g') {
                         self.activity_scroll = 0;
-                        self.g_pending = false;
+                        self.pending_prefix = None;
                     } else {
-                        self.g_pending = true;
+                        self.pending_prefix = Some('g');
                     }
                     return None;
                 }
                 KeyCode::Char('G') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_scroll = u16::MAX;
                 }
                 KeyCode::Char('d') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_scroll = self.activity_scroll.saturating_add(10);
                 }
                 KeyCode::Char('u') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_scroll = self.activity_scroll.saturating_sub(10);
                 }
                 KeyCode::Char('/') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.activity_filter_active = true;
                     self.activity_filter.clear();
                     self.activity_scroll = 0;
                 }
                 KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('q') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.close_overlay();
                     self.activity_scroll = 0;
                     self.activity_filter.clear();
                     self.activity_filter_active = false;
                 }
                 _ => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                 }
             }
         }
@@ -1551,48 +1559,48 @@ impl App {
         } else {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_scroll = self.help_scroll.saturating_add(1);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_scroll = self.help_scroll.saturating_sub(1);
                 }
                 KeyCode::Char('g') => {
-                    if self.g_pending {
+                    if self.pending_prefix == Some('g') {
                         self.help_scroll = 0;
-                        self.g_pending = false;
+                        self.pending_prefix = None;
                     } else {
-                        self.g_pending = true;
+                        self.pending_prefix = Some('g');
                     }
                 }
                 KeyCode::Char('G') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_scroll = u16::MAX;
                 }
                 KeyCode::Char('d') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_scroll = self.help_scroll.saturating_add(10);
                 }
                 KeyCode::Char('u') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_scroll = self.help_scroll.saturating_sub(10);
                 }
                 KeyCode::Char('/') => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.help_filter_active = true;
                     self.help_filter.clear();
                     self.help_scroll = 0;
                 }
                 KeyCode::Char('?') | KeyCode::Esc => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                     self.close_overlay();
                     self.help_scroll = 0;
                     self.help_filter.clear();
                     self.help_filter_active = false;
                 }
                 _ => {
-                    self.g_pending = false;
+                    self.pending_prefix = None;
                 }
             }
         }
@@ -2450,30 +2458,82 @@ mod tests {
 
     use super::super::View;
 
-    /// `g c` / `g a` / `g m` switch the active top-level view; the leader is
-    /// consumed and `App::view` updates. `g` alone only arms the leader.
+    /// `Space c` / `Space a` / `Space m` switch the active top-level view; the
+    /// leader is consumed and `App::view` updates. Space alone only arms the
+    /// leader (#0033 follow-up: Space is the view leader).
     #[test]
     fn leader_switches_top_level_view() {
         let mut app = app_with_mailboxes();
         assert_eq!(app.view, View::Mail);
 
-        // Bare `g` arms the leader without switching.
-        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
-        assert!(app.g_pending, "g must arm the leader");
+        // Bare Space arms the leader without switching.
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert_eq!(app.pending_prefix, Some(' '), "Space must arm the leader");
         assert_eq!(app.view, View::Mail);
 
-        // `g c` -> Contacts.
+        // `Space c` -> Contacts.
         app.handle_key(KeyEvent::from(KeyCode::Char('c')));
         assert_eq!(app.view, View::Contacts);
-        assert!(!app.g_pending, "leader consumed by the switch");
+        assert_eq!(app.pending_prefix, None, "leader consumed by the switch");
 
-        // `g a` -> Calendar.
-        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        // `Space a` -> Calendar (proving Space arms from a placeholder view).
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         app.handle_key(KeyEvent::from(KeyCode::Char('a')));
         assert_eq!(app.view, View::Calendar);
 
-        // `g m` -> back to Mail.
+        // `Space m` -> back to Mail.
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+        assert_eq!(app.view, View::Mail);
+    }
+
+    /// `v` toggles list selection (the binding that moved off Space, #0033
+    /// follow-up). Space no longer touches selection.
+    #[test]
+    fn v_toggles_list_selection_and_space_does_not() {
+        let mut app = app_with_mailboxes();
+        app.focus = Focus::List;
+        assert!(!app.visible.is_empty(), "fixture must have selectable emails");
+        let before = app.selection.len();
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert_eq!(app.selection.len(), before + 1, "v must add to the selection");
+
+        // Space with a non-empty list arms the view leader instead of toggling.
+        let sel_after_v = app.selection.len();
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert_eq!(app.pending_prefix, Some(' '), "Space arms the view leader");
+        assert_eq!(
+            app.selection.len(),
+            sel_after_v,
+            "Space must not change the selection"
+        );
+    }
+
+    /// `g` in Contacts arms only where continuations exist; in Calendar (no
+    /// g-continuations) it does not arm a dead leader.
+    #[test]
+    fn g_leader_does_not_arm_in_calendar() {
+        let mut app = app_with_mailboxes();
+        app.switch_view(View::Calendar);
         app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(
+            app.pending_prefix, None,
+            "g must not arm a dead leader in Calendar (no continuations)"
+        );
+
+        // Contacts DOES have gg/G continuations, so g arms there.
+        app.switch_view(View::Contacts);
+        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.pending_prefix, Some('g'), "g arms in Contacts");
+    }
+
+    /// Space switches views from the Contacts view too (Global leader).
+    #[test]
+    fn space_leader_switches_view_from_contacts() {
+        let mut app = app_with_mailboxes();
+        app.switch_view(View::Contacts);
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert_eq!(app.pending_prefix, Some(' '));
         app.handle_key(KeyEvent::from(KeyCode::Char('m')));
         assert_eq!(app.view, View::Mail);
     }
