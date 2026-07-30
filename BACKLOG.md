@@ -19,6 +19,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
 - [#TKT-0045 Reload drafts](docs/tickets/TKT-0045-reload-drafts.md) -- bug
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug
+- [#TKT-0048 Contacts/Calendar visual polish to match overlay quality](docs/tickets/TKT-0048-views-visual-polish.md) -- feature
 
 ## Later
 
