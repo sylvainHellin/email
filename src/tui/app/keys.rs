@@ -325,6 +325,16 @@ impl App {
                     });
                 }
             }
+            A::ContactsCopyEmail => {
+                self.pending_prefix = None;
+                match self.selected_contact() {
+                    Some(contact) => {
+                        let address = contact.address.clone();
+                        self.push_action(Action::CopyContactEmail { address });
+                    }
+                    None => self.set_status("No contact selected".to_string()),
+                }
+            }
             A::ContactsRefresh => {
                 self.pending_prefix = None;
                 self.refresh_contacts();
@@ -2813,6 +2823,42 @@ mod tests {
         }
     }
 
+    /// `c` in Contacts queues the clipboard copy for the selected contact.
+    /// Dispatch-level only: the actual `arboard` call lives in `actions.rs` and
+    /// would touch the real system clipboard (unavailable headless), so tests
+    /// stop at the queued `Action`, like the vCard test above.
+    #[test]
+    fn copy_email_key_queues_clipboard_copy_for_selection() {
+        let mut app = app_in_contacts();
+        app.handle_key(KeyEvent::from(KeyCode::Char('j'))); // select bob
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        match app.pending_actions.pop_front() {
+            Some(Action::CopyContactEmail { address }) => {
+                assert_eq!(address, "bob@bar.com");
+            }
+            other => panic!("expected CopyContactEmail, got {other:?}"),
+        }
+    }
+
+    /// With no contact selected (empty index) `c` is a no-op with a status
+    /// hint, not a queued copy.
+    #[test]
+    fn copy_email_key_is_noop_without_selection() {
+        let mut app = app_with_mailboxes();
+        app.view = View::Contacts;
+        app.contacts_view.loaded = true;
+        app.recompute_contact_matches();
+        assert!(app.selected_contact().is_none());
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            app.pending_actions
+                .iter()
+                .all(|a| !matches!(a, Action::CopyContactEmail { .. })),
+            "c must not queue a copy without a selection"
+        );
+        assert_eq!(app.status_message.as_deref(), Some("No contact selected"));
+    }
+
     /// Contacts keys must not fire in the Mail view: pressing `v` (vCard) in
     /// Mail does not queue a contact action (it is not a Mail binding).
     #[test]
@@ -2836,6 +2882,29 @@ mod tests {
                 .iter()
                 .all(|a| !matches!(a, Action::ComposeToContact { .. })),
             "n in Mail must be NewDraft, not ComposeToContact"
+        );
+        // `c` in Mail is edit-recipients (Drafts-only), never a contact copy.
+        app.pending_actions.clear();
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            app.pending_actions
+                .iter()
+                .all(|a| !matches!(a, Action::CopyContactEmail { .. })),
+            "c in Mail must not queue a contact copy"
+        );
+    }
+
+    /// `c` must not queue a contact copy from the Calendar view either (it has
+    /// no `c` binding, and the Global `c` is only a `Space` continuation).
+    #[test]
+    fn copy_email_key_does_not_fire_in_calendar() {
+        let mut app = app_in_calendar();
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            app.pending_actions
+                .iter()
+                .all(|a| !matches!(a, Action::CopyContactEmail { .. })),
+            "c must not queue a contact copy in Calendar"
         );
     }
 

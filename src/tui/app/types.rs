@@ -893,6 +893,12 @@ pub enum Action {
     SendContactVcard {
         contact: crate::contacts::Contact,
     },
+    /// Copy a contact's bare email address to the system clipboard. Carries the
+    /// address so the clipboard side effect stays in `actions.rs` while the
+    /// selection is resolved in the key executor (like `SendContactVcard`).
+    CopyContactEmail {
+        address: String,
+    },
     /// Open the invite email an agenda row was derived from in `$EDITOR`
     /// (#0034). Carries an explicit path: the event may live in any mailbox
     /// of the active account, not just the one the mail list is showing.

@@ -1760,6 +1760,13 @@ pub(super) fn handle_action(
             send_contact_as_vcard(app, terminal, &contact)?;
         }
 
+        Action::CopyContactEmail { address } => {
+            match super::helpers::copy_to_clipboard(&address) {
+                Ok(()) => app.set_status(format!("{address} copied to clipboard")),
+                Err(e) => app.set_status_level(format!("Copy failed: {e}"), StatusLevel::Error),
+            }
+        }
+
         Action::OpenEventSource { path } => {
             // The agenda row carries an explicit path (the invite may live in
             // any mailbox of the account), so this does not go through the

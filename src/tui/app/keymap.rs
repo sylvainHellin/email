@@ -278,6 +278,7 @@ pub enum KeyAction {
     ContactsSearch,
     ContactsCompose,
     ContactsVcard,
+    ContactsCopyEmail,
     ContactsRefresh,
     // -- Calendar view (#0034) -------------------------------------------
     CalendarDown,
@@ -490,6 +491,9 @@ pub static KEYMAP: &[KeyBinding] = &[
     b("Enter / n", Chord::Code(SpecialCode::Enter), KeyCtx::Contacts, KeyAction::ContactsCompose, "Compose to contact", true),
     b("", Chord::Char('n'), KeyCtx::Contacts, KeyAction::ContactsCompose, "", false),
     b("v", Chord::Char('v'), KeyCtx::Contacts, KeyAction::ContactsVcard, "Send contact as vCard", true),
+    // `c` is free in this context: the Global `c` is a leader continuation
+    // (`Space c`), and the mail-list `c` (edit recipients) is KeyCtx::List.
+    b("c", Chord::Char('c'), KeyCtx::Contacts, KeyAction::ContactsCopyEmail, "Copy email address", true),
     b("r", Chord::Char('r'), KeyCtx::Contacts, KeyAction::ContactsRefresh, "Refresh contact index", true),
     // -- CALENDAR (#0034) -------------------------------------------------
     // Local-first agenda over the invites on disk. Live only in the Calendar

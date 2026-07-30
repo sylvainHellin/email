@@ -81,6 +81,7 @@
       { "key": "/", "action": "Fuzzy search" },
       { "key": "Enter / n", "action": "Compose to contact" },
       { "key": "v", "action": "Send contact as vCard" },
+      { "key": "c", "action": "Copy email address" },
       { "key": "r", "action": "Refresh contact index" }
     ]
   },
