@@ -298,12 +298,14 @@ fn local_wallclock_to_utc_key(naive: chrono::NaiveDateTime) -> String {
 ///
 /// A flat 24 h, not a calendar day: across a DST boundary the implicit end is
 /// an hour off, which only shifts when a *finished* all-day event leaves the
-/// upcoming scope.
+/// upcoming scope. Overflow at the far end of the date range (a hand-edited
+/// six-digit year) degrades to the input unchanged instead of panicking.
 fn plus_one_day(sort_key: &str) -> String {
     match chrono::NaiveDateTime::parse_from_str(sort_key, "%Y-%m-%dT%H:%M:%S") {
-        Ok(naive) => (naive + chrono::Duration::days(1))
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string(),
+        Ok(naive) => naive
+            .checked_add_signed(chrono::Duration::days(1))
+            .map(|next| next.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_else(|| sort_key.to_string()),
         Err(_) => sort_key.to_string(),
     }
 }
@@ -641,6 +643,32 @@ mod tests {
             )
         );
         assert_eq!(events[0].end_sort, plus_one_day(&events[0].start_sort));
+    }
+
+    /// A hand-edited all-day date at the far end of chrono's range must not
+    /// panic in `plus_one_day` (the implicit-end `+1 day` used to overflow);
+    /// it degrades to an unchanged end key and the event still loads.
+    #[test]
+    fn far_future_all_day_event_does_not_overflow() {
+        // TZ-independent core: one day past this key does not exist.
+        let max_key = chrono::NaiveDateTime::MAX
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        assert_eq!(plus_one_day(&max_key), max_key);
+
+        // End-to-end: the reviewer's reproducer (panicked under TZ=UTC).
+        let tmp = tempfile::tempdir().unwrap();
+        write_invite(
+            &tmp.path().join("inbox"),
+            "doom.md",
+            "Heat death planning",
+            "uid-far",
+            "REQUEST",
+            0,
+            Some("+262142-12-31T00:00:00"),
+        );
+        let events = load_events_for_account(tmp.path());
+        assert_eq!(events.len(), 1);
     }
 
     /// An offset-less wallclock is a *local* time, so it must normalise to the
