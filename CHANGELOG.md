@@ -186,6 +186,18 @@ All notable changes to this project are documented in this file.
   malformed frontmatter fail with an error status and no data loss.
 
 ### Fixed
+- **Only the row under the cursor is highlighted in the TUI email list.**
+  Rows toggle-selected with `v` kept a full-row background even after the
+  cursor moved on, so several rows looked equally focused and it was
+  ambiguous which email the next keystroke would act on. Selected rows now
+  show the checked checkbox in the marker column plus the selection
+  foreground color, and the background fill belongs to the cursor row alone.
+- **File permissions survive a draft rewrite.** Every write that goes through
+  `write_atomic` (approve, demote, mark-as-sent, recipient edits) renames a
+  fresh temp file over the target, which replaced the inode and reset a draft
+  the user had chmod'ed to 0600 back to the umask default. The target's mode
+  is now copied onto the temp file before its content is written; newly
+  created files still follow the umask.
 - **The TUI cursor no longer jumps to a different email when the list changes
   underneath it.** The selection is now anchored to the selected email's
   identity (its file path) across every list rebuild: approving or demoting a

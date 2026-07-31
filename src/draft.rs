@@ -1050,10 +1050,23 @@ fn unquote_yaml(s: &str) -> &str {
 
 /// Atomically overwrite `path` by writing to a `.tmp` sibling then renaming
 /// over the destination. Mirrors `secrets::write_secret_file_atomic` minus the
-/// 0600 mode — drafts are plain files, so this preserves the permission
+/// fixed 0600 mode — drafts are plain files, so this preserves the permission
 /// semantics of an ordinary overwrite.
+///
+/// A rename replaces the destination inode, so the target's permission bits
+/// would otherwise be reset to whatever the umask gives the temp file: a
+/// draft the user had chmod'ed to 0600 came back 0644 after every status
+/// change. When the target exists, its mode is copied onto the temp file
+/// *before* the payload is written, so the content is never briefly readable
+/// under wider permissions. A new file keeps default umask behaviour.
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
+
+    #[cfg(unix)]
+    let existing_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+    };
 
     // Use a PID-qualified extension so we never collide with (and clobber) a
     // real user file that happens to be named `<draft>.tmp`.
@@ -1072,6 +1085,17 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&tmp)
         .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| {
+                format!(
+                    "Failed to preserve permissions ({mode:o}) on temp file: {}",
+                    tmp.display()
+                )
+            })?;
+    }
     file.write_all(data)
         .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
     file.sync_all()
@@ -2688,6 +2712,64 @@ mod tests {
         assert_eq!(written.frontmatter.status, EmailStatus::Sent);
         assert!(written.frontmatter.sent_at.is_some());
         assert_eq!(written.body_markdown, "Body");
+    }
+
+    /// `write_atomic` renames a fresh temp file over the destination, which
+    /// replaces the inode: without an explicit copy, a draft the user had
+    /// restricted to 0600 came back with the umask default after every
+    /// status change.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_the_targets_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("private.md");
+
+        fs::write(&path, b"first").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, b"second").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "write_atomic reset the permission bits");
+    }
+
+    /// The same guarantee through a real caller: approving a 0600 draft must
+    /// not widen it to 0644.
+    #[cfg(unix)]
+    #[test]
+    fn mark_as_approved_preserves_a_0600_drafts_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "draft");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        mark_as_approved(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "approving a draft widened its permissions");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("status: approved\n"));
+    }
+
+    /// A file that did not exist keeps default umask behaviour: no mode is
+    /// forced, so the result matches an ordinary `fs::write`.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_leaves_a_new_file_to_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let reference = tmp.path().join("reference.md");
+        fs::write(&reference, b"x").unwrap();
+        let expected = fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+
+        let path = tmp.path().join("fresh.md");
+        write_atomic(&path, b"x").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, expected);
     }
 }
 

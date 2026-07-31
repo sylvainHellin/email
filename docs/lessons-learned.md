@@ -182,3 +182,10 @@ Any writer that re-serializes a partial view of a document is lossy by construct
 `rewrite_frontmatter_scalars` (`src/draft.rs`) now backs all three, replacing only the named top-level key lines and appending absent ones before the closing fence.
 `update_status_to_sent` keeps a serde fallback for exactly one caller: `mp invite` builds a synthetic `EmailDraft` that was never written to disk, so there are no source bytes to preserve.
 The regression seam is a byte-equality assertion (`after == before.replace("status: draft", "status: approved")`), which catches field loss and reflowed quoting that a struct-level assertion cannot see.
+
+## An atomic rename replaces the inode, so it silently resets the target's permissions (2026-07-31)
+
+`write_atomic` (`src/draft.rs`) creates a temp sibling and renames it over the destination, which is what makes the overwrite atomic, but the renamed file carries its *own* inode and therefore its own mode: a draft the user had chmod'ed to 0600 came back 0644 (umask default) after every approve, demote or mark-as-sent.
+The fix copies the existing target's mode onto the temp file *before* the payload is written, not after, so the content is never briefly on disk under wider permissions than the user asked for.
+A target that does not exist is left alone, so a newly created draft still follows the umask rather than inheriting some arbitrary earlier mode.
+The same trap applies to any copy-and-rename writer; `secrets::write_secret_file_atomic` dodges it only because it hardcodes 0600 on the temp file.

@@ -27,6 +27,35 @@ fn invite_and_attachment_prefix(email: &EmailEntry) -> String {
     prefix
 }
 
+/// Style for one list row.
+///
+/// The background fill is the cursor's alone: it is the only way to tell
+/// which email the next keystroke acts on. Toggle-selected rows carry the
+/// checked checkbox in the marker column plus the selection foreground, so a
+/// multi-select stays visible without a second full-row highlight competing
+/// with the cursor (a selected row the cursor had left used to keep its
+/// background, leaving the focused email ambiguous).
+fn row_style(is_cursor: bool, is_in_selection: bool, read: bool) -> Style {
+    if is_cursor {
+        Style::default()
+            .bg(theme::active().surface)
+            .fg(theme::active().selection)
+    } else if is_in_selection {
+        let style = Style::default().fg(theme::active().selection);
+        if read {
+            style
+        } else {
+            style.add_modifier(Modifier::BOLD)
+        }
+    } else if !read {
+        Style::default()
+            .fg(theme::active().text)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::active().text_muted)
+    }
+}
+
 pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     let border_style = pane_border_style(app.focus, Focus::List);
     let title = if !app.search_query.is_empty() && app.focus != Focus::Search {
@@ -137,21 +166,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                     subject_width,
                 );
 
-                let row_style = if is_cursor {
-                    Style::default()
-                        .bg(theme::active().surface)
-                        .fg(theme::active().selection)
-                } else if is_in_selection {
-                    Style::default()
-                        .bg(theme::active().surface)
-                        .fg(theme::active().text)
-                } else if !email.read {
-                    Style::default()
-                        .fg(theme::active().text)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme::active().text_muted)
-                };
+                let style = row_style(is_cursor, is_in_selection, email.read);
 
                 let mut cells = Vec::new();
                 if has_selection {
@@ -173,7 +188,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 cells.push(Cell::from(contact));
                 cells.push(Cell::from(subject));
 
-                Row::new(cells).style(row_style)
+                Row::new(cells).style(style)
             })
             .collect();
 
@@ -228,21 +243,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                     subject_width,
                 );
 
-                let row_style = if is_cursor {
-                    Style::default()
-                        .bg(theme::active().surface)
-                        .fg(theme::active().selection)
-                } else if is_in_selection {
-                    Style::default()
-                        .bg(theme::active().surface)
-                        .fg(theme::active().text)
-                } else if !email.read {
-                    Style::default()
-                        .fg(theme::active().text)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme::active().text_muted)
-                };
+                let style = row_style(is_cursor, is_in_selection, email.read);
 
                 let mut cells = Vec::new();
                 if has_selection {
@@ -263,7 +264,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 cells.push(Cell::from(email.date_display.clone()));
                 cells.push(Cell::from(subject));
 
-                Row::new(cells).style(row_style)
+                Row::new(cells).style(style)
             })
             .collect();
 
@@ -330,5 +331,63 @@ mod badge_tests {
         let p = invite_and_attachment_prefix(&entry(true, false));
         assert!(p.starts_with(INVITE_GLYPH));
         assert!(!p.contains('\u{f0c6}'));
+    }
+}
+
+#[cfg(test)]
+mod row_style_tests {
+    use super::*;
+
+    /// The background fill marks the focused row and nothing else: a
+    /// toggle-selected row the cursor has left used to keep it, so two rows
+    /// looked equally focused and the target of the next keystroke was
+    /// ambiguous.
+    #[test]
+    fn only_the_cursor_row_gets_a_background() {
+        assert_eq!(
+            row_style(true, false, true).bg,
+            Some(theme::active().surface)
+        );
+        assert_eq!(
+            row_style(true, true, true).bg,
+            Some(theme::active().surface)
+        );
+        assert_eq!(row_style(false, true, true).bg, None);
+        assert_eq!(row_style(false, true, false).bg, None);
+        assert_eq!(row_style(false, false, true).bg, None);
+        assert_eq!(row_style(false, false, false).bg, None);
+    }
+
+    /// Without a background, the selection foreground is what still sets a
+    /// selected row apart from its unselected neighbours (on top of the
+    /// checkbox glyph in the marker column).
+    #[test]
+    fn selected_rows_keep_the_selection_foreground_and_unread_bold() {
+        assert_eq!(
+            row_style(false, true, true).fg,
+            Some(theme::active().selection)
+        );
+        assert!(!row_style(false, true, true)
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(
+            row_style(false, true, false).fg,
+            Some(theme::active().selection)
+        );
+        assert!(row_style(false, true, false)
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    /// Unselected rows are untouched by the fix: unread bold, read muted.
+    #[test]
+    fn unselected_rows_keep_their_read_state_styling() {
+        let unread = row_style(false, false, false);
+        assert_eq!(unread.fg, Some(theme::active().text));
+        assert!(unread.add_modifier.contains(Modifier::BOLD));
+
+        let read = row_style(false, false, true);
+        assert_eq!(read.fg, Some(theme::active().text_muted));
+        assert!(!read.add_modifier.contains(Modifier::BOLD));
     }
 }
