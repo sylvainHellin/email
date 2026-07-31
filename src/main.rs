@@ -220,7 +220,9 @@ enum Commands {
     },
     /// Search emails on the IMAP server
     Search {
-        /// Search query (supports from:, to:, subject:, body:, since:, before:, in: prefixes)
+        /// Search query (supports from:, to:, subject:, body:, since:, before:,
+        /// message-id:, in: prefixes). message-id: matches the RFC 5322
+        /// Message-ID exactly, with or without angle brackets.
         query: String,
         /// Mailbox to search (default: all configured mailboxes)
         #[arg(long)]
@@ -1449,6 +1451,7 @@ async fn main() -> Result<()> {
                     since,
                     before,
                     text: None,
+                    message_id: None,
                     in_mailbox: None,
                 };
                 fetch_emails(&imap_config, &criteria, &mailbox, Some(limit)).await?

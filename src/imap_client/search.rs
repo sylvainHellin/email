@@ -9,8 +9,47 @@ pub struct FetchCriteria {
     pub since: Option<String>,
     pub before: Option<String>,
     pub text: Option<String>,
+    /// RFC 5322 Message-ID to look up. Stored with or without angle brackets;
+    /// every consumer normalizes through [`normalize_message_id`].
+    pub message_id: Option<String>,
     /// Routing directive: which mailbox to search. Not an IMAP search criterion.
     pub in_mailbox: Option<String>,
+}
+
+/// Normalize a Message-ID for comparison: trim whitespace and strip one layer of
+/// angle brackets, so `<a@b>` and `a@b` compare equal. Idempotent.
+pub fn normalize_message_id(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed)
+}
+
+/// Canonical wire form of a Message-ID, always angle-bracketed: `<a@b>`.
+/// Servers store the header with the brackets, so queries must carry them.
+pub fn bracketed_message_id(raw: &str) -> String {
+    format!("<{}>", normalize_message_id(raw))
+}
+
+/// Drop results whose Message-ID is not exactly `criteria.message_id`.
+///
+/// Neither backend gives an exact match on its own: IMAP `HEADER` is a substring
+/// match over the header text, and Graph falls back to a fuzzy `$search` when
+/// `$filter` is rejected. Comparison ignores ASCII case because servers are not
+/// consistent about the domain part; it is still equality, never a substring.
+/// A no-op when no Message-ID was requested.
+pub fn retain_exact_message_id(emails: &mut Vec<crate::parse::FetchedEmail>, criteria: &FetchCriteria) {
+    let Some(ref wanted) = criteria.message_id else {
+        return;
+    };
+    let wanted = normalize_message_id(wanted);
+    emails.retain(|email| {
+        email
+            .message_id
+            .as_deref()
+            .is_some_and(|mid| normalize_message_id(mid).eq_ignore_ascii_case(wanted))
+    });
 }
 
 pub(crate) fn build_imap_search_query(criteria: &FetchCriteria) -> String {
@@ -30,6 +69,15 @@ pub(crate) fn build_imap_search_query(criteria: &FetchCriteria) -> String {
     }
     if let Some(ref body) = criteria.body {
         parts.push(format!("BODY \"{}\"", body));
+    }
+    if let Some(ref message_id) = criteria.message_id {
+        // Always bracketed: `HEADER` is a substring match, and the brackets are
+        // what stop `<abc@x>` from also matching `<prefix-abc@x>`. Exactness is
+        // finished off by retain_exact_message_id on the results.
+        parts.push(format!(
+            "HEADER \"Message-ID\" \"{}\"",
+            bracketed_message_id(message_id)
+        ));
     }
     if let Some(ref since) = criteria.since {
         if let Some(imap_date) = parse_date_to_imap(since) {
@@ -55,7 +103,8 @@ pub(crate) fn build_imap_search_query(criteria: &FetchCriteria) -> String {
 
 /// Parse a user search string into structured FetchCriteria.
 ///
-/// Recognized prefixes: from:, to:, cc:, subject:, body:, since:, before:
+/// Recognized prefixes: from:, to:, cc:, subject:, body:, since:, before:,
+/// message-id:, in:
 /// Quoted values supported: from:"John Doe"
 /// Bare text (no prefix) becomes a TEXT search.
 pub fn parse_search_query(input: &str) -> FetchCriteria {
@@ -68,6 +117,7 @@ pub fn parse_search_query(input: &str) -> FetchCriteria {
         since: None,
         before: None,
         text: None,
+        message_id: None,
         in_mailbox: None,
     };
 
@@ -95,6 +145,7 @@ pub fn parse_search_query(input: &str) -> FetchCriteria {
             ("since:", 5),
             ("before:", 6),
             ("in:", 7),
+            ("message-id:", 8),
         ] {
             if lower_rest.starts_with(prefix) {
                 for _ in 0..prefix.len() {
@@ -110,6 +161,7 @@ pub fn parse_search_query(input: &str) -> FetchCriteria {
                     5 => criteria.since = Some(value),
                     6 => criteria.before = Some(value),
                     7 => criteria.in_mailbox = Some(value),
+                    8 => criteria.message_id = Some(value),
                     _ => unreachable!(),
                 }
                 matched = true;
@@ -254,6 +306,7 @@ mod tests {
             since: None,
             before: None,
             text: None,
+            message_id: None,
             in_mailbox: None,
         };
         assert_eq!(build_imap_search_query(&criteria), "ALL");
@@ -382,5 +435,125 @@ mod tests {
         let criteria = parse_search_query("from:alice urgent");
         assert_eq!(criteria.from, Some("alice".to_string()));
         assert_eq!(criteria.text, Some("urgent".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_message_id_strips_one_bracket_layer() {
+        assert_eq!(normalize_message_id("<abc@example.com>"), "abc@example.com");
+        assert_eq!(normalize_message_id("abc@example.com"), "abc@example.com");
+        assert_eq!(normalize_message_id("  <abc@example.com> "), "abc@example.com");
+        // Half-bracketed input is left alone rather than silently mangled.
+        assert_eq!(normalize_message_id("<abc@example.com"), "<abc@example.com");
+    }
+
+    #[test]
+    fn test_bracketed_message_id_is_idempotent() {
+        assert_eq!(bracketed_message_id("abc@example.com"), "<abc@example.com>");
+        assert_eq!(
+            bracketed_message_id("<abc@example.com>"),
+            "<abc@example.com>"
+        );
+    }
+
+    #[test]
+    fn test_parse_search_query_message_id() {
+        let bare = parse_search_query("message-id:abc123@example.com");
+        assert_eq!(bare.message_id, Some("abc123@example.com".to_string()));
+        // Angle brackets survive the parser; normalization happens downstream.
+        let bracketed = parse_search_query("message-id:<abc123@example.com>");
+        assert_eq!(bracketed.message_id, Some("<abc123@example.com>".to_string()));
+        // Prefix matching is case-insensitive like every other prefix.
+        let upper = parse_search_query("MESSAGE-ID:<abc123@example.com>");
+        assert_eq!(upper.message_id, Some("<abc123@example.com>".to_string()));
+    }
+
+    #[test]
+    fn test_parse_search_query_message_id_not_confused_with_other_prefixes() {
+        let criteria = parse_search_query("in:Archive message-id:<a@b> from:alice");
+        assert_eq!(criteria.in_mailbox, Some("Archive".to_string()));
+        assert_eq!(criteria.message_id, Some("<a@b>".to_string()));
+        assert_eq!(criteria.from, Some("alice".to_string()));
+        assert_eq!(criteria.text, None);
+    }
+
+    #[test]
+    fn test_build_imap_search_query_message_id_always_bracketed() {
+        let criteria = FetchCriteria {
+            message_id: Some("abc123@example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_imap_search_query(&criteria),
+            "HEADER \"Message-ID\" \"<abc123@example.com>\""
+        );
+
+        let already = FetchCriteria {
+            message_id: Some("<abc123@example.com>".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_imap_search_query(&already),
+            "HEADER \"Message-ID\" \"<abc123@example.com>\""
+        );
+    }
+
+    fn email_with_id(id: Option<&str>) -> crate::parse::FetchedEmail {
+        crate::parse::FetchedEmail {
+            from: String::new(),
+            to: String::new(),
+            cc: None,
+            subject: String::new(),
+            date: String::new(),
+            body_text: String::new(),
+            html_body: None,
+            has_attachments: false,
+            message_id: id.map(|s| s.to_string()),
+            attachments: Vec::new(),
+            is_read: false,
+            calendar_ics: None,
+            event: None,
+        }
+    }
+
+    #[test]
+    fn test_retain_exact_message_id_drops_substring_matches() {
+        let criteria = FetchCriteria {
+            message_id: Some("<abc@example.com>".to_string()),
+            ..Default::default()
+        };
+
+        let mut emails = vec![
+            email_with_id(Some("<prefix-abc@example.com>")),
+            email_with_id(Some("<abc@example.com.evil.net>")),
+            email_with_id(Some("<abc@example.com>")),
+            email_with_id(None),
+        ];
+        retain_exact_message_id(&mut emails, &criteria);
+
+        assert_eq!(emails.len(), 1);
+        assert_eq!(
+            emails[0].message_id,
+            Some("<abc@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_retain_exact_message_id_matches_across_bracket_and_case_variants() {
+        let criteria = FetchCriteria {
+            message_id: Some("abc@Example.COM".to_string()),
+            ..Default::default()
+        };
+
+        let mut emails = vec![email_with_id(Some("<abc@example.com>"))];
+        retain_exact_message_id(&mut emails, &criteria);
+        assert_eq!(emails.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_exact_message_id_is_a_noop_without_criteria() {
+        let criteria = FetchCriteria::default();
+        let mut emails = vec![email_with_id(Some("<a@b>")), email_with_id(None)];
+        retain_exact_message_id(&mut emails, &criteria);
+        assert_eq!(emails.len(), 2);
     }
 }

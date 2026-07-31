@@ -154,6 +154,15 @@ Reserving `display_width(text).div_ceil(width)` rows for a wrapped `Paragraph` i
 
 `parse.rs` writes inbound attachments to `<mailbox>/<stem>_attachments/<name>.md` and mirrors them to `<account>/attachments/<message-id>/<name>.md`, and `sanitize_attachment_filename` preserves the `.md` extension. Any unbounded `WalkDir` over the account root that trusts `*.md` frontmatter is therefore parsing attacker-chosen content: an attached `.md` with an `event:` block and a real invite's UID plus `sequence: 4294967295` displaces the genuine agenda row (attacker summary, organizer and start time), and the same trick with `method: CANCEL` strikes a real meeting through. The live mailstore already holds 72 attachment `.md` files. The Calendar loader now skips any path with a component equal to `attachments` or ending in `_attachments` (`is_attachment_path`, `src/tui/app/calendar_view.rs`); the invite's own `invite.ics` sidecar still lives in such a dir and is still read, but only through `authoritative_ids`, keyed off a real email's path. `reconcile::build_index` has the same unbounded walk and is tracked as TKT-0047. Every other body-reading walk in the repo is already `max_depth(1)`.
 
+## IMAP `HEADER` is a substring match, so a Message-ID lookup needs a client-side exactness pass (2026-07-29)
+
+RFC 3501 defines `HEADER <field> <string>` as "contains the specified string in the text of the header", not equality, so `HEADER "Message-ID" "abc@x"` also returns `<prefix-abc@x>` and `<abc@x.evil.net>`.
+Two things make the `message-id:` search prefix (TECHLEV-6) exact.
+First, the query always goes out angle-bracketed (`bracketed_message_id`), because the brackets are what pin both ends of the identifier inside the header text.
+Second, `retain_exact_message_id` re-checks equality on the parsed results, which is also what catches the Graph backend falling back from `$filter` to a fuzzy `$search` when `internetMessageId eq` is rejected.
+The filter lives in `fetch_emails_on_session`, the single seam every IMAP search path goes through (CLI, TUI `f` overlay), rather than at the call sites.
+Comparison is `eq_ignore_ascii_case` on the bracket-stripped value: servers are inconsistent about the domain part's casing, and this is still equality, never a substring.
+
 ## The TUI cursor is a bare index, so any list rebuild silently moves it (2026-07-30)
 
 `App::list_index` indexes `visible`, which indexes `emails`, and none of those three levels carries the identity of the row the user is looking at.

@@ -17,7 +17,10 @@ pub use ops::{
     move_email_on_server, update_read_status_locally,
     get_message_id_from_file,
 };
-pub use search::{parse_search_query, FetchCriteria};
+pub use search::{
+    bracketed_message_id, normalize_message_id, parse_search_query, retain_exact_message_id,
+    FetchCriteria,
+};
 pub use sync::{
     list_mailboxes, load_mailbox_states_cache, mailbox_states_cache_path,
     save_mailbox_states_cache, sync_mailboxes, FreshObservation, MailboxState, MessageIdIndex,

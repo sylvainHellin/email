@@ -132,6 +132,10 @@ pub async fn fetch_emails_on_session(
         }
     }
 
+    // `HEADER "Message-ID"` is a substring match on the server side; make the
+    // lookup exact here so every caller of this seam gets the same guarantee.
+    super::search::retain_exact_message_id(&mut emails, criteria);
+
     Ok(emails)
 }
 

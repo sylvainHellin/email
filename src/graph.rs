@@ -1324,6 +1324,8 @@ impl GraphClient {
             emails.push(email);
         }
 
+        crate::imap_client::retain_exact_message_id(&mut emails, criteria);
+
         Ok(emails)
     }
 
@@ -1385,6 +1387,8 @@ impl GraphClient {
             emails.push(email);
         }
 
+        crate::imap_client::retain_exact_message_id(&mut emails, criteria);
+
         Ok(emails)
     }
 }
@@ -1433,6 +1437,13 @@ fn parse_search_to_graph_params(
     }
     if let Some(ref before) = criteria.before {
         filter_parts.push(format!("receivedDateTime lt {}", before));
+    }
+    if let Some(ref message_id) = criteria.message_id {
+        // Graph stores the header verbatim, angle brackets included.
+        filter_parts.push(format!(
+            "internetMessageId eq '{}'",
+            crate::imap_client::bracketed_message_id(message_id).replace('\'', "''")
+        ));
     }
 
     let search = if search_parts.is_empty() {

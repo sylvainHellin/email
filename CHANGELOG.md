@@ -15,6 +15,15 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **Search by Message-ID (TECHLEV-6).** `mp search` accepts a
+  `message-id:` prefix that resolves an RFC 5322 Message-ID to its message:
+  `mp search 'message-id:<abc@example.com>'`. Angle brackets are optional on
+  input and always added on the wire, and the match is exact rather than a
+  substring, so `<abc@x>` never returns `<prefix-abc@x>`. Works on both
+  backends (IMAP `HEADER "Message-ID"`, Graph `internetMessageId eq`), across
+  all configured mailboxes by default, and combines with the other prefixes
+  (`in:Archive message-id:...`). The TUI server-search overlay (`f`) shares the
+  same parser and gets it for free.
 - **Local calendar view in the TUI (#0034).** Switch to Calendar with
   **`Space a`** for an **agenda over the invitations already on disk**: date,
   title, and your RSVP state per row, with the shared **event card** (time,
