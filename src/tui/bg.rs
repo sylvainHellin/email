@@ -435,6 +435,14 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 // `None`, so the next visit triggers a fresh load.
                 return;
             }
+            // The cursor's identity must be read from the OLD list: a
+            // reload re-sorts (an approved draft changes status/date) and
+            // grows (new inbox mail shifts every row down), so the bare
+            // `list_index` would land on a different email. Anchor on the
+            // path, fall back to the clamped index when that email is
+            // gone from the fresh list.
+            let anchor = app.cursor_anchor();
+            let fallback = app.list_index;
             let entries = std::sync::Arc::new(entries);
             if let Some(slot) = app.email_cache.get_mut(mailbox_idx) {
                 // Cache slot and `app.emails` share the allocation (P2):
@@ -443,15 +451,9 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             }
             app.emails = entries;
             // Reapply the active search filter (if any) to the fresh
-            // entries, then clamp the cursor against the resulting view
-            // -- same selection preservation as the old synchronous
-            // reload.
+            // entries, then put the cursor back on the anchored email.
             app.rebuild_visible();
-            if !app.visible.is_empty() {
-                app.list_index = app.list_index.min(app.visible.len() - 1);
-            } else {
-                app.list_index = 0;
-            }
+            app.restore_cursor(anchor, fallback);
             if let Some(count) = app.mailbox_counts.get_mut(mailbox_idx) {
                 *count = app.emails.len();
             }

@@ -153,3 +153,23 @@ Reserving `display_width(text).div_ceil(width)` rows for a wrapped `Paragraph` i
 ## `.md` files under an account root are not all our mail: attachment dirs are sender-controlled (2026-07-29)
 
 `parse.rs` writes inbound attachments to `<mailbox>/<stem>_attachments/<name>.md` and mirrors them to `<account>/attachments/<message-id>/<name>.md`, and `sanitize_attachment_filename` preserves the `.md` extension. Any unbounded `WalkDir` over the account root that trusts `*.md` frontmatter is therefore parsing attacker-chosen content: an attached `.md` with an `event:` block and a real invite's UID plus `sequence: 4294967295` displaces the genuine agenda row (attacker summary, organizer and start time), and the same trick with `method: CANCEL` strikes a real meeting through. The live mailstore already holds 72 attachment `.md` files. The Calendar loader now skips any path with a component equal to `attachments` or ending in `_attachments` (`is_attachment_path`, `src/tui/app/calendar_view.rs`); the invite's own `invite.ics` sidecar still lives in such a dir and is still read, but only through `authoritative_ids`, keyed off a real email's path. `reconcile::build_index` has the same unbounded walk and is tracked as TKT-0047. Every other body-reading walk in the repo is already `max_depth(1)`.
+
+## The TUI cursor is a bare index, so any list rebuild silently moves it (2026-07-30)
+
+`App::list_index` indexes `visible`, which indexes `emails`, and none of those three levels carries the identity of the row the user is looking at.
+Every reload therefore had to "preserve" the selection with `list_index.min(visible.len() - 1)`, a clamp that only guarantees the index is in range, not that it still points at the same email.
+Two everyday operations break it: approving a draft rewrites `status:`/sort key so the list re-sorts, and new inbox mail prepends a row so everything shifts down one under queued keystrokes.
+The fix is to anchor on `EmailEntry::path`, the de-facto stable key the codebase already keys `selection` and `set_email_read` on: `cursor_anchor()` before the rebuild, `restore_cursor(anchor, fallback)` after, with the old clamp as the fallback when the anchored email is genuinely gone.
+`BgResult::MailboxLoaded` (`src/tui/bg.rs`) is the single funnel every async reload passes through, so anchoring there covers `reload_current_mailbox`, watcher-triggered fetches and sync arrivals at once.
+Two site-specific traps: in `switch_account` the anchor captured before the swap belongs to the *outgoing* account and can never match, so the incoming account's path is parked in `AccountState::cursor_path` by `save_to_account` instead; and in the batch-removal path the fallback must be the number of *surviving* rows above the old cursor, or archiving rows above the cursor drags it downward.
+Intentional resets (`apply_search_filter`, `reload_from_cache`, a real mailbox change) still go to row 0 by design.
+
+## Status transitions must be line surgery, not a frontmatter round-trip (2026-07-30)
+
+`mark_as_approved` / `mark_as_draft` / `update_status_to_sent` used to `parse_email_draft` into `EmailFrontmatter`, flip one field, and `serde_yaml::to_string` the struct back.
+`EmailFrontmatter` has no `date` field, so every approve silently deleted the `date:` line (plus any user-added key) and added `cc: null`/`bcc: null` noise.
+The TUI's `resolve_date` then fell back to `sent_at` (null) and finally to the filename, which for a TUI-created `draft-%Y%m%d-%H%M%S.md` does not parse, so `date_sort` became empty and the approved row teleported to the bottom of the list.
+Any writer that re-serializes a partial view of a document is lossy by construction; the repo already had the right pattern in `rewrite_draft_recipients` and `set_event_rsvp`.
+`rewrite_frontmatter_scalars` (`src/draft.rs`) now backs all three, replacing only the named top-level key lines and appending absent ones before the closing fence.
+`update_status_to_sent` keeps a serde fallback for exactly one caller: `mp invite` builds a synthetic `EmailDraft` that was never written to disk, so there are no source bytes to preserve.
+The regression seam is a byte-equality assertion (`after == before.replace("status: draft", "status: approved")`), which catches field loss and reflowed quoting that a struct-level assertion cannot see.

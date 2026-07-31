@@ -2252,6 +2252,130 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Cursor stability across list rebuilds
+    //
+    // `list_index` is a bare position into `visible`, so any reload that
+    // re-sorts or grows the entry list used to move the cursor to a
+    // different email (approving a draft re-sorted the list; new inbox mail
+    // shifted every row down under queued keystrokes). The cursor is
+    // anchored on the entry's path and restored after the rebuild.
+    // -----------------------------------------------------------------------
+
+    /// Deliver a fresh entry list through the real async funnel
+    /// (`BgResult::MailboxLoaded`), the single path every reload takes.
+    fn deliver_mailbox_load(app: &mut App, entries: Vec<EmailEntry>) {
+        crate::tui::bg::handle_bg_result(
+            app,
+            super::super::BgResult::MailboxLoaded {
+                account_index: app.active_account,
+                mailbox_idx: app.active_mailbox,
+                generation: app.mailbox_load_generation,
+                entries,
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_follows_its_email_when_the_reload_resorts_the_list() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 1;
+        let anchored = app.selected_email().unwrap().path.clone();
+
+        // The approved draft's status/date changed, so the reload sorts it
+        // last instead of second.
+        let mut resorted = sample();
+        let moved = resorted.remove(1);
+        resorted.push(moved);
+        deliver_mailbox_load(&mut app, resorted);
+
+        assert_eq!(app.list_index, 3);
+        assert_eq!(app.selected_email().unwrap().path, anchored);
+    }
+
+    #[test]
+    fn cursor_stays_put_when_new_mail_is_prepended() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 2;
+        let anchored = app.selected_email().unwrap().path.clone();
+
+        // New inbox mail sorts above everything and shifts every row down.
+        let mut grown = vec![entry("Fresh arrival", "Dave", "just landed")];
+        grown.extend(sample());
+        deliver_mailbox_load(&mut app, grown);
+
+        assert_eq!(app.list_index, 3);
+        assert_eq!(app.selected_email().unwrap().path, anchored);
+    }
+
+    #[test]
+    fn cursor_falls_back_to_the_clamped_index_when_its_email_is_gone() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 3; // "Holiday plans"
+
+        // The reload lost the anchored email (archived from another client)
+        // and is shorter than the old cursor position.
+        let shorter = vec![sample()[0].clone(), sample()[1].clone()];
+        deliver_mailbox_load(&mut app, shorter);
+
+        assert_eq!(app.list_index, 1);
+        assert_eq!(app.selected_email().unwrap().subject, "Invoice April");
+    }
+
+    #[test]
+    fn empty_reload_leaves_the_cursor_at_zero() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 3;
+        deliver_mailbox_load(&mut app, Vec::new());
+        assert_eq!(app.list_index, 0);
+        assert!(app.selected_email().is_none());
+    }
+
+    #[test]
+    fn batch_removal_above_the_cursor_does_not_drag_it() {
+        // Six rows, cursor in the middle: with only four survivors the old
+        // clamp (`min(list_index, len - 1)`) would have left the cursor at
+        // row 3, two emails below the one the user was looking at.
+        let mut emails = sample();
+        emails.push(entry("Team sync", "Dave", "agenda"));
+        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        let mut app = app_with_emails(emails);
+        app.list_index = 3; // "Holiday plans"
+        let anchored = app.selected_email().unwrap().path.clone();
+
+        // Archive the two rows above the cursor: the cursor's own email
+        // survives, so it must stay under the cursor (at its new position).
+        let mut batch = std::collections::HashSet::new();
+        batch.insert(app.emails[0].path.clone());
+        batch.insert(app.emails[1].path.clone());
+        let removed = app.remove_selected_from_list_batch(&batch);
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(app.list_index, 1);
+        assert_eq!(app.selected_email().unwrap().path, anchored);
+    }
+
+    #[test]
+    fn batch_removal_including_the_cursor_lands_on_the_next_survivor() {
+        let mut emails = sample();
+        emails.push(entry("Team sync", "Dave", "agenda"));
+        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        let mut app = app_with_emails(emails);
+        app.list_index = 3; // "Holiday plans"
+
+        // The cursor's own row is part of the batch, together with two rows
+        // above it: the cursor falls back to the count of survivors above
+        // it, i.e. the row that took its place.
+        let mut batch = std::collections::HashSet::new();
+        batch.insert(app.emails[0].path.clone());
+        batch.insert(app.emails[1].path.clone());
+        batch.insert(app.emails[3].path.clone());
+        app.remove_selected_from_list_batch(&batch);
+
+        assert_eq!(app.list_index, 1);
+        assert_eq!(app.selected_email().unwrap().subject, "Team sync");
+    }
+
+    // -----------------------------------------------------------------------
     // Quick-move mailbox picker (#0018)
     // -----------------------------------------------------------------------
 

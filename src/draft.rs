@@ -1089,6 +1089,163 @@ fn yaml_dq_escape(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// What to write for one top-level frontmatter key in
+/// [`rewrite_frontmatter_scalars`].
+#[derive(Debug, Clone)]
+enum FieldWrite {
+    /// Set the key to this raw YAML scalar (already quoted/escaped by the
+    /// caller). Appended just before the closing fence when the key is
+    /// absent.
+    Set(String),
+    /// Reset the key to a bare `key:` (deserializes to `None`) when it is
+    /// present. Never appended: a key that was not there stays away, so we
+    /// do not sprinkle `cc: null`-style noise into user files.
+    ClearIfPresent,
+}
+
+/// Rewrite ONLY the listed top-level frontmatter keys of `content`,
+/// preserving the body and every other frontmatter byte.
+///
+/// This is the shared write path behind the status transitions
+/// ([`mark_as_approved`], [`mark_as_draft`], [`update_status_to_sent`]).
+/// They used to parse into [`EmailFrontmatter`] and re-serialize, which
+/// silently dropped every field that struct does not model -- including
+/// `date:`, the key the TUI sorts on, so an approved draft teleported to
+/// the bottom of the list. Line surgery keeps unknown and user-added
+/// fields intact.
+///
+/// Matching is the same as [`rewrite_draft_recipients`]: only zero-indent
+/// key lines are managed, and a replaced key's continuation lines (block
+/// scalars, nested mappings) are dropped with it.
+fn rewrite_frontmatter_scalars(
+    content: &str,
+    updates: &[(&str, FieldWrite)],
+) -> Result<String> {
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let after_open = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow!("No frontmatter found (file does not start with '---')"))?;
+
+    // Split frontmatter lines from the untouched body at the closing fence.
+    let mut fm_lines: Vec<String> = Vec::new();
+    let mut body = String::new();
+    let mut closed = false;
+    let mut cursor = 0usize;
+    while cursor < after_open.len() {
+        let rest = &after_open[cursor..];
+        let (line, advance) = match rest.find('\n') {
+            Some(nl) => (&rest[..nl], nl + 1),
+            None => (rest, rest.len()),
+        };
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed == "---" {
+            closed = true;
+            body = after_open[cursor + advance..].to_string();
+            break;
+        }
+        fm_lines.push(trimmed.to_string());
+        cursor += advance;
+    }
+    if !closed {
+        return Err(anyhow!("Malformed frontmatter: no closing '---' fence"));
+    }
+
+    let mut written = vec![false; updates.len()];
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < fm_lines.len() {
+        let line = &fm_lines[i];
+        // Indented lines are continuation lines of the previous entry and
+        // are never matched as managed keys.
+        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        let managed = if is_top_level {
+            updates.iter().position(|(key, _)| {
+                line.len() > key.len()
+                    && line.starts_with(key)
+                    && line.as_bytes()[key.len()] == b':'
+                    && line[key.len() + 1..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c == ' ')
+            })
+        } else {
+            None
+        };
+
+        match managed {
+            Some(pos) => {
+                let (key, write) = &updates[pos];
+                out_lines.push(match write {
+                    FieldWrite::Set(value) => format!("{key}: {value}"),
+                    FieldWrite::ClearIfPresent => format!("{key}:"),
+                });
+                written[pos] = true;
+                // Skip the replaced key line and its continuation lines
+                // (any more-indented line), including blank lines interior
+                // to a block scalar but not a trailing one.
+                i += 1;
+                while i < fm_lines.len() {
+                    let cont = &fm_lines[i];
+                    if cont.starts_with(' ') || cont.starts_with('\t') {
+                        i += 1;
+                    } else if cont.trim().is_empty() {
+                        let mut j = i + 1;
+                        while j < fm_lines.len() && fm_lines[j].trim().is_empty() {
+                            j += 1;
+                        }
+                        let continues = j < fm_lines.len()
+                            && (fm_lines[j].starts_with(' ') || fm_lines[j].starts_with('\t'));
+                        if continues {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            None => {
+                out_lines.push(line.clone());
+                i += 1;
+            }
+        }
+    }
+
+    for (pos, (key, write)) in updates.iter().enumerate() {
+        if written[pos] {
+            continue;
+        }
+        if let FieldWrite::Set(value) = write {
+            out_lines.push(format!("{key}: {value}"));
+        }
+    }
+
+    let mut rebuilt = String::new();
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    for line in out_lines {
+        rebuilt.push_str(&line);
+        rebuilt.push_str(newline);
+    }
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    rebuilt.push_str(&body);
+    Ok(rebuilt)
+}
+
+/// Read `path`, apply [`rewrite_frontmatter_scalars`], write it back
+/// atomically. The file is only touched on the success path.
+fn rewrite_frontmatter_scalars_at(path: &Path, updates: &[(&str, FieldWrite)]) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let rebuilt = rewrite_frontmatter_scalars(&content, updates)?;
+    write_atomic(path, rebuilt.as_bytes())
+        .with_context(|| format!("Failed to write file: {}", path.display()))
+}
+
 pub fn parse_email_draft(path: &Path) -> Result<EmailDraft> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -1254,17 +1411,49 @@ pub fn update_status_to_sent(
     message_id: Option<&str>,
 ) -> Result<()> {
     info!("Updating status to sent: {}", draft.path.display());
-    let mut frontmatter = draft.frontmatter.clone();
-    frontmatter.status = EmailStatus::Sent;
-    frontmatter.sent_at = Some(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    frontmatter.sent_via = Some(format!("email-cli v{}", env!("CARGO_PKG_VERSION")));
-    frontmatter.message_id = message_id.map(|s| s.to_string());
+    let sent_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let sent_via = format!("email-cli v{}", env!("CARGO_PKG_VERSION"));
 
-    // Serialize the updated frontmatter
-    let yaml = serde_yaml::to_string(&frontmatter)?;
-
-    // Reconstruct the file content
-    let new_content = format!("---\n{}---\n\n{}", yaml, draft.body_markdown);
+    // Surgical path: rewrite only `status`/`sent_at`/`sent_via`/`message_id`
+    // in the draft's own bytes, so `date:` and any field `EmailFrontmatter`
+    // does not model survive the send (a dropped `date:` made the TUI sort
+    // the sent copy to the bottom of the list).
+    //
+    // Fallback: the invite flow (`mp invite`) hands us a synthetic draft that
+    // was never written to disk. With no source bytes to preserve, serialize
+    // the in-memory frontmatter as before.
+    let new_content = match fs::read_to_string(&draft.path) {
+        Ok(content) => rewrite_frontmatter_scalars(
+            &content,
+            &[
+                ("status", FieldWrite::Set(EmailStatus::Sent.to_string())),
+                ("sent_at", FieldWrite::Set(sent_at.clone())),
+                ("sent_via", FieldWrite::Set(yaml_dq_escape(&sent_via))),
+                (
+                    "message_id",
+                    match message_id {
+                        Some(id) => FieldWrite::Set(yaml_dq_escape(id)),
+                        None => FieldWrite::ClearIfPresent,
+                    },
+                ),
+            ],
+        )?,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "Could not read {} ({e}); falling back to a serialized frontmatter rewrite",
+                    draft.path.display(),
+                );
+            }
+            let mut frontmatter = draft.frontmatter.clone();
+            frontmatter.status = EmailStatus::Sent;
+            frontmatter.sent_at = Some(sent_at);
+            frontmatter.sent_via = Some(sent_via);
+            frontmatter.message_id = message_id.map(|s| s.to_string());
+            let yaml = serde_yaml::to_string(&frontmatter)?;
+            format!("---\n{}---\n\n{}", yaml, draft.body_markdown)
+        }
+    };
 
     // Determine destination path
     let dest_path = if let Some(sent_dir) = sent_dir {
@@ -2366,6 +2555,140 @@ mod tests {
         assert!(result.contains("  - status: accepted\n"), "{result}");
         assert!(result.contains("    address: a@example.com\n"), "{result}");
     }
+
+    // -----------------------------------------------------------------------
+    // Status transitions are line surgery, not a frontmatter round-trip
+    //
+    // These used to parse into `EmailFrontmatter` and re-serialize, which
+    // silently dropped every key that struct does not model. Losing `date:`
+    // made the TUI fall back to the filename (unparseable for
+    // `draft-%Y%m%d-%H%M%S.md`), so `date_sort` went empty and the approved
+    // row teleported to the bottom of the list.
+    // -----------------------------------------------------------------------
+
+    /// A draft carrying `date:` plus a field no struct models.
+    fn draft_with_unknown_fields(dir: &Path, status: &str) -> PathBuf {
+        let path = dir.join("draft-20260701-120000-hello.md");
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "---\n",
+                    "to: alice@example.com\n",
+                    "subject: Hello\n",
+                    "status: {}\n",
+                    "from: me@example.com\n",
+                    "date: 2026-07-01T12:00:00+02:00\n",
+                    "x-ticket: PROJ-42\n",
+                    "tags:\n",
+                    "  - urgent\n",
+                    "  - billing\n",
+                    "---\n",
+                    "\n",
+                    "Body stays put.\n",
+                ),
+                status,
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn mark_as_approved_only_rewrites_the_status_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "draft");
+        let before = fs::read_to_string(&path).unwrap();
+
+        mark_as_approved(&path).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before.replace("status: draft", "status: approved"));
+    }
+
+    #[test]
+    fn mark_as_draft_only_rewrites_the_status_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let before = fs::read_to_string(&path).unwrap();
+
+        mark_as_draft(&path).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before.replace("status: approved", "status: draft"));
+    }
+
+    /// The approve/demote round trip must be a byte-level identity, and in
+    /// particular must not add the `cc: null` / `bcc: null` noise a serde
+    /// round-trip produced.
+    #[test]
+    fn approve_then_demote_round_trips_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "draft");
+        let before = fs::read_to_string(&path).unwrap();
+
+        mark_as_approved(&path).unwrap();
+        mark_as_draft(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Existing validation stays: only the write path changed.
+    #[test]
+    fn mark_as_draft_still_refuses_a_sent_email() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "sent");
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(mark_as_draft(&path).is_err());
+        assert!(mark_as_approved(&path).is_err());
+        // The rejected file is left untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn update_status_to_sent_preserves_date_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let draft = parse_email_draft(&path).unwrap();
+
+        update_status_to_sent(&draft, None, Some("<abc@example.com>")).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("status: sent\n"), "{after}");
+        assert!(after.contains("date: 2026-07-01T12:00:00+02:00\n"), "{after}");
+        assert!(after.contains("x-ticket: PROJ-42\n"), "{after}");
+        assert!(after.contains("  - urgent\n"), "{after}");
+        assert!(after.contains("message_id: \"<abc@example.com>\"\n"), "{after}");
+        assert!(after.contains("sent_at: 20"), "{after}");
+        assert!(after.contains("sent_via: \"email-cli v"), "{after}");
+        assert!(after.contains("Body stays put.\n"), "{after}");
+        // The re-parsed file still round-trips through the struct.
+        let reparsed = parse_email_draft(&path).unwrap();
+        assert_eq!(reparsed.frontmatter.status, EmailStatus::Sent);
+        assert_eq!(
+            reparsed.frontmatter.message_id.as_deref(),
+            Some("<abc@example.com>")
+        );
+    }
+
+    /// `mp invite` builds a synthetic draft that was never written to disk
+    /// (its path already points into the Sent mailbox). With no source bytes
+    /// to preserve, the serde write path still applies.
+    #[test]
+    fn update_status_to_sent_falls_back_for_a_draft_with_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sent = tmp.path().join("sent");
+        let mut draft = make_draft("a@example.com", "Invite", "Body", EmailStatus::Approved);
+        draft.path = sent.join("20260701-120000-invite.md");
+
+        update_status_to_sent(&draft, Some(&sent), None).unwrap();
+
+        let written = parse_email_draft(&draft.path).unwrap();
+        assert_eq!(written.frontmatter.status, EmailStatus::Sent);
+        assert!(written.frontmatter.sent_at.is_some());
+        assert_eq!(written.body_markdown, "Body");
+    }
 }
 
 pub fn mark_as_approved(path: &Path) -> Result<String> {
@@ -2379,13 +2702,14 @@ pub fn mark_as_approved(path: &Path) -> Result<String> {
         return Err(anyhow!("Cannot approve an already sent email"));
     }
 
-    let mut frontmatter = draft.frontmatter.clone();
-    frontmatter.status = EmailStatus::Approved;
-
-    let yaml = serde_yaml::to_string(&frontmatter)?;
-    let new_content = format!("---\n{}---\n\n{}", yaml, draft.body_markdown);
-
-    fs::write(path, new_content)?;
+    // Surgical `status:` rewrite: re-serializing `EmailFrontmatter` would
+    // drop every field it does not model, including the `date:` line the
+    // TUI sorts on (the approved draft then jumped to the bottom of the
+    // list) and any user-added key.
+    rewrite_frontmatter_scalars_at(
+        path,
+        &[("status", FieldWrite::Set(EmailStatus::Approved.to_string()))],
+    )?;
 
     Ok(format!("Marked as approved: {}", path.display()))
 }
@@ -2414,13 +2738,11 @@ pub fn mark_as_draft(path: &Path) -> Result<String> {
         }
     }
 
-    let mut frontmatter = draft.frontmatter.clone();
-    frontmatter.status = EmailStatus::Draft;
-
-    let yaml = serde_yaml::to_string(&frontmatter)?;
-    let new_content = format!("---\n{}---\n\n{}", yaml, draft.body_markdown);
-
-    fs::write(path, new_content)?;
+    // Surgical `status:` rewrite, see `mark_as_approved`.
+    rewrite_frontmatter_scalars_at(
+        path,
+        &[("status", FieldWrite::Set(EmailStatus::Draft.to_string()))],
+    )?;
 
     Ok(format!("Marked as draft: {}", path.display()))
 }

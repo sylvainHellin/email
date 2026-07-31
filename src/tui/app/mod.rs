@@ -314,11 +314,13 @@ impl App {
     // ---------------------------------------------------------------
 
     pub(crate) fn save_to_account(&mut self) {
+        let cursor_path = self.cursor_anchor();
         if let Some(acct) = self.accounts.get_mut(self.active_account) {
             acct.sidebar_index = self.sidebar_index;
             acct.active_mailbox = self.active_mailbox;
             acct.mailbox_counts = self.mailbox_counts.clone();
             acct.list_index = self.list_index;
+            acct.cursor_path = cursor_path;
             acct.headers_scroll = self.headers_scroll;
             acct.preview_scroll = self.preview_scroll;
             acct.selection = self.selection.clone();
@@ -727,6 +729,13 @@ impl App {
         if self.view == View::Calendar {
             self.ensure_calendar_loaded();
         }
+        // The cursor identity to restore is the INCOMING account's own,
+        // saved when it was last parked -- the outgoing account's path
+        // can never appear in this account's list.
+        let anchor = self
+            .accounts
+            .get(idx)
+            .and_then(|acct| acct.cursor_path.clone());
         let am = self.active_mailbox;
         if let Some(cached) = self.email_cache.get(am).and_then(|c| c.as_ref()) {
             self.emails = Arc::clone(cached);
@@ -745,12 +754,12 @@ impl App {
         // (Pre-P2, the raw cache was restored even with a saved query, so
         // the filter was silently lost on switch-back; now it survives.)
         self.rebuild_visible();
-        // The restored cursor may exceed the filtered view -- clamp.
-        if !self.visible.is_empty() {
-            self.list_index = self.list_index.min(self.visible.len() - 1);
-        } else {
-            self.list_index = 0;
-        }
+        // Put the cursor back on the email it sat on when this account was
+        // parked; fall back to the saved index, clamped to the filtered
+        // view. On a cache miss the list is empty here and the async
+        // `BgResult::MailboxLoaded` arm has nothing to anchor on, so the
+        // cursor lands at row 0 once the entries arrive.
+        self.restore_cursor(anchor, self.list_index);
         self.focus = Focus::List;
     }
 
@@ -825,6 +834,39 @@ impl App {
         self.visible.iter().filter_map(|&i| self.emails.get(i))
     }
 
+    /// Capture the cursor's stable identity before a list rebuild.
+    ///
+    /// `list_index` is a bare position into `visible`, so any rebuild that
+    /// re-sorts or grows the entry list silently moves the cursor to a
+    /// different email (a draft approved at the top of Drafts, new inbox
+    /// mail shifting everything down). The file path is the de-facto
+    /// stable key of an entry (`selection`, `set_email_read` already key
+    /// on it), so we anchor on it and restore with `restore_cursor`.
+    pub(crate) fn cursor_anchor(&self) -> Option<PathBuf> {
+        self.selected_email().map(|e| e.path.clone())
+    }
+
+    /// Restore the cursor to `anchor` after `visible` was rebuilt. Falls
+    /// back to the clamped `fallback` index when the anchored email is
+    /// gone (archived, deleted, filtered out, moved to another mailbox).
+    pub(crate) fn restore_cursor(&mut self, anchor: Option<PathBuf>, fallback: usize) {
+        if self.visible.is_empty() {
+            self.list_index = 0;
+            return;
+        }
+        if let Some(p) = anchor {
+            if let Some(pos) = self
+                .visible
+                .iter()
+                .position(|&i| self.emails.get(i).is_some_and(|e| e.path == p))
+            {
+                self.list_index = pos;
+                return;
+            }
+        }
+        self.list_index = fallback.min(self.visible.len() - 1);
+    }
+
     /// Recompute `visible` from scratch: apply the active search query
     /// to the full entry list. Must be called after every reassignment
     /// or structural mutation of `self.emails` so the view never holds
@@ -889,17 +931,16 @@ impl App {
 
     pub fn remove_selected_from_list(&mut self) -> Option<PathBuf> {
         let path = self.selected_email()?.path.clone();
+        let fallback = self.list_index;
         self.with_emails_mut(|entries| entries.retain(|e| e.path != path));
         self.invalidate_pending_mailbox_loads();
 
-        // Underlying indices shifted -- recompute the view, then clamp
-        // the cursor against it (same clamp as before the refactor).
+        // Underlying indices shifted -- recompute the view, then park the
+        // cursor on the row that took the removed one's place (the "next
+        // row" behaviour), clamped to the shortened view. The removed
+        // email is gone by definition, so there is nothing to anchor on.
         self.rebuild_visible();
-        if !self.visible.is_empty() {
-            self.list_index = self.list_index.min(self.visible.len() - 1);
-        } else {
-            self.list_index = 0;
-        }
+        self.restore_cursor(None, fallback);
 
         if let Some(count) = self.mailbox_counts.get_mut(self.active_mailbox) {
             *count = self.emails.len();
@@ -919,15 +960,22 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
 
+        // The cursor's own row may or may not be part of the batch. Anchor
+        // on it when it survives; otherwise fall back to the number of
+        // surviving rows ABOVE the old cursor, so removing rows above it
+        // does not drag the cursor down the list.
+        let anchor = self.cursor_anchor().filter(|p| !paths.contains(p));
+        let fallback = self
+            .visible_emails()
+            .take(self.list_index)
+            .filter(|e| !paths.contains(&e.path))
+            .count();
+
         self.with_emails_mut(|entries| entries.retain(|e| !paths.contains(&e.path)));
         self.invalidate_pending_mailbox_loads();
 
         self.rebuild_visible();
-        if !self.visible.is_empty() {
-            self.list_index = self.list_index.min(self.visible.len() - 1);
-        } else {
-            self.list_index = 0;
-        }
+        self.restore_cursor(anchor, fallback);
 
         if let Some(count) = self.mailbox_counts.get_mut(self.active_mailbox) {
             *count = self.emails.len();
@@ -1115,19 +1163,19 @@ impl App {
 
     pub fn reload_current_mailbox(&mut self) {
         let am = self.active_mailbox;
+        let anchor = self.cursor_anchor();
+        let fallback = self.list_index;
         self.invalidate_cache_idx(am);
         self.switch_mailbox(am);
 
         // The fresh entries arrive asynchronously via
         // `BgResult::MailboxLoaded`; the stale list stays visible
-        // meanwhile. Clamp the cursor against it so the UI stays valid --
-        // the arrival handler clamps again against the fresh list and
+        // meanwhile (same-mailbox reload keeps it, see `switch_mailbox`).
+        // Restore the cursor against that stale view so the UI stays
+        // valid; the arrival handler re-anchors against the fresh list
+        // (its own `cursor_anchor` call reads the cursor we set here) and
         // updates the mailbox count.
-        if !self.visible.is_empty() {
-            self.list_index = self.list_index.min(self.visible.len() - 1);
-        } else {
-            self.list_index = 0;
-        }
+        self.restore_cursor(anchor, fallback);
     }
 
     /// Recount all mailbox sizes by walking every directory.

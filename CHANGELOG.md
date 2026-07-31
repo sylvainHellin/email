@@ -177,6 +177,22 @@ All notable changes to this project are documented in this file.
   malformed frontmatter fail with an error status and no data loss.
 
 ### Fixed
+- **The TUI cursor no longer jumps to a different email when the list changes
+  underneath it.** The selection is now anchored to the selected email's
+  identity (its file path) across every list rebuild: approving or demoting a
+  draft, new mail arriving via background sync, batch archive/delete/move, and
+  switching accounts all keep the cursor on the same email (falling back to
+  the nearest surviving row when that email left the list). Previously the
+  cursor was a bare positional index that every re-sort silently re-pointed,
+  so keystrokes already in flight could archive or delete the wrong email.
+- **`mark-approved`, `mark-draft`, and marking a draft as sent no longer
+  destroy frontmatter.** These operations previously round-tripped the
+  frontmatter through the typed struct, silently deleting the `date:` field
+  and any unknown user fields (and adding `cc: null` noise); losing `date:`
+  also made an approved draft re-sort to the bottom of the Drafts list. They
+  now rewrite only the affected lines (`status:`, and for sent also
+  `sent_at`/`sent_via`/`message_id`), preserving everything else byte for
+  byte.
 - **iMIP RSVP replies now include `DTSTART`/`DTEND`, fixing Exchange/Outlook
   rejection.** A `METHOD:REPLY` built by `mp invite accept|tentative|decline`
   previously omitted the event's start/end times. RFC 5546 marks `DTSTART`

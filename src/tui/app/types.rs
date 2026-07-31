@@ -244,6 +244,12 @@ pub struct AccountState {
     pub sidebar_index: usize,
     pub active_mailbox: usize,
     pub list_index: usize,
+    /// Path of the email `list_index` pointed at when this account was
+    /// parked. `list_index` alone is a bare position, so a list that grew
+    /// or re-sorted while the account was in the background would put the
+    /// cursor on a different email on switch-back; `App::restore_cursor`
+    /// re-anchors on this path and falls back to `list_index`.
+    pub cursor_path: Option<PathBuf>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
     pub selection: std::collections::HashSet<PathBuf>,
@@ -349,6 +355,7 @@ impl AccountState {
             sidebar_index: 0,
             active_mailbox: 0,
             list_index: 0,
+            cursor_path: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
