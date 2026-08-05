@@ -131,8 +131,27 @@ Implementation notes:
 - Eviction sets the row's blob state to evicted and unlinks the blob file (respecting dedup: only unlink when refcount hits zero); it never touches the server.
 - Re-fetch on open is a normal engine pull for one message by UID; the body arrives, the blob is rewritten, the row flips back to present.
 - The blob store needs a refcount or a periodic mark-and-sweep GC so a shared attachment is not unlinked while another message still references it.
+  Shipped as the `blobs(hash, size, refcount)` table inside the per-account `store.sqlite3`, so a reference is taken in the same transaction as the row that carries the hash.
 - Config lives in the existing config file; defaults must be sane (keep-all metadata, generous body/attachment horizons, a conservative disk cap) so a user who sets nothing still gets correct behaviour.
-- This is a new config schema, not an edit to an existing one: `src/config.rs` has zero occurrences of `retention`, `horizon` or `max_disk_bytes` today, so the three horizons, the per-account and global `max_disk_bytes`, their defaults and their round-trip tests are all new surface.
+
+Config shape as implemented in `src/config.rs` (#0037 unit 3), parsing and defaults only:
+
+```toml
+[retention]                     # global defaults, all fields optional
+metadata_horizon_days = 0       # 0 means keep all
+body_horizon_days = 365
+attachment_horizon_days = 90
+max_disk_bytes = 5000000000
+
+[accounts.retention]            # per-account override, field by field
+attachment_horizon_days = 30
+```
+
+Horizons are integer days and `0` means keep everything; the disk budget is raw bytes.
+An account value wins field by field, an unset account field falls back to the global `[retention]` table, and an unset global field falls back to the default.
+The defaults are metadata `0` (keep all envelope rows), body `365` days, attachments `90` days and `max_disk_bytes` 5 GB.
+Validation runs at config load: horizons must be between `0` and `36500` days (100 years), `max_disk_bytes` between `10000000` (10 MB) and `1000000000000` (1 TB), and a violation names the field, the value and the allowed range.
+An account whose retention section is absent entirely resolves to exactly those defaults.
 
 ### SQLite schema (v1 sketch, drop-and-rebuild on version mismatch, never a migrator)
 

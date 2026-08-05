@@ -9,7 +9,13 @@
 //!
 //! This module knows nothing about IMAP, MIME or Markdown. It owns the file,
 //! the pragmas and the schema; everything above it speaks SQL.
+//!
+//! Bodies, raw messages and attachments do not live in the database: they go
+//! to the content-addressed blob store in [`blobs`], and rows keep only the
+//! hash. The `blobs` table here is that store's refcount index, so a reference
+//! can be taken in the same transaction as the row that holds the hash.
 
+pub mod blobs;
 pub mod schema;
 
 use std::fs;
@@ -22,6 +28,7 @@ use rusqlite::Connection;
 
 use crate::timing::TimingSpan;
 
+pub use blobs::{BlobHash, BlobStore};
 pub use schema::SCHEMA_VERSION;
 
 /// Busy timeout applied to every store connection, in milliseconds. WAL lets
@@ -374,6 +381,54 @@ mod tests {
             insert(state).unwrap();
         }
         assert!(insert("almost_sent").is_err());
+    }
+
+    #[test]
+    fn blobs_table_rejects_a_negative_refcount() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+
+        store
+            .conn()
+            .execute(
+                "INSERT INTO blobs (hash, size, refcount) VALUES ('abc', 12, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .conn()
+            .execute("UPDATE blobs SET refcount = refcount - 2", [])
+            .is_err());
+
+        // A duplicate hash is the same blob, not a second row.
+        assert!(store
+            .conn()
+            .execute(
+                "INSERT INTO blobs (hash, size, refcount) VALUES ('abc', 12, 1)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn missing_blobs_table_forces_a_rebuild() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+
+        {
+            let store = Store::open(&path).unwrap();
+            insert_message(&store, "alice", "inbox", 1, "<a@example.com>").unwrap();
+            store.conn().execute_batch("DROP TABLE blobs;").unwrap();
+            assert!(!schema::all_tables_present(store.conn()).unwrap());
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert!(schema::all_tables_present(store.conn()).unwrap());
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rebuilt store must be empty");
     }
 
     #[test]

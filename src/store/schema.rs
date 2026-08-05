@@ -28,6 +28,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "meta",
     "mailboxes",
     "messages",
+    "blobs",
     "drafts",
     "outbox",
     "sync_cursors",
@@ -50,6 +51,10 @@ pub const REQUIRED_TABLES: &[&str] = &[
 ///   derived index.
 /// - `outbox` carries the durable send state machine; the four states are
 ///   enforced by a CHECK so a typo in later code fails loudly.
+/// - `blobs` is the refcount index for the content-addressed blob store in
+///   [`super::blobs`]. It lives here rather than on disk so a reference can be
+///   taken in the same transaction as the `messages` / `outbox` row that
+///   carries the hash; the file itself is the disposable side of the pair.
 /// - `messages_fts` is external-content over `messages`, as the plan sketches,
 ///   with `body_text` as a third indexed column. `messages` has no `body_text`
 ///   column (the body lives in a blob), so the index is written explicitly by
@@ -100,6 +105,12 @@ CREATE TABLE messages (
 );
 
 CREATE INDEX messages_message_id ON messages (message_id);
+
+CREATE TABLE blobs (
+    hash     TEXT PRIMARY KEY,
+    size     INTEGER NOT NULL,
+    refcount INTEGER NOT NULL DEFAULT 0 CHECK (refcount >= 0)
+);
 
 CREATE TABLE drafts (
     account  TEXT NOT NULL,

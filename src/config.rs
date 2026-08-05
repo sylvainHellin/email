@@ -28,6 +28,10 @@ pub struct GlobalConfig {
     pub notifications: bool,
     #[serde(default)]
     pub email: EmailSettings,
+    /// Global retention defaults for the local cache. Every field is optional
+    /// and falls back to the constants documented on [`RetentionPolicy`].
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
     /// Where to store SMTP/IMAP passwords and OAuth2 token caches.
@@ -81,6 +85,10 @@ pub struct AccountConfig {
     pub mailboxes: MailboxesConfig,
     #[serde(default)]
     pub signatures: SignaturesConfig,
+    /// Per-account retention overrides. Unset fields inherit the global
+    /// `[retention]` table, which itself falls back to the defaults.
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -177,6 +185,149 @@ pub struct SignatureEntry {
     #[serde(default)]
     pub name: Option<String>,
     pub path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Retention and disk budget (see docs/plans/data-access-layer.md)
+// ---------------------------------------------------------------------------
+//
+// The local store is a cache in front of the server, so evicting a body or an
+// attachment is not deletion: the envelope row stays and the bytes are
+// re-fetched on open. That is what makes retention a safe, user-facing knob.
+//
+// This is the parsing and defaults surface only. Nothing here evicts anything;
+// the pruning pass lands with the eviction work.
+
+/// Default metadata horizon: keep every envelope row, forever, so the message
+/// list and search always render the full history. Envelopes are cheap.
+pub const DEFAULT_METADATA_HORIZON_DAYS: u32 = 0;
+
+/// Default body horizon: one year of full message bodies.
+pub const DEFAULT_BODY_HORIZON_DAYS: u32 = 365;
+
+/// Default attachment horizon: 90 days. Shorter than the body horizon because
+/// attachments dominate disk use.
+pub const DEFAULT_ATTACHMENT_HORIZON_DAYS: u32 = 90;
+
+/// Default disk budget per account: 5 GB, a conservative cap that overrides
+/// the horizons when the two disagree.
+pub const DEFAULT_MAX_DISK_BYTES: u64 = 5_000_000_000;
+
+/// Upper bound on any horizon: 36500 days (100 years). Larger values are a
+/// typo, and `0` already means keep-all.
+pub const MAX_HORIZON_DAYS: u32 = 36_500;
+
+/// Lower bound on the disk budget: 10 MB. Below this the cache cannot hold a
+/// useful working set and the evictor would thrash.
+pub const MIN_MAX_DISK_BYTES: u64 = 10_000_000;
+
+/// Upper bound on the disk budget: 1 TB.
+pub const MAX_MAX_DISK_BYTES: u64 = 1_000_000_000_000;
+
+/// Retention settings as written in the config file, global or per account.
+///
+/// Every field is optional so that an account can override one horizon without
+/// restating the others; [`RetentionPolicy::resolve`] fills the gaps.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How far back to keep envelope rows, in days. `0` means keep all.
+    #[serde(default)]
+    pub metadata_horizon_days: Option<u32>,
+    /// How far back to keep message bodies, in days. `0` means keep all.
+    #[serde(default)]
+    pub body_horizon_days: Option<u32>,
+    /// How far back to keep attachment blobs, in days. `0` means keep all.
+    #[serde(default)]
+    pub attachment_horizon_days: Option<u32>,
+    /// Disk budget for this account's store and blobs, in bytes.
+    #[serde(default)]
+    pub max_disk_bytes: Option<u64>,
+}
+
+/// A fully resolved retention policy: no optionals, every value validated.
+///
+/// The horizons express intent ("keep bodies for a year") and
+/// `max_disk_bytes` is the hard cap that overrides them when the two disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub metadata_horizon_days: u32,
+    pub body_horizon_days: u32,
+    pub attachment_horizon_days: u32,
+    pub max_disk_bytes: u64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            metadata_horizon_days: DEFAULT_METADATA_HORIZON_DAYS,
+            body_horizon_days: DEFAULT_BODY_HORIZON_DAYS,
+            attachment_horizon_days: DEFAULT_ATTACHMENT_HORIZON_DAYS,
+            max_disk_bytes: DEFAULT_MAX_DISK_BYTES,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Layer `account` over `global` over the defaults, field by field, then
+    /// validate. An account that sets only `attachment_horizon_days` keeps the
+    /// global (or default) value for everything else.
+    pub fn resolve(global: &RetentionConfig, account: &RetentionConfig) -> Result<Self> {
+        let defaults = Self::default();
+        let policy = Self {
+            metadata_horizon_days: account
+                .metadata_horizon_days
+                .or(global.metadata_horizon_days)
+                .unwrap_or(defaults.metadata_horizon_days),
+            body_horizon_days: account
+                .body_horizon_days
+                .or(global.body_horizon_days)
+                .unwrap_or(defaults.body_horizon_days),
+            attachment_horizon_days: account
+                .attachment_horizon_days
+                .or(global.attachment_horizon_days)
+                .unwrap_or(defaults.attachment_horizon_days),
+            max_disk_bytes: account
+                .max_disk_bytes
+                .or(global.max_disk_bytes)
+                .unwrap_or(defaults.max_disk_bytes),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Reject values that cannot mean what the user typed, naming the field,
+    /// the offending value and the allowed range.
+    pub fn validate(&self) -> Result<()> {
+        for (field, days) in [
+            ("metadata_horizon_days", self.metadata_horizon_days),
+            ("body_horizon_days", self.body_horizon_days),
+            ("attachment_horizon_days", self.attachment_horizon_days),
+        ] {
+            if days > MAX_HORIZON_DAYS {
+                return Err(anyhow::anyhow!(
+                    "[retention] {field} = {days} is out of range: expected 0 to {MAX_HORIZON_DAYS} days \
+                     (0 means keep everything)."
+                ));
+            }
+        }
+        if self.max_disk_bytes < MIN_MAX_DISK_BYTES || self.max_disk_bytes > MAX_MAX_DISK_BYTES {
+            return Err(anyhow::anyhow!(
+                "[retention] max_disk_bytes = {} is out of range: expected {} to {} bytes \
+                 (10 MB to 1 TB).",
+                self.max_disk_bytes,
+                MIN_MAX_DISK_BYTES,
+                MAX_MAX_DISK_BYTES
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The retention policy in force for one account: its own overrides layered
+/// over the global `[retention]` table.
+pub fn retention_for(config: &GlobalConfig, account: &AccountConfig) -> Result<RetentionPolicy> {
+    RetentionPolicy::resolve(&config.retention, &account.retention)
+        .with_context(|| format!("invalid retention config for account '{}'", account.name))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +479,21 @@ pub fn load_global_config() -> Result<GlobalConfig> {
     reject_legacy_keys(&content, &path)?;
     let config: GlobalConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    validate_retention(&config)
+        .with_context(|| format!("Invalid config file: {}", path.display()))?;
     debug!("Loaded global config from {}", path.display());
     Ok(config)
+}
+
+/// Reject out-of-range retention values at load time rather than at the first
+/// eviction pass. The global table is checked on its own so a config with no
+/// accounts still fails loudly.
+fn validate_retention(config: &GlobalConfig) -> Result<()> {
+    RetentionPolicy::resolve(&config.retention, &RetentionConfig::default())?;
+    for account in &config.accounts {
+        retention_for(config, account)?;
+    }
+    Ok(())
 }
 
 /// Refuse to parse legacy configs containing `[accounts.directories]` or
@@ -1344,6 +1508,162 @@ server = "Newsletters"
     fn test_default_account_empty() {
         let config = GlobalConfig::default();
         assert!(default_account(&config).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Retention config
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn retention_absent_section_yields_documented_defaults() {
+        let toml_str = r#"
+[[accounts]]
+name = "test"
+
+[accounts.smtp]
+host = "smtp.example.com"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retention, RetentionConfig::default());
+
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(policy, RetentionPolicy::default());
+        assert_eq!(policy.metadata_horizon_days, 0, "metadata defaults to keep-all");
+        assert_eq!(policy.body_horizon_days, 365);
+        assert_eq!(policy.attachment_horizon_days, 90);
+        assert_eq!(policy.max_disk_bytes, 5_000_000_000);
+    }
+
+    #[test]
+    fn retention_every_field_round_trips() {
+        let toml_str = r#"
+[retention]
+metadata_horizon_days = 3650
+body_horizon_days = 180
+attachment_horizon_days = 30
+max_disk_bytes = 2000000000
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retention.metadata_horizon_days, Some(3650));
+        assert_eq!(config.retention.body_horizon_days, Some(180));
+        assert_eq!(config.retention.attachment_horizon_days, Some(30));
+        assert_eq!(config.retention.max_disk_bytes, Some(2_000_000_000));
+
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(
+            policy,
+            RetentionPolicy {
+                metadata_horizon_days: 3650,
+                body_horizon_days: 180,
+                attachment_horizon_days: 30,
+                max_disk_bytes: 2_000_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn retention_account_overrides_the_global_field_by_field() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 180
+max_disk_bytes = 2000000000
+
+[[accounts]]
+name = "inherits"
+
+[[accounts]]
+name = "overrides"
+
+[accounts.retention]
+attachment_horizon_days = 7
+max_disk_bytes = 500000000
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+
+        let inherits = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(inherits.body_horizon_days, 180);
+        assert_eq!(inherits.attachment_horizon_days, 90, "falls back to the default");
+        assert_eq!(inherits.max_disk_bytes, 2_000_000_000);
+
+        let overrides = retention_for(&config, &config.accounts[1]).unwrap();
+        assert_eq!(overrides.attachment_horizon_days, 7);
+        assert_eq!(overrides.max_disk_bytes, 500_000_000);
+        assert_eq!(
+            overrides.body_horizon_days, 180,
+            "unset account fields keep the global value"
+        );
+        assert_eq!(overrides.metadata_horizon_days, 0);
+    }
+
+    #[test]
+    fn retention_zero_horizon_means_keep_all() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 0
+attachment_horizon_days = 0
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(policy.body_horizon_days, 0);
+        assert_eq!(policy.attachment_horizon_days, 0);
+    }
+
+    #[test]
+    fn retention_out_of_range_horizon_is_rejected_clearly() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 40000
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        let err = validate_retention(&config).unwrap_err().to_string();
+        assert!(err.contains("body_horizon_days"), "missing field name: {err}");
+        assert!(err.contains("40000"), "missing offending value: {err}");
+        assert!(err.contains("36500"), "missing allowed range: {err}");
+    }
+
+    #[test]
+    fn retention_out_of_range_disk_budget_is_rejected_clearly() {
+        for value in ["1000", "9000000000000"] {
+            let toml_str = format!(
+                "[[accounts]]\nname = \"test\"\n\n[accounts.retention]\nmax_disk_bytes = {value}\n"
+            );
+            let config: GlobalConfig = toml::from_str(&toml_str).unwrap();
+            let err = validate_retention(&config).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("max_disk_bytes"), "missing field name: {msg}");
+            assert!(msg.contains(value), "missing offending value: {msg}");
+            assert!(msg.contains("test"), "missing account name: {msg}");
+        }
+    }
+
+    #[test]
+    fn retention_negative_value_is_rejected_at_parse_time() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = -1
+"#;
+        let err = toml::from_str::<GlobalConfig>(toml_str).unwrap_err().to_string();
+        assert!(
+            err.contains("body_horizon_days"),
+            "parse error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn retention_global_is_validated_without_any_account() {
+        let toml_str = "[retention]\nmax_disk_bytes = 1\n";
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.accounts.is_empty());
+        assert!(validate_retention(&config).is_err());
     }
 
     #[test]

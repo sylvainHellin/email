@@ -219,3 +219,11 @@ The store's schema sketch declares `messages_fts USING fts5(subject, from_, body
 The failure surfaces later as `no such column: T.body_text` from `snippet()`, `highlight()`, `SELECT subject FROM messages_fts` and the `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')` command.
 So the search path must join the matched rowid back to `messages` for anything it wants to display, and the index has to be written by ingest rather than rebuilt from the content table.
 That is workable here only because a store that loses its index is dropped and refilled by the next sync ([src/store/schema.rs](../src/store/schema.rs)).
+
+## A blob refcount that unlinks inside a transaction can outlive its rollback (2026-08-06)
+
+`BlobStore::release` ([src/store/blobs.rs](../src/store/blobs.rs)) is handed the caller's connection so the decrement commits with the row that dropped the reference, but the `unlink` at refcount zero is a filesystem call and does not roll back with it.
+A caller that releases and then rolls back therefore keeps a row whose `body_blob` names a file that is already gone.
+That direction is survivable because the server is truth (a missing blob reads as evicted and is re-fetched), while the opposite direction is not: a committed row pointing at bytes that were never written is a hole in the read path.
+Same reasoning drives the write order on the ingest side, where the blob file is written *before* the transaction that acquires the reference, so a crash leaves an unreferenced orphan rather than a dangling hash.
+The temp file also lives in the destination fan-out directory (`blobs/ab/cd/.<hash>.tmp.<pid>.<n>`), not in a shared temp root, so the rename stays on one filesystem and an interrupted write is invisible to both `contains` and `read`.
