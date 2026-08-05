@@ -1,11 +1,11 @@
-//! Path-free envelope dump of the local `.md` tree (`mp dump-mailbox --json`).
+//! Path-free envelope dump of the message store (`mp dump-mailbox --json`).
 //!
-//! Written for #0049 unit 0c, as the parity harness for the data-access-layer
-//! redesign: the complete nuke removes the byte-identity oracle, so this
-//! command records one normalised record per message from the current
-//! file-based stack. The new SQLite store must be able to emit the same
-//! records from the database, which is why nothing here carries a filesystem
-//! path: a path is the one thing the two stacks cannot agree on.
+//! Written for #0049 unit 0c as the parity harness for the data-access-layer
+//! redesign: it recorded one normalised record per message from the file-based
+//! stack, and #0038 flipped its source to the SQLite store while keeping the
+//! record shape and the sort contract identical. Nothing here carries a
+//! filesystem path -- that was true when the source was a `.md` tree, and it
+//! is what makes the flip invisible in the output.
 //!
 //! # Record shape
 //!
@@ -14,58 +14,52 @@
 //!
 //! - `account`: account name as configured in `[[accounts]]`.
 //! - `mailbox`: the role or slugified server name (`inbox`, `drafts`, `sent`,
-//!   `archive`, or the slug of an `extra` mailbox), i.e. the leaf that
-//!   `config::mailbox_dir` builds. Never a path.
-//! - `message_id`: the `message_id:` frontmatter value verbatim, angle
-//!   brackets included, or `null` when the file has none. Deliberately not
-//!   synthesized: synthesizing an identity for identity-less mail is the new
-//!   stack's behaviour, and recording it here would launder it into the
-//!   oracle.
-//! - `from`, `to`, `cc`, `subject`: frontmatter values verbatim (no display
-//!   name extraction, no `(no subject)` placeholder), `null` when absent.
-//! - `date_sort`: the current build's sort key, produced by
-//!   `tui::app::resolve_date` (UTC `%Y-%m-%dT%H:%M:%S`, falling back to the
-//!   date encoded in the filename, then to the empty string). The fallback reads the
-//!   file *name*, never the directory, so the value stays reproducible from a
-//!   store that keeps the original filename or the parsed date.
+//!   `archive`, or the slug of an `extra` mailbox), i.e. `messages.mailbox`,
+//!   which is the same leaf `config::mailbox_dir` builds. Never a path.
+//! - `message_id`: `messages.message_id`, angle brackets included. See the
+//!   allow-list ([docs/dump-allow-list.md](../docs/dump-allow-list.md)): the
+//!   file build recorded `null` for mail with no `Message-ID:` header, while
+//!   ingest synthesizes one, so identity-less mail now dumps its synthetic id.
+//! - `from`, `to`, `cc`, `subject`: the stored header values verbatim (no
+//!   display name extraction, no `(no subject)` placeholder), `null` when
+//!   absent. A stored empty string is treated as absent: the store cannot
+//!   tell "header missing" from "header empty" and the file build's `null` is
+//!   the far commoner of the two.
+//! - `date_sort`: the sort key `tui::app::resolve_date` derives from the
+//!   stored `Date:` header (UTC `%Y-%m-%dT%H:%M:%S`), empty when the header is
+//!   missing or unparseable. The file build had a filename-derived fallback in
+//!   between; see the allow-list.
 //! - `flags`: sorted, deduplicated state tokens from the closed set
-//!   `approved`, `draft`, `seen`. `seen` comes from `read: true`, `draft` and
-//!   `approved` from `status:`. The current build tracks no other per-message
-//!   flag locally (no answered, no flagged), so the list is short by
-//!   construction rather than by omission.
-//! - `attachments`: array of `{"name", "size"}`, sorted by name then size.
-//!   Names come from the `attachments:` frontmatter list (the record the
-//!   stack itself keeps), reduced to their file name: sent and draft mail
-//!   stores the *source* path of an outgoing attachment there
-//!   (`/tmp/briefing.mp3`), and a path is exactly what must not reach the
-//!   output. `size` is the byte length of the matching file in the sibling
-//!   `<stem>_attachments/` directory, or `null` when that file is missing
-//!   (which is the normal case for those outgoing entries). A message with
-//!   `has_attachments: true` but no `attachments:` list dumps an empty array,
-//!   which is exactly what the current build knows.
-//! - `invite`: `true` when the file carries an `event:` frontmatter block
-//!   (same predicate as `EmailEntry::is_invite`).
+//!   `approved`, `draft`, `seen`. `seen` comes from `\Seen` in
+//!   `messages.flags`. `draft` and `approved` cannot occur on a `messages`
+//!   row: drafts are not indexed until #0050.
+//! - `attachments`: array of `{"name", "size"}`, sorted by name then size,
+//!   read from the attachment blobs of the row. `size` is the blob length and
+//!   is therefore always present. The iMIP sidecar is excluded, exactly as the
+//!   `attachments:` frontmatter list excluded it.
+//! - `invite`: `true` when the message carries an iMIP payload (same predicate
+//!   as `store::read::is_invite`).
 //!
 //! # Ordering
 //!
 //! Records are sorted by `(account, mailbox, date_sort, message_id, subject,
-//! file name)`, with absent values sorting as the empty string. The file name
-//! is the final tiebreaker only: it is unique within a mailbox directory, so
-//! the order is total even for two messages that agree on everything else, and
-//! it is never emitted. Two runs over an unchanged tree are byte-identical;
-//! nothing in the output depends on the wallclock of the run.
+//! uid)`, with absent values sorting as the empty string. The uid is the final
+//! tiebreaker only: it is unique within `(account, mailbox)`, so the order is
+//! total even for two messages that agree on everything else, and like the
+//! file name it replaced it is never emitted. Two runs over an unchanged store
+//! are byte-identical; nothing in the output depends on the wallclock of the
+//! run.
 //!
-//! Offline by construction: this module reads the local tree and nothing else.
+//! Offline by construction: this module reads the local store and nothing else.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::AccountConfig;
-use crate::parse::attachments_dir_for;
+use crate::store::read::{self, MessageRow};
+use crate::store::Store;
 use crate::tui::app::{build_mailboxes, resolve_date};
 
 /// One attachment, name and size only.
@@ -92,26 +86,6 @@ pub struct EnvelopeRecord {
     pub invite: bool,
 }
 
-/// Raw frontmatter fields this dump needs. Deliberately a local copy of the
-/// TUI's `Frontmatter` (see `tui::app::types`): the load path is about to be
-/// replaced wholesale, and coupling the oracle to it would mean the oracle
-/// changes with the thing it measures.
-#[derive(Debug, Deserialize, Default)]
-struct DumpFrontmatter {
-    from: Option<String>,
-    to: Option<String>,
-    cc: Option<String>,
-    subject: Option<String>,
-    status: Option<String>,
-    date: Option<String>,
-    sent_at: Option<String>,
-    message_id: Option<String>,
-    attachments: Option<Vec<String>>,
-    read: Option<bool>,
-    #[serde(default)]
-    event: Option<crate::types::EventFrontmatter>,
-}
-
 /// Collect envelope records for every account in `accounts`, restricted to the
 /// mailboxes named in `mailbox_filter` when that filter is non-empty (matched
 /// case-insensitively against both the mailbox id and its sidebar label).
@@ -120,16 +94,34 @@ pub fn collect_records(accounts: &[AccountConfig], mailbox_filter: &[String]) ->
     let mut rows: Vec<(SortKey, EnvelopeRecord)> = Vec::new();
 
     for account in accounts {
-        for mailbox in build_mailboxes(account) {
-            let id = mailbox_id(&mailbox.dir);
-            if !mailbox_selected(&id, &mailbox.label, mailbox_filter) {
+        let Some(store) = crate::tui::app::open_store(&account.name) else {
+            continue;
+        };
+        // The configured mailboxes decide what the filter can name and what a
+        // label means; the rows themselves come from the store. A mailbox the
+        // store has no rows for contributes nothing, exactly as a missing
+        // directory did.
+        let selected: Vec<String> = build_mailboxes(account)
+            .into_iter()
+            .filter_map(|mailbox| {
+                let id = mailbox_id(&mailbox.dir);
+                mailbox_selected(&id, &mailbox.label, mailbox_filter).then_some(id)
+            })
+            .collect();
+
+        let all = match read::list_account(&store, &account.name) {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::warn!("[dump] reading {}: {e:#}", account.name);
                 continue;
             }
-            for path in mailbox_files(&mailbox.dir) {
-                if let Some(record) = read_record(&account.name, &id, &path) {
-                    rows.push((sort_key(&record, &path), record));
-                }
+        };
+        for row in all {
+            if !selected.iter().any(|id| *id == row.mailbox) {
+                continue;
             }
+            let record = read_record(&store, &account.name, &row);
+            rows.push((sort_key(&record, &row), record));
         }
     }
 
@@ -150,17 +142,17 @@ pub fn to_ndjson(records: &[EnvelopeRecord]) -> String {
     out
 }
 
-/// `(account, mailbox, date_sort, message_id, subject, file name)`.
-type SortKey = (String, String, String, String, String, String);
+/// `(account, mailbox, date_sort, message_id, subject, uid)`.
+type SortKey = (String, String, String, String, String, i64);
 
-fn sort_key(record: &EnvelopeRecord, path: &Path) -> SortKey {
+fn sort_key(record: &EnvelopeRecord, row: &MessageRow) -> SortKey {
     (
         record.account.clone(),
         record.mailbox.clone(),
         record.date_sort.clone(),
         record.message_id.clone().unwrap_or_default(),
         record.subject.clone().unwrap_or_default(),
-        path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        row.uid,
     )
 }
 
@@ -170,17 +162,6 @@ fn mailbox_id(dir: &Path) -> String {
     dir.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-/// The file name of an `attachments:` entry. Outgoing mail stores the source
-/// path of the attachment (`/tmp/audio/briefing.mp3`), so the raw value can be
-/// absolute; the file name is the part both stacks can agree on. Entries that
-/// are already bare names pass through unchanged.
-fn attachment_name(raw: &str) -> String {
-    Path::new(raw)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| raw.to_string())
-}
-
 fn mailbox_selected(id: &str, label: &str, filter: &[String]) -> bool {
     filter.is_empty()
         || filter
@@ -188,75 +169,61 @@ fn mailbox_selected(id: &str, label: &str, filter: &[String]) -> bool {
             .any(|want| want.eq_ignore_ascii_case(id) || want.eq_ignore_ascii_case(label))
 }
 
-/// Top-level `.md` files of a mailbox directory, in unspecified order (the
-/// caller sorts). Mirrors `load_emails`: depth 1, `.md` only.
-fn mailbox_files(dir: &Path) -> Vec<PathBuf> {
-    if !dir.is_dir() {
-        return Vec::new();
-    }
-    walkdir::WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "md"))
-        .map(|e| e.into_path())
-        .collect()
+/// A stored header value, with the empty string read as absent.
+///
+/// Ingest writes whatever the parser produced, and an absent header arrives as
+/// an empty string rather than as SQL `NULL`. The file build recorded `null`
+/// for an absent header and had no way to produce an empty one, so the empty
+/// string maps back to `null` here.
+fn header(value: Option<&String>) -> Option<String> {
+    value.filter(|v| !v.is_empty()).cloned()
 }
 
-/// Parse one file into a record. Returns `None` for files the current build
-/// cannot read either (non-UTF-8 bytes), matching `load_emails`, which drops
-/// them from the list.
-fn read_record(account: &str, mailbox: &str, path: &Path) -> Option<EnvelopeRecord> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let fm: DumpFrontmatter = parsed
-        .data
-        .and_then(|d| d.deserialize().ok())
-        .unwrap_or_default();
-
-    let (_display, date_sort) = resolve_date(&fm.date, &fm.sent_at, path);
+/// Turn one store row into a record.
+fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord {
+    // The same `resolve_date` the TUI applies, over the same stored `Date:`
+    // header, so the two stacks cannot drift. The path argument is empty:
+    // the filename fallback died with the filenames (see the allow-list).
+    let (_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
 
     let mut flags: BTreeSet<String> = BTreeSet::new();
-    if fm.read == Some(true) {
+    if row.is_read() {
         flags.insert("seen".to_string());
     }
-    match fm.status.as_deref() {
-        Some("draft") => {
-            flags.insert("draft".to_string());
-        }
-        Some("approved") => {
-            flags.insert("approved".to_string());
-        }
-        _ => {}
-    }
+    // `draft` and `approved` were frontmatter `status:` values. Nothing writes
+    // them to a `messages` row: drafts live outside this table until #0050.
 
-    let att_dir = attachments_dir_for(path);
-    let mut attachments: Vec<AttachmentRecord> = fm
-        .attachments
-        .unwrap_or_default()
+    let mut attachments: Vec<AttachmentRecord> = read::attachments_for(store, row.id)
+        .unwrap_or_else(|e| {
+            log::warn!("[dump] attachments of message {}: {e:#}", row.id);
+            Vec::new()
+        })
         .into_iter()
-        .map(|raw| {
-            let name = attachment_name(&raw);
-            let size = std::fs::metadata(att_dir.join(&name)).ok().map(|m| m.len());
-            AttachmentRecord { name, size }
+        .map(|att| AttachmentRecord {
+            name: att.name,
+            size: Some(att.size),
         })
         .collect();
     attachments.sort();
 
-    Some(EnvelopeRecord {
+    let invite = read::is_invite(store, row.id).unwrap_or_else(|e| {
+        log::warn!("[dump] invite check for message {}: {e:#}", row.id);
+        false
+    });
+
+    EnvelopeRecord {
         account: account.to_string(),
-        mailbox: mailbox.to_string(),
-        message_id: fm.message_id,
-        from: fm.from,
-        to: fm.to,
-        cc: fm.cc,
-        subject: fm.subject,
+        mailbox: row.mailbox.clone(),
+        message_id: header(Some(&row.message_id)),
+        from: header(row.from.as_ref()),
+        to: header(row.to.as_ref()),
+        cc: header(row.cc.as_ref()),
+        subject: header(row.subject.as_ref()),
         date_sort,
         flags: flags.into_iter().collect(),
         attachments,
-        invite: fm.event.is_some(),
-    })
+        invite,
+    }
 }
 
 #[cfg(test)]
@@ -269,17 +236,6 @@ mod tests {
     fn mailbox_id_is_the_directory_leaf() {
         assert_eq!(mailbox_id(Path::new("/data/accounts/tum/inbox")), "inbox");
         assert_eq!(mailbox_id(Path::new("/data/accounts/tum/some-folder")), "some-folder");
-    }
-
-    /// parity: an attachment recorded as a source path (sent and draft mail
-    /// does this) dumps as its file name, so no filesystem path reaches the
-    /// output.
-    #[test]
-    fn attachment_names_are_stripped_to_the_file_name() {
-        assert_eq!(attachment_name("/tmp/audio/briefing.mp3"), "briefing.mp3");
-        assert_eq!(attachment_name("report.pdf"), "report.pdf");
-        assert_eq!(attachment_name(""), "");
-        assert_eq!(attachment_name("/"), "/");
     }
 
     /// parity: an empty filter selects everything; a non-empty one matches the

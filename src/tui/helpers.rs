@@ -10,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use super::app::{App, EmailEntry, SearchHit, SearchTarget};
+use super::app::{App, EmailEntry, MessageRef, SearchHit, SearchTarget};
 
 use crate::config::{all_configured_mailboxes, AccountConfig, ImapConfig};
 use crate::draft::parse_email_draft;
@@ -281,6 +281,7 @@ pub(super) struct SyncResultMeta {
 }
 
 pub(super) async fn lib_do_multi_search(
+    account: &str,
     imap_config: &ImapConfig,
     query: &str,
     targets: &[SearchTarget],
@@ -318,7 +319,7 @@ pub(super) async fn lib_do_multi_search(
                 );
                 total += emails.len();
                 for fetched in emails {
-                    let entry = fetched_to_email_entry(&fetched);
+                    let entry = fetched_to_email_entry(account, &fetched);
                     hits.push(SearchHit {
                         entry,
                         fetched,
@@ -369,6 +370,7 @@ pub(super) async fn lib_do_sync_graph(
 }
 
 pub(super) async fn lib_do_multi_search_graph(
+    account: &str,
     graph_config: &crate::config::GraphConfig,
     query: &str,
     targets: &[SearchTarget],
@@ -394,7 +396,7 @@ pub(super) async fn lib_do_multi_search_graph(
             Ok(emails) => {
                 total += emails.len();
                 for fetched in emails {
-                    let entry = fetched_to_email_entry(&fetched);
+                    let entry = fetched_to_email_entry(account, &fetched);
                     hits.push(SearchHit {
                         entry,
                         fetched,
@@ -414,7 +416,30 @@ pub(super) async fn lib_do_multi_search_graph(
     Ok(hits)
 }
 
-fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
+/// Turn a server-search hit into a list entry.
+///
+/// The hit came straight off the server and was never ingested, so it may or
+/// may not correspond to a row this account already holds. The entry is
+/// resolved against the store by Message-ID (`store::read::find_by_message_id`,
+/// the same indexed lookup that replaced the startup Message-ID walk in
+/// #0038): a hit that resolves carries `Some(MessageRef)` and behaves like any
+/// other row, a hit that does not carries `None` and every row-dependent
+/// operation on it declines with a status message. There is deliberately no
+/// sentinel `MessageRef`: an entry that pretends to be row 0 could reach the
+/// selection set and a batch action would then act on the wrong message.
+///
+/// This is the honest continuation of the gap #0049 recorded as 4a
+/// ("server-search open hit only resolves messages already local"): before the
+/// nuke the resolution was a Message-ID scan of the mailbox directory, now it
+/// is the same question asked of the store. A server-only hit is still listed
+/// and previewable from the fetched content and still not openable as a local
+/// message; closing that needs the hit to be ingested on demand, which is not
+/// this unit.
+///
+/// A message that lives in several mailboxes resolves to the first row in
+/// `(mailbox, uid)` order, which is what the directory scan did too (it looked
+/// only in the mailbox the hit came from and took the single match there).
+fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
     let (date_display, date_sort) =
         if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&fetched.date) {
             (
@@ -428,8 +453,10 @@ fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
             )
         };
 
+    let msg = resolve_fetched_hit(account, fetched);
+
     EmailEntry {
-        path: PathBuf::new(),
+        msg,
         from: fetched.from.clone(),
         to: fetched.to.clone(),
         cc: fetched.cc.clone(),
@@ -441,6 +468,24 @@ fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
         has_attachments: fetched.has_attachments,
         read: fetched.is_read,
         event: fetched.event.clone(),
+    }
+}
+
+/// Look one server-search hit up in the account's store by Message-ID.
+///
+/// `None` covers all three misses that mean the same thing to the caller: the
+/// account has no store yet, the hit carries no Message-ID, or no row holds
+/// it. The store is opened per hit, which is a few microseconds against a
+/// search that just did a network round trip.
+fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageRef> {
+    let message_id = fetched.message_id.as_deref()?;
+    let store = crate::tui::app::open_store(account)?;
+    match crate::store::read::find_by_message_id(&store, account, message_id) {
+        Ok(rows) => rows.first().map(|row| MessageRef::new(row.id)),
+        Err(e) => {
+            log::warn!("[store] resolving search hit {message_id}: {e:#}");
+            None
+        }
     }
 }
 
@@ -491,12 +536,14 @@ pub(super) fn resolve_send_account(
 
 /// Resolve a server-search hit to a local file, when one exists.
 ///
-/// This used to *write* the hit to the mailbox directory as `.md` so the rest
-/// of the TUI could open it. Ingest no longer writes files, so the hit is only
-/// openable when a previous sync already put it on disk; the lookup is by
-/// Message-ID in frontmatter (never a whole-file substring match, which could
-/// false-match an ID quoted in another email's body). Server-only hits become
-/// openable again when the read path moves onto the store (#0038).
+/// This used to *write* the hit to the mailbox directory as `.md`, then (once
+/// ingest stopped writing files) to find an already-synced copy by scanning
+/// the mailbox directory for the Message-ID. Both are gone: the hit is
+/// resolved to a store row when the entry is built
+/// (`fetched_to_email_entry`), and turning that row back into a file is the
+/// same bridge every other file-taking operation goes through, which declines
+/// until #0038 scope item 7. So this returns `None` for every hit today; the
+/// callers already have the "could not open locally" branch that says so.
 pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
     let idx = app.server_search_index;
     let result = app.server_search_results.get(idx)?;
@@ -505,11 +552,7 @@ pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
         return Some(path.clone());
     }
 
-    let save_dir = result.source_local_dir.clone();
-    let message_id = result.fetched.message_id.clone()?;
-
-    let ids = crate::parse::scan_mailbox_message_ids(&save_dir).ok()?;
-    let path = ids.get(&message_id)?.clone();
+    let path = crate::tui::actions::message_path(result.entry.msg?)?;
     let result = app.server_search_results.get_mut(idx)?;
     result.saved_path = Some(path.clone());
     Some(path)
@@ -561,7 +604,7 @@ mod tests {
             sidebar_index: 0,
             active_mailbox: 0,
             list_index: 0,
-            cursor_path: None,
+            cursor_ref: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
@@ -571,8 +614,6 @@ mod tests {
             watcher_active: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
-            message_id_index: Default::default(),
-            indexing: false,
         }
     }
 
@@ -734,14 +775,14 @@ mod tests {
     // fetched_to_email_entry
     // -----------------------------------------------------------------------
 
-    /// parity. A server-search hit becomes a list row with an empty path and
-    /// an empty status (it is not on disk yet; `ensure_search_result_saved`
-    /// fills those in on demand), and the remaining fields are copied through.
+    /// parity. A server-search hit becomes a list row with no store row (the
+    /// account below has no store at all) and an empty status, and the
+    /// remaining fields are copied through.
     #[test]
-    fn fetched_to_email_entry_copies_fields_and_leaves_path_and_status_empty() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+    fn fetched_to_email_entry_copies_fields_and_leaves_msg_and_status_empty() {
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
 
-        assert_eq!(entry.path, PathBuf::new());
+        assert_eq!(entry.msg, None);
         assert_eq!(entry.status, "");
         assert_eq!(entry.subject, "Grüße");
         assert_eq!(entry.to, "me@example.com");
@@ -762,13 +803,13 @@ mod tests {
     /// Target: `date_sort` in UTC, i.e. `2024-01-01T08:00:00` below.
     #[test]
     fn fetched_to_email_entry_sort_key_keeps_the_sender_local_wallclock() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 10:00:00 +0200"));
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 10:00:00 +0200"));
         assert_eq!(entry.date_display, "2024-01-01");
         assert_eq!(entry.date_sort, "2024-01-01T10:00:00");
 
         // 10:00+0200 is 08:00 UTC, so this later message (09:00 UTC) must sort
         // after it. On the recorded wallclock keys it sorts before.
-        let later = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 09:00:00 +0000"));
+        let later = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 09:00:00 +0000"));
         assert_eq!(later.date_sort, "2024-01-01T09:00:00");
         assert!(
             later.date_sort < entry.date_sort,
@@ -782,16 +823,77 @@ mod tests {
     /// string cannot panic, with the raw string as the sort key.
     #[test]
     fn fetched_to_email_entry_falls_back_to_the_first_ten_chars() {
-        let entry = fetched_to_email_entry(&fetched("2024-01-01 12:00 (approx)"));
+        let entry = fetched_to_email_entry("nobody", &fetched("2024-01-01 12:00 (approx)"));
         assert_eq!(entry.date_display, "2024-01-01");
         assert_eq!(entry.date_sort, "2024-01-01 12:00 (approx)");
 
-        let placeholder = fetched_to_email_entry(&fetched("(unknown date)"));
+        let placeholder = fetched_to_email_entry("nobody", &fetched("(unknown date)"));
         assert_eq!(placeholder.date_display, "(unknown d");
         assert_eq!(placeholder.date_sort, "(unknown date)");
 
-        let unicode = fetched_to_email_entry(&fetched("日本語の日付です、これは長い"));
+        let unicode = fetched_to_email_entry("nobody", &fetched("日本語の日付です、これは長い"));
         assert_eq!(unicode.date_display, "日本語の日付です、こ");
+    }
+
+    /// The decided behaviour for a server-search hit (#0038): the entry is
+    /// resolved against the account's store by Message-ID, so a hit a previous
+    /// sync already ingested carries that row's `MessageRef` and a hit that
+    /// exists only on the server carries `None`. No sentinel ref is minted for
+    /// the second case, because a fake ref could reach the selection set and a
+    /// batch action would then act on a different message.
+    #[test]
+    fn a_search_hit_carries_a_ref_only_when_the_store_holds_it() {
+        let _guard = crate::config::data_dir_lock();
+        let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+
+        let mut local = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        local.message_id = Some("<local@example.de>".to_string());
+        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
+        let blobs = crate::store::BlobStore::for_account("alice");
+        let row_id = crate::ingest::ingest_message(
+            &store,
+            &blobs,
+            &crate::ingest::IngestInput {
+                account: "alice",
+                mailbox: "inbox",
+                uid: 1,
+                email: &local,
+                raw: None,
+            },
+        )
+        .unwrap()
+        .row_id;
+        drop(store);
+
+        let resolved = fetched_to_email_entry("alice", &local);
+        assert_eq!(
+            resolved.msg,
+            Some(crate::tui::app::MessageRef::new(row_id)),
+            "a hit the store already holds resolves to its row"
+        );
+
+        let mut server_only = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        server_only.message_id = Some("<never-synced@example.de>".to_string());
+        assert_eq!(
+            fetched_to_email_entry("alice", &server_only).msg,
+            None,
+            "a server-only hit carries no ref"
+        );
+
+        let mut anonymous = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        anonymous.message_id = None;
+        assert_eq!(
+            fetched_to_email_entry("alice", &anonymous).msg,
+            None,
+            "a hit without a Message-ID cannot be resolved"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+        }
     }
 
     /// known-bug. The row keeps the raw `From:` header, address included,
@@ -801,7 +903,7 @@ mod tests {
     /// Target: one projection for both paths.
     #[test]
     fn fetched_to_email_entry_keeps_the_raw_from_header() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
         assert_eq!(entry.from, "Jürgen Müller <juergen@example.de>");
         assert_eq!(
             crate::tui::app::extract_display_name(&entry.from),

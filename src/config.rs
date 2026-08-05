@@ -659,6 +659,20 @@ impl ImapConfig {
 // Override with the `MAILYPOPPINS_DATA_DIR` env var (for tests, or for power
 // users running mailypoppins from a portable location).
 
+/// Serialise tests that mutate `MAILYPOPPINS_DATA_DIR`.
+///
+/// One lock for the whole crate: several modules point the data dir at a
+/// tempdir for the duration of a test, and per-module locks do not serialise
+/// against each other.
+#[cfg(test)]
+pub(crate) fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Root data directory for all app-owned files.
 pub fn mailypoppins_data_dir() -> PathBuf {
     if let Ok(p) = std::env::var("MAILYPOPPINS_DATA_DIR") {
@@ -1362,15 +1376,6 @@ name = "test"
     // -----------------------------------------------------------------------
     // mailypoppins_data_dir + derived path helpers
     // -----------------------------------------------------------------------
-
-    /// Serialize tests that mutate `MAILYPOPPINS_DATA_DIR` so they don't race.
-    fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn data_dir_env_override() {

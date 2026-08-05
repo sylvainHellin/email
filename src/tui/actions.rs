@@ -8,7 +8,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
     Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus, MailboxKind,
-    Overlay, StatusLevel,
+    MessageRef, Overlay, StatusLevel,
 };
 use super::helpers::{
     edit_file, ensure_search_result_saved, lib_do_multi_search_graph, lib_do_sync_graph,
@@ -29,6 +29,39 @@ use crate::imap_client::{
 };
 use crate::types::EmailStatus;
 
+// ---------------------------------------------------------------------------
+// The `.md` bridge (#0038 unit A, temporary)
+// ---------------------------------------------------------------------------
+
+/// Resolve a [`MessageRef`] to the `.md` file the mutation paths still need,
+/// which is never possible: it always returns `None`.
+///
+/// #0037 stopped writing the `.md` tree and #0038 moved the read path onto the
+/// store, but the mutation paths (edit, reply, forward, send, approve,
+/// archive, delete, move, flag, RSVP, attachments) still take a file path all
+/// the way down into `draft.rs`, `imap_client` and `graph.rs`. Rewriting them
+/// onto the store is #0038 scope item 7, and that item is the owner that
+/// deletes this function together with every `let Some(path) = ... else` guard
+/// that calls it. Nothing else may add a caller, and nothing may make it
+/// return `Some`: a resurrected `.md` path would be as wrong as a store miss.
+///
+/// The reason it exists at all rather than the arms being deleted: the arms
+/// are the specification of what item 7 has to reproduce, and deleting them
+/// would lose that. Guarded by
+/// `the_file_bridge_never_resolves_a_path`.
+pub(super) fn message_path(_msg: MessageRef) -> Option<PathBuf> {
+    None
+}
+
+/// The status line a mutation shows when [`message_path`] declined.
+///
+/// `what` names the operation ("Reply", "Archive"). The message tells the user
+/// both halves of the truth: this build will do it soon, and there is a
+/// working way to do it right now.
+pub(super) fn store_backed_soon(what: &str) -> String {
+    format!("{what} is store-backed soon (#0038); mp-legacy is the working fallback meanwhile")
+}
+
 pub(super) fn handle_action(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -38,8 +71,12 @@ pub(super) fn handle_action(
     match action {
         Action::EditCurrent => {
             if let Some(email) = app.selected_email() {
-                let path = email.path.clone();
+                let msg = email.msg;
                 let was_unread = !email.read;
+                let Some(path) = msg.and_then(message_path) else {
+                    app.set_status_level(store_backed_soon("Open"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 suspend_terminal(terminal)?;
                 let result = edit_file(&path);
                 resume_terminal(terminal)?;
@@ -60,7 +97,11 @@ pub(super) fn handle_action(
         }
 
         Action::Reply(reply_all) => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Reply"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 let default_from = app
                     .smtp_config
                     .as_ref()
@@ -86,7 +127,11 @@ pub(super) fn handle_action(
         }
 
         Action::Forward => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Forward"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 let default_from = app
                     .smtp_config
                     .as_ref()
@@ -112,7 +157,11 @@ pub(super) fn handle_action(
         }
 
         Action::Send => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Send"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 let (acct_idx, smtp_config, _imap_config, graph_config, account_config, signature) =
                     resolve_send_account(app, &path);
 
@@ -298,7 +347,11 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::Rsvp { path, choice } => {
+        Action::Rsvp { msg, choice } => {
+            let Some(path) = message_path(msg) else {
+                app.set_status_level(store_backed_soon("RSVP"), StatusLevel::Warning);
+                return Ok(());
+            };
             let (acct_idx, smtp_config, _imap_config, graph_config, account_config, _sig) =
                 resolve_send_account(app, &path);
 
@@ -606,7 +659,11 @@ pub(super) fn handle_action(
         }
 
         Action::Approve => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Approve"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 match mark_as_approved(&path) {
                     Ok(msg) => {
                         app.set_status(msg);
@@ -619,15 +676,19 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::BatchApprove(paths) => {
-            let total = paths.len();
+        Action::BatchApprove(msgs) => {
+            let total = msgs.len();
             let mut succeeded = 0usize;
             let mut failed = 0usize;
-            for path in &paths {
-                match mark_as_approved(path) {
+            for msg in &msgs {
+                let Some(path) = message_path(*msg) else {
+                    app.set_status_level(store_backed_soon("Approve"), StatusLevel::Warning);
+                    return Ok(());
+                };
+                match mark_as_approved(&path) {
                     Ok(_) => succeeded += 1,
                     Err(e) => {
-                        log::warn!("Approve failed for {}: {e}", path.display());
+                        log::warn!("Approve failed for {msg}: {e}");
                         failed += 1;
                     }
                 }
@@ -645,7 +706,11 @@ pub(super) fn handle_action(
         }
 
         Action::MarkDraft => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Mark-draft"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 match mark_as_draft(&path) {
                     Ok(msg) => {
                         app.set_status(msg);
@@ -657,15 +722,19 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::BatchMarkDraft(paths) => {
-            let total = paths.len();
+        Action::BatchMarkDraft(msgs) => {
+            let total = msgs.len();
             let mut succeeded = 0usize;
             let mut failed = 0usize;
-            for path in &paths {
-                match mark_as_draft(path) {
+            for msg in &msgs {
+                let Some(path) = message_path(*msg) else {
+                    app.set_status_level(store_backed_soon("Mark-draft"), StatusLevel::Warning);
+                    return Ok(());
+                };
+                match mark_as_draft(&path) {
                     Ok(_) => succeeded += 1,
                     Err(e) => {
-                        log::warn!("Mark-draft failed for {}: {e}", path.display());
+                        log::warn!("Mark-draft failed for {msg}: {e}");
                         failed += 1;
                     }
                 }
@@ -683,7 +752,11 @@ pub(super) fn handle_action(
         }
 
         Action::Archive => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Archive"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 let archive_dir = match app.archive_dir.clone() {
                     Some(d) => d,
                     None => {
@@ -735,14 +808,11 @@ pub(super) fn handle_action(
                         }
                     };
 
-                    // Optimistically update in-memory index
-                    if let Some(mid) = get_message_id_from_file(&path) {
-                        app.remove_from_message_index(&path, &mid);
-                        // The file will be moved to archive_dir by the background task.
-                        // We don't know the exact filename yet, so the archive entry
-                        // will be updated on the next sync or bg_result.
-                    }
-
+                    // The in-memory Message-ID index this used to update is
+                    // gone (#0038): the cross-mailbox lookup is an indexed
+                    // query now, so a move needs no index maintenance. The
+                    // store row itself still moves on the next sync until
+                    // #0038 scope item 7 writes it optimistically.
                     app.remove_selected_from_list();
                     app.bg_count += 1;
                     app.bg_mutations += 1;
@@ -772,7 +842,11 @@ pub(super) fn handle_action(
         }
 
         Action::Delete => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Delete"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 if app.is_graph() {
                     let graph_config = app.graph_config.clone().unwrap();
 
@@ -807,11 +881,6 @@ pub(super) fn handle_action(
                         }
                     };
 
-                    // Optimistically update in-memory index
-                    if let Some(mid) = get_message_id_from_file(&path) {
-                        app.remove_from_message_index(&path, &mid);
-                    }
-
                     app.remove_selected_from_list();
                     app.bg_count += 1;
                     app.bg_mutations += 1;
@@ -835,7 +904,12 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::BatchArchive(paths) => {
+        Action::BatchArchive(msgs) => {
+            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
+            else {
+                app.set_status_level(store_backed_soon("Archive"), StatusLevel::Warning);
+                return Ok(());
+            };
             let archive_dir = match app.archive_dir.clone() {
                 Some(d) => d,
                 None => {
@@ -848,8 +922,8 @@ pub(super) fn handle_action(
             };
             let archive_server_name = app.archive_server_name.clone();
 
-            let path_set: HashSet<PathBuf> = paths.iter().cloned().collect();
-            app.remove_selected_from_list_batch(&path_set);
+            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
+            app.remove_selected_from_list_batch(&msg_set);
 
             let count = paths.len();
             app.bg_count += count;
@@ -914,9 +988,14 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::BatchDelete(paths) => {
-            let path_set: HashSet<PathBuf> = paths.iter().cloned().collect();
-            app.remove_selected_from_list_batch(&path_set);
+        Action::BatchDelete(msgs) => {
+            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
+            else {
+                app.set_status_level(store_backed_soon("Delete"), StatusLevel::Warning);
+                return Ok(());
+            };
+            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
+            app.remove_selected_from_list_batch(&msg_set);
 
             let count = paths.len();
             app.bg_count += count;
@@ -972,7 +1051,7 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::MoveToMailbox { paths, dest_idx } => {
+        Action::MoveToMailbox { msgs, dest_idx } => {
             // Quick-move to an arbitrary mailbox (#0018): generalized
             // archive. Optimistic list removal + async server/local move,
             // rollback handled by move_email_locally (IMAP) and reported
@@ -1017,23 +1096,16 @@ pub(super) fn handle_action(
                 }
             };
 
-            // Optimistically update the in-memory index: the file moves
-            // to dest_dir keeping its name.
-            for path in &paths {
-                if let Some(mid) = get_message_id_from_file(path) {
-                    app.remove_from_message_index(path, &mid);
-                    if let Some(name) = path.file_name() {
-                        app.insert_into_message_index(
-                            &dest_dir,
-                            mid,
-                            dest_dir.join(name),
-                        );
-                    }
-                }
-            }
+            // The in-memory Message-ID index a move used to re-point is gone
+            // (#0038); the lookup is an indexed query over `messages` now.
+            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
+            else {
+                app.set_status_level(store_backed_soon("Move"), StatusLevel::Warning);
+                return Ok(());
+            };
 
-            let path_set: HashSet<PathBuf> = paths.iter().cloned().collect();
-            app.remove_selected_from_list_batch(&path_set);
+            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
+            app.remove_selected_from_list_batch(&msg_set);
 
             let count = paths.len();
             app.bg_count += count;
@@ -1111,12 +1183,19 @@ pub(super) fn handle_action(
         Action::ToggleRead => {
             if let Some(email) = app.selected_email() {
                 let new_read = !email.read;
-                let path = email.path.clone();
+                let Some(msg) = email.msg else {
+                    app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
+                    return Ok(());
+                };
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 let message_id = get_message_id_from_file(&path);
 
                 // Optimistic local update (list + shared cache slot).
                 update_read_status_locally(&path, new_read).ok();
-                app.set_email_read(&path, new_read);
+                app.set_email_read(msg, new_read);
 
                 let label = if new_read {
                     "Marked as read"
@@ -1130,7 +1209,6 @@ pub(super) fn handle_action(
                     if app.is_graph() {
                         let graph_cfg = app.graph_config.clone().unwrap();
                         let acct_idx = app.active_account;
-                        let path_clone = path.clone();
                         app.bg_count += 1;
                         let tx = bg_tx.clone();
                         std::thread::spawn(move || {
@@ -1140,7 +1218,7 @@ pub(super) fn handle_action(
                                 rt.block_on(crate::graph::mark_read_graph(&graph_cfg, &mid, new_read));
                             let _ = tx.send(BgResult::ToggleRead {
                                 account_index: acct_idx,
-                                path: path_clone,
+                                msg,
                                 new_read_state: new_read,
                                 result: result
                                     .map(|()| String::new())
@@ -1150,7 +1228,6 @@ pub(super) fn handle_action(
                     } else if let Some(imap_config) = app.imap_config.clone() {
                         let mailbox = app.active_server_mailbox();
                         let acct_idx = app.active_account;
-                        let path_clone = path.clone();
                         app.bg_count += 1;
                         let tx = bg_tx.clone();
                         std::thread::spawn(move || {
@@ -1163,7 +1240,7 @@ pub(super) fn handle_action(
                             };
                             let _ = tx.send(BgResult::ToggleRead {
                                 account_index: acct_idx,
-                                path: path_clone,
+                                msg,
                                 new_read_state: new_read,
                                 result: result
                                     .map(|()| String::new())
@@ -1180,19 +1257,25 @@ pub(super) fn handle_action(
                 if email.read {
                     return Ok(());
                 }
-                let path = email.path.clone();
+                let Some(msg) = email.msg else {
+                    return Ok(());
+                };
+                // Silent decline: this is the auto-mark that rides on opening
+                // an email, and the open itself already said its piece.
+                let Some(path) = message_path(msg) else {
+                    return Ok(());
+                };
                 let message_id = get_message_id_from_file(&path);
 
                 // Optimistic local update (silent; list + shared cache slot).
                 update_read_status_locally(&path, true).ok();
-                app.set_email_read(&path, true);
+                app.set_email_read(msg, true);
 
                 // Async server update (no status message for auto-mark)
                 if let Some(mid) = message_id {
                     if app.is_graph() {
                         let graph_cfg = app.graph_config.clone().unwrap();
                         let acct_idx = app.active_account;
-                        let path_clone = path.clone();
                         app.bg_count += 1;
                         let tx = bg_tx.clone();
                         std::thread::spawn(move || {
@@ -1203,7 +1286,7 @@ pub(super) fn handle_action(
                             ));
                             let _ = tx.send(BgResult::ToggleRead {
                                 account_index: acct_idx,
-                                path: path_clone,
+                                msg,
                                 new_read_state: true,
                                 result: result
                                     .map(|()| String::new())
@@ -1213,7 +1296,6 @@ pub(super) fn handle_action(
                     } else if let Some(imap_config) = app.imap_config.clone() {
                         let mailbox = app.active_server_mailbox();
                         let acct_idx = app.active_account;
-                        let path_clone = path.clone();
                         app.bg_count += 1;
                         let tx = bg_tx.clone();
                         std::thread::spawn(move || {
@@ -1223,7 +1305,7 @@ pub(super) fn handle_action(
                                 rt.block_on(mark_read_on_server(&imap_config, &mid, &mailbox));
                             let _ = tx.send(BgResult::ToggleRead {
                                 account_index: acct_idx,
-                                path: path_clone,
+                                msg,
                                 new_read_state: true,
                                 result: result
                                     .map(|()| String::new())
@@ -1235,16 +1317,21 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::BatchToggleRead(paths) => {
-            let any_unread = paths
+        Action::BatchToggleRead(msgs) => {
+            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
+            else {
+                app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
+                return Ok(());
+            };
+            let any_unread = msgs
                 .iter()
-                .any(|p| app.emails.iter().any(|e| e.path == *p && !e.read));
+                .any(|m| app.emails.iter().any(|e| e.msg == Some(*m) && !e.read));
             let new_read = any_unread;
 
             // Optimistic local update (list + shared cache slot).
-            for path in &paths {
+            for (msg, path) in msgs.iter().zip(&paths) {
                 update_read_status_locally(path, new_read).ok();
-                app.set_email_read(path, new_read);
+                app.set_email_read(*msg, new_read);
             }
             app.selection.clear();
 
@@ -1255,7 +1342,10 @@ pub(super) fn handle_action(
             };
             app.set_status(label);
 
-            // Async server update
+            // Async server update. The delivered `msg` is the first of the
+            // batch: the handler only uses it to roll one row back, which is
+            // the pre-existing shape of this arm (it reported one path too).
+            let first = msgs.first().copied();
             if app.is_graph() {
                 let graph_cfg = app.graph_config.clone().unwrap();
                 let acct_idx = app.active_account;
@@ -1274,12 +1364,14 @@ pub(super) fn handle_action(
                             }
                         }
                     }
-                    let _ = tx.send(BgResult::ToggleRead {
-                        account_index: acct_idx,
-                        path: paths.first().cloned().unwrap_or_default(),
-                        new_read_state: new_read,
-                        result: Ok(String::new()),
-                    });
+                    if let Some(msg) = first {
+                        let _ = tx.send(BgResult::ToggleRead {
+                            account_index: acct_idx,
+                            msg,
+                            new_read_state: new_read,
+                            result: Ok(String::new()),
+                        });
+                    }
                 });
             } else if let Some(imap_config) = app.imap_config.clone() {
                 let mailbox = app.active_server_mailbox();
@@ -1301,18 +1393,24 @@ pub(super) fn handle_action(
                             }
                         }
                     }
-                    let _ = tx.send(BgResult::ToggleRead {
-                        account_index: acct_idx,
-                        path: paths.first().cloned().unwrap_or_default(),
-                        new_read_state: new_read,
-                        result: Ok(String::new()),
-                    });
+                    if let Some(msg) = first {
+                        let _ = tx.send(BgResult::ToggleRead {
+                            account_index: acct_idx,
+                            msg,
+                            new_read_state: new_read,
+                            result: Ok(String::new()),
+                        });
+                    }
                 });
             }
         }
 
         Action::CopyPath => {
-            if let Some(path) = app.selected_email_path() {
+            if let Some(msg) = app.selected_email_ref() {
+                let Some(path) = message_path(msg) else {
+                    app.set_status_level(store_backed_soon("Copy path"), StatusLevel::Warning);
+                    return Ok(());
+                };
                 match super::helpers::copy_to_clipboard(&path.display().to_string()) {
                     Ok(()) => app.set_status("Path copied to clipboard".to_string()),
                     Err(e) => app.set_status_level(format!("Copy failed: {e}"), StatusLevel::Error),
@@ -1493,15 +1591,16 @@ pub(super) fn handle_action(
             // bump `bg_count` (spinner), spawn, deliver via `bg_tx`. The
             // handler in `tui/bg.rs` drops the result if the generation
             // or account/mailbox indices went stale meanwhile.
-            let dir = match app.mailboxes.get(mailbox_idx) {
-                Some(mb) => mb.dir.clone(),
+            let mailbox = match app.mailboxes.get(mailbox_idx) {
+                Some(mb) => super::app::mailbox_key(mb),
                 None => return Ok(()),
             };
+            let account = app.account_config.name.clone();
             let account_index = app.active_account;
             app.bg_count += 1;
             let tx = bg_tx.clone();
             std::thread::spawn(move || {
-                let entries = super::app::load_emails(&dir);
+                let entries = super::app::load_emails(&account, &mailbox);
                 let _ = tx.send(BgResult::MailboxLoaded {
                     account_index,
                     mailbox_idx,
@@ -1582,6 +1681,9 @@ pub(super) fn handle_action(
         }
 
         Action::ServerSearch { query, targets } => {
+            // The account name travels with the search so each hit can be
+            // resolved against that account's store (#0038).
+            let account = app.account_config.name.clone();
             app.server_search_loading = true;
             app.server_search_status = Some("Searching...".to_string());
             app.bg_count += 1;
@@ -1593,6 +1695,7 @@ pub(super) fn handle_action(
                     let rt =
                         tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
                     let result = rt.block_on(lib_do_multi_search_graph(
+                        &account,
                         &graph_config,
                         &query,
                         &targets,
@@ -1619,6 +1722,7 @@ pub(super) fn handle_action(
                     let rt =
                         tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
                     let result = rt.block_on(super::helpers::lib_do_multi_search(
+                        &account,
                         &imap_config,
                         &query,
                         &targets,
@@ -2487,6 +2591,36 @@ fn parse_graph_recipients(field: Option<&str>) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `.md` bridge must never hand a mutation a file path back.
+    ///
+    /// This is the guard on the stop-gate state: while #0038 scope item 7 is
+    /// open, every file-taking mutation arm is fronted by [`message_path`],
+    /// and the only correct answer is `None`. If someone makes it resolve a
+    /// path again, the mutation would write into a tree that ingest no longer
+    /// maintains and the store would silently diverge, so this test fails
+    /// loudly rather than letting that ship.
+    #[test]
+    fn the_file_bridge_never_resolves_a_path() {
+        for id in [1, 2, 42, i64::MAX] {
+            assert_eq!(
+                message_path(MessageRef::new(id)),
+                None,
+                "message_path resolved a .md path for row {id}; #0038 item 7 owns \
+                 removing this bridge, nothing may make it return Some"
+            );
+        }
+    }
+
+    /// The decline message names both the future (store-backed) and the
+    /// present (mp-legacy), so a user who hits it knows what to do now.
+    #[test]
+    fn the_decline_message_points_at_the_working_fallback() {
+        let msg = store_backed_soon("Archive");
+        assert!(msg.starts_with("Archive "), "{msg}");
+        assert!(msg.contains("store-backed"), "{msg}");
+        assert!(msg.contains("mp-legacy"), "{msg}");
+    }
 
     #[test]
     fn normalize_strips_trailing_comma_and_space() {

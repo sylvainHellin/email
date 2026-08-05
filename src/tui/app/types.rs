@@ -2,22 +2,58 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
 use chrono::NaiveDate;
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
-use serde::Deserialize;
 
-use crate::parse::{FetchedEmail, scan_mailbox_message_ids};
+use crate::parse::FetchedEmail;
+use crate::store::read::{self, MessageRow};
+use crate::store::{BlobStore, Store};
 
-/// In-memory index of the `.md` tree: `local_dir -> {message_id -> file_path}`.
+// ---------------------------------------------------------------------------
+// MessageRef
+// ---------------------------------------------------------------------------
+
+/// Stable in-process handle for one stored message: `messages.id`, the
+/// synthetic primary key of the row.
 ///
-/// A read-path structure: it is what lets the TUI resolve a Message-ID to a
-/// file without re-walking the mailbox directories. Ingest no longer consumes
-/// it (the store answers that question with a query), and it retires with the
-/// file layer in #0038.
-pub type MessageIdIndex =
-    std::collections::HashMap<PathBuf, std::collections::HashMap<String, PathBuf>>;
+/// This is what replaced `EmailEntry.path` when the read path moved onto the
+/// store (#0038). Everything that used to key on the file path keys on this:
+/// the list selection set, the cursor anchor across a list rebuild, and the
+/// payload of every queued `Action`.
+///
+/// The synthetic id rather than `(account, mailbox, uid)` because those are
+/// precisely the coordinates that move. `src/store/schema.rs` puts it plainly:
+/// the id exists "so a move or a UIDVALIDITY reset does not invalidate
+/// references held elsewhere", and a selection the user made two seconds
+/// before a sync renumbered the mailbox is exactly such a reference.
+///
+/// Scoped to one account, because the store is: two accounts can hold the same
+/// id for different messages. Every holder (`selection`, `cursor_ref`, a queued
+/// `Action`) is per-account state that is dropped or re-anchored on account
+/// switch, so the scope never has to be carried alongside.
+///
+/// The user-facing name of a message is the `mp://<account>/<mailbox>/<key>`
+/// selector, which is a different thing with a different job (it survives a
+/// restart, this does not) and lands with #0050.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageRef(i64);
+
+impl MessageRef {
+    /// Wrap a `messages.id` read back from the store.
+    pub fn new(row_id: i64) -> Self {
+        Self(row_id)
+    }
+
+    /// The `messages.id` this refers to.
+    pub fn row_id(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MessageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "message #{}", self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // EmailEntry (ported from beautifulmail's email.rs)
@@ -27,7 +63,17 @@ pub type MessageIdIndex =
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EmailEntry {
-    pub path: PathBuf,
+    /// Identity of the underlying `messages` row. Replaced the file path in
+    /// #0038; see [`MessageRef`].
+    ///
+    /// `None` means "this entry has no store row", which happens for exactly
+    /// one kind of entry: a server-search hit whose Message-ID does not
+    /// resolve locally (see `tui::helpers::fetched_to_email_entry`). Such an
+    /// entry can be listed and previewed from the fetched content, and every
+    /// row-dependent operation on it must decline with a status message
+    /// rather than act on some other message. A sentinel `MessageRef` would
+    /// be a lie that could reach the selection set, so the absence is typed.
+    pub msg: Option<MessageRef>,
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
@@ -74,80 +120,149 @@ impl EmailEntry {
     }
 }
 
-/// Raw frontmatter fields (all optional to handle varying formats).
-#[derive(Debug, Deserialize, Default)]
-struct Frontmatter {
-    from: Option<String>,
-    to: Option<String>,
-    cc: Option<String>,
-    subject: Option<String>,
-    status: Option<String>,
-    date: Option<String>,
-    sent_at: Option<String>,
-    has_attachments: Option<bool>,
-    #[allow(dead_code)]
-    attachments: Option<Vec<String>>,
-    read: Option<bool>,
-    #[serde(default)]
-    event: Option<crate::types::EventFrontmatter>,
-}
-
-/// Load all emails from a directory.
-pub fn load_emails(dir: &Path) -> Vec<EmailEntry> {
-    let mut entries = Vec::new();
-
-    let walker = walkdir::WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "md"));
-
-    for entry in walker {
-        match parse_email(entry.path()) {
-            Ok(email) => entries.push(email),
-            Err(_) => continue,
+/// Load one mailbox of one account from the store, newest first.
+///
+/// `mailbox` is the role or slug ingest recorded, which is the leaf of the
+/// `MailboxInfo::dir` the sidebar carries (see [`mailbox_key`]).
+///
+/// There is no directory walk and no fallback to one. After #0037 nothing
+/// writes `.md`, so a message that is not in the store is an ingest bug, and a
+/// walk that produced it anyway would hide that bug behind a slow path.
+/// A store that cannot be opened or queried logs and yields an empty list,
+/// which is what a mailbox that has never synced looks like anyway.
+///
+/// Bodies are still resolved eagerly, one blob read per row, because the list
+/// and the preview share a single `EmailEntry`. Splitting them is #0038 scope
+/// item 5.
+pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
+    let mut span = crate::timing::TimingSpan::with_context(
+        "load_emails",
+        format!("{account}/{mailbox}"),
+    );
+    let Some(store) = open_store(account) else {
+        return Vec::new();
+    };
+    let rows = match read::list_mailbox(&store, account, mailbox) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("[store] listing {account}/{mailbox} failed: {e:#}");
+            return Vec::new();
         }
-    }
+    };
+    span.mark(&format!("{} row(s)", rows.len()));
 
-    // Sort by date descending (newest first)
-    entries.sort_by(|a, b| b.date_sort.cmp(&a.date_sort));
-    entries
+    let blobs = BlobStore::for_account(account);
+    let mut bodies = read::load_bodies(&blobs, &rows);
+    span.mark("bodies read");
+
+    let status = status_for_mailbox(mailbox);
+    rows.into_iter()
+        .map(|row| {
+            let body = bodies.remove(&row.id).unwrap_or_default();
+            entry_from_row(row, &status, body)
+        })
+        .collect()
 }
 
-/// Parse a single email markdown file.
-fn parse_email(path: &Path) -> Result<EmailEntry> {
-    let content = std::fs::read_to_string(path)?;
-    let matter = Matter::<YAML>::new();
-    let result = matter.parse(&content);
-
-    let fm: Frontmatter = result
-        .data
-        .and_then(|d| d.deserialize().ok())
+/// Per-mailbox message counts for the sidebar, as one grouped query.
+///
+/// Index-aligned with `mailboxes`: a mailbox the store has no rows for counts
+/// zero, so a configured-but-never-synced mailbox keeps its slot rather than
+/// shifting every count after it.
+pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> {
+    let counts = open_store(account)
+        .and_then(|store| match read::mailbox_counts(&store, account) {
+            Ok(counts) => Some(counts),
+            Err(e) => {
+                log::warn!("[store] counting mailboxes for {account} failed: {e:#}");
+                None
+            }
+        })
         .unwrap_or_default();
 
-    let body = result.content;
+    mailboxes
+        .iter()
+        .map(|mb| counts.get(&mailbox_key(mb)).copied().unwrap_or(0))
+        .collect()
+}
 
-    let from = fm.from.unwrap_or_default();
-    let to = fm.to.unwrap_or_default();
-    let subject = fm.subject.unwrap_or_else(|| "(no subject)".to_string());
-    let status = fm.status.unwrap_or_else(|| "unknown".to_string());
+/// Open the account's store, or `None` when there is not one yet.
+///
+/// A missing file is the normal state of an account that has never synced, so
+/// it is not logged; anything else is, because [`Store::open`] already rebuilds
+/// every recoverable case and only reports genuine filesystem failures.
+///
+/// Stores are opened per call rather than parked on `AccountState`, because
+/// `rusqlite::Connection` is not `Sync` and the TUI clones account state
+/// across threads. This follows `crate::outbox::counts_for_account`.
+pub fn open_store(account: &str) -> Option<Store> {
+    let path = crate::config::store_path(account);
+    if !path.exists() {
+        return None;
+    }
+    match Store::open(&path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            log::warn!("[store] could not open the store for {account}: {e:#}");
+            None
+        }
+    }
+}
 
-    let (date_display, date_sort) = resolve_date(&fm.date, &fm.sent_at, path);
+/// The `messages.mailbox` value for a sidebar mailbox: the leaf of its
+/// directory, which is the same role-or-slug string the sync path passes to
+/// ingest. The directory itself is no longer read; only its name is still the
+/// agreed key between config and store.
+pub fn mailbox_key(mb: &MailboxInfo) -> String {
+    mb.dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
 
-    Ok(EmailEntry {
-        path: path.to_path_buf(),
-        from: extract_display_name(&from),
-        to: extract_display_name(&to),
-        cc: fm.cc,
-        subject,
-        status,
+/// The `status` string the file-based build wrote into frontmatter, derived
+/// from the mailbox instead. Rendered in the headers pane as `[inbox]`,
+/// `[archived]` and so on; the same mapping [`kind_to_status`] applies.
+fn status_for_mailbox(mailbox: &str) -> String {
+    match mailbox {
+        "archive" => "archived".to_string(),
+        "sent" => "sent".to_string(),
+        "drafts" => "draft".to_string(),
+        _ => "inbox".to_string(),
+    }
+}
+
+/// Map one store row plus its already-resolved body into a display entry.
+///
+/// Date display and sort keys are derived from the stored `Date:` header by
+/// the same [`resolve_date`] the file build used, so both stacks apply one
+/// rule; the path argument is empty because the filename fallback died with
+/// the filenames.
+///
+/// `event` stays `None`: rendering an invite needs the ics blob parsed, which
+/// is the calendar flip (#0038 scope item 6). The list invite badge and the
+/// preview event card are dark until then.
+fn entry_from_row(row: MessageRow, status: &str, body: String) -> EmailEntry {
+    let (date_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
+    let read = row.is_read();
+    EmailEntry {
+        msg: Some(MessageRef::new(row.id)),
+        from: extract_display_name(row.from.as_deref().unwrap_or_default()),
+        to: extract_display_name(row.to.as_deref().unwrap_or_default()),
+        cc: row.cc,
+        subject: row
+            .subject
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(no subject)".to_string()),
+        status: status.to_string(),
         date_display,
         date_sort,
+        read,
+        has_attachments: row.has_attachments,
         body,
-        has_attachments: fm.has_attachments.unwrap_or(false),
-        read: fm.read.unwrap_or(false),
-        event: fm.event,
-    })
+        event: None,
+    }
 }
 
 /// Extract a short display name from an email address.
@@ -252,15 +367,15 @@ pub struct AccountState {
     pub sidebar_index: usize,
     pub active_mailbox: usize,
     pub list_index: usize,
-    /// Path of the email `list_index` pointed at when this account was
+    /// Identity of the email `list_index` pointed at when this account was
     /// parked. `list_index` alone is a bare position, so a list that grew
     /// or re-sorted while the account was in the background would put the
     /// cursor on a different email on switch-back; `App::restore_cursor`
-    /// re-anchors on this path and falls back to `list_index`.
-    pub cursor_path: Option<PathBuf>,
+    /// re-anchors on this reference and falls back to `list_index`.
+    pub cursor_ref: Option<MessageRef>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
-    pub selection: std::collections::HashSet<PathBuf>,
+    pub selection: std::collections::HashSet<MessageRef>,
     pub search_query: String,
     pub search_includes_body: bool,
     pub bg_mutations: usize,
@@ -271,16 +386,6 @@ pub struct AccountState {
     /// a message stuck between SMTP and its Sent copy is visible rather than
     /// silent.
     pub outbox: crate::outbox::OutboxCounts,
-    /// In-memory index: local_dir -> {message_id -> file_path}.
-    /// Initialised empty at startup and populated asynchronously by a
-    /// background indexing thread (see `BgResult::IndexReady`); updated
-    /// incrementally during sync/mutations.
-    pub message_id_index: MessageIdIndex,
-    /// True between `AccountState::new` and the arrival of
-    /// `BgResult::IndexReady` for this account. While true,
-    /// `message_id_index` is empty (or partially populated) and
-    /// sync/fetch actions are queued via the existing `bg_count` gate.
-    pub indexing: bool,
 }
 
 impl AccountState {
@@ -331,15 +436,12 @@ impl AccountState {
         );
         let mailboxes = build_mailboxes(&account_config);
         let n = mailboxes.len();
-        let counts = count_all_emails(&mailboxes);
+        // One grouped query, no directory walk. The startup Message-ID scan
+        // that used to run beside it is gone outright (#0038): identity is the
+        // row, and a cross-mailbox lookup is an indexed query at the moment it
+        // is asked, not a map built over every file at launch.
+        let counts = count_all_emails(&account_config.name, &mailboxes);
         span.mark(&format!("built {} mailbox(es)", n));
-
-        // The in-memory message-ID index is built off the main thread
-        // (see `build_message_id_index` and `BgResult::IndexReady`) so
-        // first-frame render is not blocked by walking ~17 k frontmatter
-        // files. Until the index arrives, sync/fetch actions are queued
-        // via the existing `bg_count` gate in `tui/actions.rs`.
-        let message_id_index: MessageIdIndex = std::collections::HashMap::new();
 
         Self {
             account_config,
@@ -358,7 +460,7 @@ impl AccountState {
             sidebar_index: 0,
             active_mailbox: 0,
             list_index: 0,
-            cursor_path: None,
+            cursor_ref: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
@@ -368,8 +470,6 @@ impl AccountState {
             watcher_active: false,
             has_unseen: false,
             outbox,
-            message_id_index,
-            indexing: true,
         }
     }
 
@@ -428,22 +528,15 @@ pub enum BgResult {
     },
     ToggleRead {
         account_index: usize,
-        path: PathBuf,
+        msg: MessageRef,
         new_read_state: bool,
         result: Result<String, String>,
     },
     ServerSearch {
         result: Result<Vec<SearchHit>, String>,
     },
-    /// The async startup index scan has finished for one account.
-    /// Carries the freshly built `message_id_index` to be merged into
-    /// `AccountState`. See `build_message_id_index` and ticket #0003.
-    IndexReady {
-        account_index: usize,
-        index: MessageIdIndex,
-    },
-    /// A background `load_emails` walk of one mailbox directory has
-    /// finished (P1 step 2: the walk blocks for seconds on large
+    /// A background `load_emails` query for one mailbox has
+    /// finished (P1 step 2: the load blocks for seconds on large
     /// mailboxes, so it runs off the UI thread). Applied only while
     /// `generation` still matches `App::mailbox_load_generation` --
     /// stale/out-of-order results are dropped (see
@@ -454,43 +547,6 @@ pub enum BgResult {
         generation: u64,
         entries: Vec<EmailEntry>,
     },
-}
-
-/// Walk every mailbox directory of an account and build the
-/// `message_id_index` (`local_dir -> {message_id -> file_path}`).
-///
-/// Extracted from `AccountState::new` so it can run on a background
-/// thread at TUI launch (ticket #0003). Per-dir `[TIMING]` log lines
-/// are preserved verbatim so cold-start observability is unchanged.
-pub fn build_message_id_index(
-    mailboxes: &[MailboxInfo],
-    account_name: &str,
-) -> MessageIdIndex {
-    let mut span = crate::timing::TimingSpan::with_context(
-        "build_message_id_index",
-        account_name.to_string(),
-    );
-    let mut message_id_index: MessageIdIndex = std::collections::HashMap::new();
-    let mut total_indexed = 0usize;
-    for mb in mailboxes {
-        if mb.dir.is_dir() {
-            let t0 = std::time::Instant::now();
-            if let Ok(ids) = scan_mailbox_message_ids(&mb.dir) {
-                let n = ids.len();
-                total_indexed += n;
-                log::info!(
-                    "[TIMING] AccountState::new [{}] scan {} ({} files): {} ms",
-                    account_name,
-                    mb.dir.display(),
-                    n,
-                    t0.elapsed().as_millis()
-                );
-                message_id_index.insert(mb.dir.clone(), ids);
-            }
-        }
-    }
-    span.mark(&format!("indexed {} files total", total_indexed));
-    message_id_index
 }
 
 /// A mailbox target for server search.
@@ -812,26 +868,26 @@ pub enum Action {
     SendApproved,
     NewDraft,
     Approve,
-    BatchApprove(Vec<PathBuf>),
+    BatchApprove(Vec<MessageRef>),
     /// Demote a single approved draft back to `draft` status (#0021).
     MarkDraft,
     /// Batch variant for `Action::MarkDraft` -- run mark_as_draft over
     /// the current selection.
-    BatchMarkDraft(Vec<PathBuf>),
+    BatchMarkDraft(Vec<MessageRef>),
     Archive,
     Delete,
-    BatchArchive(Vec<PathBuf>),
-    BatchDelete(Vec<PathBuf>),
-    /// Quick-move emails to another mailbox (#0018). `paths` is the
+    BatchArchive(Vec<MessageRef>),
+    BatchDelete(Vec<MessageRef>),
+    /// Quick-move emails to another mailbox (#0018). `msgs` is the
     /// selection (or the cursor email); `dest_idx` indexes
     /// `App::mailboxes`.
     MoveToMailbox {
-        paths: Vec<PathBuf>,
+        msgs: Vec<MessageRef>,
         dest_idx: usize,
     },
     ToggleRead,
     MarkAsRead,
-    BatchToggleRead(Vec<PathBuf>),
+    BatchToggleRead(Vec<MessageRef>),
     CopyPath,
     /// Open the newest log file from `logs_dir()` in `$EDITOR` (#0025).
     OpenLogFile,
@@ -844,8 +900,8 @@ pub enum Action {
         dest_dir: PathBuf,
     },
     Fetch,
-    /// Walk one mailbox directory of the active account off the UI
-    /// thread (P1 step 2). Queued by `App::request_mailbox_load` on
+    /// Load one mailbox of the active account off the UI thread (P1
+    /// step 2). Queued by `App::request_mailbox_load` on
     /// every cache-miss switch/reload; the result arrives as
     /// `BgResult::MailboxLoaded` carrying the same `generation`.
     LoadMailbox {
@@ -853,9 +909,7 @@ pub enum Action {
         generation: u64,
     },
     /// Quick-sync a specific account by index. Used for the per-account
-    /// startup auto-fetch (#0001) -- caller must guarantee that account's
-    /// `message_id_index` is ready (i.e. its `BgResult::IndexReady`
-    /// has already been handled).
+    /// startup auto-fetch (#0001).
     FetchAccount(usize),
     Sync,
     ServerSearch {
@@ -877,7 +931,7 @@ pub enum Action {
     /// RSVP to a received invite (#0029): send a METHOD:REPLY to the
     /// organizer on a background thread and flip local `event.rsvp`.
     Rsvp {
-        path: PathBuf,
+        msg: MessageRef,
         choice: RsvpChoice,
     },
     /// Compose a new draft to a contact (#0033). Opens the compose wizard
@@ -953,7 +1007,7 @@ impl RsvpChoice {
 /// Three choices (Accept / Tentative / Decline) plus Esc to cancel.
 pub struct RsvpOverlay {
     /// The invite email being answered.
-    pub path: PathBuf,
+    pub msg: MessageRef,
     /// Event summary, shown in the overlay title.
     pub summary: String,
     /// Cursor over the three choices.
@@ -1052,7 +1106,7 @@ pub struct MailboxPicker {
     /// Cursor position in `filtered`.
     pub selected: usize,
     /// Emails to move (current selection, or the cursor email).
-    pub paths: Vec<PathBuf>,
+    pub msgs: Vec<MessageRef>,
 }
 
 /// Whether the directory picker is in zoxide or browser mode.
@@ -1161,27 +1215,6 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
     }
 
     result
-}
-
-pub fn count_all_emails(mailboxes: &[MailboxInfo]) -> Vec<usize> {
-    mailboxes
-        .iter()
-        .map(|mb| {
-            if mb.dir.is_dir() {
-                walkdir::WalkDir::new(&mb.dir)
-                    .max_depth(1)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().is_some_and(|ext| ext == "md")
-                    })
-                    .count()
-            } else {
-                0
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1302,19 +1335,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_message_id_index (ticket #0003)
+    // Store-backed list and counts
+    //
+    // Ported from the file-tree fixtures of #0049 unit 0b. The tagging
+    // convention carries over: `parity` means the recorded behaviour must
+    // reproduce, and where a `known-bug` case became unreachable the comment
+    // says so instead of quietly disappearing.
     // -----------------------------------------------------------------------
 
-    fn write_msg(dir: &Path, filename: &str, message_id: &str) {
-        std::fs::write(
-            dir.join(filename),
-            format!(
-                "---\nmessage_id: {}\nsubject: test\n---\n\nbody\n",
-                message_id
-            ),
-        )
-        .unwrap();
-    }
+    use crate::ingest::{ingest_message, IngestInput};
+    use crate::parse::FetchedEmail;
+    use crate::store::BlobStore;
 
     fn mb(label: &str, dir: PathBuf, kind: MailboxKind) -> MailboxInfo {
         MailboxInfo {
@@ -1326,175 +1357,261 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_message_id_index_collects_per_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        let archive = tmp.path().join("archive");
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::create_dir_all(&archive).unwrap();
-
-        write_msg(&inbox, "a.md", "<a@example.com>");
-        write_msg(&inbox, "b.md", "<b@example.com>");
-        write_msg(&archive, "c.md", "<c@example.com>");
-
-        let mailboxes = vec![
-            mb("Inbox", inbox.clone(), MailboxKind::Inbox),
-            mb("Archive", archive.clone(), MailboxKind::Archive),
-        ];
-
-        let index = build_message_id_index(&mailboxes, "test-account");
-
-        assert_eq!(index.len(), 2);
-        assert_eq!(index.get(&inbox).unwrap().len(), 2);
-        assert_eq!(index.get(&archive).unwrap().len(), 1);
-        assert!(index.get(&inbox).unwrap().contains_key("<a@example.com>"));
-        assert!(index.get(&archive).unwrap().contains_key("<c@example.com>"));
+    /// Point the data directory at a temp dir so `config::store_path` and
+    /// `BlobStore::for_account` resolve inside the fixture. Serialised against
+    /// the other data-dir tests by `config::data_dir_lock`.
+    struct DataDir {
+        dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
     }
 
-    #[test]
-    fn test_build_message_id_index_skips_missing_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exists = tmp.path().join("inbox");
-        std::fs::create_dir_all(&exists).unwrap();
-        write_msg(&exists, "a.md", "<a@example.com>");
-        let missing = tmp.path().join("does-not-exist");
+    impl DataDir {
+        fn new() -> Self {
+            let guard = crate::config::data_dir_lock();
+            let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+            Self {
+                dir,
+                _guard: guard,
+                previous,
+            }
+        }
 
-        let mailboxes = vec![
-            mb("Inbox", exists.clone(), MailboxKind::Inbox),
-            mb("Archive", missing.clone(), MailboxKind::Archive),
-        ];
-
-        let index = build_message_id_index(&mailboxes, "test-account");
-        // Missing dirs are silently skipped (no panic, no entry).
-        assert!(index.contains_key(&exists));
-        assert!(!index.contains_key(&missing));
+        /// Mailbox info whose directory leaf is `name`, i.e. whose
+        /// `mailbox_key` is `name`. The directory is never created: the read
+        /// path must not care whether it exists.
+        fn mailbox(&self, label: &str, name: &str, kind: MailboxKind) -> MailboxInfo {
+            mb(label, crate::config::mailbox_dir("alice", name), kind)
+        }
     }
 
-    #[test]
-    fn test_build_message_id_index_empty_mailboxes() {
-        let index = build_message_id_index(&[], "test-account");
-        assert!(index.is_empty());
+    impl Drop for DataDir {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+            }
+            let _ = &self.dir;
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // count_all_emails (#0049 unit 0b: sidebar counts had no oracle)
-    //
-    // Tagging convention for this block, per #0049: `parity` means the new
-    // build must reproduce the recorded behaviour, `known-bug` means the
-    // recorded behaviour is wrong and the comment names the target.
-    // -----------------------------------------------------------------------
+    fn fixture_email(subject: &str, date: &str, read: bool) -> FetchedEmail {
+        FetchedEmail {
+            from: format!("Sender {subject} <s@example.com>"),
+            to: "me@example.com".into(),
+            cc: None,
+            subject: subject.into(),
+            date: date.into(),
+            body_text: format!("body of {subject}"),
+            html_body: None,
+            has_attachments: false,
+            message_id: Some(format!("<{subject}@example.com>")),
+            attachments: Vec::new(),
+            is_read: read,
+            calendar_ics: None,
+            event: None,
+        }
+    }
 
-    /// Write an email file with an explicit read flag.
-    fn write_email(dir: &Path, filename: &str, read: bool) {
-        std::fs::write(
-            dir.join(filename),
-            format!("---\nsubject: test\nread: {read}\n---\n\nbody\n"),
+    /// Write a fixture message through the real ingest API, so the rows under
+    /// test are the rows the sync path actually produces.
+    fn ingest_fixture(mailbox: &str, uid: i64, email: &FetchedEmail) {
+        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
+        let blobs = BlobStore::for_account("alice");
+        ingest_message(
+            &store,
+            &blobs,
+            &IngestInput {
+                account: "alice",
+                mailbox,
+                uid,
+                email,
+                raw: None,
+            },
         )
         .unwrap();
     }
 
-    /// parity. The sidebar number is the count of `.md` files directly in the
-    /// mailbox directory: companion `.html` files, the `_attachments`
-    /// sidecars, and anything nested one level deeper are all excluded, and
-    /// the count matches the number of rows `load_emails` produces for the
-    /// same tree.
+    /// parity. The sidebar number is the number of messages the mailbox holds,
+    /// and it equals the number of rows `load_emails` produces for the same
+    /// mailbox. In the file build this was a count of top-level `.md` files
+    /// and the two could disagree; both sides now read the same rows.
     #[test]
-    fn count_all_emails_counts_top_level_md_files_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        let archive = tmp.path().join("archive");
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::create_dir_all(&archive).unwrap();
-
-        write_email(&inbox, "a.md", false);
-        write_email(&inbox, "b.md", true);
-        write_email(&inbox, "c.md", true);
-        std::fs::write(inbox.join("b.html"), "<p>companion</p>").unwrap();
-        std::fs::write(inbox.join("notes.txt"), "not an email").unwrap();
-        let att = inbox.join("b_attachments");
-        std::fs::create_dir_all(&att).unwrap();
-        write_email(&att, "nested.md", false);
-
-        write_email(&archive, "old.md", true);
+    fn counts_match_the_number_of_listable_messages() {
+        let data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("a", "Mon, 01 Jan 2024 09:00:00 +0000", false));
+        ingest_fixture("inbox", 2, &fixture_email("b", "Mon, 01 Jan 2024 10:00:00 +0000", true));
+        ingest_fixture("inbox", 3, &fixture_email("c", "Mon, 01 Jan 2024 11:00:00 +0000", true));
+        ingest_fixture("archive", 1, &fixture_email("old", "Mon, 01 Jan 2023 09:00:00 +0000", true));
 
         let mailboxes = vec![
-            mb("Inbox", inbox.clone(), MailboxKind::Inbox),
-            mb("Archive", archive.clone(), MailboxKind::Archive),
+            data.mailbox("Inbox", "inbox", MailboxKind::Inbox),
+            data.mailbox("Archive", "archive", MailboxKind::Archive),
         ];
 
-        assert_eq!(count_all_emails(&mailboxes), vec![3, 1]);
-        assert_eq!(load_emails(&inbox).len(), 3);
-        assert_eq!(load_emails(&archive).len(), 1);
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![3, 1]);
+        assert_eq!(load_emails("alice", "inbox").len(), 3);
+        assert_eq!(load_emails("alice", "archive").len(), 1);
     }
 
-    /// parity. A mailbox directory that does not exist yet (configured but
-    /// never synced) counts 0 instead of panicking or being skipped, so the
-    /// returned vector stays index-aligned with `mailboxes`.
+    /// parity. A mailbox that was configured but never synced counts 0 rather
+    /// than being skipped, so the returned vector stays index-aligned with
+    /// `mailboxes`. An account with no store at all is the same case.
     #[test]
-    fn count_all_emails_returns_zero_for_missing_and_empty_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let empty = tmp.path().join("empty");
-        std::fs::create_dir_all(&empty).unwrap();
+    fn counts_are_zero_for_unsynced_mailboxes_and_stay_index_aligned() {
+        let data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("a", "Mon, 01 Jan 2024 09:00:00 +0000", false));
 
         let mailboxes = vec![
-            mb("Inbox", tmp.path().join("never-synced"), MailboxKind::Inbox),
-            mb("Sent", empty, MailboxKind::Sent),
+            data.mailbox("Never synced", "some-folder", MailboxKind::Extra),
+            data.mailbox("Inbox", "inbox", MailboxKind::Inbox),
+            data.mailbox("Sent", "sent", MailboxKind::Sent),
         ];
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![0, 1, 0]);
+        assert_eq!(count_all_emails("alice", &[]), Vec::<usize>::new());
 
-        assert_eq!(count_all_emails(&mailboxes), vec![0, 0]);
-        assert_eq!(count_all_emails(&[]), Vec::<usize>::new());
+        // No store file yet: every count is zero and nothing panics.
+        assert_eq!(count_all_emails("nobody", &mailboxes), vec![0, 0, 0]);
+        assert!(load_emails("nobody", "inbox").is_empty());
     }
 
-    /// parity, and the recorded shape of a gap. The count is a total, not an
-    /// unread count: it is identical for an all-read and an all-unread
-    /// mailbox. There is no unread-count function anywhere in the current
-    /// build, so the sidebar cannot show one (#0049 names this as a gap with
-    /// no current behaviour to be at parity with).
+    /// parity. The count is a total, not an unread count: it is identical for
+    /// an all-read and an all-unread mailbox. There was no unread-count
+    /// function in the file build and there is none here, so the sidebar still
+    /// cannot show one (#0049 recorded this as a gap, not a contract).
     #[test]
-    fn count_all_emails_ignores_the_read_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let all_read = tmp.path().join("read");
-        let all_unread = tmp.path().join("unread");
-        std::fs::create_dir_all(&all_read).unwrap();
-        std::fs::create_dir_all(&all_unread).unwrap();
-
+    fn counts_ignore_the_read_flag() {
+        let data = DataDir::new();
         for i in 0..3 {
-            write_email(&all_read, &format!("r{i}.md"), true);
-            write_email(&all_unread, &format!("u{i}.md"), false);
+            ingest_fixture(
+                "inbox",
+                i + 1,
+                &fixture_email(&format!("r{i}"), "Mon, 01 Jan 2024 09:00:00 +0000", true),
+            );
+            ingest_fixture(
+                "archive",
+                i + 1,
+                &fixture_email(&format!("u{i}"), "Mon, 01 Jan 2024 09:00:00 +0000", false),
+            );
         }
 
         let mailboxes = vec![
-            mb("Read", all_read, MailboxKind::Inbox),
-            mb("Unread", all_unread, MailboxKind::Inbox),
+            data.mailbox("Read", "inbox", MailboxKind::Inbox),
+            data.mailbox("Unread", "archive", MailboxKind::Archive),
         ];
-        assert_eq!(count_all_emails(&mailboxes), vec![3, 3]);
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![3, 3]);
     }
 
-    /// known-bug. The count is over files, not over messages the user can
-    /// actually see: a `.md` file whose bytes are not valid UTF-8 is counted
-    /// but is dropped by `load_emails` (its `read_to_string` fails), so the
-    /// sidebar says 2 while the list shows 1 row.
-    /// Target: the count must equal the number of listable messages. In the
-    /// new build both sides read the same store rows, which removes the
-    /// divergence by construction; a count derived from a directory walk must
-    /// not come back.
+    /// Resolution of the `known-bug` case recorded in #0049 unit 0b
+    /// (`count_all_emails_counts_files_the_list_cannot_show`): the file build
+    /// counted a non-UTF-8 `.md` that `load_emails` then dropped, so the
+    /// sidebar said 2 while the list showed 1.
+    ///
+    /// The bug is gone by construction, not by fix: there is no file to be
+    /// unreadable, and both numbers come from the same rows. The honest
+    /// store-side statement of the same property is that an unreadable *body
+    /// blob* (the nearest surviving analogue, and a case retention can
+    /// genuinely produce) still lists and still counts, because the envelope
+    /// lives in the row. It degrades to an empty body, never to a missing row.
     #[test]
-    fn count_all_emails_counts_files_the_list_cannot_show() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
+    fn a_message_whose_body_blob_is_gone_still_lists_and_still_counts() {
+        let data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("good", "Mon, 01 Jan 2024 09:00:00 +0000", false));
+        ingest_fixture("inbox", 2, &fixture_email("broken", "Mon, 01 Jan 2024 10:00:00 +0000", false));
 
-        write_email(&inbox, "good.md", false);
-        // Invalid UTF-8 in the body: 0xFF is not a legal UTF-8 byte anywhere.
-        std::fs::write(
-            inbox.join("broken.md"),
-            b"---\nsubject: broken\n---\n\nbody \xff\n",
-        )
-        .unwrap();
+        // Evict one body the way a retention sweep would: unlink the blob file
+        // and leave the row pointing at it.
+        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
+        let hash: String = store
+            .conn()
+            .query_row(
+                "SELECT body_blob FROM messages WHERE subject = 'broken'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blobs = BlobStore::for_account("alice");
+        std::fs::remove_file(blobs.path_for(&crate::store::BlobHash::parse(&hash).unwrap()))
+            .unwrap();
+        drop(store);
 
-        let mailboxes = vec![mb("Inbox", inbox.clone(), MailboxKind::Inbox)];
-        assert_eq!(count_all_emails(&mailboxes), vec![2]);
-        assert_eq!(load_emails(&inbox).len(), 1, "the sidebar over-counts by 1");
+        let mailboxes = vec![data.mailbox("Inbox", "inbox", MailboxKind::Inbox)];
+        let entries = load_emails("alice", "inbox");
+        assert_eq!(entries.len(), 2, "the row survives its blob");
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
+        let broken = entries.iter().find(|e| e.subject == "broken").unwrap();
+        assert_eq!(broken.body, "", "an evicted body degrades to empty");
+        assert_eq!(broken.from, "Sender broken", "the envelope is intact");
+    }
+
+    /// parity. The list is newest first, exactly as the file build sorted it,
+    /// and the sort now happens in SQL over `date_sort`.
+    #[test]
+    fn the_list_is_newest_first_and_deterministic() {
+        let _data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("older", "Mon, 01 Jan 2024 09:00:00 +0000", false));
+        ingest_fixture("inbox", 2, &fixture_email("newest", "Mon, 01 Jan 2024 18:00:00 +0000", false));
+        ingest_fixture("inbox", 3, &fixture_email("middle", "Mon, 01 Jan 2024 12:00:00 +0000", false));
+
+        let subjects: Vec<String> = load_emails("alice", "inbox")
+            .into_iter()
+            .map(|e| e.subject)
+            .collect();
+        assert_eq!(subjects, vec!["newest", "middle", "older"]);
+        let again: Vec<String> = load_emails("alice", "inbox")
+            .into_iter()
+            .map(|e| e.subject)
+            .collect();
+        assert_eq!(subjects, again, "two loads must agree");
+    }
+
+    /// parity. Display fields keep the file build's rules: the display name is
+    /// extracted from the address, the date is the sender-local day with a UTC
+    /// sort key, and an empty subject becomes the `(no subject)` placeholder.
+    #[test]
+    fn display_fields_follow_the_file_builds_rules() {
+        let _data = DataDir::new();
+        let mut e = fixture_email("x", "Mon, 06 May 2024 10:00:00 +0200", true);
+        e.subject = String::new();
+        e.from = "Ada Lovelace <ada@example.com>".into();
+        ingest_fixture("inbox", 1, &e);
+
+        let entries = load_emails("alice", "inbox");
+        let entry = &entries[0];
+        assert_eq!(entry.subject, "(no subject)");
+        assert_eq!(entry.from, "Ada Lovelace");
+        assert_eq!(entry.date_display, "2024-05-06", "display stays sender-local");
+        assert_eq!(entry.date_sort, "2024-05-06T08:00:00", "the sort key is UTC");
+        assert!(entry.read);
+        assert_eq!(entry.body, "body of x");
+        assert_eq!(entry.status, "inbox", "status comes from the mailbox now");
+    }
+
+    /// The mailbox key the store is queried with is the directory leaf, which
+    /// is the role or slug the config builds and the sync path hands to
+    /// ingest. Nothing reads the directory itself.
+    #[test]
+    fn the_mailbox_key_is_the_directory_leaf() {
+        assert_eq!(
+            mailbox_key(&mb("Inbox", PathBuf::from("/data/accounts/tum/inbox"), MailboxKind::Inbox)),
+            "inbox"
+        );
+        assert_eq!(
+            mailbox_key(&mb("F", PathBuf::from("/data/accounts/tum/some-folder"), MailboxKind::Extra)),
+            "some-folder"
+        );
+    }
+
+    /// The `status` string the headers pane shows is derived from the mailbox,
+    /// reproducing what the file build wrote into frontmatter at save time.
+    #[test]
+    fn status_is_derived_from_the_mailbox() {
+        assert_eq!(status_for_mailbox("inbox"), "inbox");
+        assert_eq!(status_for_mailbox("archive"), "archived");
+        assert_eq!(status_for_mailbox("sent"), "sent");
+        assert_eq!(status_for_mailbox("drafts"), "draft");
+        assert_eq!(status_for_mailbox("some-folder"), "inbox");
     }
 }

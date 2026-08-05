@@ -34,7 +34,9 @@ use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
-use crate::tui::app::{App, CalendarEvent, EmailEntry, MailboxInfo, MailboxKind, Overlay, View};
+use crate::tui::app::{
+    App, CalendarEvent, EmailEntry, MailboxInfo, MailboxKind, MessageRef, Overlay, View,
+};
 use crate::tui::theme::{self, Theme};
 use crate::types::EventFrontmatter;
 
@@ -189,10 +191,11 @@ fn mailbox(label: &str, icon: &'static str, kind: MailboxKind) -> MailboxInfo {
     }
 }
 
-/// One frozen inbox entry. Every field is literal: no clock, no filesystem.
+/// One frozen inbox entry. Every field is literal: no clock, no filesystem,
+/// no store -- `row` is the `messages.id` the entry would have carried.
 #[allow(clippy::too_many_arguments)]
 fn email(
-    file: &str,
+    row: i64,
     from: &str,
     subject: &str,
     date: &str,
@@ -202,7 +205,7 @@ fn email(
     body: &str,
 ) -> EmailEntry {
     EmailEntry {
-        path: PathBuf::from(format!("/fixture/inbox/{file}")),
+        msg: Some(MessageRef::new(row)),
         from: from.to_string(),
         to: "sylvain@example.org".to_string(),
         cc: None,
@@ -253,7 +256,7 @@ fn mail_fixture() -> App {
 
     let emails = vec![
         email(
-            "0001-uebergabe.md",
+            1,
             "Planung Muller <planung@example.org>",
             "Einladung: Baustellen\u{fc}bergabe \u{2014} \u{4f1a}\u{8b70} \u{2713}",
             "2026-07-28",
@@ -263,7 +266,7 @@ fn mail_fixture() -> App {
             "Hallo Sylvain,\n\nanbei der Plan f\u{fc}r die \u{dc}bergabe.\n\n> Bitte bis Freitag best\u{e4}tigen.\n\nGr\u{fc}\u{df}e\n",
         ),
         email(
-            "0002-status.md",
+            2,
             "Anna Weber <anna.weber@example.com>",
             "Re: Statusbericht KW31",
             "2026-07-27",
@@ -273,7 +276,7 @@ fn mail_fixture() -> App {
             "Danke, sieht gut aus.\n\nEin Punkt bleibt offen: der `export`-Schritt.\n",
         ),
         email(
-            "0003-scan.md",
+            3,
             "scanner@example.net",
             "Scan 2026-07-26 (3 Seiten)",
             "2026-07-26",
@@ -283,7 +286,7 @@ fn mail_fixture() -> App {
             "Automatischer Scan, siehe Anhang.\n",
         ),
         email(
-            "0004-newsletter.md",
+            4,
             "TUM Newsletter <news@example.edu>",
             "Wochenr\u{fc}ckblick: sehr langer Betreff der garantiert abgeschnitten wird",
             "2026-07-24",
@@ -293,7 +296,7 @@ fn mail_fixture() -> App {
             "Die Themen der Woche.\n",
         ),
         email(
-            "0005-invoice.md",
+            5,
             "buchhaltung@example.org",
             "Rechnung 2026-0714",
             "2026-07-21",
@@ -400,10 +403,7 @@ fn golden_mail_view() {
 #[test]
 fn golden_mail_view_with_selection() {
     let mut app = mail_fixture();
-    app.selection = HashSet::from([
-        PathBuf::from("/fixture/inbox/0001-uebergabe.md"),
-        PathBuf::from("/fixture/inbox/0003-scan.md"),
-    ]);
+    app.selection = HashSet::from([MessageRef::new(1), MessageRef::new(3)]);
     // Cursor off the selection: the cursor fill and the selection foreground
     // are separate signals and must stay separable in the legend.
     app.list_index = 1;

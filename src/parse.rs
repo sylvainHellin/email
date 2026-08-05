@@ -2,10 +2,8 @@ use anyhow::Result;
 use chrono::Utc;
 use colored::*;
 use mailparse::{parse_mail, MailHeaderMap};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char boundary.
 ///
@@ -604,45 +602,6 @@ pub fn parse_email_date_prefix(date_str: &str) -> String {
     }
     // Fallback: use current datetime
     Utc::now().format("%Y-%m-%d-%H%M").to_string()
-}
-
-/// Low-level scanner: walks a mailbox directory and extracts message_id from frontmatter.
-/// Returns {message_id -> file_path}. Used as the canonical base for all scanning.
-pub(crate) fn scan_mailbox_message_ids(dir: &Path) -> Result<HashMap<String, PathBuf>> {
-    let mut ids = HashMap::new();
-    if !dir.exists() {
-        return Ok(ids);
-    }
-    for entry in WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            if let Ok(content) = fs::read_to_string(path) {
-                let mut in_frontmatter = false;
-                for line in content.lines() {
-                    if line == "---" {
-                        if !in_frontmatter {
-                            in_frontmatter = true;
-                            continue;
-                        } else {
-                            break;
-                        }
-                    }
-                    if in_frontmatter && line.starts_with("message_id:") {
-                        let id = line.trim_start_matches("message_id:").trim().trim_matches('"').trim_matches('\'');
-                        if !id.is_empty() {
-                            ids.insert(id.to_string(), path.to_path_buf());
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(ids)
 }
 
 pub fn display_fetched_emails(emails: &[FetchedEmail], full_body: bool) {

@@ -6,8 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::{
     Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
-    EmailEntry, Focus, MailboxKind, MailboxPicker, Message, Overlay, RsvpChoice, RsvpOverlay,
-    SearchOverlayFocus,
+    EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
+    RsvpOverlay, SearchOverlayFocus,
 };
 
 impl App {
@@ -437,10 +437,20 @@ impl App {
             }
             A::Forward => {
                 self.pending_prefix = None;
-                if let Some(path) = self.selected_email_path() {
-                    self.push_action(Action::OpenComposeWizard(ComposeMode::Forward {
-                        source_path: path,
-                    }));
+                if let Some(msg) = self.selected_email_ref() {
+                    // The compose wizard still reads the source email from a
+                    // `.md` file; #0038 scope item 7 owns moving it onto the
+                    // store, and the bridge declines until then.
+                    match crate::tui::actions::message_path(msg) {
+                        Some(source_path) => {
+                            self.push_action(Action::OpenComposeWizard(ComposeMode::Forward {
+                                source_path,
+                            }));
+                        }
+                        None => self.set_status(crate::tui::actions::store_backed_soon(
+                            "Forward",
+                        )),
+                    }
                 }
             }
             A::EditRecipients => {
@@ -448,10 +458,17 @@ impl App {
                 // hint (the guard is advisory, resolved everywhere).
                 self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
-                    if let Some(path) = self.selected_email_path() {
-                        self.push_action(Action::OpenComposeWizard(ComposeMode::EditDraft {
-                            source_path: path,
-                        }));
+                    if let Some(msg) = self.selected_email_ref() {
+                        match crate::tui::actions::message_path(msg) {
+                            Some(source_path) => {
+                                self.push_action(Action::OpenComposeWizard(
+                                    ComposeMode::EditDraft { source_path },
+                                ));
+                            }
+                            None => self.set_status(crate::tui::actions::store_backed_soon(
+                                "Edit recipients",
+                            )),
+                        }
                     }
                 } else {
                     self.set_status(
@@ -461,7 +478,7 @@ impl App {
             }
             A::SelectAllVisible => {
                 self.pending_prefix = None;
-                self.selection = self.visible_emails().map(|e| e.path.clone()).collect();
+                self.selection = self.visible_emails().filter_map(|e| e.msg).collect();
             }
             A::Archive => {
                 self.pending_prefix = None;
@@ -548,8 +565,8 @@ impl App {
             A::ToggleRead => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let paths: Vec<PathBuf> = self.selection.iter().cloned().collect();
-                    self.push_action(Action::BatchToggleRead(paths));
+                    let msgs: Vec<MessageRef> = self.selection.iter().copied().collect();
+                    self.push_action(Action::BatchToggleRead(msgs));
                 } else {
                     self.push_action(Action::ToggleRead);
                 }
@@ -596,22 +613,31 @@ impl App {
             }
             A::OpenInBrowser => {
                 self.pending_prefix = None;
-                if let Some(email) = self.selected_email() {
-                    let html_path = email.path.with_extension("html");
-                    if html_path.exists() {
-                        self.push_action(Action::OpenHtmlInBrowser(html_path));
-                    } else {
-                        self.set_status("No HTML version available".to_string());
+                if let Some(msg) = self.selected_email_ref() {
+                    // The rendered HTML is a `.md` companion file; same bridge
+                    // as every other file-taking operation (#0038 item 7).
+                    match crate::tui::actions::message_path(msg) {
+                        Some(path) => {
+                            let html_path = path.with_extension("html");
+                            if html_path.exists() {
+                                self.push_action(Action::OpenHtmlInBrowser(html_path));
+                            } else {
+                                self.set_status("No HTML version available".to_string());
+                            }
+                        }
+                        None => self.set_status(crate::tui::actions::store_backed_soon(
+                            "Open in browser",
+                        )),
                     }
                 }
             }
             A::ToggleSelect => {
                 self.pending_prefix = None;
-                if let Some(path) = self.selected_email_path() {
-                    if self.selection.contains(&path) {
-                        self.selection.remove(&path);
+                if let Some(msg) = self.selected_email_ref() {
+                    if self.selection.contains(&msg) {
+                        self.selection.remove(&msg);
                     } else {
-                        self.selection.insert(path);
+                        self.selection.insert(msg);
                     }
                     if self.list_index < self.visible.len() - 1 {
                         self.list_index += 1;
@@ -659,20 +685,20 @@ impl App {
                 {
                     match dialog.action {
                         ConfirmAction::Approve if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchApprove(paths));
+                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            self.push_action(Action::BatchApprove(msgs));
                         }
                         ConfirmAction::MarkDraft if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchMarkDraft(paths));
+                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            self.push_action(Action::BatchMarkDraft(msgs));
                         }
                         ConfirmAction::Archive if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchArchive(paths));
+                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            self.push_action(Action::BatchArchive(msgs));
                         }
                         ConfirmAction::Delete if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchDelete(paths));
+                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            self.push_action(Action::BatchDelete(msgs));
                         }
                         _ => {
                             self.push_action(match dialog.action {
@@ -1126,8 +1152,12 @@ impl App {
             .as_ref()
             .and_then(|e| e.summary.clone())
             .unwrap_or_else(|| email.subject.clone());
+        let Some(msg) = email.msg else {
+            self.set_status("This search hit has no local copy to RSVP from".to_string());
+            return;
+        };
         self.overlay = Overlay::Rsvp(RsvpOverlay {
-            path: email.path.clone(),
+            msg,
             summary,
             selected: 0,
         });
@@ -1166,17 +1196,17 @@ impl App {
             );
             return;
         }
-        let summary = event
-            .event
-            .summary
-            .clone()
-            .unwrap_or_else(|| event.subject.clone());
-        let path = event.path.clone();
-        self.overlay = Overlay::Rsvp(RsvpOverlay {
-            path,
-            summary,
-            selected: 0,
-        });
+        // The agenda row is still read from the `.md` tree (the calendar
+        // loader is #0038 scope item 6), so it carries a path and no
+        // `MessageRef` to hand the RSVP overlay. Unreachable in practice
+        // while the tree is gone -- the agenda has no rows to select -- but
+        // stated rather than faked: item 6 sources events from `messages`
+        // rows and this becomes a plain `RsvpOverlay { msg }`.
+        let _ = &event.path;
+        self.set_status(
+            "RSVP from the agenda is store-backed soon (#0038); RSVP from the mail list meanwhile"
+                .to_string(),
+        );
     }
 
     fn handle_rsvp_overlay_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -1205,7 +1235,7 @@ impl App {
                     return None;
                 };
                 self.push_action(Action::Rsvp {
-                    path: overlay.path,
+                    msg: overlay.msg,
                     choice,
                 });
                 // Consume-and-close: promote any error queued behind it.
@@ -1459,10 +1489,10 @@ impl App {
             return;
         }
 
-        let paths: Vec<PathBuf> = if !self.selection.is_empty() {
-            self.selection.iter().cloned().collect()
-        } else if let Some(p) = self.selected_email_path() {
-            vec![p]
+        let msgs: Vec<MessageRef> = if !self.selection.is_empty() {
+            self.selection.iter().copied().collect()
+        } else if let Some(m) = self.selected_email_ref() {
+            vec![m]
         } else {
             return;
         };
@@ -1485,7 +1515,7 @@ impl App {
             candidates,
             filtered,
             selected: 0,
-            paths,
+            msgs,
         });
     }
 
@@ -1513,7 +1543,7 @@ impl App {
                     };
                     self.selection.clear();
                     self.push_action(Action::MoveToMailbox {
-                        paths: picker.paths,
+                        msgs: picker.msgs,
                         dest_idx,
                     });
                     // Consume-and-close: promote any error queued behind it.
@@ -1538,8 +1568,15 @@ impl App {
 
     /// Helper to open the attachment picker in the given mode.
     fn open_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        if let Some(email) = self.selected_email() {
-            match crate::parse::list_attachments(&email.path) {
+        if let Some(msg) = self.selected_email_ref() {
+            // Attachments live in the blob store now, but the picker and the
+            // save/open pipeline below it still take file paths; #0038 scope
+            // item 7 owns that rewrite and the bridge declines until then.
+            let Some(path) = crate::tui::actions::message_path(msg) else {
+                self.set_status(crate::tui::actions::store_backed_soon("Attachments"));
+                return;
+            };
+            match crate::parse::list_attachments(&path) {
                 Ok(files) if files.is_empty() => {
                     self.set_status("No attachments".to_string());
                 }
@@ -2044,9 +2081,20 @@ mod tests {
     use super::super::PersistentError;
     use std::path::PathBuf;
 
+    /// A `MessageRef` derived from the subject, so the same fixture email
+    /// built twice (a reload delivering a re-sorted `sample()`) carries the
+    /// same identity, exactly as two loads of one store row would. The
+    /// subject is the fixtures' de-facto primary key.
+    fn ref_for(subject: &str) -> MessageRef {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        subject.hash(&mut h);
+        MessageRef::new((h.finish() >> 1) as i64)
+    }
+
     fn entry(subject: &str, from: &str, body: &str) -> EmailEntry {
         EmailEntry {
-            path: PathBuf::from(format!("/mail/inbox/{subject}.md")),
+            msg: Some(ref_for(subject)),
             from: from.to_string(),
             to: "me@example.com".to_string(),
             cc: None,
@@ -2218,7 +2266,7 @@ mod tests {
         app.list_index = 2; // "Weekly report" via body match
 
         let removed = app.remove_selected_from_list().unwrap();
-        assert!(removed.ends_with("Weekly report.md"));
+        assert_eq!(removed, ref_for("Weekly report"));
         // The underlying list lost exactly that entry...
         assert_eq!(app.emails.len(), 3);
         assert!(app.emails.iter().all(|e| e.subject != "Weekly report"));
@@ -2233,8 +2281,8 @@ mod tests {
     #[test]
     fn set_email_read_updates_shared_cache_without_deep_clone() {
         let mut app = app_with_emails(sample());
-        let path = app.emails[1].path.clone();
-        app.set_email_read(&path, true);
+        let msg = app.emails[1].msg.unwrap();
+        app.set_email_read(msg, true);
         assert!(app.emails[1].read);
         let cached = app.email_cache[0].as_ref().unwrap();
         assert!(std::sync::Arc::ptr_eq(cached, &app.emails));
@@ -2245,8 +2293,8 @@ mod tests {
     fn with_emails_mut_leaves_invalidated_cache_slot_none() {
         let mut app = app_with_emails(sample());
         app.email_cache[0] = None; // e.g. load in flight
-        let path = app.emails[0].path.clone();
-        app.set_email_read(&path, true);
+        let msg = app.emails[0].msg.unwrap();
+        app.set_email_read(msg, true);
         assert!(app.emails[0].read);
         assert!(app.email_cache[0].is_none());
     }
@@ -2258,7 +2306,7 @@ mod tests {
     // re-sorts or grows the entry list used to move the cursor to a
     // different email (approving a draft re-sorted the list; new inbox mail
     // shifted every row down under queued keystrokes). The cursor is
-    // anchored on the entry's path and restored after the rebuild.
+    // anchored on the entry's `MessageRef` and restored after the rebuild.
     // -----------------------------------------------------------------------
 
     /// Deliver a fresh entry list through the real async funnel
@@ -2279,7 +2327,7 @@ mod tests {
     fn cursor_follows_its_email_when_the_reload_resorts_the_list() {
         let mut app = app_with_emails(sample());
         app.list_index = 1;
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // The approved draft's status/date changed, so the reload sorts it
         // last instead of second.
@@ -2289,14 +2337,14 @@ mod tests {
         deliver_mailbox_load(&mut app, resorted);
 
         assert_eq!(app.list_index, 3);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
     fn cursor_stays_put_when_new_mail_is_prepended() {
         let mut app = app_with_emails(sample());
         app.list_index = 2;
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // New inbox mail sorts above everything and shifts every row down.
         let mut grown = vec![entry("Fresh arrival", "Dave", "just landed")];
@@ -2304,7 +2352,7 @@ mod tests {
         deliver_mailbox_load(&mut app, grown);
 
         assert_eq!(app.list_index, 3);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
@@ -2340,18 +2388,18 @@ mod tests {
         emails.push(entry("Renewal notice", "Eve", "expires soon"));
         let mut app = app_with_emails(emails);
         app.list_index = 3; // "Holiday plans"
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // Archive the two rows above the cursor: the cursor's own email
         // survives, so it must stay under the cursor (at its new position).
         let mut batch = std::collections::HashSet::new();
-        batch.insert(app.emails[0].path.clone());
-        batch.insert(app.emails[1].path.clone());
+        batch.insert(app.emails[0].msg.unwrap());
+        batch.insert(app.emails[1].msg.unwrap());
         let removed = app.remove_selected_from_list_batch(&batch);
 
         assert_eq!(removed.len(), 2);
         assert_eq!(app.list_index, 1);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
@@ -2366,9 +2414,9 @@ mod tests {
         // above it: the cursor falls back to the count of survivors above
         // it, i.e. the row that took its place.
         let mut batch = std::collections::HashSet::new();
-        batch.insert(app.emails[0].path.clone());
-        batch.insert(app.emails[1].path.clone());
-        batch.insert(app.emails[3].path.clone());
+        batch.insert(app.emails[0].msg.unwrap());
+        batch.insert(app.emails[1].msg.unwrap());
+        batch.insert(app.emails[3].msg.unwrap());
         app.remove_selected_from_list_batch(&batch);
 
         assert_eq!(app.list_index, 1);
@@ -2404,7 +2452,7 @@ mod tests {
                 .collect(),
             filtered: (0..labels.len()).collect(),
             selected: 0,
-            paths: vec![PathBuf::from("/mail/inbox/a.md")],
+            msgs: vec![MessageRef::new(1)],
         }
     }
 
@@ -2477,19 +2525,19 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["Sent", "Archive"]);
         // Cursor email is carried as the move target.
-        assert_eq!(picker.paths.len(), 1);
+        assert_eq!(picker.msgs.len(), 1);
     }
 
     #[test]
     fn open_picker_uses_selection_when_present() {
         let mut app = app_with_mailboxes();
-        app.selection.insert(app.emails[0].path.clone());
-        app.selection.insert(app.emails[2].path.clone());
+        app.selection.insert(app.emails[0].msg.unwrap());
+        app.selection.insert(app.emails[2].msg.unwrap());
         app.handle_key(KeyEvent::from(KeyCode::Char('M')));
         let Overlay::Mailbox(picker) = &app.overlay else {
             panic!("picker should open");
         };
-        assert_eq!(picker.paths.len(), 2);
+        assert_eq!(picker.msgs.len(), 2);
     }
 
     #[test]
@@ -2511,9 +2559,9 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(!matches!(app.overlay, Overlay::Mailbox(_)));
         match app.pending_actions.pop_front() {
-            Some(Action::MoveToMailbox { paths, dest_idx }) => {
+            Some(Action::MoveToMailbox { msgs, dest_idx }) => {
                 assert_eq!(dest_idx, 3); // Archive
-                assert_eq!(paths.len(), 1);
+                assert_eq!(msgs.len(), 1);
             }
             other => panic!("expected MoveToMailbox, got {:?}", other),
         }
@@ -2634,11 +2682,11 @@ mod tests {
 
         app.set_persistent_error("Move failed: boom\nEmail restored.".to_string());
 
-        // Picker (and its carried paths) survive; the error is queued.
+        // Picker (and its carried messages) survive; the error is queued.
         let Overlay::Mailbox(picker) = &app.overlay else {
             panic!("picker must not be clobbered by a background error");
         };
-        assert_eq!(picker.paths.len(), 1);
+        assert_eq!(picker.msgs.len(), 1);
         assert!(app.pending_error.is_some());
         assert_eq!(app.status_message.as_deref(), Some("Move failed: boom"));
 
@@ -3108,16 +3156,25 @@ mod tests {
         assert_eq!(app.pending_prefix, None);
     }
 
-    /// `V` on a received invite opens the RSVP overlay for that event's path.
+    /// `V` on a received agenda invite declines while the calendar loader is
+    /// still file-based (#0038 scope item 6 moves it onto `messages` rows).
+    /// The agenda row carries a `.md` path and no `MessageRef`, and the RSVP
+    /// overlay only speaks `MessageRef` now; minting a fake one would let the
+    /// RSVP fire against the wrong message. Unreachable in the running build
+    /// (the agenda has no rows without the `.md` tree), asserted here because
+    /// the fixture builds the rows in memory.
     #[test]
-    fn calendar_rsvp_opens_overlay_for_received_invite() {
+    fn calendar_rsvp_declines_until_the_calendar_moves_onto_the_store() {
         let mut app = app_in_calendar();
         app.handle_key(KeyEvent::from(KeyCode::Char('V')));
-        let Overlay::Rsvp(overlay) = &app.overlay else {
-            panic!("V must open the RSVP overlay on a received invite");
-        };
-        assert_eq!(overlay.summary, "Standup");
-        assert_eq!(overlay.path, PathBuf::from("/mail/inbox/Standup.md"));
+        assert!(
+            !matches!(app.overlay, Overlay::Rsvp(_)),
+            "the agenda row has no store row to RSVP from yet"
+        );
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("store-backed soon")));
     }
 
     /// `V` on an invite we sent refuses with a hint (we are the organizer).
@@ -3166,8 +3223,15 @@ mod tests {
     #[test]
     fn calendar_rsvp_overlay_t_selects_tentative_not_scope_toggle() {
         let mut app = app_in_calendar();
-        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
-        assert!(matches!(app.overlay, Overlay::Rsvp(_)));
+        // Opened directly rather than with `V`: the agenda cannot open it
+        // until the calendar loader moves onto the store (#0038 item 6, see
+        // `calendar_rsvp_declines_until_the_calendar_moves_onto_the_store`),
+        // and what this test is about is key precedence with the overlay up.
+        app.overlay = Overlay::Rsvp(RsvpOverlay {
+            msg: MessageRef::new(1),
+            summary: "Standup".to_string(),
+            selected: 0,
+        });
         let scope_before = app.calendar_view.show_past;
         app.handle_key(KeyEvent::from(KeyCode::Char('t')));
         let Overlay::Rsvp(overlay) = &app.overlay else {

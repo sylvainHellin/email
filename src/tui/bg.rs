@@ -1,8 +1,7 @@
 use super::app::{
-    Action, App, BgResult, MailboxKind, SearchOverlayFocus, SearchResultEntry,
+    App, BgResult, MailboxKind, SearchOverlayFocus, SearchResultEntry,
     StatusLevel,
 };
-use crate::imap_client::update_read_status_locally;
 
 /// Whether a `BgResult::MailboxLoaded` may be applied or must be dropped
 /// as stale (P1 step 2). A background walk is only valid if the user is
@@ -285,51 +284,22 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             }
         }
 
-        BgResult::ToggleRead { account_index, path, new_read_state, result } => {
+        BgResult::ToggleRead { account_index, msg, new_read_state, result } => {
             // ToggleRead does NOT use bg_mutations -- it doesn't block fetch/sync
             match result {
                 Ok(_) => { /* Server confirmed, local already updated optimistically */ }
                 Err(e) => {
-                    // Rollback local state
+                    // Rollback local state. Only the in-memory list is
+                    // reverted: the durable half of the rollback is the store
+                    // row, and writing it is #0038 scope item 7.
                     let reverted = !new_read_state;
-                    update_read_status_locally(&path, reverted).ok();
                     if account_index == app.active_account {
                         // Updates both the in-memory list and the shared
                         // cache slot (they are the same Arc).
-                        app.set_email_read(&path, reverted);
+                        app.set_email_read(msg, reverted);
                     }
                     app.push_status(format!("Read status sync failed: {e}"), StatusLevel::Warning);
                 }
-            }
-        }
-
-        BgResult::IndexReady { account_index, index } => {
-            let mut should_auto_fetch = false;
-            if let Some(acct) = app.accounts.get_mut(account_index) {
-                acct.message_id_index = index;
-                acct.indexing = false;
-                // Trigger the per-account startup auto-fetch (#0001) iff
-                // the account has a remote source configured. Local-only
-                // accounts (no IMAP, no Graph) get nothing to fetch.
-                should_auto_fetch =
-                    acct.imap_config.is_some() || acct.graph_config.is_some();
-            }
-            // Clear status only when the LAST account finishes. Each
-            // account spawns its own indexing thread; we want the
-            // "Indexing..." spinner to remain visible until they all
-            // arrive. The per-thread `bg_count` decrement above keeps
-            // the spinner spinning; setting a Success message here on
-            // the final arrival mirrors the other bg-result UX.
-            if !app.accounts.iter().any(|a| a.indexing) {
-                app.set_status_level("Index ready".to_string(), StatusLevel::Success);
-            }
-            // Push *after* the status update so the per-account
-            // "Quick sync (...)" message wins over "Index ready". Use
-            // `push_action` rather than `push_action_dedup` -- different
-            // `FetchAccount(idx)` values share a discriminant and would
-            // otherwise be falsely deduplicated.
-            if should_auto_fetch {
-                app.push_action(Action::FetchAccount(account_index));
             }
         }
 
@@ -354,8 +324,8 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             // reload re-sorts (an approved draft changes status/date) and
             // grows (new inbox mail shifts every row down), so the bare
             // `list_index` would land on a different email. Anchor on the
-            // path, fall back to the clamped index when that email is
-            // gone from the fresh list.
+            // message ref, fall back to the clamped index when that email
+            // is gone from the fresh list.
             let anchor = app.cursor_anchor();
             let fallback = app.list_index;
             let entries = std::sync::Arc::new(entries);

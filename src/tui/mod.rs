@@ -75,34 +75,26 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
     // Background task results channel
     let (bg_tx, bg_rx) = mpsc::channel::<BgResult>();
 
-    // Kick off the per-account message-ID index scan on background
-    // threads so the first frame paints without waiting on the
-    // ~1.4 s walkdir over ~17 k frontmatter files (ticket #0003).
-    // Each thread sends `BgResult::IndexReady` when done; the
-    // existing `bg_count > 0` gate in `Action::Fetch` / `Action::Sync`
-    // queues user-triggered sync operations until the index arrives.
-    // The `IndexReady` handler in `bg.rs` also pushes a per-account
-    // `Action::FetchAccount` to drive the startup auto-fetch (#0001),
-    // which staggers naturally because each account fires as soon as
-    // its own index lands.
-    if !app.accounts.is_empty() {
-        for (i, acct) in app.accounts.iter().enumerate() {
-            let mailboxes = acct.mailboxes.clone();
-            let account_name = acct.account_config.name.clone();
-            let tx = bg_tx.clone();
-            app.bg_count += 1;
-            std::thread::spawn(move || {
-                let index = app::build_message_id_index(&mailboxes, &account_name);
-                let _ = tx.send(BgResult::IndexReady {
-                    account_index: i,
-                    index,
-                });
-            });
-        }
-        app.set_status_level(
-            "Indexing...".to_string(),
-            app::StatusLevel::Progress,
-        );
+    // The per-account message-ID index scan that used to run here is gone
+    // (#0038): identity is the `messages` row and a cross-mailbox lookup is
+    // an indexed query at the moment it is asked, so there is nothing to
+    // build at launch and no "Indexing..." phase to wait through.
+    //
+    // The startup auto-fetch (#0001) used to ride on that scan finishing
+    // (`BgResult::IndexReady` pushed one `Action::FetchAccount` per
+    // account). With no scan to wait for it is queued directly, one action
+    // per account with a remote source; local-only accounts have nothing to
+    // fetch. The actions still run one at a time through the normal queue,
+    // so the staggering the old path got for free is preserved.
+    let auto_fetch: Vec<usize> = app
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, acct)| acct.imap_config.is_some() || acct.graph_config.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    for i in auto_fetch {
+        app.push_action(app::Action::FetchAccount(i));
     }
 
     while app.running {

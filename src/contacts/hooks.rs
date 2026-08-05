@@ -170,15 +170,11 @@ mod tests {
     use crate::contacts::{build_index_for_account, cache_path};
     use crate::types::{EmailFrontmatter, EmailStatus};
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Serialize tests that mutate `MAILYPOPPINS_DATA_DIR`.
-    fn data_dir_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    /// Serialize tests that mutate `MAILYPOPPINS_DATA_DIR`. Crate-wide, so it
+    /// also serialises against the other modules that do it.
+    use crate::config::data_dir_lock;
+    use std::sync::MutexGuard;
 
     /// Test fixture: point `MAILYPOPPINS_DATA_DIR` at a tempdir for the
     /// duration of the returned guard, and create the account directory.

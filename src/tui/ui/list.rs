@@ -156,7 +156,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, email)| {
                 let is_cursor = i == app.list_index;
-                let is_in_selection = has_selection && app.selection.contains(&email.path);
+                let is_in_selection = has_selection && email.msg.is_some_and(|m| app.selection.contains(&m));
                 let contact = truncate(email.display_contact(app.active_kind()), contact_width);
                 // Invite badge (calendar glyph) is distinct from the
                 // attachment paperclip; an invite may also have attachments.
@@ -236,7 +236,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, email)| {
                 let is_cursor = i == app.list_index;
-                let is_in_selection = has_selection && app.selection.contains(&email.path);
+                let is_in_selection = has_selection && email.msg.is_some_and(|m| app.selection.contains(&m));
                 let subject_prefix = invite_and_attachment_prefix(email);
                 let subject = truncate(
                     &format!("{}{}", subject_prefix, email.subject),
@@ -296,11 +296,10 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
 mod badge_tests {
     use super::*;
     use crate::types::EventFrontmatter;
-    use std::path::PathBuf;
 
     fn entry(is_invite: bool, has_att: bool) -> EmailEntry {
         EmailEntry {
-            path: PathBuf::from("/x.md"),
+            msg: Some(crate::tui::app::MessageRef::new(1)),
             from: "a".into(), to: "b".into(), cc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),

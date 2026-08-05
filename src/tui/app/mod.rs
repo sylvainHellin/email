@@ -64,7 +64,7 @@ pub struct App {
     pub pending_prefix: Option<char>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
-    pub selection: HashSet<PathBuf>,
+    pub selection: HashSet<MessageRef>,
     pub email_cache: Vec<Option<Arc<Vec<EmailEntry>>>>,
     pub search_query: String,
     pub search_includes_body: bool,
@@ -223,7 +223,11 @@ impl App {
 
         app.load_from_account(0);
         if !app.mailboxes.is_empty() {
-            let loaded = Arc::new(load_emails(&app.mailboxes[0].dir));
+            let account_name = app.account_config.name.clone();
+            let loaded = Arc::new(load_emails(
+                &account_name,
+                &mailbox_key(&app.mailboxes[0]),
+            ));
             app.email_cache[0] = Some(Arc::clone(&loaded));
             app.emails = loaded;
             app.rebuild_visible();
@@ -314,13 +318,13 @@ impl App {
     // ---------------------------------------------------------------
 
     pub(crate) fn save_to_account(&mut self) {
-        let cursor_path = self.cursor_anchor();
+        let cursor_ref = self.cursor_anchor();
         if let Some(acct) = self.accounts.get_mut(self.active_account) {
             acct.sidebar_index = self.sidebar_index;
             acct.active_mailbox = self.active_mailbox;
             acct.mailbox_counts = self.mailbox_counts.clone();
             acct.list_index = self.list_index;
-            acct.cursor_path = cursor_path;
+            acct.cursor_ref = cursor_ref;
             acct.headers_scroll = self.headers_scroll;
             acct.preview_scroll = self.preview_scroll;
             acct.selection = self.selection.clone();
@@ -735,7 +739,7 @@ impl App {
         let anchor = self
             .accounts
             .get(idx)
-            .and_then(|acct| acct.cursor_path.clone());
+            .and_then(|acct| acct.cursor_ref);
         let am = self.active_mailbox;
         if let Some(cached) = self.email_cache.get(am).and_then(|c| c.as_ref()) {
             self.emails = Arc::clone(cached);
@@ -839,26 +843,27 @@ impl App {
     /// `list_index` is a bare position into `visible`, so any rebuild that
     /// re-sorts or grows the entry list silently moves the cursor to a
     /// different email (a draft approved at the top of Drafts, new inbox
-    /// mail shifting everything down). The file path is the de-facto
-    /// stable key of an entry (`selection`, `set_email_read` already key
-    /// on it), so we anchor on it and restore with `restore_cursor`.
-    pub(crate) fn cursor_anchor(&self) -> Option<PathBuf> {
-        self.selected_email().map(|e| e.path.clone())
+    /// mail shifting everything down). The `MessageRef` is the stable key
+    /// of an entry (`selection`, `set_email_read` key on it too), so we
+    /// anchor on it and restore with `restore_cursor`. An entry with no
+    /// store row cannot be anchored and falls back to the index.
+    pub(crate) fn cursor_anchor(&self) -> Option<MessageRef> {
+        self.selected_email().and_then(|e| e.msg)
     }
 
     /// Restore the cursor to `anchor` after `visible` was rebuilt. Falls
     /// back to the clamped `fallback` index when the anchored email is
     /// gone (archived, deleted, filtered out, moved to another mailbox).
-    pub(crate) fn restore_cursor(&mut self, anchor: Option<PathBuf>, fallback: usize) {
+    pub(crate) fn restore_cursor(&mut self, anchor: Option<MessageRef>, fallback: usize) {
         if self.visible.is_empty() {
             self.list_index = 0;
             return;
         }
-        if let Some(p) = anchor {
+        if let Some(m) = anchor {
             if let Some(pos) = self
                 .visible
                 .iter()
-                .position(|&i| self.emails.get(i).is_some_and(|e| e.path == p))
+                .position(|&i| self.emails.get(i).is_some_and(|e| e.msg == Some(m)))
             {
                 self.list_index = pos;
                 return;
@@ -914,25 +919,26 @@ impl App {
         r
     }
 
-    /// Optimistically set the read flag of one entry (by path) in both
-    /// the in-memory list and the cache slot. No-op if the path is not
-    /// in the active mailbox's list.
-    pub(crate) fn set_email_read(&mut self, path: &Path, read: bool) {
+    /// Optimistically set the read flag of one entry (by message ref) in
+    /// both the in-memory list and the cache slot. No-op if the message is
+    /// not in the active mailbox's list.
+    pub(crate) fn set_email_read(&mut self, msg: MessageRef, read: bool) {
         self.with_emails_mut(|entries| {
-            if let Some(e) = entries.iter_mut().find(|e| e.path == path) {
+            if let Some(e) = entries.iter_mut().find(|e| e.msg == Some(msg)) {
                 e.read = read;
             }
         });
     }
 
-    pub fn selected_email_path(&self) -> Option<PathBuf> {
-        self.selected_email().map(|e| e.path.clone())
+    /// The `MessageRef` of the cursor email, when it has a store row.
+    pub fn selected_email_ref(&self) -> Option<MessageRef> {
+        self.selected_email().and_then(|e| e.msg)
     }
 
-    pub fn remove_selected_from_list(&mut self) -> Option<PathBuf> {
-        let path = self.selected_email()?.path.clone();
+    pub fn remove_selected_from_list(&mut self) -> Option<MessageRef> {
+        let msg = self.selected_email()?.msg?;
         let fallback = self.list_index;
-        self.with_emails_mut(|entries| entries.retain(|e| e.path != path));
+        self.with_emails_mut(|entries| entries.retain(|e| e.msg != Some(msg)));
         self.invalidate_pending_mailbox_loads();
 
         // Underlying indices shifted -- recompute the view, then park the
@@ -949,29 +955,34 @@ impl App {
         self.headers_scroll = 0;
         self.preview_scroll = 0;
 
-        Some(path)
+        Some(msg)
     }
 
-    pub fn remove_selected_from_list_batch(&mut self, paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
-        let removed: Vec<PathBuf> = self
+    pub fn remove_selected_from_list_batch(
+        &mut self,
+        msgs: &HashSet<MessageRef>,
+    ) -> Vec<MessageRef> {
+        let removed: Vec<MessageRef> = self
             .emails
             .iter()
-            .filter(|e| paths.contains(&e.path))
-            .map(|e| e.path.clone())
+            .filter_map(|e| e.msg)
+            .filter(|m| msgs.contains(m))
             .collect();
 
         // The cursor's own row may or may not be part of the batch. Anchor
         // on it when it survives; otherwise fall back to the number of
         // surviving rows ABOVE the old cursor, so removing rows above it
         // does not drag the cursor down the list.
-        let anchor = self.cursor_anchor().filter(|p| !paths.contains(p));
+        let anchor = self.cursor_anchor().filter(|m| !msgs.contains(m));
         let fallback = self
             .visible_emails()
             .take(self.list_index)
-            .filter(|e| !paths.contains(&e.path))
+            .filter(|e| !e.msg.is_some_and(|m| msgs.contains(&m)))
             .count();
 
-        self.with_emails_mut(|entries| entries.retain(|e| !paths.contains(&e.path)));
+        self.with_emails_mut(|entries| {
+            entries.retain(|e| !e.msg.is_some_and(|m| msgs.contains(&m)))
+        });
         self.invalidate_pending_mailbox_loads();
 
         self.rebuild_visible();
@@ -985,35 +996,6 @@ impl App {
         self.preview_scroll = 0;
 
         removed
-    }
-
-    /// Remove a message_id from the in-memory index for the active account.
-    /// Called optimistically when archiving/deleting an email.
-    pub fn remove_from_message_index(&mut self, file_path: &std::path::Path, message_id: &str) {
-        if let Some(acct) = self.accounts.get_mut(self.active_account) {
-            for dir_map in acct.message_id_index.values_mut() {
-                if dir_map.get(message_id).is_some_and(|p| p == file_path) {
-                    dir_map.remove(message_id);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Insert a message_id into the in-memory index for the active account.
-    /// Used when archiving (file moves to archive dir).
-    pub fn insert_into_message_index(
-        &mut self,
-        dir: &std::path::Path,
-        message_id: String,
-        file_path: std::path::PathBuf,
-    ) {
-        if let Some(acct) = self.accounts.get_mut(self.active_account) {
-            acct.message_id_index
-                .entry(dir.to_path_buf())
-                .or_default()
-                .insert(message_id, file_path);
-        }
     }
 
     /// Surface a persistent error that requires explicit dismissal.
@@ -1178,10 +1160,10 @@ impl App {
         self.restore_cursor(anchor, fallback);
     }
 
-    /// Recount all mailbox sizes by walking every directory.
+    /// Recount all mailbox sizes with one grouped query (#0038).
     /// Only needed after full sync/reconciliation that moves emails between mailboxes.
     pub fn recount_all_mailboxes(&mut self) {
-        self.mailbox_counts = count_all_emails(&self.mailboxes);
+        self.mailbox_counts = count_all_emails(&self.account_config.name, &self.mailboxes);
     }
 
     pub(crate) fn switch_mailbox(&mut self, idx: usize) {

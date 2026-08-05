@@ -1,29 +1,80 @@
-//! Contract for `mp dump-mailbox --json`, the pre-nuke envelope oracle
-//! (#0049, unit 0c).
+//! Contract for `mp dump-mailbox --json`, the envelope oracle (#0049 unit 0c,
+//! flipped onto the store by #0038 unit A).
 //!
-//! parity, all of it. The dump is the only oracle left once the file-based
-//! stack is nuked: the new SQLite store must be able to emit exactly these
-//! records, byte for byte, from the database. The expected NDJSON below is
-//! therefore written out in full rather than snapshotted, so the record shape,
-//! the field order, the null handling and the sort key are all readable in one
-//! place and a change to any of them is a deliberate edit.
+//! parity, all of it. The dump is the only oracle that survives the nuke of
+//! the `.md` stack: the records below were recorded from the file build and
+//! the store build must emit the same ones. The expected NDJSON is written out
+//! in full rather than snapshotted, so the record shape, the field order, the
+//! null handling and the sort key are readable in one place and a change to
+//! any of them is a deliberate edit.
 //!
-//! The binary is run rather than the library called, because the CLI surface
-//! (`--json` required, `-A` selecting one account, `--mailbox` filtering) is
-//! part of the contract. `HOME` and `MAILYPOPPINS_DATA_DIR` point at a
-//! temporary tree, so the test never reads the real mailstore and never
-//! touches the network.
+//! Every intended difference from the pre-nuke output is one line in
+//! [docs/dump-allow-list.md](../docs/dump-allow-list.md); the ones this
+//! fixture exercises are called out at the message that exercises them.
+//!
+//! The fixture is written through the real ingest API rather than by inserting
+//! rows, so what is dumped is what a sync produces. The binary is then run
+//! rather than the library called, because the CLI surface (`--json` required,
+//! `-A` selecting one account, `--mailbox` filtering) is part of the contract.
+//! `HOME` and `MAILYPOPPINS_DATA_DIR` point at a temporary tree, so the test
+//! never reads the real mailstore and never touches the network.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use email::ingest::{ingest_message, IngestInput};
+use email::parse::{AttachmentData, FetchedEmail};
+use email::store::{BlobStore, Store};
 use tempfile::TempDir;
 
 const MP: &str = env!("CARGO_BIN_EXE_mp");
 
-/// Lay down a config with two accounts and a fixture mail tree, and return the
-/// temp dir holding both (dropped by the caller, which unlinks the tree).
+fn email(from: &str, to: &str, subject: &str, date: &str) -> FetchedEmail {
+    FetchedEmail {
+        from: from.to_string(),
+        to: to.to_string(),
+        cc: None,
+        subject: subject.to_string(),
+        date: date.to_string(),
+        body_text: format!("Body of {subject}.\n"),
+        html_body: None,
+        has_attachments: false,
+        message_id: None,
+        attachments: Vec::new(),
+        is_read: false,
+        calendar_ics: None,
+        event: None,
+    }
+}
+
+/// Ingest one message into `account`'s store, as a sync would.
+///
+/// The store and blob paths are built from `data` explicitly rather than
+/// through `config::store_path`, which reads `MAILYPOPPINS_DATA_DIR`: these
+/// tests run in one process and each has its own temp tree, so a process-wide
+/// env var would let two fixtures write into each other.
+fn ingest(data: &Path, account: &str, mailbox: &str, uid: i64, message: &FetchedEmail) {
+    let account_dir = data.join("accounts").join(account);
+    fs::create_dir_all(&account_dir).expect("account dir");
+    let store = Store::open(account_dir.join("store.sqlite3")).expect("store");
+    let blobs = BlobStore::new(account_dir.join("blobs"));
+    ingest_message(
+        &store,
+        &blobs,
+        &IngestInput {
+            account,
+            mailbox,
+            uid,
+            email: message,
+            raw: None,
+        },
+    )
+    .expect("ingest");
+}
+
+/// Lay down a config with two accounts and an ingested store for each, and
+/// return the temp dir holding both.
 fn fixture_tree() -> TempDir {
     let tmp = TempDir::new().expect("tempdir");
     let home = tmp.path();
@@ -48,101 +99,124 @@ default_from = "beta@example.com"
 "#;
     write(&home.join(".config/email/config.toml"), config);
 
-    let alpha = data.join("accounts/alpha");
-    let beta = data.join("accounts/beta");
-
-    // Read, with cc, a unicode subject, two attachments of which only one is
-    // on disk, and a message-id.
-    write(
-        &alpha.join("inbox/2026-07-02-1357_ivana_bericht.md"),
-        "---\n\
-         from: Ivana Hecimovic <ivana@example.com>\n\
-         to: Sylvain Hellin <sylvain@example.com>\n\
-         cc: '\"Prof. Petzold\" <petzold@example.com>'\n\
-         subject: 'Bericht über Anträge'\n\
-         date: Thu, 2 Jul 2026 13:57:30 +0200\n\
-         message_id: <f7ef260c@example.com>\n\
-         status: inbox\n\
-         has_attachments: true\n\
-         attachments:\n\
-         - notes.pdf\n\
-         - agenda.txt\n\
-         read: true\n\
-         ---\n\n\
-         Body.\n",
+    // Read, with cc, a unicode subject, two attachments and a message-id.
+    // Allow-list: both attachment sizes are present, because an attachment in
+    // the store is a blob. The file build recorded `null` for an attachment
+    // named in frontmatter whose file was not on disk.
+    let mut bericht = email(
+        "Ivana Hecimovic <ivana@example.com>",
+        "Sylvain Hellin <sylvain@example.com>",
+        "Bericht über Anträge",
+        "Thu, 2 Jul 2026 13:57:30 +0200",
     );
-    write(
-        &alpha.join("inbox/2026-07-02-1357_ivana_bericht_attachments/agenda.txt"),
-        "abc",
-    );
+    bericht.cc = Some("\"Prof. Petzold\" <petzold@example.com>".to_string());
+    bericht.message_id = Some("<f7ef260c@example.com>".to_string());
+    bericht.is_read = true;
+    bericht.has_attachments = true;
+    bericht.attachments = vec![
+        AttachmentData {
+            filename: "notes.pdf".to_string(),
+            content: b"%PDF-1.4 notes".to_vec(),
+            content_id: None,
+        },
+        AttachmentData {
+            filename: "agenda.txt".to_string(),
+            content: b"abc".to_vec(),
+            content_id: None,
+        },
+    ];
+    ingest(&data, "alpha", "inbox", 1, &bericht);
 
-    // Unread invite with no message-id: the dump records the absence instead
-    // of synthesizing an identity.
-    write(
-        &alpha.join("inbox/2026-07-01-0900_organizer_kickoff.md"),
-        "---\n\
-         from: Organizer <organizer@example.com>\n\
-         to: sylvain@example.com\n\
-         subject: Kickoff\n\
-         date: Wed, 1 Jul 2026 09:00:00 +0200\n\
-         status: inbox\n\
-         read: false\n\
-         event:\n\
-        \x20 uid: evt-1\n\
-        \x20 method: REQUEST\n\
-        \x20 sequence: 0\n\
-        \x20 summary: Kickoff\n\
-        \x20 rsvp: needs-action\n\
-        \x20 recurrence: ''\n\
-         ---\n\n\
-         Invite body.\n",
+    // Unread invite with no Message-ID header.
+    // Allow-list: ingest synthesizes an id, where the file build recorded
+    // `null`. The iMIP payload sets `invite` and is not an attachment.
+    let mut kickoff = email(
+        "Organizer <organizer@example.com>",
+        "sylvain@example.com",
+        "Kickoff",
+        "Wed, 1 Jul 2026 09:00:00 +0200",
     );
-
-    // Not valid UTF-8: dropped, exactly as `load_emails` drops it.
-    fs::write(
-        alpha.join("inbox/2026-07-03-1000_broken_bytes.md"),
-        [b'-', b'-', b'-', b'\n', 0xff, 0xfe, b'\n'],
-    )
-    .expect("write broken file");
-
-    // Ties on date_sort and message-id: subject then filename order them.
-    write(
-        &alpha.join("inbox/2026-07-04-1000_b_same.md"),
-        "---\nfrom: b@example.com\nsubject: Same second\ndate: Sat, 4 Jul 2026 10:00:00 +0000\nstatus: inbox\n---\n\nb\n",
+    kickoff.calendar_ics = Some(
+        b"BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Kickoff\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            .to_vec(),
     );
-    write(
-        &alpha.join("inbox/2026-07-04-1000_a_same.md"),
-        "---\nfrom: a@example.com\nsubject: Same second\ndate: Sat, 4 Jul 2026 10:00:00 +0000\nstatus: inbox\n---\n\na\n",
+    ingest(&data, "alpha", "inbox", 2, &kickoff);
+
+    // Two messages in the same second: the sort key falls through to
+    // message_id (both synthetic here), then subject, then uid. Two rows that
+    // agree all the way down to uid cannot be built through ingest -- the same
+    // envelope in the same mailbox is one row, re-bound to the new uid -- so
+    // uid is the tiebreaker that makes the order total, not one a fixture can
+    // exercise.
+    ingest(
+        &data,
+        "alpha",
+        "inbox",
+        4,
+        &email("b@example.com", "sylvain@example.com", "Same second", "Sat, 4 Jul 2026 10:00:00 +0000"),
+    );
+    ingest(
+        &data,
+        "alpha",
+        "inbox",
+        3,
+        &email("a@example.com", "sylvain@example.com", "Same second", "Sat, 4 Jul 2026 10:00:00 +0000"),
     );
 
-    // Drafts: status flags, and no date at all (the filename fallback).
-    write(
-        &alpha.join("drafts/2026-06-30-0815_reply-to-ivana.md"),
-        "---\nto: ivana@example.com\nsubject: 'Re: Bericht'\nstatus: draft\n---\n\nDraft body.\n",
-    );
-    write(
-        &alpha.join("drafts/ready.md"),
-        "---\nto: ivana@example.com\nsubject: Ready to go\nstatus: approved\n---\n\nApproved body.\n",
-    );
-
-    // Sent: sent_at instead of date, and an attachment recorded as the source
-    // path it was sent from (what outgoing mail really stores).
-    write(
-        &alpha.join("sent/2026-06-29-1200_ivana_re-bericht.md"),
-        "---\nfrom: sylvain@example.com\nto: ivana@example.com\nsubject: 'Re: Bericht'\nsent_at: 2026-06-29T12:00:00Z\nstatus: sent\nmessage_id: <sent-1@example.com>\nhas_attachments: true\nattachments:\n- /tmp/outgoing/report.pdf\n---\n\nSent body.\n",
+    // No usable `Date:` header at all.
+    // Allow-list: `date_sort` is empty. The file build fell back to the date
+    // encoded in the file name, which no longer exists.
+    ingest(
+        &data,
+        "alpha",
+        "inbox",
+        5,
+        &email("undated@example.com", "sylvain@example.com", "No date header", "(unknown date)"),
     );
 
-    // An `extra` mailbox: the slug of the server name is the mailbox id.
-    write(
-        &alpha.join("team-reports/2026-06-28-0700_bot_weekly.md"),
-        "---\nfrom: bot@example.com\nto: sylvain@example.com\nsubject: Weekly\ndate: Sun, 28 Jun 2026 07:00:00 +0000\nstatus: inbox\nmessage_id: <weekly-1@example.com>\nread: true\n---\n\nWeekly body.\n",
+    // Sent, with an attachment. The file build stored the *source* path of an
+    // outgoing attachment (`/tmp/outgoing/report.pdf`) and reduced it to a
+    // file name; the store holds the blob and its name.
+    let mut reply = email(
+        "sylvain@example.com",
+        "ivana@example.com",
+        "Re: Bericht",
+        "Mon, 29 Jun 2026 12:00:00 +0000",
     );
+    reply.message_id = Some("<sent-1@example.com>".to_string());
+    reply.has_attachments = true;
+    reply.attachments = vec![AttachmentData {
+        filename: "report.pdf".to_string(),
+        content: b"%PDF-1.4".to_vec(),
+        content_id: None,
+    }];
+    ingest(&data, "alpha", "sent", 1, &reply);
+
+    // An `extra` mailbox: the slug of the server name is the mailbox key.
+    let mut weekly = email(
+        "bot@example.com",
+        "sylvain@example.com",
+        "Weekly",
+        "Sun, 28 Jun 2026 07:00:00 +0000",
+    );
+    weekly.message_id = Some("<weekly-1@example.com>".to_string());
+    weekly.is_read = true;
+    ingest(&data, "alpha", "team-reports", 1, &weekly);
 
     // Second account, so account ordering is exercised.
-    write(
-        &beta.join("archive/2026-05-01-0500_someone_old.md"),
-        "---\nfrom: someone@example.com\nto: beta@example.com\nsubject: Old thread\ndate: Fri, 1 May 2026 05:00:00 +0000\nstatus: archived\nmessage_id: <old-1@example.com>\nread: true\n---\n\nOld body.\n",
+    let mut old = email(
+        "someone@example.com",
+        "beta@example.com",
+        "Old thread",
+        "Fri, 1 May 2026 05:00:00 +0000",
     );
+    old.message_id = Some("<old-1@example.com>".to_string());
+    old.is_read = true;
+    ingest(&data, "beta", "archive", 1, &old);
+
+    // Drafts contribute nothing: they have no `messages` rows until #0050
+    // indexes them. The file build dumped two draft records here; that is the
+    // documented stop-gate state, not a lost record.
 
     tmp
 }
@@ -167,20 +241,23 @@ fn dump(tmp: &TempDir, args: &[&str]) -> String {
 }
 
 /// The full expected dump: every field, in order, for every fixture message.
+///
+/// The `sha256-...@local.invalid` id is the synthetic identity ingest gives
+/// mail with no `Message-ID:` header (the sha256 prefix of its canonical
+/// envelope); it is written out literally so a change to that derivation
+/// shows up here as a deliberate edit.
 const EXPECTED: &str = concat!(
-    r#"{"account":"alpha","mailbox":"drafts","message_id":null,"from":null,"to":"ivana@example.com","cc":null,"subject":"Ready to go","date_sort":"","flags":["approved"],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-9a19496e192edba7@local.invalid>","from":"undated@example.com","to":"sylvain@example.com","cc":null,"subject":"No date header","date_sort":"","flags":[],"attachments":[],"invite":false}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"drafts","message_id":null,"from":null,"to":"ivana@example.com","cc":null,"subject":"Re: Bericht","date_sort":"2026-06-30T08:15:00","flags":["draft"],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-50b9b217cc3bf6f3@local.invalid>","from":"Organizer <organizer@example.com>","to":"sylvain@example.com","cc":null,"subject":"Kickoff","date_sort":"2026-07-01T07:00:00","flags":[],"attachments":[],"invite":true}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":null,"from":"Organizer <organizer@example.com>","to":"sylvain@example.com","cc":null,"subject":"Kickoff","date_sort":"2026-07-01T07:00:00","flags":[],"attachments":[],"invite":true}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<f7ef260c@example.com>","from":"Ivana Hecimovic <ivana@example.com>","to":"Sylvain Hellin <sylvain@example.com>","cc":"\"Prof. Petzold\" <petzold@example.com>","subject":"Bericht über Anträge","date_sort":"2026-07-02T11:57:30","flags":["seen"],"attachments":[{"name":"agenda.txt","size":3},{"name":"notes.pdf","size":14}],"invite":false}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<f7ef260c@example.com>","from":"Ivana Hecimovic <ivana@example.com>","to":"Sylvain Hellin <sylvain@example.com>","cc":"\"Prof. Petzold\" <petzold@example.com>","subject":"Bericht über Anträge","date_sort":"2026-07-02T11:57:30","flags":["seen"],"attachments":[{"name":"agenda.txt","size":3},{"name":"notes.pdf","size":null}],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-56189be5b91b92d9@local.invalid>","from":"a@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":null,"from":"a@example.com","to":null,"cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-a8c9281df15da4b3@local.invalid>","from":"b@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":null,"from":"b@example.com","to":null,"cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
-    "\n",
-    r#"{"account":"alpha","mailbox":"sent","message_id":"<sent-1@example.com>","from":"sylvain@example.com","to":"ivana@example.com","cc":null,"subject":"Re: Bericht","date_sort":"2026-06-29T12:00:00","flags":[],"attachments":[{"name":"report.pdf","size":null}],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"sent","message_id":"<sent-1@example.com>","from":"sylvain@example.com","to":"ivana@example.com","cc":null,"subject":"Re: Bericht","date_sort":"2026-06-29T12:00:00","flags":[],"attachments":[{"name":"report.pdf","size":8}],"invite":false}"#,
     "\n",
     r#"{"account":"alpha","mailbox":"team-reports","message_id":"<weekly-1@example.com>","from":"bot@example.com","to":"sylvain@example.com","cc":null,"subject":"Weekly","date_sort":"2026-06-28T07:00:00","flags":["seen"],"attachments":[],"invite":false}"#,
     "\n",
@@ -188,10 +265,9 @@ const EXPECTED: &str = concat!(
     "\n",
 );
 
-/// parity: the exact serialized dump of the whole fixture tree. This is the
-/// record-shape contract, including null message-ids (never synthesized),
-/// verbatim header values, attachment sizes (null when the file is gone), the
-/// invite flag and the absence of any filesystem path.
+/// parity: the exact serialized dump of the whole fixture store. This is the
+/// record-shape contract, including verbatim header values, attachment sizes,
+/// the invite flag and the absence of any filesystem path.
 #[test]
 fn dump_mailbox_emits_the_recorded_envelope_shape() {
     let tmp = fixture_tree();
@@ -201,11 +277,10 @@ fn dump_mailbox_emits_the_recorded_envelope_shape() {
         !out.contains(&tmp.path().to_string_lossy().to_string()),
         "dump must not contain filesystem paths"
     );
-    assert!(!out.contains("/tmp/outgoing"), "attachment source paths must not leak");
 }
 
-/// parity: two consecutive runs over an unchanged tree are byte-identical, so
-/// a diff against the new build can only mean a behaviour change.
+/// parity: two consecutive runs over an unchanged store are byte-identical, so
+/// a diff against another build can only mean a behaviour change.
 #[test]
 fn dump_mailbox_is_deterministic_across_runs() {
     let tmp = fixture_tree();
@@ -225,7 +300,7 @@ fn dump_mailbox_honours_account_and_mailbox_selectors() {
     assert!(beta.contains(r#""account":"beta""#));
 
     let inbox = dump(&tmp, &["-A", "alpha", "dump-mailbox", "--json", "--mailbox", "INBOX"]);
-    assert_eq!(inbox.lines().count(), 4);
+    assert_eq!(inbox.lines().count(), 5);
     assert!(inbox.lines().all(|l| l.contains(r#""mailbox":"inbox""#)));
 
     let extra = dump(
@@ -239,7 +314,7 @@ fn dump_mailbox_honours_account_and_mailbox_selectors() {
         &tmp,
         &["-A", "alpha", "dump-mailbox", "--json", "--mailbox", "sent", "--mailbox", "drafts"],
     );
-    assert_eq!(two.lines().count(), 3);
+    assert_eq!(two.lines().count(), 1, "drafts have no rows until #0050");
 }
 
 /// parity: the output format is pinned by a required flag, so a future default
