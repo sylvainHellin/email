@@ -701,12 +701,14 @@ pub struct SearchHit {
     pub source_status: String,
 }
 
-/// A single server search result held in memory (with save state).
+/// A single server search result held in memory.
+///
+/// It used to carry the path it had been saved to; nothing saves a hit to a
+/// file any more (#0038), and naming one without a file is #0050's selector.
 #[derive(Debug, Clone)]
 pub struct SearchResultEntry {
     pub entry: EmailEntry,
     pub fetched: FetchedEmail,
-    pub saved_path: Option<PathBuf>,
     pub source_label: String,
     pub source_local_dir: PathBuf,
     pub source_status: String,

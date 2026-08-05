@@ -7,59 +7,142 @@ use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
-    Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus, MailboxKind,
-    MessageRef, Overlay, StatusLevel,
+    mailbox_key, open_store, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard,
+    Focus, MailboxKind, MessageRef, Overlay, StatusLevel,
 };
 use super::helpers::{
-    edit_file, ensure_search_result_saved, lib_do_multi_search_graph, lib_do_sync_graph,
-    resolve_send_account, resume_terminal, suspend_terminal,
+    edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
 };
+use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
-use crate::draft::{
-    create_forward_draft, create_reply_draft, find_drafts, mark_as_approved, mark_as_draft,
-    new_draft_skeleton, parse_email_draft,
-    mark_draft_sent, validate_draft,
-};
-use crate::imap_client::{
-    archive_email_locally, batch_archive_emails_locally,
-    batch_delete_emails_locally, delete_email_locally, get_message_id_from_file,
-    mark_read_on_server, mark_unread_on_server, move_email_locally,
-    update_read_status_locally,
-};
+use crate::draft::{create_forward_draft, find_drafts, mark_draft_sent, new_draft_skeleton};
+use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
 // ---------------------------------------------------------------------------
-// The `.md` bridge (#0038 unit A, temporary)
+// What is still addressed by file (#0050)
 // ---------------------------------------------------------------------------
 
-/// Resolve a [`MessageRef`] to the `.md` file the mutation paths still need,
-/// which is never possible: it always returns `None`.
+/// The status line an action shows while it still needs a `.md` file.
 ///
-/// #0037 stopped writing the `.md` tree and #0038 moved the read path onto the
-/// store, but the mutation paths (edit, reply, forward, send, approve,
-/// archive, delete, move, flag, RSVP, attachments) still take a file path all
-/// the way down into `draft.rs`, `imap_client` and `graph.rs`. Rewriting them
-/// onto the store is #0038 scope item 7, and that item is the owner that
-/// deletes this function together with every `let Some(path) = ... else` guard
-/// that calls it. Nothing else may add a caller, and nothing may make it
-/// return `Some`: a resurrected `.md` path would be as wrong as a store miss.
+/// The mutations moved onto the store with #0038 scope item 7, which is what
+/// deleted the always-`None` bridge these used to share. What is left is the
+/// operations that name a message *outside* the store: a draft to edit, a file
+/// to hand `$EDITOR`, an attachment to write somewhere. Those are the selector
+/// contract and the drafts index, i.e. [#0050], and they decline until it
+/// lands.
 ///
-/// The reason it exists at all rather than the arms being deleted: the arms
-/// are the specification of what item 7 has to reproduce, and deleting them
-/// would lose that. Guarded by
-/// `the_file_bridge_never_resolves_a_path`.
-pub(super) fn message_path(_msg: MessageRef) -> Option<PathBuf> {
-    None
+/// `what` names the operation ("Reply", "Attachments"). The message tells the
+/// user both halves of the truth: this build will do it soon, and there is a
+/// working way to do it right now.
+pub(super) fn needs_selector_contract(what: &str) -> String {
+    format!("{what} lands with the selector contract (#0050); mp-legacy is the working fallback meanwhile")
 }
 
-/// The status line a mutation shows when [`message_path`] declined.
+// ---------------------------------------------------------------------------
+// Mutation plumbing (#0038 scope item 7)
+// ---------------------------------------------------------------------------
+
+/// The account's store and blob store, or a status line saying why not.
 ///
-/// `what` names the operation ("Reply", "Archive"). The message tells the user
-/// both halves of the truth: this build will do it soon, and there is a
-/// working way to do it right now.
-pub(super) fn store_backed_soon(what: &str) -> String {
-    format!("{what} is store-backed soon (#0038); mp-legacy is the working fallback meanwhile")
+/// A mutation without a store is not a silent no-op: the row it would have
+/// written is the whole local half of the operation.
+fn store_for_mutation(app: &mut App, what: &str) -> Option<(crate::store::Store, BlobStore)> {
+    let account = app.account_config.name.clone();
+    match open_store(&account) {
+        Some(store) => Some((store, BlobStore::for_account(&account))),
+        None => {
+            app.set_status_level(
+                format!("{what} failed: no store for {account} yet (sync first)"),
+                StatusLevel::Error,
+            );
+            None
+        }
+    }
+}
+
+/// The backend the server op runs against, resolved before any optimistic
+/// write so a missing config leaves the store and the list untouched.
+fn backend_for_mutation(app: &mut App) -> Option<Backend> {
+    if app.is_graph() {
+        match app.graph_config.clone() {
+            Some(c) => Some(Backend::Graph(Box::new(c))),
+            None => {
+                app.set_status_level("Graph not configured".to_string(), StatusLevel::Error);
+                None
+            }
+        }
+    } else {
+        match app.imap_config.clone() {
+            Some(c) => Some(Backend::Imap(Box::new(c))),
+            None => {
+                app.set_status_level("IMAP not configured".to_string(), StatusLevel::Error);
+                None
+            }
+        }
+    }
+}
+
+/// Fire the server half of a batch of already-applied mutations.
+///
+/// One `BgResult` per op, so the counters the UI keeps stay balanced, and one
+/// rollback per failure: a move that the server refused is put back where it
+/// came from, which is what the pre-store build did by moving the file back.
+/// A refused delete has nothing to put back and converges on the next sync
+/// (see [`crate::store::write`]); a refused flag is rolled back by the
+/// `BgResult::ToggleRead` handler, which owns the in-memory half too.
+fn dispatch<F>(
+    account: String,
+    backend: Backend,
+    prepared: Vec<Prepared>,
+    tx: mpsc::Sender<BgResult>,
+    report: F,
+) where
+    F: Fn(&Prepared, Result<String, String>) -> BgResult + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let ops: Vec<ServerOp> = prepared.iter().map(|p| p.op.clone()).collect();
+        let results = rt.block_on(mutations::run_ops(&backend, &ops));
+        for (prep, result) in prepared.iter().zip(results) {
+            let result = match result {
+                Ok(()) => Ok(String::new()),
+                Err(e) => {
+                    if matches!(prep.op, ServerOp::Move { .. }) {
+                        mutations::rollback_move(&account, &prep.previous);
+                    }
+                    Err(e.to_string())
+                }
+            };
+            let _ = tx.send(report(prep, result));
+        }
+    });
+}
+
+/// What a mutation leaves stale beyond the list it just changed.
+///
+/// The destination mailbox's cached list no longer matches its rows, every
+/// sidebar count is one query away from the truth, and an invite that moved or
+/// died changes the agenda the Calendar view is holding (the same refresh
+/// `bg.rs` runs after an RSVP). The store write has already happened when this
+/// is called, so all three read the new state.
+fn refresh_after_mutation(app: &mut App, dest_idx: Option<usize>, touched_invite: bool) {
+    if let Some(idx) = dest_idx {
+        app.invalidate_cache_idx(idx);
+    }
+    app.recount_all_mailboxes();
+    if touched_invite {
+        app.rebuild_calendar_if_loaded();
+    }
+}
+
+/// True when any of `msgs` is an invite row in the current list, read *before*
+/// the mutation removes them.
+fn any_invite(app: &App, msgs: &[MessageRef]) -> bool {
+    app.emails
+        .iter()
+        .any(|e| e.is_invite && e.msg.is_some_and(|m| msgs.contains(&m)))
 }
 
 pub(super) fn handle_action(
@@ -70,283 +153,21 @@ pub(super) fn handle_action(
 ) -> Result<()> {
     match action {
         Action::EditCurrent => {
-            if let Some(email) = app.selected_email() {
-                let msg = email.msg;
-                let was_unread = !email.read;
-                let Some(path) = msg.and_then(message_path) else {
-                    app.set_status_level(store_backed_soon("Open"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                suspend_terminal(terminal)?;
-                let result = edit_file(&path);
-                resume_terminal(terminal)?;
-                match result {
-                    Ok(()) => app.set_status("Returned from editor".to_string()),
-                    Err(e) => app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error),
-                }
-                // Auto-mark as read after opening in editor. Queued
-                // BEFORE the reload so the read-flag file write happens
-                // before the background mailbox walk spawns -- otherwise
-                // the walk could read the file pre-write and the fresh
-                // list would briefly show the email as unread again.
-                if was_unread {
-                    app.push_action(Action::MarkAsRead);
-                }
-                app.reload_current_mailbox();
-            }
+            // Opening a message in `$EDITOR` means handing it a file, which is
+            // `mp edit <selector>`'s job and lands with #0050.
+            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
         }
-
-        Action::Reply(reply_all) => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Reply"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                let default_from = app
-                    .smtp_config
-                    .as_ref()
-                    .map(|s| s.default_from.clone())
-                    .unwrap_or_else(|| app.account_config.default_from.clone());
-                let drafts_dir = app.drafts_dir.clone();
-                match create_reply_draft(&path, reply_all, &default_from, drafts_dir.as_deref()) {
-                    Ok(draft_path) => {
-                        suspend_terminal(terminal)?;
-                        let _ = edit_file(&draft_path);
-                        resume_terminal(terminal)?;
-                        app.set_status("Reply draft ready".to_string());
-                        if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
-                            app.invalidate_cache_idx(idx);
-                        }
-                    }
-                    Err(e) => {
-                        app.set_status_level(format!("Reply failed: {e}"), StatusLevel::Error)
-                    }
-                }
-                app.reload_current_mailbox();
-            }
+        Action::Reply(_reply_all) => {
+            // Reply and forward write a draft from the source message; the
+            // drafts index that names both is #0050's.
+            app.set_status_level(needs_selector_contract("Reply"), StatusLevel::Warning);
         }
-
         Action::Forward => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Forward"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                let default_from = app
-                    .smtp_config
-                    .as_ref()
-                    .map(|s| s.default_from.clone())
-                    .unwrap_or_else(|| app.account_config.default_from.clone());
-                let drafts_dir = app.drafts_dir.clone();
-                match create_forward_draft(&path, &default_from, drafts_dir.as_deref()) {
-                    Ok(draft_path) => {
-                        suspend_terminal(terminal)?;
-                        let _ = edit_file(&draft_path);
-                        resume_terminal(terminal)?;
-                        app.set_status("Forward draft ready".to_string());
-                        if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
-                            app.invalidate_cache_idx(idx);
-                        }
-                    }
-                    Err(e) => {
-                        app.set_status_level(format!("Forward failed: {e}"), StatusLevel::Error)
-                    }
-                }
-                app.reload_current_mailbox();
-            }
+            app.set_status_level(needs_selector_contract("Forward"), StatusLevel::Warning);
         }
-
         Action::Send => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Send"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                let (acct_idx, smtp_config, _imap_config, graph_config, account_config, signature) =
-                    resolve_send_account(app, &path);
-
-                if graph_config.is_some()
-                    && account_config.auth_method == crate::config::AuthMethod::Graph
-                {
-                    let graph_config = graph_config.unwrap();
-                    let email_settings = app.global_config.email.clone();
-
-                    app.bg_count += 1;
-                    app.set_status_level(
-                        "Sending via Graph...".to_string(),
-                        StatusLevel::Progress,
-                    );
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = (|| -> anyhow::Result<String> {
-                            let draft = parse_email_draft(&path)?;
-                            validate_draft(&draft)?;
-
-                            let to = parse_graph_recipients(draft.frontmatter.to.as_deref());
-                            let cc = parse_graph_recipients(draft.frontmatter.cc.as_deref());
-                            let bcc = parse_graph_recipients(draft.frontmatter.bcc.as_deref());
-                            let to_refs: Vec<(&str, &str)> =
-                                to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                            let cc_refs: Vec<(&str, &str)> =
-                                cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                            let bcc_refs: Vec<(&str, &str)> =
-                                bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-
-                            let quoted_html = draft.path.with_extension("html");
-                            let quoted = if quoted_html.exists() {
-                                std::fs::read_to_string(&quoted_html).ok()
-                            } else {
-                                None
-                            };
-                            let html_body = crate::send::markdown_to_html(
-                                &draft.body_markdown,
-                                &email_settings,
-                                signature.as_deref(),
-                                quoted.as_deref(),
-                            );
-
-                            let mut att_data: Vec<(String, Vec<u8>, String)> = Vec::new();
-                            if let Some(ref attachments) = draft.frontmatter.attachments {
-                                for att_path in attachments {
-                                    let expanded = shellexpand::tilde(att_path);
-                                    let p = std::path::Path::new(expanded.as_ref());
-                                    let content = std::fs::read(p)?;
-                                    let filename = p
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| "attachment".to_string());
-                                    let content_type =
-                                        mime_guess::from_path(p).first_or_octet_stream().to_string();
-                                    att_data.push((filename, content, content_type));
-                                }
-                            }
-
-                            let client = rt
-                                .block_on(crate::graph::GraphClient::new_async(&graph_config))?;
-                            let built = crate::send::build_draft_message(
-                                &draft,
-                                &account_config.default_from,
-                                &email_settings,
-                                signature.as_deref(),
-                                None,
-                            )?;
-                            let report = rt.block_on(crate::send::send_durably_via(
-                                &built,
-                                &account_config,
-                                client.send_mail(
-                                    &to_refs,
-                                    &cc_refs,
-                                    &bcc_refs,
-                                    &draft.frontmatter.subject,
-                                    &html_body,
-                                    &att_data,
-                                ),
-                            ))?;
-                            if !report.send_result.any_succeeded() {
-                                anyhow::bail!(
-                                    "{}",
-                                    report
-                                        .send_result
-                                        .failed()
-                                        .first()
-                                        .and_then(|r| r.error.clone())
-                                        .unwrap_or_else(|| "Graph send failed".to_string())
-                                );
-                            }
-
-                            mark_draft_sent(&draft, Some(&built.message_id))?;
-                            crate::contacts::hooks::bump_after_send(&account_config, &draft);
-
-                            Ok(format!(
-                                "Sent via Graph to {} recipient(s) [{}]",
-                                to.len() + cc.len() + bcc.len(),
-                                report.status_line()
-                            ))
-                        })();
-                        let _ = tx.send(BgResult::Send {
-                            account_index: acct_idx,
-                            result: result.map_err(|e| e.to_string()),
-                        });
-                    });
-                } else {
-                    let smtp_config = match smtp_config {
-                        Some(c) => c,
-                        None => {
-                            app.set_status_level(
-                                "SMTP not configured".to_string(),
-                                StatusLevel::Error,
-                            );
-                            return Ok(());
-                        }
-                    };
-                    let email_settings = app.global_config.email.clone();
-
-                    app.bg_count += 1;
-                    app.set_status_level("Sending...".to_string(), StatusLevel::Progress);
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = (|| -> anyhow::Result<String> {
-                            let draft = parse_email_draft(&path)?;
-                            validate_draft(&draft)?;
-
-                            let built = crate::send::build_draft_message(
-                                &draft,
-                                &smtp_config.default_from,
-                                &email_settings,
-                                signature.as_deref(),
-                                None,
-                            )?;
-                            let report = rt.block_on(crate::send::send_durably(
-                                &built,
-                                &account_config,
-                                &smtp_config,
-                            ))?;
-                            let send_result = &report.send_result;
-
-                            if send_result.any_succeeded() {
-                                mark_draft_sent(&draft, Some(&built.message_id))?;
-                                crate::contacts::hooks::bump_after_send(&account_config, &draft);
-                                if send_result.all_succeeded() {
-                                    Ok(format!(
-                                        "Sent to {} recipient(s) [{}]",
-                                        send_result.results.len(),
-                                        report.status_line()
-                                    ))
-                                } else {
-                                    let failed: Vec<String> = send_result
-                                        .failed()
-                                        .iter()
-                                        .map(|r| r.address.clone())
-                                        .collect();
-                                    Ok(format!(
-                                        "Partial: {}/{} succeeded [{}] -- failed: {}",
-                                        send_result.succeeded().len(),
-                                        send_result.results.len(),
-                                        report.status_line(),
-                                        failed.join(", ")
-                                    ))
-                                }
-                            } else {
-                                anyhow::bail!(
-                                    "Failed to send to all {} recipient(s) [{}]",
-                                    send_result.results.len(),
-                                    report.status_line()
-                                )
-                            }
-                        })();
-                        let _ = tx.send(BgResult::Send {
-                            account_index: acct_idx,
-                            result: result.map_err(|e| e.to_string()),
-                        });
-                    });
-                }
-            }
+            app.set_status_level(needs_selector_contract("Send"), StatusLevel::Warning);
         }
-
         Action::Rsvp { msg, choice } => {
             // The invitation's own iMIP payload is the source of truth for the
             // reply, and it lives in the message's blob (#0038 item 6). The
@@ -668,405 +489,43 @@ pub(super) fn handle_action(
         }
 
         Action::Approve => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Approve"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                match mark_as_approved(&path) {
-                    Ok(msg) => {
-                        app.set_status(msg);
-                        app.reload_current_mailbox();
-                    }
-                    Err(e) => {
-                        app.set_status_level(format!("Approve failed: {e}"), StatusLevel::Error)
-                    }
-                }
-            }
+            app.set_status_level(needs_selector_contract("Approve"), StatusLevel::Warning);
         }
-
-        Action::BatchApprove(msgs) => {
-            let total = msgs.len();
-            let mut succeeded = 0usize;
-            let mut failed = 0usize;
-            for msg in &msgs {
-                let Some(path) = message_path(*msg) else {
-                    app.set_status_level(store_backed_soon("Approve"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                match mark_as_approved(&path) {
-                    Ok(_) => succeeded += 1,
-                    Err(e) => {
-                        log::warn!("Approve failed for {msg}: {e}");
-                        failed += 1;
-                    }
-                }
-            }
-            if failed == 0 {
-                app.set_status(format!("Approved {} drafts", succeeded));
-            } else {
-                app.set_status_level(
-                    format!("Approved {}/{} drafts ({} failed)", succeeded, total, failed),
-                    StatusLevel::Warning,
-                );
-            }
-            app.selection.clear();
-            app.reload_current_mailbox();
+        Action::BatchApprove(_msgs) => {
+            app.set_status_level(needs_selector_contract("Approve"), StatusLevel::Warning);
         }
-
         Action::MarkDraft => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Mark-draft"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                match mark_as_draft(&path) {
-                    Ok(msg) => {
-                        app.set_status(msg);
-                        app.reload_current_mailbox();
-                    }
-                    Err(e) => app
-                        .set_status_level(format!("Mark-draft failed: {e}"), StatusLevel::Error),
-                }
-            }
+            app.set_status_level(needs_selector_contract("Mark-draft"), StatusLevel::Warning);
         }
-
-        Action::BatchMarkDraft(msgs) => {
-            let total = msgs.len();
-            let mut succeeded = 0usize;
-            let mut failed = 0usize;
-            for msg in &msgs {
-                let Some(path) = message_path(*msg) else {
-                    app.set_status_level(store_backed_soon("Mark-draft"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                match mark_as_draft(&path) {
-                    Ok(_) => succeeded += 1,
-                    Err(e) => {
-                        log::warn!("Mark-draft failed for {msg}: {e}");
-                        failed += 1;
-                    }
-                }
-            }
-            if failed == 0 {
-                app.set_status(format!("Marked {} as draft", succeeded));
-            } else {
-                app.set_status_level(
-                    format!("Marked {}/{} as draft ({} failed)", succeeded, total, failed),
-                    StatusLevel::Warning,
-                );
-            }
-            app.selection.clear();
-            app.reload_current_mailbox();
+        Action::BatchMarkDraft(_msgs) => {
+            app.set_status_level(needs_selector_contract("Mark-draft"), StatusLevel::Warning);
         }
-
         Action::Archive => {
             if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Archive"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                let archive_dir = match app.archive_dir.clone() {
-                    Some(d) => d,
-                    None => {
-                        app.set_status_level(
-                            "Archive directory not configured".to_string(),
-                            StatusLevel::Error,
-                        );
-                        return Ok(());
-                    }
-                };
-                let archive_server_name = app.archive_server_name.clone();
-
-                if app.is_graph() {
-                    let graph_config = app.graph_config.clone().unwrap();
-
-                    app.remove_selected_from_list();
-                    app.bg_count += 1;
-                    app.bg_mutations += 1;
-                    app.set_status_level("Archiving...".to_string(), StatusLevel::Progress);
-                    terminal.draw(|frame| ui::view(app, frame))?;
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(crate::graph::archive_email_graph(
-                                &graph_config,
-                                &archive_dir,
-                                &path,
-                                &archive_server_name,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                } else {
-                    let imap_config = match app.imap_config.clone() {
-                        Some(c) => c,
-                        None => {
-                            app.set_status_level(
-                                "IMAP not configured".to_string(),
-                                StatusLevel::Error,
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    // The in-memory Message-ID index this used to update is
-                    // gone (#0038): the cross-mailbox lookup is an indexed
-                    // query now, so a move needs no index maintenance. The
-                    // store row itself still moves on the next sync until
-                    // #0038 scope item 7 writes it optimistically.
-                    app.remove_selected_from_list();
-                    app.bg_count += 1;
-                    app.bg_mutations += 1;
-                    app.set_status_level("Archiving...".to_string(), StatusLevel::Progress);
-                    terminal.draw(|frame| ui::view(app, frame))?;
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(archive_email_locally(
-                                &imap_config,
-                                &archive_dir,
-                                &path,
-                                &archive_server_name,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                }
+                archive_msgs(app, terminal, bg_tx, vec![msg], false)?;
             }
         }
 
         Action::Delete => {
             if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Delete"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                if app.is_graph() {
-                    let graph_config = app.graph_config.clone().unwrap();
-
-                    app.remove_selected_from_list();
-                    app.bg_count += 1;
-                    app.bg_mutations += 1;
-                    app.set_status_level("Deleting...".to_string(), StatusLevel::Progress);
-                    terminal.draw(|frame| ui::view(app, frame))?;
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(crate::graph::delete_email_graph(&graph_config, &path))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Delete {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                } else {
-                    let imap_config = match app.imap_config.clone() {
-                        Some(c) => c,
-                        None => {
-                            app.set_status_level(
-                                "IMAP not configured".to_string(),
-                                StatusLevel::Error,
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    app.remove_selected_from_list();
-                    app.bg_count += 1;
-                    app.bg_mutations += 1;
-                    app.set_status_level("Deleting...".to_string(), StatusLevel::Progress);
-                    terminal.draw(|frame| ui::view(app, frame))?;
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(delete_email_locally(&imap_config, &path))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Delete {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                }
+                delete_msgs(app, terminal, bg_tx, vec![msg], false)?;
             }
         }
 
         Action::BatchArchive(msgs) => {
-            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
-            else {
-                app.set_status_level(store_backed_soon("Archive"), StatusLevel::Warning);
-                return Ok(());
-            };
-            let archive_dir = match app.archive_dir.clone() {
-                Some(d) => d,
-                None => {
-                    app.set_status_level(
-                        "Archive directory not configured".to_string(),
-                        StatusLevel::Error,
-                    );
-                    return Ok(());
-                }
-            };
-            let archive_server_name = app.archive_server_name.clone();
-
-            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
-            app.remove_selected_from_list_batch(&msg_set);
-
-            let count = paths.len();
-            app.bg_count += count;
-            app.bg_mutations += count;
-            app.set_status_level(
-                format!("Archiving {} emails...", count),
-                StatusLevel::Progress,
-            );
-            terminal.draw(|frame| ui::view(app, frame))?;
-
-            let acct_idx = app.active_account;
-            let tx = bg_tx.clone();
-
-            if app.is_graph() {
-                let graph_config = app.graph_config.clone().unwrap();
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    for path in &paths {
-                        let result = rt
-                            .block_on(crate::graph::archive_email_graph(
-                                &graph_config,
-                                &archive_dir,
-                                path,
-                                &archive_server_name,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    }
-                });
-            } else {
-                let imap_config = match app.imap_config.clone() {
-                    Some(c) => c,
-                    None => {
-                        app.set_status_level(
-                            "IMAP not configured".to_string(),
-                            StatusLevel::Error,
-                        );
-                        return Ok(());
-                    }
-                };
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    let results = rt.block_on(batch_archive_emails_locally(
-                        &imap_config,
-                        &archive_dir,
-                        &paths,
-                        &archive_server_name,
-                    ));
-                    for (_path, result) in results {
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result: result.map(|()| String::new()).map_err(|e| e.to_string()),
-                        });
-                    }
-                });
-            }
+            archive_msgs(app, terminal, bg_tx, msgs, true)?;
         }
 
         Action::BatchDelete(msgs) => {
-            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
-            else {
-                app.set_status_level(store_backed_soon("Delete"), StatusLevel::Warning);
-                return Ok(());
-            };
-            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
-            app.remove_selected_from_list_batch(&msg_set);
-
-            let count = paths.len();
-            app.bg_count += count;
-            app.bg_mutations += count;
-            app.set_status_level(
-                format!("Deleting {} emails...", count),
-                StatusLevel::Progress,
-            );
-            terminal.draw(|frame| ui::view(app, frame))?;
-
-            let acct_idx = app.active_account;
-            let tx = bg_tx.clone();
-
-            if app.is_graph() {
-                let graph_config = app.graph_config.clone().unwrap();
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    for path in &paths {
-                        let result = rt
-                            .block_on(crate::graph::delete_email_graph(&graph_config, path))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Delete {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    }
-                });
-            } else {
-                let imap_config = match app.imap_config.clone() {
-                    Some(c) => c,
-                    None => {
-                        app.set_status_level(
-                            "IMAP not configured".to_string(),
-                            StatusLevel::Error,
-                        );
-                        return Ok(());
-                    }
-                };
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    let results =
-                        rt.block_on(batch_delete_emails_locally(&imap_config, &paths));
-                    for (_path, result) in results {
-                        let _ = tx.send(BgResult::Delete {
-                            account_index: acct_idx,
-                            result: result.map(|()| String::new()).map_err(|e| e.to_string()),
-                        });
-                    }
-                });
-            }
+            delete_msgs(app, terminal, bg_tx, msgs, true)?;
         }
 
         Action::MoveToMailbox { msgs, dest_idx } => {
-            // Quick-move to an arbitrary mailbox (#0018): generalized
-            // archive. Optimistic list removal + async server/local move,
-            // rollback handled by move_email_locally (IMAP) and reported
-            // via BgResult::Move.
-            let (dest_dir, dest_label, dest_kind) = match app.mailboxes.get(dest_idx) {
-                Some(mb) => (mb.dir.clone(), mb.label.clone(), mb.kind),
+            // Quick-move to an arbitrary mailbox (#0018): the generalized
+            // archive. The store row moves optimistically, the server op
+            // follows, and a refusal puts the row back (#0038 item 7).
+            let (dest_mailbox, dest_label) = match app.mailboxes.get(dest_idx) {
+                Some(mb) => (mailbox_key(mb), mb.label.clone()),
                 None => return Ok(()),
             };
             let dest_server = match app
@@ -1084,39 +543,35 @@ pub(super) fn handle_action(
                 }
             };
             let source_server = app.active_server_mailbox();
-            let old_status = super::app::kind_to_status(app.active_kind());
-            let new_status = super::app::kind_to_status(dest_kind);
 
-            // Resolve the backend config BEFORE any optimistic mutation
-            // (same order as Archive) so a missing config leaves the
-            // list and index untouched.
-            let imap_config = if app.is_graph() {
-                None
-            } else {
-                match app.imap_config.clone() {
-                    Some(c) => Some(c),
-                    None => {
-                        app.set_status_level(
-                            "IMAP not configured".to_string(),
-                            StatusLevel::Error,
-                        );
-                        return Ok(());
-                    }
-                }
+            // Resolve the backend and the store BEFORE any optimistic
+            // mutation (same order as Archive) so a missing config leaves the
+            // list and the rows untouched.
+            let Some(backend) = backend_for_mutation(app) else {
+                return Ok(());
             };
-
-            // The in-memory Message-ID index a move used to re-point is gone
-            // (#0038); the lookup is an indexed query over `messages` now.
-            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
-            else {
-                app.set_status_level(store_backed_soon("Move"), StatusLevel::Warning);
+            let Some((store, _blobs)) = store_for_mutation(app, "Move") else {
                 return Ok(());
             };
 
-            let msg_set: HashSet<MessageRef> = msgs.iter().copied().collect();
-            app.remove_selected_from_list_batch(&msg_set);
+            let touched_invite = any_invite(app, &msgs);
+            let prepared =
+                mutations::prepare_move(&store, &msgs, &dest_mailbox, &source_server, &dest_server);
+            drop(store);
+            if prepared.is_empty() {
+                app.set_status_level(
+                    "Move failed: nothing to move".to_string(),
+                    StatusLevel::Error,
+                );
+                return Ok(());
+            }
 
-            let count = paths.len();
+            let moved: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
+            app.remove_selected_from_list_batch(&moved);
+            app.selection.clear();
+            refresh_after_mutation(app, Some(dest_idx), touched_invite);
+
+            let count = prepared.len();
             app.bg_count += count;
             app.bg_mutations += count;
             app.set_status_level(
@@ -1131,137 +586,38 @@ pub(super) fn handle_action(
 
             let acct_idx = app.active_account;
             let source_idx = app.active_mailbox;
-            let tx = bg_tx.clone();
-
-            if app.is_graph() {
-                let graph_config = app.graph_config.clone().unwrap();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("failed to create tokio runtime");
-                    for path in &paths {
-                        let result = rt
-                            .block_on(crate::graph::move_email_graph(
-                                &graph_config,
-                                &dest_dir,
-                                path,
-                                &dest_server,
-                                &old_status,
-                                &new_status,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Move {
-                            account_index: acct_idx,
-                            source_mailbox_idx: source_idx,
-                            dest_mailbox_idx: dest_idx,
-                            dest_label: dest_label.clone(),
-                            result,
-                        });
-                    }
-                });
-            } else {
-                let imap_config = imap_config.expect("checked before optimistic mutation");
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("failed to create tokio runtime");
-                    for path in &paths {
-                        let result = rt
-                            .block_on(move_email_locally(
-                                &imap_config,
-                                &dest_dir,
-                                path,
-                                &source_server,
-                                &dest_server,
-                                &old_status,
-                                &new_status,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Move {
-                            account_index: acct_idx,
-                            source_mailbox_idx: source_idx,
-                            dest_mailbox_idx: dest_idx,
-                            dest_label: dest_label.clone(),
-                            result,
-                        });
-                    }
-                });
-            }
+            let account = app.account_config.name.clone();
+            dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
+                BgResult::Move {
+                    account_index: acct_idx,
+                    source_mailbox_idx: source_idx,
+                    dest_mailbox_idx: dest_idx,
+                    dest_label: dest_label.clone(),
+                    result,
+                }
+            });
         }
 
         Action::ToggleRead => {
             if let Some(email) = app.selected_email() {
                 let new_read = !email.read;
                 let Some(msg) = email.msg else {
-                    app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
                     return Ok(());
                 };
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                let message_id = get_message_id_from_file(&path);
-
-                // Optimistic local update (list + shared cache slot).
-                update_read_status_locally(&path, new_read).ok();
-                app.set_email_read(msg, new_read);
-
                 let label = if new_read {
                     "Marked as read"
                 } else {
                     "Marked as unread"
                 };
-                app.set_status(label.to_string());
-
-                // Async server update
-                if let Some(mid) = message_id {
-                    if app.is_graph() {
-                        let graph_cfg = app.graph_config.clone().unwrap();
-                        let acct_idx = app.active_account;
-                        app.bg_count += 1;
-                        let tx = bg_tx.clone();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            let result =
-                                rt.block_on(crate::graph::mark_read_graph(&graph_cfg, &mid, new_read));
-                            let _ = tx.send(BgResult::ToggleRead {
-                                account_index: acct_idx,
-                                msg,
-                                new_read_state: new_read,
-                                result: result
-                                    .map(|()| String::new())
-                                    .map_err(|e| e.to_string()),
-                            });
-                        });
-                    } else if let Some(imap_config) = app.imap_config.clone() {
-                        let mailbox = app.active_server_mailbox();
-                        let acct_idx = app.active_account;
-                        app.bg_count += 1;
-                        let tx = bg_tx.clone();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            let result = if new_read {
-                                rt.block_on(mark_read_on_server(&imap_config, &mid, &mailbox))
-                            } else {
-                                rt.block_on(mark_unread_on_server(&imap_config, &mid, &mailbox))
-                            };
-                            let _ = tx.send(BgResult::ToggleRead {
-                                account_index: acct_idx,
-                                msg,
-                                new_read_state: new_read,
-                                result: result
-                                    .map(|()| String::new())
-                                    .map_err(|e| e.to_string()),
-                            });
-                        });
-                    }
+                if set_read_flag(app, bg_tx, vec![msg], new_read) {
+                    app.set_status(label.to_string());
                 }
             }
         }
 
         Action::MarkAsRead => {
+            // The auto-mark that rides on opening an email: same path, no
+            // status line of its own.
             if let Some(email) = app.selected_email() {
                 if email.read {
                     return Ok(());
@@ -1269,164 +625,31 @@ pub(super) fn handle_action(
                 let Some(msg) = email.msg else {
                     return Ok(());
                 };
-                // Silent decline: this is the auto-mark that rides on opening
-                // an email, and the open itself already said its piece.
-                let Some(path) = message_path(msg) else {
-                    return Ok(());
-                };
-                let message_id = get_message_id_from_file(&path);
-
-                // Optimistic local update (silent; list + shared cache slot).
-                update_read_status_locally(&path, true).ok();
-                app.set_email_read(msg, true);
-
-                // Async server update (no status message for auto-mark)
-                if let Some(mid) = message_id {
-                    if app.is_graph() {
-                        let graph_cfg = app.graph_config.clone().unwrap();
-                        let acct_idx = app.active_account;
-                        app.bg_count += 1;
-                        let tx = bg_tx.clone();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            let result = rt.block_on(crate::graph::mark_read_graph(
-                                &graph_cfg, &mid, true,
-                            ));
-                            let _ = tx.send(BgResult::ToggleRead {
-                                account_index: acct_idx,
-                                msg,
-                                new_read_state: true,
-                                result: result
-                                    .map(|()| String::new())
-                                    .map_err(|e| e.to_string()),
-                            });
-                        });
-                    } else if let Some(imap_config) = app.imap_config.clone() {
-                        let mailbox = app.active_server_mailbox();
-                        let acct_idx = app.active_account;
-                        app.bg_count += 1;
-                        let tx = bg_tx.clone();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            let result =
-                                rt.block_on(mark_read_on_server(&imap_config, &mid, &mailbox));
-                            let _ = tx.send(BgResult::ToggleRead {
-                                account_index: acct_idx,
-                                msg,
-                                new_read_state: true,
-                                result: result
-                                    .map(|()| String::new())
-                                    .map_err(|e| e.to_string()),
-                            });
-                        });
-                    }
-                }
+                set_read_flag(app, bg_tx, vec![msg], true);
             }
         }
 
         Action::BatchToggleRead(msgs) => {
-            let Some(paths) = msgs.iter().map(|m| message_path(*m)).collect::<Option<Vec<_>>>()
-            else {
-                app.set_status_level(store_backed_soon("Read flag"), StatusLevel::Warning);
-                return Ok(());
-            };
             let any_unread = msgs
                 .iter()
                 .any(|m| app.emails.iter().any(|e| e.msg == Some(*m) && !e.read));
             let new_read = any_unread;
-
-            // Optimistic local update (list + shared cache slot).
-            for (msg, path) in msgs.iter().zip(&paths) {
-                update_read_status_locally(path, new_read).ok();
-                app.set_email_read(*msg, new_read);
-            }
-            app.selection.clear();
-
-            let label = if new_read {
-                format!("Marked {} as read", paths.len())
-            } else {
-                format!("Marked {} as unread", paths.len())
-            };
-            app.set_status(label);
-
-            // Async server update. The delivered `msg` is the first of the
-            // batch: the handler only uses it to roll one row back, which is
-            // the pre-existing shape of this arm (it reported one path too).
-            let first = msgs.first().copied();
-            if app.is_graph() {
-                let graph_cfg = app.graph_config.clone().unwrap();
-                let acct_idx = app.active_account;
-                app.bg_count += 1;
-                let tx = bg_tx.clone();
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    for path in &paths {
-                        if let Some(mid) = get_message_id_from_file(path) {
-                            let result = rt.block_on(crate::graph::mark_read_graph(
-                                &graph_cfg, &mid, new_read,
-                            ));
-                            if let Err(e) = result {
-                                log::warn!("Failed to toggle read for {}: {}", mid, e);
-                            }
-                        }
-                    }
-                    if let Some(msg) = first {
-                        let _ = tx.send(BgResult::ToggleRead {
-                            account_index: acct_idx,
-                            msg,
-                            new_read_state: new_read,
-                            result: Ok(String::new()),
-                        });
-                    }
-                });
-            } else if let Some(imap_config) = app.imap_config.clone() {
-                let mailbox = app.active_server_mailbox();
-                let acct_idx = app.active_account;
-                app.bg_count += 1;
-                let tx = bg_tx.clone();
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                    for path in &paths {
-                        if let Some(mid) = get_message_id_from_file(path) {
-                            let result = if new_read {
-                                rt.block_on(mark_read_on_server(&imap_config, &mid, &mailbox))
-                            } else {
-                                rt.block_on(mark_unread_on_server(&imap_config, &mid, &mailbox))
-                            };
-                            if let Err(e) = result {
-                                log::warn!("Failed to toggle read for {}: {}", mid, e);
-                            }
-                        }
-                    }
-                    if let Some(msg) = first {
-                        let _ = tx.send(BgResult::ToggleRead {
-                            account_index: acct_idx,
-                            msg,
-                            new_read_state: new_read,
-                            result: Ok(String::new()),
-                        });
-                    }
+            let count = msgs.len();
+            if set_read_flag(app, bg_tx, msgs, new_read) {
+                app.selection.clear();
+                app.set_status(if new_read {
+                    format!("Marked {count} as read")
+                } else {
+                    format!("Marked {count} as unread")
                 });
             }
         }
 
         Action::CopyPath => {
-            if let Some(msg) = app.selected_email_ref() {
-                let Some(path) = message_path(msg) else {
-                    app.set_status_level(store_backed_soon("Copy path"), StatusLevel::Warning);
-                    return Ok(());
-                };
-                match super::helpers::copy_to_clipboard(&path.display().to_string()) {
-                    Ok(()) => app.set_status("Path copied to clipboard".to_string()),
-                    Err(e) => app.set_status_level(format!("Copy failed: {e}"), StatusLevel::Error),
-                }
-            }
+            // Becomes `CopyMessageRef` over the canonical `mp://` selector
+            // (#0050 scope item 7); there is no path to copy meanwhile.
+            app.set_status_level(needs_selector_contract("Copy path"), StatusLevel::Warning);
         }
-
         Action::OpenLogFile => match crate::config::latest_log_file() {
             Some(path) => {
                 suspend_terminal(terminal)?;
@@ -1834,32 +1057,9 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::OpenEventSource { msg } => {
-            // The agenda row carries its own message reference (the invite may
-            // live in any mailbox of the account), so this does not go through
-            // the mail cursor like `Action::EditCurrent`; it shares the same
-            // bridge to a file, which #0038 scope item 7 owns.
-            let Some(path) = message_path(msg) else {
-                app.set_status_level(store_backed_soon("Open"), StatusLevel::Warning);
-                return Ok(());
-            };
-            suspend_terminal(terminal)?;
-            let result = edit_file(&path);
-            resume_terminal(terminal)?;
-            match result {
-                Ok(()) => {
-                    // The invite may have changed under us, so rebuild the
-                    // agenda. `refresh_calendar` sets its own status;
-                    // overwriting it here would hide the reloaded count behind
-                    // a bare "Returned from editor", so let that one stand.
-                    app.refresh_calendar();
-                }
-                Err(e) => {
-                    app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error)
-                }
-            }
+        Action::OpenEventSource { msg: _ } => {
+            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
         }
-
         Action::ComposeWizardCancel => {
             app.close_overlay();
             app.focus = Focus::List;
@@ -2387,6 +1587,13 @@ fn slugify_subject_for_filename(subject: &str) -> String {
     slug.chars().take(40).collect()
 }
 
+/// The overlay's own action set: a server-search hit is not a list row, so it
+/// has its own Open / Save / Reply / Forward / Archive.
+///
+/// Four of the five address the hit as a file (an editor, a browser rendition,
+/// a draft), which is #0050's ground. The fifth is a mutation, and it runs on
+/// the store like every other one, for the hits that resolved to a row: a hit
+/// the account has never synced has nothing local to archive, and says so.
 fn handle_search_result_action(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2395,189 +1602,238 @@ fn handle_search_result_action(
 ) -> Result<()> {
     match action {
         Action::SearchResultOpen => {
-            if let Some(path) = ensure_search_result_saved(app) {
-                suspend_terminal(terminal)?;
-                let result = edit_file(&path);
-                resume_terminal(terminal)?;
-                match result {
-                    Ok(()) => app.set_status("Returned from editor".to_string()),
-                    Err(e) => app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error),
-                }
-            } else {
-                app.set_status_level(
-                    "Failed to save email locally".to_string(),
-                    StatusLevel::Error,
-                );
-            }
+            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
         }
 
         Action::SearchResultOpenInBrowser => {
-            if let Some(path) = ensure_search_result_saved(app) {
-                let html_path = path.with_extension("html");
-                if html_path.exists() {
-                    match crate::parse::open_file_with_system(&html_path) {
-                        Ok(()) => app.set_status("Opened in browser".to_string()),
-                        Err(e) => {
-                            app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error)
-                        }
-                    }
-                } else {
-                    app.set_status("No HTML version available".to_string());
-                }
-            } else {
-                app.set_status_level(
-                    "Failed to save email locally".to_string(),
-                    StatusLevel::Error,
-                );
-            }
+            app.set_status_level(
+                needs_selector_contract("Open in browser"),
+                StatusLevel::Warning,
+            );
         }
 
-        Action::SearchResultReply(reply_all) => {
-            if let Some(path) = ensure_search_result_saved(app) {
-                let default_from = app
-                    .smtp_config
-                    .as_ref()
-                    .map(|s| s.default_from.clone())
-                    .unwrap_or_else(|| app.account_config.default_from.clone());
-                let drafts_dir = app.drafts_dir.clone();
-                match create_reply_draft(&path, reply_all, &default_from, drafts_dir.as_deref()) {
-                    Ok(draft_path) => {
-                        suspend_terminal(terminal)?;
-                        let _ = edit_file(&draft_path);
-                        resume_terminal(terminal)?;
-                        app.set_status("Reply draft ready".to_string());
-                        if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
-                            app.invalidate_cache_idx(idx);
-                        }
-                    }
-                    Err(e) => {
-                        app.set_status_level(format!("Reply failed: {e}"), StatusLevel::Error)
-                    }
-                }
-            } else {
-                app.set_status_level(
-                    "Failed to save email locally".to_string(),
-                    StatusLevel::Error,
-                );
-            }
+        Action::SearchResultReply(_) => {
+            app.set_status_level(needs_selector_contract("Reply"), StatusLevel::Warning);
         }
 
         Action::SearchResultForward => {
-            if let Some(path) = ensure_search_result_saved(app) {
-                let default_from = app
-                    .smtp_config
-                    .as_ref()
-                    .map(|s| s.default_from.clone())
-                    .unwrap_or_else(|| app.account_config.default_from.clone());
-                let drafts_dir = app.drafts_dir.clone();
-                match create_forward_draft(&path, &default_from, drafts_dir.as_deref()) {
-                    Ok(draft_path) => {
-                        suspend_terminal(terminal)?;
-                        let _ = edit_file(&draft_path);
-                        resume_terminal(terminal)?;
-                        app.set_status("Forward draft ready".to_string());
-                        if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
-                            app.invalidate_cache_idx(idx);
-                        }
-                    }
-                    Err(e) => {
-                        app.set_status_level(format!("Forward failed: {e}"), StatusLevel::Error)
-                    }
-                }
-            } else {
-                app.set_status_level(
-                    "Failed to save email locally".to_string(),
-                    StatusLevel::Error,
-                );
-            }
+            app.set_status_level(needs_selector_contract("Forward"), StatusLevel::Warning);
         }
 
         Action::SearchResultArchive => {
-            if let Some(path) = ensure_search_result_saved(app) {
-                let archive_dir = match app.archive_dir.clone() {
-                    Some(d) => d,
-                    None => {
-                        app.set_status_level(
-                            "Archive dir not configured".to_string(),
-                            StatusLevel::Error,
-                        );
-                        return Ok(());
-                    }
-                };
-                let archive_server_name = app.archive_server_name.clone();
-
-                app.server_search_results.remove(app.server_search_index);
-                if app.server_search_index >= app.server_search_results.len()
-                    && !app.server_search_results.is_empty()
-                {
-                    app.server_search_index = app.server_search_results.len() - 1;
-                }
-
-                app.bg_count += 1;
-                app.bg_mutations += 1;
-                app.set_status_level("Archiving...".to_string(), StatusLevel::Progress);
-                let acct_idx = app.active_account;
-                let tx = bg_tx.clone();
-
-                if app.is_graph() {
-                    let graph_config = app.graph_config.clone().unwrap();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(crate::graph::archive_email_graph(
-                                &graph_config,
-                                &archive_dir,
-                                &path,
-                                &archive_server_name,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                } else {
-                    let imap_config = match app.imap_config.clone() {
-                        Some(c) => c,
-                        None => {
-                            app.set_status_level(
-                                "IMAP not configured".to_string(),
-                                StatusLevel::Error,
-                            );
-                            return Ok(());
-                        }
-                    };
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = rt
-                            .block_on(archive_email_locally(
-                                &imap_config,
-                                &archive_dir,
-                                &path,
-                                &archive_server_name,
-                            ))
-                            .map(|()| String::new())
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(BgResult::Archive {
-                            account_index: acct_idx,
-                            result,
-                        });
-                    });
-                }
-            } else {
+            let hit = app
+                .server_search_results
+                .get(app.server_search_index)
+                .and_then(|r| r.entry.msg);
+            let Some(msg) = hit else {
                 app.set_status_level(
-                    "Failed to save email locally".to_string(),
+                    "Not in the local store yet: sync (F) before archiving this hit".to_string(),
                     StatusLevel::Error,
                 );
+                return Ok(());
+            };
+
+            let index = app.server_search_index;
+            app.server_search_results.remove(index);
+            if app.server_search_index >= app.server_search_results.len()
+                && !app.server_search_results.is_empty()
+            {
+                app.server_search_index = app.server_search_results.len() - 1;
             }
+
+            archive_msgs(app, terminal, bg_tx, vec![msg], false)?;
         }
 
         _ => {}
     }
     Ok(())
+}
+
+
+/// Archive one or many messages: the store rows move into the archive mailbox,
+/// then the server op follows (#0038 scope item 7).
+///
+/// `batch` says whether the selection should be cleared afterwards, which is
+/// the only difference between the single and the batch arm.
+fn archive_msgs(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    bg_tx: &mpsc::Sender<BgResult>,
+    msgs: Vec<MessageRef>,
+    batch: bool,
+) -> Result<()> {
+    let Some(dest_idx) = app.find_mailbox_by_kind(MailboxKind::Archive) else {
+        app.set_status_level(
+            "Archive mailbox not configured".to_string(),
+            StatusLevel::Error,
+        );
+        return Ok(());
+    };
+    let dest_mailbox = match app.mailboxes.get(dest_idx) {
+        Some(mb) => mailbox_key(mb),
+        None => return Ok(()),
+    };
+    let dest_server = app.archive_server_name.clone();
+    let source_server = app.active_server_mailbox();
+
+    let Some(backend) = backend_for_mutation(app) else {
+        return Ok(());
+    };
+    let Some((store, _blobs)) = store_for_mutation(app, "Archive") else {
+        return Ok(());
+    };
+
+    let touched_invite = any_invite(app, &msgs);
+    let prepared =
+        mutations::prepare_move(&store, &msgs, &dest_mailbox, &source_server, &dest_server);
+    drop(store);
+    if prepared.is_empty() {
+        app.set_status_level(
+            "Archive failed: nothing to archive".to_string(),
+            StatusLevel::Error,
+        );
+        return Ok(());
+    }
+
+    let archived: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
+    app.remove_selected_from_list_batch(&archived);
+    if batch {
+        app.selection.clear();
+    }
+    refresh_after_mutation(app, Some(dest_idx), touched_invite);
+
+    let count = prepared.len();
+    app.bg_count += count;
+    app.bg_mutations += count;
+    app.set_status_level(
+        if count == 1 {
+            "Archiving...".to_string()
+        } else {
+            format!("Archiving {count} emails...")
+        },
+        StatusLevel::Progress,
+    );
+    terminal.draw(|frame| ui::view(app, frame))?;
+
+    let acct_idx = app.active_account;
+    let account = app.account_config.name.clone();
+    dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
+        BgResult::Archive {
+            account_index: acct_idx,
+            result,
+        }
+    });
+    Ok(())
+}
+
+/// Delete one or many messages: the store rows go, then the server op follows.
+///
+/// The rows are removed rather than tombstoned, so a refused server delete is
+/// answered by the next sync refetching the message; see
+/// [`crate::store::write`] for why that is the right shape here.
+fn delete_msgs(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    bg_tx: &mpsc::Sender<BgResult>,
+    msgs: Vec<MessageRef>,
+    batch: bool,
+) -> Result<()> {
+    let source_server = app.active_server_mailbox();
+    let Some(backend) = backend_for_mutation(app) else {
+        return Ok(());
+    };
+    let Some((store, blobs)) = store_for_mutation(app, "Delete") else {
+        return Ok(());
+    };
+
+    let touched_invite = any_invite(app, &msgs);
+    let prepared = mutations::prepare_delete(&store, &blobs, &msgs, &source_server);
+    drop(store);
+    if prepared.is_empty() {
+        app.set_status_level(
+            "Delete failed: nothing to delete".to_string(),
+            StatusLevel::Error,
+        );
+        return Ok(());
+    }
+
+    // Every deleted row's id is dead the moment the row is: the list, the
+    // selection set and the cursor anchor must not carry one across this
+    // boundary, because a re-ingest of the same message mints a new id.
+    let deleted: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
+    app.remove_selected_from_list_batch(&deleted);
+    if batch {
+        app.selection.clear();
+    }
+    refresh_after_mutation(app, None, touched_invite);
+
+    let count = prepared.len();
+    app.bg_count += count;
+    app.bg_mutations += count;
+    app.set_status_level(
+        if count == 1 {
+            "Deleting...".to_string()
+        } else {
+            format!("Deleting {count} emails...")
+        },
+        StatusLevel::Progress,
+    );
+    terminal.draw(|frame| ui::view(app, frame))?;
+
+    let acct_idx = app.active_account;
+    let account = app.account_config.name.clone();
+    dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
+        BgResult::Delete {
+            account_index: acct_idx,
+            result,
+        }
+    });
+    Ok(())
+}
+
+/// Set the read flag on one or many messages: store row first, then the server.
+///
+/// Returns false when nothing was applied, so the caller can skip its status
+/// line. The in-memory list is updated beside the row because the list is what
+/// the user is looking at; both halves are rolled back together by the
+/// `BgResult::ToggleRead` handler when the server refuses.
+fn set_read_flag(
+    app: &mut App,
+    bg_tx: &mpsc::Sender<BgResult>,
+    msgs: Vec<MessageRef>,
+    read: bool,
+) -> bool {
+    let server_mailbox = app.active_server_mailbox();
+    let Some(backend) = backend_for_mutation(app) else {
+        return false;
+    };
+    let Some((store, _blobs)) = store_for_mutation(app, "Read flag") else {
+        return false;
+    };
+    let prepared = mutations::prepare_read_flag(&store, &msgs, read, &server_mailbox);
+    drop(store);
+    if prepared.is_empty() {
+        return false;
+    }
+
+    for prep in &prepared {
+        app.set_email_read(prep.msg(), read);
+    }
+
+    let acct_idx = app.active_account;
+    let account = app.account_config.name.clone();
+    // ToggleRead deliberately does not touch `bg_mutations`: a flag does not
+    // block a fetch the way a move does.
+    app.bg_count += prepared.len();
+    dispatch(account, backend, prepared, bg_tx.clone(), move |prep, result| {
+        BgResult::ToggleRead {
+            account_index: acct_idx,
+            msg: prep.msg(),
+            new_read_state: read,
+            result,
+        }
+    });
+    true
 }
 
 fn parse_name_address(s: &str) -> (String, String) {
@@ -2605,35 +1861,52 @@ fn parse_graph_recipients(field: Option<&str>) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::EmailEntry;
 
-    /// The `.md` bridge must never hand a mutation a file path back.
-    ///
-    /// This is the guard on the stop-gate state: while #0038 scope item 7 is
-    /// open, every file-taking mutation arm is fronted by [`message_path`],
-    /// and the only correct answer is `None`. If someone makes it resolve a
-    /// path again, the mutation would write into a tree that ingest no longer
-    /// maintains and the store would silently diverge, so this test fails
-    /// loudly rather than letting that ship.
-    #[test]
-    fn the_file_bridge_never_resolves_a_path() {
-        for id in [1, 2, 42, i64::MAX] {
-            assert_eq!(
-                message_path(MessageRef::new(id)),
-                None,
-                "message_path resolved a .md path for row {id}; #0038 item 7 owns \
-                 removing this bridge, nothing may make it return Some"
-            );
+    fn entry(subject: &str, id: i64, is_invite: bool) -> EmailEntry {
+        EmailEntry {
+            msg: Some(MessageRef::new(id)),
+            from: "Sender <s@example.com>".to_string(),
+            to: "me@example.com".to_string(),
+            cc: None,
+            subject: subject.to_string(),
+            status: "inbox".to_string(),
+            date_display: "2026-07-01".to_string(),
+            date_sort: "2026-07-01T00:00:00".to_string(),
+            has_attachments: false,
+            read: false,
+            is_invite,
         }
     }
 
-    /// The decline message names both the future (store-backed) and the
-    /// present (mp-legacy), so a user who hits it knows what to do now.
+    /// The decline message names both the future (the selector contract) and
+    /// the present (mp-legacy), so a user who hits it knows what to do now.
+    ///
+    /// This is what is left of the #0038 bridge: the mutations are store-backed,
+    /// and only the operations that address a message as a *file* still
+    /// decline.
     #[test]
     fn the_decline_message_points_at_the_working_fallback() {
-        let msg = store_backed_soon("Archive");
-        assert!(msg.starts_with("Archive "), "{msg}");
-        assert!(msg.contains("store-backed"), "{msg}");
+        let msg = needs_selector_contract("Reply");
+        assert!(msg.starts_with("Reply "), "{msg}");
+        assert!(msg.contains("#0050"), "{msg}");
         assert!(msg.contains("mp-legacy"), "{msg}");
+    }
+
+    /// The agenda is only rebuilt when a mutation actually touched an invite,
+    /// which is read off the list rows *before* they are removed.
+    #[test]
+    fn only_a_mutation_that_touches_an_invite_asks_for_an_agenda_rebuild() {
+        let mut app = App::default_for_tests();
+        app.emails = std::sync::Arc::new(vec![
+            entry("Standup", 1, true),
+            entry("Receipt", 2, false),
+        ]);
+
+        assert!(any_invite(&app, &[MessageRef::new(1)]));
+        assert!(any_invite(&app, &[MessageRef::new(2), MessageRef::new(1)]));
+        assert!(!any_invite(&app, &[MessageRef::new(2)]));
+        assert!(!any_invite(&app, &[MessageRef::new(404)]));
     }
 
     #[test]

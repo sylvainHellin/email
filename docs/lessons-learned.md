@@ -300,3 +300,15 @@ One event usually exists as several rows: the copy in `sent`, the copy the serve
 They are deduped by iCal UID keeping the highest `(sequence, dtstamp)`, but a self-invited event shares one `DTSTAMP` across every copy, so that comparison ties and the winner falls to the next component.
 With a plain identity tiebreak the winner is whichever mailbox name sorts last, and `is_organizer` flips off for any custom mailbox sorting after `sent` (`team` beat `sent`).
 The rank is therefore `(sequence, dtstamp, is_organizer, mailbox, uid)`, with the organizer flag load-bearing above the identity, in [src/tui/app/calendar_view.rs](../src/tui/app/calendar_view.rs) (#0034, carried onto rows in #0038).
+
+## A deleted row's id is handed to the next message, so no reference may cross a delete
+
+`messages.id` is a plain `INTEGER PRIMARY KEY`, which is `rowid`, and SQLite assigns `max(rowid) + 1`.
+Delete the row and the number goes back in the pool: the next ingest into an empty table is handed the id the deleted message had, so a `MessageRef` kept across the boundary does not merely miss, it silently names a different message.
+Every holder therefore drops it at the mutation: the list, the selection set and the cursor anchor are scrubbed in `App::remove_selected_from_list` and its batch twin, and the hazard itself is pinned by `a_deleted_row_id_can_be_handed_to_the_next_message` in [src/store/write.rs](../src/store/write.rs) (#0038 unit D).
+
+## A moved row cannot keep its uid, because `UNIQUE (account, mailbox, uid)` is the identity
+
+Moving a message locally is an `UPDATE messages SET mailbox = ?`, and the destination may already hold a row under the source's UID: uids are per-mailbox counters, so a collision is ordinary rather than exotic.
+The moved row parks on `uid = -id` instead, a value no backend produces (IMAP uids are unsigned and `ingest::graph_uid` clears the sign bit) and unique by construction, which reads as "moved locally, not yet seen there by a sync".
+The next sync of the destination finds the row through the `message_id` index and writes the real uid over it, which is the same rebind a UIDVALIDITY reset takes, so nothing extra is needed to converge (#0038 unit D).

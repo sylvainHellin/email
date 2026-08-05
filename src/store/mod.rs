@@ -18,6 +18,7 @@
 pub mod blobs;
 pub mod read;
 pub mod schema;
+pub mod write;
 
 use std::fs;
 use std::path::{Path, PathBuf};

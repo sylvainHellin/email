@@ -3,6 +3,7 @@ mod actions;
 mod bg;
 mod event;
 mod helpers;
+mod mutations;
 pub mod theme;
 mod ui;
 

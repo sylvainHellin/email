@@ -1,4 +1,4 @@
-mod calendar_view;
+pub(crate) mod calendar_view;
 mod keymap;
 mod keys;
 mod types;
@@ -549,6 +549,22 @@ impl App {
         self.recompute_calendar_visible();
         let count = self.calendar_view.visible.len();
         self.set_status(format!("Calendar refreshed ({count} events)"));
+    }
+
+    /// Rebuild the agenda in place when the view is holding one, and say
+    /// nothing.
+    ///
+    /// The agenda is a snapshot of the invite rows, so a mutation that moved or
+    /// deleted one leaves it wrong until it is rebuilt (#0038 scope item 7).
+    /// This is [`Self::refresh_calendar`] without the status line, because the
+    /// mutation that triggers it has already written its own ("Archiving...")
+    /// and replacing that with a calendar count would hide what is in flight.
+    pub fn rebuild_calendar_if_loaded(&mut self) {
+        if !self.calendar_view.loaded {
+            return;
+        }
+        self.calendar_view.events = self.load_calendar_events();
+        self.recompute_calendar_visible();
     }
 
     /// Recompute the visible agenda rows for the current scope, clamping the
@@ -1139,6 +1155,10 @@ impl App {
         let msg = self.selected_email()?.msg?;
         let fallback = self.list_index;
         self.with_emails_mut(|entries| entries.retain(|e| e.msg != Some(msg)));
+        // A removed row's id must not survive in the selection: a delete frees
+        // it, and a re-ingest of the same message mints a new one, so a held
+        // reference would either miss or, worse, name a different message.
+        self.selection.remove(&msg);
         self.invalidate_pending_mailbox_loads();
 
         // Underlying indices shifted -- recompute the view, then park the
@@ -1183,6 +1203,9 @@ impl App {
         self.with_emails_mut(|entries| {
             entries.retain(|e| !e.msg.is_some_and(|m| msgs.contains(&m)))
         });
+        // See `remove_selected_from_list`: the ids are dead, so nothing may
+        // keep holding them.
+        self.selection.retain(|m| !msgs.contains(m));
         self.invalidate_pending_mailbox_loads();
 
         self.rebuild_visible();

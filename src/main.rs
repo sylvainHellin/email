@@ -770,62 +770,19 @@ async fn run_send_invite(
 
 /// RSVP to a received calendar invitation (`mp invite accept|tentative|decline`).
 ///
-/// Reads the invitation's `invite.ics` blob out of the account's store, builds
-/// a `METHOD:REPLY` with the account's `PARTSTAT` and emails it to the
-/// `ORGANIZER`. Nothing local is rewritten: our own `PARTSTAT` is derived from
-/// the reply the outbox files in Sent (#0038 scope item 6). Graph accounts are
-/// rejected (Graph RSVP is #0036).
-///
-/// `file` still names a `.md` path, which no longer exists: naming a message
-/// on the command line is the selector contract [#0050] owns, so this command
-/// declines until it lands rather than guessing which row was meant.
-async fn run_invite_rsvp(
-    account_config: &email::config::AccountConfig,
-    smtp_config: &SmtpConfig,
-    file: &Path,
-    rsvp: email::invite::Rsvp,
-) -> Result<()> {
-    if account_config.auth_method == AuthMethod::Graph {
-        return Err(anyhow!(
-            "`mp invite` RSVP is not supported for Graph accounts yet (Graph calendar RSVP \
-             is tracked by #0036, blocked on #0035). Use an SMTP-configured account."
-        ));
-    }
-
-    let ics = std::fs::read(file).map_err(|e| {
-        anyhow!(
-            "cannot read {}: {e}. Mail is no longer stored as files; addressing a message on \
-             the command line lands with the selector contract (#0050). RSVP from the TUI \
-             (`V`) meanwhile.",
-            file.display()
-        )
-    })?;
-
-    let account_address = email::parse::extract_email_address(&account_config.default_from);
-
-    println!("Sending {} reply...", rsvp.subject_verb().to_lowercase());
-    let outcome =
-        email::send::send_rsvp(&ics, account_config, &account_address, rsvp, smtp_config).await?;
-
-    if !outcome.send_result.any_succeeded() {
-        return Err(anyhow!(
-            "Failed to send RSVP to organizer {}",
-            outcome.organizer
-        ));
-    }
-
-    println!(
-        "{} {} — replied to {}",
-        "✓".green().bold(),
-        outcome.subject,
-        outcome.organizer
-    );
-    println!(
-        "  {} Note: not synced to the Exchange server calendar (no Graph in v1).",
-        "ℹ".blue()
-    );
-
-    Ok(())
+/// Declines, and does so before touching the filesystem. `file` names a `.md`
+/// path that no longer exists, and reading whatever is at that path as raw ics
+/// would let any file on the machine be parsed as an invitation on its way to
+/// the same refusal. Naming a message on the command line is the selector
+/// contract [#0050] owns; the TUI RSVP (`V`) reads the invite blob out of the
+/// store and works today.
+fn decline_invite_rsvp(file: &Path) -> anyhow::Error {
+    anyhow!(
+        "cannot RSVP to {}: mail is no longer stored as files, and addressing a message on \
+         the command line lands with the selector contract (#0050). RSVP from the TUI (`V`) \
+         meanwhile.",
+        file.display()
+    )
 }
 
 #[tokio::main]
@@ -908,12 +865,6 @@ async fn main() -> Result<()> {
         .inbox
         .as_ref()
         .map(|_| email::config::mailbox_dir(&account_config.name, "inbox"));
-    let archive_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .archive
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "archive"));
-
     match cli.command {
         Some(Commands::Send {
             file,
@@ -1547,7 +1498,8 @@ async fn main() -> Result<()> {
                 InviteAction::Tentative { file } => (file, email::invite::Rsvp::Tentative),
                 InviteAction::Decline { file } => (file, email::invite::Rsvp::Declined),
             };
-            run_invite_rsvp(&account_config, &smtp_config, &file, rsvp).await?;
+            let _ = rsvp;
+            return Err(decline_invite_rsvp(&file));
         }
 
         Some(Commands::ListMailboxes) => {
@@ -1746,65 +1698,18 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Archive { file }) => {
-            let dir = archive_dir.as_ref().ok_or_else(|| {
-                anyhow!("Archive mailbox not configured. Check [mailboxes.archive] in {}", config_path().display())
-            })?;
-            let archive_server_name = account_config.mailboxes.archive.as_ref()
-                .map(|m| m.server.as_str())
-                .unwrap_or("Archive");
-
-            let result = if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                graph::archive_email_graph(&graph_config, dir, &file, archive_server_name).await
-            } else {
-                let imap_config = ImapConfig::load(&account_config)?;
-                archive_email_locally(&imap_config, dir, &file, archive_server_name).await
-            };
-
-            match result {
-                Ok(()) => {
-                    println!(
-                        "{} Archived: {}",
-                        "✓".green(),
-                        file.display()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to archive {}: {}",
-                        "✗".red(),
-                        file.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        Some(Commands::Delete { file }) => {
-            let result = if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                graph::delete_email_graph(&graph_config, &file).await
-            } else {
-                let imap_config = ImapConfig::load(&account_config)?;
-                delete_email_locally(&imap_config, &file).await
-            };
-
-            match result {
-                Ok(()) => {
-                    println!("{} Deleted: {}", "✓".green(), file.display());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to delete {}: {}",
-                        "✗".red(),
-                        file.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
+        Some(Commands::Archive { file }) | Some(Commands::Delete { file }) => {
+            // Both mutations are store-backed and server-backed now (#0038
+            // scope item 7), and both are addressed by row rather than by
+            // file. Naming a message on the command line is the selector
+            // contract #0050 owns, so this declines instead of guessing which
+            // row a path was meant to be.
+            return Err(anyhow!(
+                "{} is not a message any more: mail is stored in the account database, and \
+                 addressing a message on the command line lands with the selector contract \
+                 (#0050). Archive or delete from the TUI (`a` / `d`) meanwhile.",
+                file.display()
+            ));
         }
 
         Some(Commands::Open { file }) => {

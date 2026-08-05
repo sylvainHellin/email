@@ -1,6 +1,8 @@
 use std::io::{self, stdout};
 use std::panic;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
@@ -490,6 +492,7 @@ fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageR
 // Account resolution for Send
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // no caller until `Send` returns with the drafts index (#0050)
 pub(super) fn resolve_send_account(
     app: &App,
     draft_path: &Path,
@@ -525,34 +528,6 @@ pub(super) fn resolve_send_account(
         acct.account_config.clone(),
         acct.signature_content.clone(),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Search result helpers
-// ---------------------------------------------------------------------------
-
-/// Resolve a server-search hit to a local file, when one exists.
-///
-/// This used to *write* the hit to the mailbox directory as `.md`, then (once
-/// ingest stopped writing files) to find an already-synced copy by scanning
-/// the mailbox directory for the Message-ID. Both are gone: the hit is
-/// resolved to a store row when the entry is built
-/// (`fetched_to_email_entry`), and turning that row back into a file is the
-/// same bridge every other file-taking operation goes through, which declines
-/// until #0038 scope item 7. So this returns `None` for every hit today; the
-/// callers already have the "could not open locally" branch that says so.
-pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
-    let idx = app.server_search_index;
-    let result = app.server_search_results.get(idx)?;
-
-    if let Some(ref path) = result.saved_path {
-        return Some(path.clone());
-    }
-
-    let path = crate::tui::actions::message_path(result.entry.msg?)?;
-    let result = app.server_search_results.get_mut(idx)?;
-    result.saved_path = Some(path.clone());
-    Some(path)
 }
 
 // ---------------------------------------------------------------------------

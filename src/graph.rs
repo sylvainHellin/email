@@ -687,23 +687,6 @@ pub async fn sync_mailboxes_graph(
     Ok(result)
 }
 
-/// Remove a local `.md` email and its companions.
-///
-/// Still file-based: this is the *mutation* path (`mp delete`), which keeps
-/// operating on the `.md` tree the TUI reads until the read path moves onto
-/// the store in #0038.
-fn remove_local_email(path: &std::path::Path) {
-    std::fs::remove_file(path).ok();
-    let html_path = path.with_extension("html");
-    if html_path.exists() {
-        std::fs::remove_file(&html_path).ok();
-    }
-    let att_dir = crate::parse::attachments_dir_for(path);
-    if att_dir.is_dir() {
-        std::fs::remove_dir_all(&att_dir).ok();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 5: Send via Graph
 // ---------------------------------------------------------------------------
@@ -967,101 +950,52 @@ impl GraphClient {
     }
 }
 
-/// Archive an email via Graph API: find by message-id, move on server, move locally.
-pub async fn archive_email_graph(
+/// Move a message to another folder via Graph (#0018), naming it by its
+/// `Message-ID` and touching nothing locally: the store row was already moved
+/// optimistically by the caller (`crate::store::write`). Archiving is this with
+/// the archive folder as destination.
+///
+/// A message the server does not have is not an error. Graph's copy may already
+/// be gone (moved from another client), and the local row is what the user is
+/// looking at.
+pub async fn move_message_graph(
     config: &GraphConfig,
-    archive_dir: &std::path::Path,
-    file_path: &std::path::Path,
-    archive_folder: &str,
-) -> Result<()> {
-    move_email_graph(config, archive_dir, file_path, archive_folder, "inbox", "archived").await
-}
-
-/// Move an email to another folder via Graph API: find by message-id,
-/// move on server, move locally with a `status:` frontmatter update
-/// (#0018). Generalizes the archive flow -- archiving is
-/// `move_email_graph(.., archive_folder, "inbox", "archived")`.
-pub async fn move_email_graph(
-    config: &GraphConfig,
-    dest_dir: &std::path::Path,
-    file_path: &std::path::Path,
+    internet_message_id: &str,
     dest_folder: &str,
-    old_status: &str,
-    new_status: &str,
 ) -> Result<()> {
-    let message_id = crate::imap_client::get_message_id_from_file(file_path)
-        .ok_or_else(|| anyhow!("No message_id found in {}", file_path.display()))?;
-
     let client = GraphClient::new_async(config).await?;
 
-    // Find the message on the server
-    if let Some(graph_id) = client.find_message_by_internet_id(&message_id).await? {
-        client.move_message(&graph_id, dest_folder).await?;
-        info!("Graph: moved message {} to {}", message_id, dest_folder);
-    } else {
-        warn!(
-            "Graph: message {} not found on server, moving locally only",
-            message_id
-        );
+    match client.find_message_by_internet_id(internet_message_id).await? {
+        Some(graph_id) => {
+            client.move_message(&graph_id, dest_folder).await?;
+            info!("Graph: moved message {} to {}", internet_message_id, dest_folder);
+        }
+        None => warn!(
+            "Graph: message {} not found on server, nothing to move",
+            internet_message_id
+        ),
     }
-
-    // Move local files
-    std::fs::create_dir_all(dest_dir)?;
-    let filename = file_path
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid file path"))?;
-    let dest = dest_dir.join(filename);
-
-    // Update frontmatter status to match the destination mailbox
-    if let Ok(content) = std::fs::read_to_string(file_path) {
-        let updated = content.replace(
-            &format!("status: {}", old_status),
-            &format!("status: {}", new_status),
-        );
-        std::fs::write(file_path, updated)?;
-    }
-
-    std::fs::rename(file_path, &dest)?;
-
-    // Move .html companion
-    let html_src = file_path.with_extension("html");
-    if html_src.exists() {
-        let html_dest = dest.with_extension("html");
-        std::fs::rename(&html_src, &html_dest)?;
-    }
-
-    // Move _attachments directory
-    let att_src = crate::parse::attachments_dir_for(file_path);
-    if att_src.is_dir() {
-        let att_dest = crate::parse::attachments_dir_for(&dest);
-        std::fs::rename(&att_src, &att_dest)?;
-    }
-
     Ok(())
 }
 
-/// Delete an email via Graph API: find by message-id, delete on server, remove locally.
-pub async fn delete_email_graph(
+/// Delete a message via Graph, naming it by its `Message-ID`. Same contract as
+/// [`move_message_graph`]: server only, and a missing message is not an error.
+pub async fn delete_message_graph(
     config: &GraphConfig,
-    file_path: &std::path::Path,
+    internet_message_id: &str,
 ) -> Result<()> {
-    let message_id = crate::imap_client::get_message_id_from_file(file_path)
-        .ok_or_else(|| anyhow!("No message_id found in {}", file_path.display()))?;
-
     let client = GraphClient::new_async(config).await?;
 
-    if let Some(graph_id) = client.find_message_by_internet_id(&message_id).await? {
-        client.delete_message(&graph_id).await?;
-        info!("Graph: deleted message {} from server", message_id);
-    } else {
-        warn!(
-            "Graph: message {} not found on server, deleting locally only",
-            message_id
-        );
+    match client.find_message_by_internet_id(internet_message_id).await? {
+        Some(graph_id) => {
+            client.delete_message(&graph_id).await?;
+            info!("Graph: deleted message {} from server", internet_message_id);
+        }
+        None => warn!(
+            "Graph: message {} not found on server, nothing to delete",
+            internet_message_id
+        ),
     }
-
-    // Remove local files
-    remove_local_email(file_path);
     Ok(())
 }
 

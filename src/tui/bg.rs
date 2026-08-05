@@ -122,12 +122,10 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                     };
                     app.set_status_level(text, StatusLevel::Success);
                     if account_index == app.active_account {
-                        // The source list was already updated optimistically;
-                        // only the destination cache went stale.
+                        // The source list and every sidebar count were already
+                        // updated when the row moved (#0038 item 7); only the
+                        // destination's cached list is still stale.
                         app.invalidate_cache_idx(dest_mailbox_idx);
-                        if let Some(count) = app.mailbox_counts.get_mut(dest_mailbox_idx) {
-                            *count += 1;
-                        }
                     } else {
                         app.invalidate_all_caches_on(account_index);
                     }
@@ -293,10 +291,16 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             match result {
                 Ok(_) => { /* Server confirmed, local already updated optimistically */ }
                 Err(e) => {
-                    // Rollback local state. Only the in-memory list is
-                    // reverted: the durable half of the rollback is the store
-                    // row, and writing it is #0038 scope item 7.
+                    // Roll back both halves: the store row that carries the
+                    // flag, and the in-memory list the user is looking at.
                     let reverted = !new_read_state;
+                    let account = app
+                        .accounts
+                        .get(account_index)
+                        .map(|a| a.account_config.name.clone());
+                    if let Some(account) = account {
+                        super::mutations::rollback_read_flag(&account, msg, reverted);
+                    }
                     if account_index == app.active_account {
                         // Updates both the in-memory list and the shared
                         // cache slot (they are the same Arc).
@@ -364,7 +368,6 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                         .map(|hit| SearchResultEntry {
                             entry: hit.entry,
                             fetched: hit.fetched,
-                            saved_path: None,
                             source_label: hit.source_label,
                             source_local_dir: hit.source_local_dir,
                             source_status: hit.source_status,

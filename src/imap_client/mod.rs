@@ -6,16 +6,12 @@ mod sent;
 mod store_sync;
 mod watch;
 
-pub use batch::{batch_archive_emails_locally, batch_delete_emails_locally};
+pub use batch::{batch_delete_on_server, batch_move_on_server};
 pub use fetch::{
     fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, FetchedRaw, MailboxState,
 };
 pub use ops::{
-    archive_email_locally, archive_email_on_server,
-    delete_email_locally, delete_email_on_server,
-    mark_read_on_server, mark_unread_on_server, move_email_locally,
-    move_email_on_server, update_read_status_locally,
-    get_message_id_from_file,
+    delete_email_on_server, mark_read_on_server, mark_unread_on_server, move_email_on_server,
 };
 pub use sent::ImapSentMailbox;
 pub use search::{

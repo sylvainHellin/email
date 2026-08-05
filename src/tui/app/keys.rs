@@ -1,10 +1,9 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
+    Action, App, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
     EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
     RsvpOverlay, SearchBodies, SearchOverlayFocus,
@@ -437,20 +436,11 @@ impl App {
             }
             A::Forward => {
                 self.pending_prefix = None;
-                if let Some(msg) = self.selected_email_ref() {
-                    // The compose wizard still reads the source email from a
-                    // `.md` file; #0038 scope item 7 owns moving it onto the
-                    // store, and the bridge declines until then.
-                    match crate::tui::actions::message_path(msg) {
-                        Some(source_path) => {
-                            self.push_action(Action::OpenComposeWizard(ComposeMode::Forward {
-                                source_path,
-                            }));
-                        }
-                        None => self.set_status(crate::tui::actions::store_backed_soon(
-                            "Forward",
-                        )),
-                    }
+                if self.selected_email_ref().is_some() {
+                    // The compose wizard reads the source email from a `.md`
+                    // file, which is the drafts index and the selector
+                    // contract's ground (#0050).
+                    self.set_status(crate::tui::actions::needs_selector_contract("Forward"));
                 }
             }
             A::EditRecipients => {
@@ -458,17 +448,10 @@ impl App {
                 // hint (the guard is advisory, resolved everywhere).
                 self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
-                    if let Some(msg) = self.selected_email_ref() {
-                        match crate::tui::actions::message_path(msg) {
-                            Some(source_path) => {
-                                self.push_action(Action::OpenComposeWizard(
-                                    ComposeMode::EditDraft { source_path },
-                                ));
-                            }
-                            None => self.set_status(crate::tui::actions::store_backed_soon(
-                                "Edit recipients",
-                            )),
-                        }
+                    if self.selected_email_ref().is_some() {
+                        self.set_status(crate::tui::actions::needs_selector_contract(
+                            "Edit recipients",
+                        ));
                     }
                 } else {
                     self.set_status(
@@ -613,22 +596,12 @@ impl App {
             }
             A::OpenInBrowser => {
                 self.pending_prefix = None;
-                if let Some(msg) = self.selected_email_ref() {
-                    // The rendered HTML is a `.md` companion file; same bridge
-                    // as every other file-taking operation (#0038 item 7).
-                    match crate::tui::actions::message_path(msg) {
-                        Some(path) => {
-                            let html_path = path.with_extension("html");
-                            if html_path.exists() {
-                                self.push_action(Action::OpenHtmlInBrowser(html_path));
-                            } else {
-                                self.set_status("No HTML version available".to_string());
-                            }
-                        }
-                        None => self.set_status(crate::tui::actions::store_backed_soon(
-                            "Open in browser",
-                        )),
-                    }
+                if self.selected_email_ref().is_some() {
+                    // The rendered HTML is written next to a `.md` file, so
+                    // opening it needs the same file addressing #0050 owns.
+                    self.set_status(crate::tui::actions::needs_selector_contract(
+                        "Open in browser",
+                    ));
                 }
             }
             A::ToggleSelect => {
@@ -1574,77 +1547,23 @@ impl App {
     }
 
     /// Helper to open the attachment picker in the given mode.
+    ///
+    /// Attachments live in the blob store, but the picker and the save/open
+    /// pipeline below it address them as files under `_attachments/`, which is
+    /// the file edge #0050 settles.
     fn open_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        if let Some(msg) = self.selected_email_ref() {
-            // Attachments live in the blob store now, but the picker and the
-            // save/open pipeline below it still take file paths; #0038 scope
-            // item 7 owns that rewrite and the bridge declines until then.
-            let Some(path) = crate::tui::actions::message_path(msg) else {
-                self.set_status(crate::tui::actions::store_backed_soon("Attachments"));
-                return;
-            };
-            match crate::parse::list_attachments(&path) {
-                Ok(files) if files.is_empty() => {
-                    self.set_status("No attachments".to_string());
-                }
-                Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Open => {
-                    self.push_action(Action::OpenAttachment(files.into_iter().next().unwrap()));
-                }
-                Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Save => {
-                    // Single file in save mode -- skip picker, go straight to dir picker
-                    let sources = files;
-                    self.open_dir_picker(sources);
-                }
-                Ok(files) => {
-                    self.overlay = Overlay::Attachment(AttachmentPicker {
-                        files,
-                        selected: 0,
-                        mode,
-                        selected_set: HashSet::new(),
-                    });
-                }
-                Err(e) => {
-                    self.set_status(format!("Attachments error: {e}"));
-                }
-            }
+        let _ = mode;
+        if self.selected_email_ref().is_some() {
+            self.set_status(crate::tui::actions::needs_selector_contract("Attachments"));
         }
     }
 
-    /// Helper to open the attachment picker for a search result.
-    /// Saves the search result locally first, then feeds into the same
-    /// attachment picker / dir picker pipeline as the regular list.
+    /// Helper to open the attachment picker for a search result: the same
+    /// file edge as [`Self::open_attachment_picker`], and the same #0050
+    /// boundary.
     fn open_search_result_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        let path = match super::super::helpers::ensure_search_result_saved(self) {
-            Some(p) => p,
-            None => {
-                self.set_status("Failed to save email locally".to_string());
-                return;
-            }
-        };
-
-        match crate::parse::list_attachments(&path) {
-            Ok(files) if files.is_empty() => {
-                self.set_status("No attachments".to_string());
-            }
-            Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Open => {
-                self.push_action(Action::OpenAttachment(files.into_iter().next().unwrap()));
-            }
-            Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Save => {
-                let sources = files;
-                self.open_dir_picker(sources);
-            }
-            Ok(files) => {
-                self.overlay = Overlay::Attachment(AttachmentPicker {
-                    files,
-                    selected: 0,
-                    mode,
-                    selected_set: HashSet::new(),
-                });
-            }
-            Err(e) => {
-                self.set_status(format!("Attachments error: {e}"));
-            }
-        }
+        let _ = mode;
+        self.set_status(crate::tui::actions::needs_selector_contract("Attachments"));
     }
 
     /// Open the directory picker overlay with the given source files.
@@ -2094,6 +2013,7 @@ fn refresh_browser_entries(picker: &mut DirPicker) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::AttachmentPicker;
     use super::super::PersistentError;
     use std::path::PathBuf;
 
@@ -2460,6 +2380,50 @@ mod tests {
 
         assert_eq!(app.list_index, 1);
         assert_eq!(app.selected_email().unwrap().subject, "Team sync");
+    }
+
+    /// A deleted row's `MessageRef` must not survive in the selection.
+    ///
+    /// The id of a deleted row is not reserved: the next ingest is handed the
+    /// same number (pinned by `store::write`'s
+    /// `a_deleted_row_id_can_be_handed_to_the_next_message`), so a reference
+    /// held across the boundary can name a *different* message. The list drops
+    /// it, and so must the selection set (#0038 scope item 7).
+    #[test]
+    fn removing_a_row_drops_its_reference_from_the_selection() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 2;
+        let doomed = app.selected_email().unwrap().msg.unwrap();
+        let survivor = app.emails[0].msg.unwrap();
+        app.selection.insert(doomed);
+        app.selection.insert(survivor);
+
+        app.remove_selected_from_list();
+
+        assert!(
+            !app.selection.contains(&doomed),
+            "the selection kept a reference to a row that no longer exists"
+        );
+        assert!(app.selection.contains(&survivor));
+        assert!(app.cursor_anchor().is_none_or(|m| m != doomed));
+    }
+
+    /// Same guarantee for a batch: every removed reference leaves the
+    /// selection, so a follow-up mutation cannot act on a freed row id.
+    #[test]
+    fn batch_removal_drops_every_removed_reference_from_the_selection() {
+        let mut app = app_with_emails(sample());
+        let batch: std::collections::HashSet<MessageRef> = app.emails[..2]
+            .iter()
+            .filter_map(|e| e.msg)
+            .collect();
+        app.selection = app.emails.iter().filter_map(|e| e.msg).collect();
+
+        app.remove_selected_from_list_batch(&batch);
+
+        assert_eq!(app.selection.len(), 2);
+        assert!(app.selection.is_disjoint(&batch));
+        assert!(app.emails.iter().all(|e| !e.msg.is_some_and(|m| batch.contains(&m))));
     }
 
     // -----------------------------------------------------------------------
