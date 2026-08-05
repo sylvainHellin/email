@@ -1386,4 +1386,125 @@ mod tests {
         let index = build_message_id_index(&[], "test-account");
         assert!(index.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // count_all_emails (#0049 unit 0b: sidebar counts had no oracle)
+    //
+    // Tagging convention for this block, per #0049: `parity` means the new
+    // build must reproduce the recorded behaviour, `known-bug` means the
+    // recorded behaviour is wrong and the comment names the target.
+    // -----------------------------------------------------------------------
+
+    /// Write an email file with an explicit read flag.
+    fn write_email(dir: &Path, filename: &str, read: bool) {
+        std::fs::write(
+            dir.join(filename),
+            format!("---\nsubject: test\nread: {read}\n---\n\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    /// parity. The sidebar number is the count of `.md` files directly in the
+    /// mailbox directory: companion `.html` files, the `_attachments`
+    /// sidecars, and anything nested one level deeper are all excluded, and
+    /// the count matches the number of rows `load_emails` produces for the
+    /// same tree.
+    #[test]
+    fn count_all_emails_counts_top_level_md_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(&archive).unwrap();
+
+        write_email(&inbox, "a.md", false);
+        write_email(&inbox, "b.md", true);
+        write_email(&inbox, "c.md", true);
+        std::fs::write(inbox.join("b.html"), "<p>companion</p>").unwrap();
+        std::fs::write(inbox.join("notes.txt"), "not an email").unwrap();
+        let att = inbox.join("b_attachments");
+        std::fs::create_dir_all(&att).unwrap();
+        write_email(&att, "nested.md", false);
+
+        write_email(&archive, "old.md", true);
+
+        let mailboxes = vec![
+            mb("Inbox", inbox.clone(), MailboxKind::Inbox),
+            mb("Archive", archive.clone(), MailboxKind::Archive),
+        ];
+
+        assert_eq!(count_all_emails(&mailboxes), vec![3, 1]);
+        assert_eq!(load_emails(&inbox).len(), 3);
+        assert_eq!(load_emails(&archive).len(), 1);
+    }
+
+    /// parity. A mailbox directory that does not exist yet (configured but
+    /// never synced) counts 0 instead of panicking or being skipped, so the
+    /// returned vector stays index-aligned with `mailboxes`.
+    #[test]
+    fn count_all_emails_returns_zero_for_missing_and_empty_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let mailboxes = vec![
+            mb("Inbox", tmp.path().join("never-synced"), MailboxKind::Inbox),
+            mb("Sent", empty, MailboxKind::Sent),
+        ];
+
+        assert_eq!(count_all_emails(&mailboxes), vec![0, 0]);
+        assert_eq!(count_all_emails(&[]), Vec::<usize>::new());
+    }
+
+    /// parity, and the recorded shape of a gap. The count is a total, not an
+    /// unread count: it is identical for an all-read and an all-unread
+    /// mailbox. There is no unread-count function anywhere in the current
+    /// build, so the sidebar cannot show one (#0049 names this as a gap with
+    /// no current behaviour to be at parity with).
+    #[test]
+    fn count_all_emails_ignores_the_read_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let all_read = tmp.path().join("read");
+        let all_unread = tmp.path().join("unread");
+        std::fs::create_dir_all(&all_read).unwrap();
+        std::fs::create_dir_all(&all_unread).unwrap();
+
+        for i in 0..3 {
+            write_email(&all_read, &format!("r{i}.md"), true);
+            write_email(&all_unread, &format!("u{i}.md"), false);
+        }
+
+        let mailboxes = vec![
+            mb("Read", all_read, MailboxKind::Inbox),
+            mb("Unread", all_unread, MailboxKind::Inbox),
+        ];
+        assert_eq!(count_all_emails(&mailboxes), vec![3, 3]);
+    }
+
+    /// known-bug. The count is over files, not over messages the user can
+    /// actually see: a `.md` file whose bytes are not valid UTF-8 is counted
+    /// but is dropped by `load_emails` (its `read_to_string` fails), so the
+    /// sidebar says 2 while the list shows 1 row.
+    /// Target: the count must equal the number of listable messages. In the
+    /// new build both sides read the same store rows, which removes the
+    /// divergence by construction; a count derived from a directory walk must
+    /// not come back.
+    #[test]
+    fn count_all_emails_counts_files_the_list_cannot_show() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        write_email(&inbox, "good.md", false);
+        // Invalid UTF-8 in the body: 0xFF is not a legal UTF-8 byte anywhere.
+        std::fs::write(
+            inbox.join("broken.md"),
+            b"---\nsubject: broken\n---\n\nbody \xff\n",
+        )
+        .unwrap();
+
+        let mailboxes = vec![mb("Inbox", inbox.clone(), MailboxKind::Inbox)];
+        assert_eq!(count_all_emails(&mailboxes), vec![2]);
+        assert_eq!(load_emails(&inbox).len(), 1, "the sidebar over-counts by 1");
+    }
 }

@@ -619,3 +619,300 @@ pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
         Err(_) => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests (#0049 unit 0b)
+//
+// `src/tui/helpers.rs` had no tests at all. These capture the two pieces the
+// audit called out as user-visible: which account a draft is sent from, and
+// how a server-search hit is turned into a list row.
+//
+// Tagging convention, per #0049: `parity` means the new build must reproduce
+// the recorded behaviour, `known-bug` means the recorded behaviour is wrong
+// and the comment names the target. Nothing here is fixed in this unit.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AccountConfig;
+    use crate::parse::FetchedEmail;
+
+    // -----------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------
+
+    /// A minimal `AccountState`. Built as a struct literal rather than through
+    /// `AccountState::new`, which reads the user's config, keyring and
+    /// signature files and would make these tests machine-dependent.
+    fn account(name: &str, default_from: &str) -> super::super::app::AccountState {
+        super::super::app::AccountState {
+            account_config: AccountConfig {
+                name: name.to_string(),
+                default_from: default_from.to_string(),
+                ..Default::default()
+            },
+            imap_config: None,
+            smtp_config: None,
+            graph_config: None,
+            signature_content: Some(format!("-- \n{name}")),
+            sent_dir: Some(PathBuf::from(format!("/tmp/{name}/sent"))),
+            archive_dir: None,
+            archive_server_name: "Archive".to_string(),
+            drafts_dir: None,
+            inbox_dir: None,
+            mailboxes: Vec::new(),
+            mailbox_counts: Vec::new(),
+            email_cache: Vec::new(),
+            sidebar_index: 0,
+            active_mailbox: 0,
+            list_index: 0,
+            cursor_path: None,
+            headers_scroll: 0,
+            preview_scroll: 0,
+            selection: std::collections::HashSet::new(),
+            search_query: String::new(),
+            search_includes_body: false,
+            bg_mutations: 0,
+            watcher_active: false,
+            has_unseen: false,
+            message_id_index: Default::default(),
+            indexing: false,
+            mailbox_states: Default::default(),
+        }
+    }
+
+    fn app_with(accounts: Vec<super::super::app::AccountState>, active: usize) -> App {
+        let mut app = App::default_for_tests();
+        app.accounts = accounts;
+        app.active_account = active;
+        app
+    }
+
+    /// Write a draft whose `from:` is exactly `from`.
+    fn draft(dir: &Path, name: &str, from: Option<&str>) -> PathBuf {
+        let from_line = match from {
+            Some(f) => format!("from: \"{f}\"\n"),
+            None => String::new(),
+        };
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("---\nto: someone@example.com\nsubject: hi\nstatus: draft\n{from_line}---\n\nbody\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    fn fetched(date: &str) -> FetchedEmail {
+        FetchedEmail {
+            from: "Jürgen Müller <juergen@example.de>".to_string(),
+            to: "me@example.com".to_string(),
+            cc: Some("cc@example.com".to_string()),
+            subject: "Grüße".to_string(),
+            date: date.to_string(),
+            body_text: "body text".to_string(),
+            html_body: Some("<p>body text</p>".to_string()),
+            has_attachments: true,
+            message_id: Some("<m1@example.de>".to_string()),
+            attachments: Vec::new(),
+            is_read: true,
+            calendar_ics: None,
+            event: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_send_account
+    // -----------------------------------------------------------------------
+
+    /// parity. The draft's `from:` selects the account, case-insensitively,
+    /// and the whole per-account bundle (index, configs, signature, sent dir)
+    /// comes from that account rather than from the active one.
+    #[test]
+    fn resolve_send_account_matches_the_draft_from_address_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_with(
+            vec![
+                account("work", "sylvain@work.example"),
+                account("perso", "sylvain@perso.example"),
+            ],
+            0,
+        );
+        let path = draft(
+            tmp.path(),
+            "d.md",
+            Some("Sylvain Hellin <SYLVAIN@Perso.Example>"),
+        );
+
+        let (idx, _smtp, _imap, _graph, cfg, signature, sent_dir) =
+            resolve_send_account(&app, &path);
+        assert_eq!(idx, 1);
+        assert_eq!(cfg.name, "perso");
+        assert_eq!(signature.as_deref(), Some("-- \nperso"));
+        assert_eq!(sent_dir, Some(PathBuf::from("/tmp/perso/sent")));
+    }
+
+    /// parity. With no `from:` in the draft, or with a `from:` that matches no
+    /// account, or with an unreadable path, the active account sends. The
+    /// fallback is silent: nothing tells the user the address they typed was
+    /// ignored.
+    #[test]
+    fn resolve_send_account_falls_back_to_the_active_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_with(
+            vec![
+                account("work", "sylvain@work.example"),
+                account("perso", "sylvain@perso.example"),
+            ],
+            1,
+        );
+
+        let no_from = draft(tmp.path(), "no-from.md", None);
+        assert_eq!(resolve_send_account(&app, &no_from).0, 1);
+
+        let foreign = draft(tmp.path(), "foreign.md", Some("someone@elsewhere.example"));
+        assert_eq!(resolve_send_account(&app, &foreign).0, 1);
+
+        let missing = tmp.path().join("does-not-exist.md");
+        assert_eq!(resolve_send_account(&app, &missing).0, 1);
+    }
+
+    /// parity. When two accounts share the same address the first one in
+    /// config order wins.
+    #[test]
+    fn resolve_send_account_takes_the_first_of_two_accounts_sharing_an_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_with(
+            vec![
+                account("first", "shared@example.com"),
+                account("second", "shared@example.com"),
+            ],
+            1,
+        );
+        let path = draft(tmp.path(), "d.md", Some("shared@example.com"));
+        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        assert_eq!(idx, 0);
+        assert_eq!(cfg.name, "first");
+    }
+
+    /// known-bug. The match is a substring test (`from.contains(default_from)`),
+    /// not an address comparison, so a draft from `not-sylvain@work.example`
+    /// resolves to the `sylvain@work.example` account: the mail goes out over
+    /// the wrong account's SMTP server and is filed in the wrong Sent folder.
+    /// Target: compare the parsed address of the draft's `from:` with the
+    /// account address for equality (case-insensitive), and fall back to the
+    /// active account when nothing matches.
+    #[test]
+    fn resolve_send_account_substring_match_picks_a_foreign_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_with(
+            vec![
+                account("decoy", "no-such@example.org"),
+                account("work", "sylvain@work.example"),
+            ],
+            0,
+        );
+        let path = draft(tmp.path(), "d.md", Some("not-sylvain@work.example"));
+        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        assert_eq!(idx, 1, "a different mailbox matched by substring");
+        assert_eq!(cfg.name, "work");
+    }
+
+    /// known-bug. An account with an empty `default_from` (a half-configured
+    /// account, which the config wizard allows) swallows every draft, because
+    /// every string contains the empty string. It wins even over the account
+    /// whose address the draft actually names, since it comes first.
+    /// Target: an empty account address must never match.
+    #[test]
+    fn resolve_send_account_empty_default_from_matches_every_draft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_with(
+            vec![account("half-configured", ""), account("work", "sylvain@work.example")],
+            1,
+        );
+        let path = draft(tmp.path(), "d.md", Some("sylvain@work.example"));
+        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        assert_eq!(idx, 0);
+        assert_eq!(cfg.name, "half-configured");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetched_to_email_entry
+    // -----------------------------------------------------------------------
+
+    /// parity. A server-search hit becomes a list row with an empty path and
+    /// an empty status (it is not on disk yet; `ensure_search_result_saved`
+    /// fills those in on demand), and the remaining fields are copied through.
+    #[test]
+    fn fetched_to_email_entry_copies_fields_and_leaves_path_and_status_empty() {
+        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+
+        assert_eq!(entry.path, PathBuf::new());
+        assert_eq!(entry.status, "");
+        assert_eq!(entry.subject, "Grüße");
+        assert_eq!(entry.to, "me@example.com");
+        assert_eq!(entry.cc.as_deref(), Some("cc@example.com"));
+        assert_eq!(entry.body, "body text");
+        assert!(entry.has_attachments);
+        assert!(entry.read);
+        assert!(entry.event.is_none());
+        assert_eq!(entry.date_display, "2024-01-01");
+    }
+
+    /// known-bug. The sort key keeps the sender's local wallclock instead of
+    /// being normalised to UTC, so two hits from different timezones on the
+    /// same day sort by wallclock rather than by instant. `resolve_date` in
+    /// `src/tui/app/types.rs` normalises (that was the fix for #0024); this
+    /// path never got it, so a search result and the same email loaded from
+    /// disk carry different sort keys.
+    /// Target: `date_sort` in UTC, i.e. `2024-01-01T08:00:00` below.
+    #[test]
+    fn fetched_to_email_entry_sort_key_keeps_the_sender_local_wallclock() {
+        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 10:00:00 +0200"));
+        assert_eq!(entry.date_display, "2024-01-01");
+        assert_eq!(entry.date_sort, "2024-01-01T10:00:00");
+
+        // 10:00+0200 is 08:00 UTC, so this later message (09:00 UTC) must sort
+        // after it. On the recorded wallclock keys it sorts before.
+        let later = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 09:00:00 +0000"));
+        assert_eq!(later.date_sort, "2024-01-01T09:00:00");
+        assert!(
+            later.date_sort < entry.date_sort,
+            "the later message sorts first"
+        );
+    }
+
+    /// parity. A `Date:` header that is not RFC 2822 (or the `(unknown date)`
+    /// placeholder from `parse_rfc822_to_fetched_email`) degrades to its first
+    /// ten characters for display, counted in characters so a multi-byte date
+    /// string cannot panic, with the raw string as the sort key.
+    #[test]
+    fn fetched_to_email_entry_falls_back_to_the_first_ten_chars() {
+        let entry = fetched_to_email_entry(&fetched("2024-01-01 12:00 (approx)"));
+        assert_eq!(entry.date_display, "2024-01-01");
+        assert_eq!(entry.date_sort, "2024-01-01 12:00 (approx)");
+
+        let placeholder = fetched_to_email_entry(&fetched("(unknown date)"));
+        assert_eq!(placeholder.date_display, "(unknown d");
+        assert_eq!(placeholder.date_sort, "(unknown date)");
+
+        let unicode = fetched_to_email_entry(&fetched("日本語の日付です、これは長い"));
+        assert_eq!(unicode.date_display, "日本語の日付です、こ");
+    }
+
+    /// known-bug. The row keeps the raw `From:` header, address included,
+    /// while `parse_email` (the on-disk path) stores only the display name.
+    /// The same email therefore reads "Jürgen Müller <juergen@example.de>" in
+    /// the search overlay and "Jürgen Müller" in the list.
+    /// Target: one projection for both paths.
+    #[test]
+    fn fetched_to_email_entry_keeps_the_raw_from_header() {
+        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+        assert_eq!(entry.from, "Jürgen Müller <juergen@example.de>");
+        assert_eq!(
+            crate::tui::app::extract_display_name(&entry.from),
+            "Jürgen Müller",
+            "what the list would have shown for the same email"
+        );
+    }
+}

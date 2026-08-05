@@ -1,0 +1,580 @@
+---
+source: tests/cli_help_snapshot.rs
+expression: out
+---
+$ mp --help
+A CLI tool for sending emails from Markdown drafts with YAML frontmatter
+
+Usage: mp [OPTIONS] [FILE] [COMMAND]
+
+Commands:
+  send            Send a single approved email, or (with --invite) a calendar invitation
+  send-approved   Send all approved emails in a directory
+  list            List emails by status
+  validate        Validate YAML frontmatter in files
+  mark-approved   Mark an email as approved
+  mark-draft      Demote an approved draft back to `draft` status (reverse of `mark-approved`)
+  new             Create a new email draft from template
+  reply           Create a reply draft from a received email
+  forward         Forward an email to new recipients
+  invite          RSVP to a received calendar invitation (iMIP REPLY over SMTP)
+  list-mailboxes  List available IMAP mailboxes/folders
+  fetch           Fetch emails from IMAP server
+  sync            Sync local mailbox folders with IMAP server
+  watch           Watch a mailbox for changes using IMAP IDLE
+  archive         Archive an inbox email (server + local)
+  delete          Delete an inbox email (server + local)
+  open            Open an email's attachment in the default application
+  save            Save an email's attachment(s) to a directory
+  search          Search emails on the IMAP server
+  config          Manage configuration
+  contacts        Contact index operations
+  calendar        Calendar / iMIP invite operations
+  dump-keys       Dump the TUI key bindings from the single KEYMAP source of truth
+  help            Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [FILE]  File to preview (dry-run mode)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+  -V, --version                Print version
+
+$ mp send --help
+Send a single approved email, or (with --invite) a calendar invitation
+
+Usage: mp send [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  Path to the email draft file (omit when using --invite)
+
+Options:
+  -y, --yes                        Skip confirmation prompt
+      --invite                     Send an iMIP calendar invitation (METHOD:REQUEST) instead of a draft. Attendees come from --to/--cc; the subject is used as the event summary. Requires --to, --start, --subject, and one of --end/--duration
+      --to <TO>                    Invite recipient(s), comma-separated (invite mode; ATTENDEE + To)
+      --cc <CC>                    Invite CC recipient(s), comma-separated (invite mode; ATTENDEE + Cc)
+      --subject <SUBJECT>          Event subject / summary (invite mode)
+      --start <START>              Event start. Local time (2026-07-20T14:00 or "2026-07-20 14:00") or RFC3339 with offset (2026-07-20T14:00:00+02:00, ...Z). Invite mode
+      --end <END>                  Event end (same formats as --start). Provide this or --duration
+      --duration <DURATION>        Event duration instead of --end: ISO8601 (PT1H30M) or short (1h30m)
+      --location <LOCATION>        Optional event location (invite mode)
+      --description <DESCRIPTION>  Optional event description / body (invite mode)
+  -s, --signature <SIGNATURE>      Signature to use (overrides config default)
+      --no-signature               Skip signature entirely
+  -A, --account <ACCOUNT>          Account to use (default: first in config)
+  -h, --help                       Print help
+
+$ mp send-approved --help
+Send all approved emails in a directory
+
+Usage: mp send-approved [OPTIONS] [DIR]
+
+Arguments:
+  [DIR]  Directory containing email drafts [default: .]
+
+Options:
+  -y, --yes                    Skip confirmation prompt
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp list --help
+List emails by status
+
+Usage: mp list [OPTIONS] [DIR]
+
+Arguments:
+  [DIR]  Directory to scan [default: .]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp validate --help
+Validate YAML frontmatter in files
+
+Usage: mp validate [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  File or directory to validate
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp mark-approved --help
+Mark an email as approved
+
+Usage: mp mark-approved [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  File to mark as approved
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp mark-draft --help
+Demote an approved draft back to `draft` status (reverse of `mark-approved`)
+
+Usage: mp mark-draft [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  File to mark as draft
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp new --help
+Create a new email draft from template
+
+Usage: mp new [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Name for the new draft file
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp reply --help
+Create a reply draft from a received email
+
+Usage: mp reply [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  Path to the email to reply to (interactive selection if omitted)
+
+Options:
+      --all                    Reply to all recipients
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp forward --help
+Forward an email to new recipients
+
+Usage: mp forward [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  Path to the email to forward (interactive selection if omitted)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp invite --help
+RSVP to a received calendar invitation (iMIP REPLY over SMTP)
+
+Usage: mp invite [OPTIONS] <COMMAND>
+
+Commands:
+  accept     Accept the invitation (PARTSTAT=ACCEPTED)
+  tentative  Tentatively accept the invitation (PARTSTAT=TENTATIVE)
+  decline    Decline the invitation (PARTSTAT=DECLINED)
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp invite accept --help
+Accept the invitation (PARTSTAT=ACCEPTED)
+
+Usage: mp invite accept [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the received invite email `.md`
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp invite tentative --help
+Tentatively accept the invitation (PARTSTAT=TENTATIVE)
+
+Usage: mp invite tentative [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the received invite email `.md`
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp invite decline --help
+Decline the invitation (PARTSTAT=DECLINED)
+
+Usage: mp invite decline [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the received invite email `.md`
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp list-mailboxes --help
+List available IMAP mailboxes/folders
+
+Usage: mp list-mailboxes [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp fetch --help
+Fetch emails from IMAP server
+
+Usage: mp fetch [OPTIONS]
+
+Options:
+      --from <FROM>            Filter by sender address
+      --to <TO>                Filter by recipient address
+      --cc <CC>                Filter by CC address
+      --subject <SUBJECT>      Subject contains
+      --body <BODY>            Body contains
+      --since <SINCE>          Emails since date (YYYY-MM-DD)
+      --before <BEFORE>        Emails before date (YYYY-MM-DD)
+  -n, --limit <LIMIT>          Max results (default: 10) [default: 10]
+      --full                   Show full body instead of preview
+      --mailbox <MAILBOX>      Mailbox name (default: INBOX) [default: INBOX]
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp sync --help
+Sync local mailbox folders with IMAP server
+
+Usage: mp sync [OPTIONS]
+
+Options:
+  -n, --limit <LIMIT>          Max messages per mailbox (default: 50) [default: 50]
+      --mailbox <MAILBOX>      Mailboxes to sync (default: INBOX, Archive, Sent)
+      --reconcile              Reconcile local files against server (detect moves/deletes)
+      --dry-run                Show what would change without making any modifications
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp watch --help
+Watch a mailbox for changes using IMAP IDLE
+
+Usage: mp watch [OPTIONS]
+
+Options:
+      --mailbox <MAILBOX>      Mailbox to watch (default: INBOX) [default: INBOX]
+      --timeout <TIMEOUT>      Timeout in seconds (exits with code 2 on timeout)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp archive --help
+Archive an inbox email (server + local)
+
+Usage: mp archive [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the inbox email file
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp delete --help
+Delete an inbox email (server + local)
+
+Usage: mp delete [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the inbox email file
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp open --help
+Open an email's attachment in the default application
+
+Usage: mp open [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the email file
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp save --help
+Save an email's attachment(s) to a directory
+
+Usage: mp save [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the email file
+
+Options:
+  -o, --output <OUTPUT>        Output directory (default: current directory)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp search --help
+Search emails on the IMAP server
+
+Usage: mp search [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>  Search query (supports from:, to:, subject:, body:, since:, before:, message-id:, in: prefixes). message-id: matches the RFC 5322 Message-ID exactly, with or without angle brackets
+
+Options:
+      --mailbox <MAILBOX>      Mailbox to search (default: all configured mailboxes)
+  -n, --limit <LIMIT>          Max results (default: 20) [default: 20]
+      --full                   Show full body instead of preview
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config --help
+Manage configuration
+
+Usage: mp config [OPTIONS] <COMMAND>
+
+Commands:
+  init           Interactive setup wizard
+  show           Show current configuration
+  set-password   Store a password in the active secrets backend
+  reset-secrets  Wipe the encrypted secrets file (and OAuth2 token caches) and re-prompt for credentials. Use this after a Time Machine restore to a new machine, or whenever the secrets file can no longer be decrypted
+  add-account    Add a new account to the existing config
+  oauth2-login   Run OAuth2 device code flow to acquire and cache a token
+  path           Print config file path
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config init --help
+Interactive setup wizard
+
+Usage: mp config init [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config show --help
+Show current configuration
+
+Usage: mp config show [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config set-password --help
+Store a password in the active secrets backend
+
+Usage: mp config set-password [OPTIONS] <WHICH>
+
+Arguments:
+  <WHICH>  Which password to set: "smtp" or "imap"
+
+Options:
+      --account <ACCOUNT>      Account name (required if multiple accounts)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp config reset-secrets --help
+Wipe the encrypted secrets file (and OAuth2 token caches) and re-prompt for credentials. Use this after a Time Machine restore to a new machine, or whenever the secrets file can no longer be decrypted
+
+Usage: mp config reset-secrets [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config add-account --help
+Add a new account to the existing config
+
+Usage: mp config add-account [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp config oauth2-login --help
+Run OAuth2 device code flow to acquire and cache a token
+
+Usage: mp config oauth2-login [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account name (default: first OAuth2 account)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp config path --help
+Print config file path
+
+Usage: mp config path [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp contacts --help
+Contact index operations
+
+Usage: mp contacts [OPTIONS] <COMMAND>
+
+Commands:
+  search   Search the contact index
+  rebuild  Rebuild the contact index from local mailbox files
+  stats    Show index statistics
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp contacts search --help
+Search the contact index
+
+Usage: mp contacts search [OPTIONS] [QUERY]
+
+Arguments:
+  [QUERY]  Query string (fuzzy-matched against name and email)
+
+Options:
+      --parsable               Emit tab-delimited `email\tname` lines (for mutt/aerc/vim integration)
+  -n, --limit <LIMIT>          Max number of results [default: 20]
+      --account <ACCOUNT>      Account name (default: first configured account)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp contacts rebuild --help
+Rebuild the contact index from local mailbox files
+
+Usage: mp contacts rebuild [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account name (default: all configured accounts)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp contacts stats --help
+Show index statistics
+
+Usage: mp contacts stats [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account name (default: first configured account)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp calendar --help
+Calendar / iMIP invite operations
+
+Usage: mp calendar [OPTIONS] <COMMAND>
+
+Commands:
+  rebuild  Reconcile locally-stored invites against attendee REPLY emails, recomputing `event.attendees[].status` from the whole mailstore. Idempotent and safe to re-run; rebuilds derived state from IMAP alone
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp calendar rebuild --help
+Reconcile locally-stored invites against attendee REPLY emails, recomputing `event.attendees[].status` from the whole mailstore. Idempotent and safe to re-run; rebuilds derived state from IMAP alone
+
+Usage: mp calendar rebuild [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account name (default: all configured accounts)
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp dump-keys --help
+Dump the TUI key bindings from the single KEYMAP source of truth.
+
+Markdown by default; `--json` emits the section-grouped shape the website consumes. Regenerate the site data with: `mp dump-keys --json > website/src/data/tui-keys.json` (see scripts/regen-website-keys.sh).
+
+Usage: mp dump-keys [OPTIONS]
+
+Options:
+      --json
+          Emit JSON grouped by section instead of Markdown
+
+  -s, --signature <SIGNATURE>
+          Signature to use (overrides config default)
+
+      --no-signature
+          Skip signature entirely
+
+  -A, --account <ACCOUNT>
+          Account to use (default: first in config)
+
+  -h, --help
+          Print help (see a summary with '-h')

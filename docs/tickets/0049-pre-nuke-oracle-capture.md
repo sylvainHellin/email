@@ -23,6 +23,37 @@ It must be closed before [#0037](0037-sqlite-store-engine-skeleton.md) opens.
 3. Envelope dump (unit 0c). Add `mp dump-mailbox --json` to the current build, emitting one normalised, path-free record per message (account, mailbox, message-id, from, to, cc, subject, date_sort, flags, attachment names and sizes, invite flag), stably sorted. Landing this small additive command on `main` before the freeze is approved. Capture dumps for every real account into a git-ignored local directory, since they contain real mail metadata.
 4. Freeze (unit 0d). `cp "$(which mp)" ~/.local/bin/mp-legacy`, tag the tree `pre-dal-nuke`, and record both in [data-access-layer](../plans/data-access-layer.md).
 
+## Unit 0b capture notes
+
+Where the fixtures live:
+
+- [tests/mime_oracle_integration.rs](../../tests/mime_oracle_integration.rs): RFC 2047 encoded-word headers, non-UTF-8 body charsets, malformed MIME.
+- [tests/cli_help_snapshot.rs](../../tests/cli_help_snapshot.rs): one insta snapshot of `mp --help` and all 37 subcommand help screens, captured by running the built binary (`--help` maps to clap's short help for commands with no long help and to the long help for `mp dump-keys`, so an in-process `render_long_help` would record a layout no user sees).
+- `count_all_emails` in the `src/tui/app/types.rs` test module, `resolve_send_account` and `fetched_to_email_entry` in a new test module in `src/tui/helpers.rs`.
+
+Every test carries a `parity` or `known-bug` tag in its doc comment.
+The `known-bug` captures, with their targets:
+
+- Raw 8-bit header bytes decode as strict ISO-8859-1, so 0x80..0x9F become C1 control characters, while the same bytes inside an `=?ISO-8859-1?...?=` encoded-word and in a body decode as windows-1252.
+  The three paths disagree; the windows-1252 mapping is the right one.
+- A multipart with no `boundary=` parameter, or with a boundary that never appears in the body, yields an entirely empty body: the message renders blank.
+  The raw entity body must stay reachable.
+- A nested `message/rfc822` part is dropped whole: not extracted into the body, not listed as an attachment.
+  Forwarded-as-attachment mail is invisible.
+- `resolve_send_account` matches the draft's `from:` against the account address with `contains`, so `not-sylvain@work.example` resolves to the `sylvain@work.example` account, and an account with an empty `default_from` swallows every draft.
+  Compare parsed addresses for equality instead.
+- `fetched_to_email_entry` keeps the sender-local wallclock in `date_sort` (the #0024 fix never reached this path) and keeps the raw `From:` header where the on-disk path stores the display name only.
+- `count_all_emails` counts files, not listable messages: a `.md` file that is not valid UTF-8 is counted but is dropped by `load_emails`, so the sidebar over-counts.
+
+Named gaps, not captured:
+
+- Unread counts.
+  No unread-count function exists in the current build, so there is no behaviour to be at parity with; the sidebar number is a total and the test records only that.
+  The new build's unread count is new behaviour, to be specified rather than reproduced.
+- `lib_do_sync`, `lib_do_multi_search` and `ensure_search_result_saved` in `src/tui/helpers.rs` remain untested: the first two need a live IMAP session, and all three mutate `App` through the background-result path.
+  Out of scope for this unit, which was limited to the two pure helpers.
+- Server-side flag round-trip, `open_file_with_system` and `copy_to_clipboard` (audit gap-list) stay untested: they need a network peer or a desktop session, so neither is an offline oracle.
+
 ## Acceptance criteria
 
 - The golden-frame snapshots are committed, two consecutive runs are identical, and no test reads a live account.

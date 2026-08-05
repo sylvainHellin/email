@@ -189,3 +189,18 @@ The regression seam is a byte-equality assertion (`after == before.replace("stat
 The fix copies the existing target's mode onto the temp file *before* the payload is written, not after, so the content is never briefly on disk under wider permissions than the user asked for.
 A target that does not exist is left alone, so a newly created draft still follows the umask rather than inheriting some arbitrary earlier mode.
 The same trap applies to any copy-and-rename writer; `secrets::write_secret_file_atomic` dodges it only because it hardcodes 0600 on the temp file.
+
+## `mailparse` decodes 8-bit header bytes two different ways (2026-08-05)
+
+Bytes 0x80..0x9F reach the user as different characters depending on where they sit in the message.
+Inside an `=?ISO-8859-1?Q?...?=` encoded-word, and inside a body declared `charset=iso-8859-1`, they decode as windows-1252, so 0x93/0x94 become the curly quotes the sender meant; that mapping is what the WHATWG encoding standard and every browser do with the `ISO-8859-1` label.
+Raw in a header with no encoded-word at all, they decode as strict ISO-8859-1 instead, so the same bytes land as the invisible C1 control characters U+0093/U+0094 and get written straight into the frontmatter.
+Charset decoding is otherwise solid on the receive path: ISO-8859-1, windows-1252 and Shift_JIS bodies, quoted-printable included, all come out right, and a latin-1 HTML body is transcoded to UTF-8 with its stale `<meta charset>` replaced.
+The oracles are in [tests/mime_oracle_integration.rs](../tests/mime_oracle_integration.rs), tagged `parity` or `known-bug` per [#0049](tickets/0049-pre-nuke-oracle-capture.md).
+
+## clap's `--help` is not always the long help (2026-08-05)
+
+Snapshotting the CLI surface in-process with `Cli::command().render_long_help()` records a layout no user ever sees.
+clap only wires `--help` to the long help when the command actually has long help somewhere; `mp send --help` and `mp send -h` are byte-identical compact output, while `mp dump-keys --help` differs from `-h` because that one carries a multi-paragraph doc comment.
+The in-process route also needs `.bin_name("mp")` (clap otherwise prints the `#[command(name)]`, "mailypoppins") and a `cmd.build()` to propagate that name into nested usage lines.
+Running the built binary through `env!("CARGO_BIN_EXE_mp")` avoids all three traps, needs no dependency, and costs about 0.25s for the whole 38-screen walk.
