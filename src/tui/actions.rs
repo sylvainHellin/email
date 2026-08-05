@@ -16,19 +16,17 @@ use super::helpers::{
 };
 use super::ui;
 
-use crate::config::resolve_sent_mailbox;
 use crate::draft::{
     create_forward_draft, create_reply_draft, find_drafts, mark_as_approved, mark_as_draft,
     new_draft_skeleton, parse_email_draft,
-    update_status_to_sent, validate_draft,
+    mark_draft_sent, validate_draft,
 };
 use crate::imap_client::{
-    append_to_sent_folder, archive_email_locally, batch_archive_emails_locally,
+    archive_email_locally, batch_archive_emails_locally,
     batch_delete_emails_locally, delete_email_locally, get_message_id_from_file,
     mark_read_on_server, mark_unread_on_server, move_email_locally,
     update_read_status_locally,
 };
-use crate::send::send_email;
 use crate::types::EmailStatus;
 
 pub(super) fn handle_action(
@@ -115,7 +113,7 @@ pub(super) fn handle_action(
 
         Action::Send => {
             if let Some(path) = app.selected_email_path() {
-                let (acct_idx, smtp_config, imap_config, graph_config, account_config, signature, sent_dir) =
+                let (acct_idx, smtp_config, _imap_config, graph_config, account_config, signature) =
                     resolve_send_account(app, &path);
 
                 if graph_config.is_some()
@@ -178,21 +176,44 @@ pub(super) fn handle_action(
 
                             let client = rt
                                 .block_on(crate::graph::GraphClient::new_async(&graph_config))?;
-                            rt.block_on(client.send_mail(
-                                &to_refs,
-                                &cc_refs,
-                                &bcc_refs,
-                                &draft.frontmatter.subject,
-                                &html_body,
-                                &att_data,
+                            let built = crate::send::build_draft_message(
+                                &draft,
+                                &account_config.default_from,
+                                &email_settings,
+                                signature.as_deref(),
+                                None,
+                            )?;
+                            let report = rt.block_on(crate::send::send_durably_via(
+                                &built,
+                                &account_config,
+                                client.send_mail(
+                                    &to_refs,
+                                    &cc_refs,
+                                    &bcc_refs,
+                                    &draft.frontmatter.subject,
+                                    &html_body,
+                                    &att_data,
+                                ),
                             ))?;
+                            if !report.send_result.any_succeeded() {
+                                anyhow::bail!(
+                                    "{}",
+                                    report
+                                        .send_result
+                                        .failed()
+                                        .first()
+                                        .and_then(|r| r.error.clone())
+                                        .unwrap_or_else(|| "Graph send failed".to_string())
+                                );
+                            }
 
-                            update_status_to_sent(&draft, sent_dir.as_deref(), None)?;
+                            mark_draft_sent(&draft, Some(&built.message_id))?;
                             crate::contacts::hooks::bump_after_send(&account_config, &draft);
 
                             Ok(format!(
-                                "Sent via Graph to {} recipient(s)",
-                                to.len() + cc.len() + bcc.len()
+                                "Sent via Graph to {} recipient(s) [{}]",
+                                to.len() + cc.len() + bcc.len(),
+                                report.status_line()
                             ))
                         })();
                         let _ = tx.send(BgResult::Send {
@@ -223,33 +244,28 @@ pub(super) fn handle_action(
                             let draft = parse_email_draft(&path)?;
                             validate_draft(&draft)?;
 
-                            let (send_result, raw_message, message_id) = rt.block_on(send_email(
+                            let built = crate::send::build_draft_message(
                                 &draft,
-                                &smtp_config,
+                                &smtp_config.default_from,
                                 &email_settings,
                                 signature.as_deref(),
                                 None,
+                            )?;
+                            let report = rt.block_on(crate::send::send_durably(
+                                &built,
+                                &account_config,
+                                &smtp_config,
                             ))?;
+                            let send_result = &report.send_result;
 
-                            if send_result.all_succeeded() || send_result.any_succeeded() {
-                                update_status_to_sent(
-                                    &draft,
-                                    sent_dir.as_deref(),
-                                    message_id.as_deref(),
-                                )?;
-                                if let Some(ref imap_cfg) = imap_config {
-                                    let sent_mailbox = resolve_sent_mailbox(&account_config);
-                                    let _ = rt.block_on(append_to_sent_folder(
-                                        imap_cfg,
-                                        &raw_message,
-                                        &sent_mailbox,
-                                    ));
-                                }
+                            if send_result.any_succeeded() {
+                                mark_draft_sent(&draft, Some(&built.message_id))?;
                                 crate::contacts::hooks::bump_after_send(&account_config, &draft);
                                 if send_result.all_succeeded() {
                                     Ok(format!(
-                                        "Sent to {} recipient(s)",
-                                        send_result.results.len()
+                                        "Sent to {} recipient(s) [{}]",
+                                        send_result.results.len(),
+                                        report.status_line()
                                     ))
                                 } else {
                                     let failed: Vec<String> = send_result
@@ -258,16 +274,18 @@ pub(super) fn handle_action(
                                         .map(|r| r.address.clone())
                                         .collect();
                                     Ok(format!(
-                                        "Partial: {}/{} succeeded -- failed: {}",
+                                        "Partial: {}/{} succeeded [{}] -- failed: {}",
                                         send_result.succeeded().len(),
                                         send_result.results.len(),
+                                        report.status_line(),
                                         failed.join(", ")
                                     ))
                                 }
                             } else {
                                 anyhow::bail!(
-                                    "Failed to send to all {} recipient(s)",
-                                    send_result.results.len()
+                                    "Failed to send to all {} recipient(s) [{}]",
+                                    send_result.results.len(),
+                                    report.status_line()
                                 )
                             }
                         })();
@@ -281,7 +299,7 @@ pub(super) fn handle_action(
         }
 
         Action::Rsvp { path, choice } => {
-            let (acct_idx, smtp_config, imap_config, graph_config, account_config, _sig, _sent) =
+            let (acct_idx, smtp_config, _imap_config, graph_config, account_config, _sig) =
                 resolve_send_account(app, &path);
 
             if graph_config.is_some()
@@ -319,21 +337,13 @@ pub(super) fn handle_action(
                 let result = (|| -> anyhow::Result<String> {
                     let outcome = rt.block_on(crate::send::send_rsvp(
                         &path,
+                        &account_config,
                         &account_address,
                         rsvp,
                         &smtp_config,
                     ))?;
                     if !outcome.send_result.any_succeeded() {
                         anyhow::bail!("Failed to send RSVP to {}", outcome.organizer);
-                    }
-                    // Best-effort IMAP APPEND to Sent, matching the send path.
-                    if let Some(ref imap_cfg) = imap_config {
-                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                        let _ = rt.block_on(append_to_sent_folder(
-                            imap_cfg,
-                            &outcome.raw_message,
-                            &sent_mailbox,
-                        ));
                     }
                     Ok(format!("{} — replied to {}", outcome.subject, outcome.organizer))
                 })();
@@ -351,7 +361,6 @@ pub(super) fn handle_action(
                     let email_settings = app.global_config.email.clone();
                     let account_config = app.account_config.clone();
                     let signature = app.signature_content.clone();
-                    let sent_dir = app.sent_dir.clone();
 
                     app.bg_count += 1;
                     app.set_status_level(
@@ -373,7 +382,7 @@ pub(super) fn handle_action(
                             let mut failed = 0usize;
 
                             for draft in &drafts {
-                                let send_result = (|| -> anyhow::Result<()> {
+                                let send_result = (|| -> anyhow::Result<String> {
                                     let to = parse_graph_recipients(
                                         draft.frontmatter.to.as_deref(),
                                     );
@@ -429,24 +438,34 @@ pub(super) fn handle_action(
                                     let client = rt.block_on(
                                         crate::graph::GraphClient::new_async(&graph_config),
                                     )?;
-                                    rt.block_on(client.send_mail(
-                                        &to_refs,
-                                        &cc_refs,
-                                        &bcc_refs,
-                                        &draft.frontmatter.subject,
-                                        &html_body,
-                                        &att_data,
+                                    let built = crate::send::build_draft_message(
+                                        draft,
+                                        &account_config.default_from,
+                                        &email_settings,
+                                        signature.as_deref(),
+                                        None,
+                                    )?;
+                                    let report = rt.block_on(crate::send::send_durably_via(
+                                        &built,
+                                        &account_config,
+                                        client.send_mail(
+                                            &to_refs,
+                                            &cc_refs,
+                                            &bcc_refs,
+                                            &draft.frontmatter.subject,
+                                            &html_body,
+                                            &att_data,
+                                        ),
                                     ))?;
-                                    Ok(())
+                                    if !report.send_result.any_succeeded() {
+                                        anyhow::bail!("Graph send failed");
+                                    }
+                                    Ok(built.message_id)
                                 })();
 
                                 match send_result {
-                                    Ok(()) => {
-                                        let _ = update_status_to_sent(
-                                            draft,
-                                            sent_dir.as_deref(),
-                                            None,
-                                        );
+                                    Ok(message_id) => {
+                                        let _ = mark_draft_sent(draft, Some(&message_id));
                                         crate::contacts::hooks::bump_after_send(
                                             &account_config,
                                             draft,
@@ -477,9 +496,7 @@ pub(super) fn handle_action(
                     };
                     let email_settings = app.global_config.email.clone();
                     let account_config = app.account_config.clone();
-                    let imap_config = app.imap_config.clone();
                     let signature = app.signature_content.clone();
-                    let sent_dir = app.sent_dir.clone();
 
                     app.bg_count += 1;
                     app.set_status_level(
@@ -501,31 +518,28 @@ pub(super) fn handle_action(
                             let mut failed = 0usize;
 
                             for draft in &drafts {
-                                match rt.block_on(send_email(
+                                let built = match crate::send::build_draft_message(
                                     draft,
-                                    &smtp_config,
+                                    &smtp_config.default_from,
                                     &email_settings,
                                     signature.as_deref(),
                                     None,
+                                ) {
+                                    Ok(built) => built,
+                                    Err(_) => {
+                                        failed += 1;
+                                        continue;
+                                    }
+                                };
+                                match rt.block_on(crate::send::send_durably(
+                                    &built,
+                                    &account_config,
+                                    &smtp_config,
                                 )) {
-                                    Ok((send_result, raw_message, message_id)) => {
-                                        if send_result.all_succeeded()
-                                            || send_result.any_succeeded()
-                                        {
-                                            let _ = update_status_to_sent(
-                                                draft,
-                                                sent_dir.as_deref(),
-                                                message_id.as_deref(),
-                                            );
-                                            if let Some(ref imap_cfg) = imap_config {
-                                                let sent_mailbox =
-                                                    resolve_sent_mailbox(&account_config);
-                                                let _ = rt.block_on(append_to_sent_folder(
-                                                    imap_cfg,
-                                                    &raw_message,
-                                                    &sent_mailbox,
-                                                ));
-                                            }
+                                    Ok(report) => {
+                                        if report.send_result.any_succeeded() {
+                                            let _ =
+                                                mark_draft_sent(draft, Some(&built.message_id));
                                             crate::contacts::hooks::bump_after_send(
                                                 &account_config,
                                                 draft,

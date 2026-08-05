@@ -89,6 +89,30 @@ pub struct AccountConfig {
     /// `[retention]` table, which itself falls back to the defaults.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Whether a sent message is copied into the server's Sent mailbox by this
+    /// client. See [`SaveToSent`]; `auto` is almost always right.
+    #[serde(default)]
+    pub save_to_sent: SaveToSent,
+}
+
+/// Whether the client APPENDs its own copy of a sent message to the Sent
+/// mailbox (#0037 item 5).
+///
+/// Getting this wrong costs duplicate Sent items, the Thunderbird bug 1427619
+/// failure mode, so the default detects the account type instead of guessing a
+/// fixed answer: Gmail, Microsoft Graph and Proton save the message themselves
+/// on submission, generic IMAP does not.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SaveToSent {
+    /// Skip the APPEND for accounts whose server already saves the copy, keep
+    /// it for everything else. See [`server_saves_to_sent`].
+    #[default]
+    Auto,
+    /// Always APPEND, even when the server may also save a copy.
+    Always,
+    /// Never APPEND. The Sent mailbox is then entirely the server's business.
+    Never,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -712,6 +736,45 @@ pub fn latest_log_file() -> Option<PathBuf> {
                 .unwrap_or(false)
         })
         .max()
+}
+
+/// True when the account's *server* files a copy of every submitted message in
+/// Sent, so a client-side APPEND would duplicate it.
+///
+/// Three families do this, and they are recognised by what the config already
+/// carries rather than by a new setting:
+///
+/// - Microsoft Graph, where `sendMail` writes to Sent Items as part of the API
+///   call (recognised by `auth_method = "graph"`);
+/// - Gmail, which files SMTP submissions in `[Gmail]/Sent Mail` (recognised by
+///   the `gmail.com` / `googlemail.com` SMTP or IMAP host);
+/// - Proton, whose Bridge does the same for the SMTP it exposes (recognised by
+///   a `proton` hostname; a Bridge configured against bare `127.0.0.1` cannot
+///   be told apart from any other local relay and needs
+///   `save_to_sent = "never"`).
+pub fn server_saves_to_sent(account: &AccountConfig) -> bool {
+    if account.auth_method == AuthMethod::Graph {
+        return true;
+    }
+    let hosts = [account.smtp.host.as_str(), account.imap.host.as_str()];
+    hosts.iter().any(|host| {
+        let host = host.to_ascii_lowercase();
+        host.ends_with("gmail.com")
+            || host.ends_with("googlemail.com")
+            || host.contains("protonmail")
+            || host.contains("proton.me")
+    })
+}
+
+/// Whether this client should APPEND its own copy of a sent message to the
+/// Sent mailbox: the `save_to_sent` setting, with `auto` resolved through
+/// [`server_saves_to_sent`].
+pub fn appends_to_sent(account: &AccountConfig) -> bool {
+    match account.save_to_sent {
+        SaveToSent::Always => true,
+        SaveToSent::Never => false,
+        SaveToSent::Auto => !server_saves_to_sent(account),
+    }
 }
 
 /// Resolve the sent mailbox server name from config

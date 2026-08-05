@@ -116,6 +116,23 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let unread_count = app.visible_emails().filter(|e| !e.read).count();
     let any_watching = app.accounts.iter().any(|a| a.watcher_active);
     let watch_prefix = if any_watching { "WATCHING " } else { "" };
+    // Outbox badge (#0037 item 5): only rendered when something is actually
+    // outstanding, so the quiet case costs no width and no attention.
+    let outbox = app
+        .accounts
+        .iter()
+        .fold(crate::outbox::OutboxCounts::default(), |mut acc, a| {
+            acc.open += a.outbox.open;
+            acc.failed += a.outbox.failed;
+            acc
+        });
+    let outbox_text = if outbox.failed > 0 {
+        format!("OUTBOX {} ({} failed) | ", outbox.total(), outbox.failed)
+    } else if outbox.open > 0 {
+        format!("OUTBOX {} | ", outbox.open)
+    } else {
+        String::new()
+    };
     let sel_text = if app.selection.is_empty() {
         String::new()
     } else {
@@ -139,8 +156,12 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         format!("{} {}/{} ", app.active_label(), app.list_index + 1, shown)
     };
-    let right_len =
-        (sel_text.len() + unread_text.len() + watch_prefix.len() + mailbox_text.len() + 1) as u16;
+    let right_len = (sel_text.len()
+        + unread_text.len()
+        + outbox_text.len()
+        + watch_prefix.len()
+        + mailbox_text.len()
+        + 1) as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -218,6 +239,16 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             unread_text,
             Style::default().fg(theme::active().unread_count),
         ));
+    }
+    if !outbox_text.is_empty() {
+        // A failed row needs a human, so it gets the error colour; a row that
+        // is merely waiting for its APPEND gets the softer one.
+        let style = if outbox.failed > 0 {
+            Style::default().fg(theme::active().error)
+        } else {
+            Style::default().fg(theme::active().emphasis)
+        };
+        right_spans.push(Span::styled(outbox_text, style));
     }
     if any_watching {
         right_spans.push(Span::styled(

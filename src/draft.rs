@@ -1429,79 +1429,57 @@ pub fn preview_draft(
     Ok(())
 }
 
-pub fn update_status_to_sent(
-    draft: &EmailDraft,
-    sent_dir: Option<&Path>,
-    message_id: Option<&str>,
-) -> Result<()> {
+/// Mark a draft as sent, in place.
+///
+/// The local sent `.md` this used to write into `sent/` is gone with the rest
+/// of the `.md` tree (#0037): the Sent copy is now the durable outbox's job,
+/// which APPENDs it to the server and ingests it into the store. What is left
+/// here is the draft's own bookkeeping, rewritten surgically in the draft's
+/// bytes so `date:` and any field `EmailFrontmatter` does not model survive the
+/// send.
+///
+/// A draft that was never written to disk (the synthetic one `mp invite`
+/// builds) has nothing to mark, and says so in the log rather than
+/// materialising a file nobody asked for.
+pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<()> {
     info!("Updating status to sent: {}", draft.path.display());
     let sent_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sent_via = format!("email-cli v{}", env!("CARGO_PKG_VERSION"));
 
-    // Surgical path: rewrite only `status`/`sent_at`/`sent_via`/`message_id`
-    // in the draft's own bytes, so `date:` and any field `EmailFrontmatter`
-    // does not model survive the send (a dropped `date:` made the TUI sort
-    // the sent copy to the bottom of the list).
-    //
-    // Fallback: the invite flow (`mp invite`) hands us a synthetic draft that
-    // was never written to disk. With no source bytes to preserve, serialize
-    // the in-memory frontmatter as before.
-    let new_content = match fs::read_to_string(&draft.path) {
-        Ok(content) => rewrite_frontmatter_scalars(
-            &content,
-            &[
-                ("status", FieldWrite::Set(EmailStatus::Sent.to_string())),
-                ("sent_at", FieldWrite::Set(sent_at.clone())),
-                ("sent_via", FieldWrite::Set(yaml_dq_escape(&sent_via))),
-                (
-                    "message_id",
-                    match message_id {
-                        Some(id) => FieldWrite::Set(yaml_dq_escape(id)),
-                        None => FieldWrite::ClearIfPresent,
-                    },
-                ),
-            ],
-        )?,
+    let content = match fs::read_to_string(&draft.path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!(
+                "No draft file at {}; nothing to mark as sent",
+                draft.path.display()
+            );
+            return Ok(());
+        }
         Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!(
-                    "Could not read {} ({e}); falling back to a serialized frontmatter rewrite",
-                    draft.path.display(),
-                );
-            }
-            let mut frontmatter = draft.frontmatter.clone();
-            frontmatter.status = EmailStatus::Sent;
-            frontmatter.sent_at = Some(sent_at);
-            frontmatter.sent_via = Some(sent_via);
-            frontmatter.message_id = message_id.map(|s| s.to_string());
-            let yaml = serde_yaml::to_string(&frontmatter)?;
-            format!("---\n{}---\n\n{}", yaml, draft.body_markdown)
+            return Err(anyhow::Error::from(e))
+                .context(format!("reading the draft {}", draft.path.display()))
         }
     };
 
-    // Determine destination path
-    let dest_path = if let Some(sent_dir) = sent_dir {
-        fs::create_dir_all(sent_dir)?;
-        // Keep the original filename (already includes date-time prefix)
-        let original_name = draft
-            .path
-            .file_name()
-            .ok_or_else(|| anyhow!("Draft path has no filename: {}", draft.path.display()))?
-            .to_string_lossy();
-        sent_dir.join(original_name.as_ref())
-    } else {
-        draft.path.clone()
-    };
+    let new_content = rewrite_frontmatter_scalars(
+        &content,
+        &[
+            ("status", FieldWrite::Set(EmailStatus::Sent.to_string())),
+            ("sent_at", FieldWrite::Set(sent_at)),
+            ("sent_via", FieldWrite::Set(yaml_dq_escape(&sent_via))),
+            (
+                "message_id",
+                match message_id {
+                    Some(id) => FieldWrite::Set(yaml_dq_escape(id)),
+                    None => FieldWrite::ClearIfPresent,
+                },
+            ),
+        ],
+    )?;
+    fs::write(&draft.path, new_content)?;
 
-    // Write the updated content
-    fs::write(&dest_path, new_content)?;
-
-    // If we moved the file, remove the original
-    if sent_dir.is_some() && dest_path != draft.path {
-        fs::remove_file(&draft.path)?;
-    }
-
-    // Clean up companion HTML file (not needed in sent/)
+    // The companion HTML only exists to carry the quoted reply into the send;
+    // once sent it is dead weight next to the draft.
     let html_companion = draft.path.with_extension("html");
     if html_companion.exists() {
         fs::remove_file(&html_companion).ok();
@@ -2678,12 +2656,12 @@ mod tests {
     }
 
     #[test]
-    fn update_status_to_sent_preserves_date_and_unknown_fields() {
+    fn mark_draft_sent_preserves_date_and_unknown_fields() {
         let tmp = tempfile::tempdir().unwrap();
         let path = draft_with_unknown_fields(tmp.path(), "approved");
         let draft = parse_email_draft(&path).unwrap();
 
-        update_status_to_sent(&draft, None, Some("<abc@example.com>")).unwrap();
+        mark_draft_sent(&draft, Some("<abc@example.com>")).unwrap();
 
         let after = fs::read_to_string(&path).unwrap();
         assert!(after.contains("status: sent\n"), "{after}");
@@ -2703,22 +2681,21 @@ mod tests {
         );
     }
 
-    /// `mp invite` builds a synthetic draft that was never written to disk
-    /// (its path already points into the Sent mailbox). With no source bytes
-    /// to preserve, the serde write path still applies.
+    /// `mp invite` builds a synthetic draft that was never written to disk.
+    /// There is nothing to mark and nothing to write: the sent copy is the
+    /// outbox's, not a file this function invents (#0037).
     #[test]
-    fn update_status_to_sent_falls_back_for_a_draft_with_no_file() {
+    fn mark_draft_sent_is_a_no_op_for_a_draft_with_no_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let sent = tmp.path().join("sent");
         let mut draft = make_draft("a@example.com", "Invite", "Body", EmailStatus::Approved);
-        draft.path = sent.join("20260701-120000-invite.md");
+        draft.path = tmp.path().join("20260701-120000-invite.md");
 
-        update_status_to_sent(&draft, Some(&sent), None).unwrap();
+        mark_draft_sent(&draft, None).unwrap();
 
-        let written = parse_email_draft(&draft.path).unwrap();
-        assert_eq!(written.frontmatter.status, EmailStatus::Sent);
-        assert!(written.frontmatter.sent_at.is_some());
-        assert_eq!(written.body_markdown, "Body");
+        assert!(
+            !draft.path.exists(),
+            "a draft with no file must not be materialised by marking it sent"
+        );
     }
 
     /// `write_atomic` renames a fresh temp file over the destination, which

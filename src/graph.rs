@@ -804,14 +804,27 @@ impl GraphClient {
             "saveToSentItems": "true"
         });
 
-        let resp = self
+        // A connect or builder failure never reached the API, so nothing was
+        // sent; anything else (a timeout, a dropped response) leaves it
+        // unknown, and the outbox must not re-send on its own. See
+        // [`crate::outbox::AmbiguousSubmission`].
+        let resp = match self
             .client
             .post(&url)
             .bearer_auth(self.bearer())
             .json(&payload)
             .send()
             .await
-            .context("Failed to send mail via Graph API")?;
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_connect() || e.is_builder() => {
+                return Err(anyhow!(e).context("Failed to send mail via Graph API"))
+            }
+            Err(e) => {
+                return Err(anyhow!(crate::outbox::AmbiguousSubmission(e.to_string()))
+                    .context("Failed to send mail via Graph API"))
+            }
+        };
 
         if resp.status().is_success() || resp.status().as_u16() == 202 {
             info!("Graph sendMail succeeded");

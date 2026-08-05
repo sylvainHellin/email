@@ -235,6 +235,10 @@ pub(super) async fn lib_do_sync(
         })
         .collect();
 
+    // The sync tick is also the outbox's retry tick: a Sent copy that could
+    // not be appended when the message was sent lands here (#0037 item 5).
+    crate::send::resume_outbox(account_config).await;
+
     let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false).await?;
     Ok((finish_sync(account_config, &result), SyncResultMeta {
         new_inbox_mail: result.new_inbox_mail.clone(),
@@ -454,7 +458,6 @@ pub(super) fn resolve_send_account(
     Option<crate::config::GraphConfig>,
     AccountConfig,
     Option<String>,
-    Option<PathBuf>,
 ) {
     if let Ok(draft) = parse_email_draft(draft_path) {
         let from = draft.frontmatter.from.unwrap_or_default().to_lowercase();
@@ -467,7 +470,6 @@ pub(super) fn resolve_send_account(
                     acct.graph_config.clone(),
                     acct.account_config.clone(),
                     acct.signature_content.clone(),
-                    acct.sent_dir.clone(),
                 );
             }
         }
@@ -480,7 +482,6 @@ pub(super) fn resolve_send_account(
         acct.graph_config.clone(),
         acct.account_config.clone(),
         acct.signature_content.clone(),
-        acct.sent_dir.clone(),
     )
 }
 
@@ -568,6 +569,7 @@ mod tests {
             search_includes_body: false,
             bg_mutations: 0,
             watcher_active: false,
+            outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
             message_id_index: Default::default(),
             indexing: false,
@@ -637,12 +639,11 @@ mod tests {
             Some("Sylvain Hellin <SYLVAIN@Perso.Example>"),
         );
 
-        let (idx, _smtp, _imap, _graph, cfg, signature, sent_dir) =
+        let (idx, _smtp, _imap, _graph, cfg, signature) =
             resolve_send_account(&app, &path);
         assert_eq!(idx, 1);
         assert_eq!(cfg.name, "perso");
         assert_eq!(signature.as_deref(), Some("-- \nperso"));
-        assert_eq!(sent_dir, Some(PathBuf::from("/tmp/perso/sent")));
     }
 
     /// parity. With no `from:` in the draft, or with a `from:` that matches no
@@ -683,7 +684,7 @@ mod tests {
             1,
         );
         let path = draft(tmp.path(), "d.md", Some("shared@example.com"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 0);
         assert_eq!(cfg.name, "first");
     }
@@ -706,7 +707,7 @@ mod tests {
             0,
         );
         let path = draft(tmp.path(), "d.md", Some("not-sylvain@work.example"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 1, "a different mailbox matched by substring");
         assert_eq!(cfg.name, "work");
     }
@@ -724,7 +725,7 @@ mod tests {
             1,
         );
         let path = draft(tmp.path(), "d.md", Some("sylvain@work.example"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 0);
         assert_eq!(cfg.name, "half-configured");
     }

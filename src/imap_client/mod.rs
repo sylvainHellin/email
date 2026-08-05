@@ -2,6 +2,7 @@ mod batch;
 mod fetch;
 mod ops;
 pub mod search;
+mod sent;
 mod store_sync;
 mod watch;
 
@@ -10,12 +11,13 @@ pub use fetch::{
     fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, FetchedRaw, MailboxState,
 };
 pub use ops::{
-    append_to_sent_folder, archive_email_locally, archive_email_on_server,
+    archive_email_locally, archive_email_on_server,
     delete_email_locally, delete_email_on_server,
     mark_read_on_server, mark_unread_on_server, move_email_locally,
     move_email_on_server, update_read_status_locally,
     get_message_id_from_file,
 };
+pub use sent::ImapSentMailbox;
 pub use search::{
     bracketed_message_id, normalize_message_id, parse_search_query, retain_exact_message_id,
     FetchCriteria,

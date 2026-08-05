@@ -242,3 +242,17 @@ old body unreadable and leaves a stale FTS entry behind that no later write can
 remove (#0037 unit 4a).
 Order is: write the row, delete the old FTS entry, re-point the blob references,
 insert the new FTS entry.
+
+## The outbox holds a plain blob reference, and a failed row keeps its bytes
+
+An `outbox` row's `raw_blob` is acquired through `BlobStore::acquire` with **no** `message_blobs` row, because that table's foreign key targets `messages` and a submission is not a message (#0037 unit 4b).
+The reference is released when the row reaches `done`, inside the same transaction, and on an explicit `outbox::discard`.
+It is deliberately *not* released on the transition into `failed`: that state exists so a human can read the message SMTP may or may not have delivered, and releasing would unlink exactly those bytes.
+Completion also ingests the sent copy *before* releasing, so the raw hash passes from the outbox reference to the message's own reference without touching zero (`release` unlinks the instant it does).
+
+## async-imap 0.11 discards APPENDUID
+
+`Session::append` returns `Result<()>` and its tagged-`OK` response code, where `APPENDUID` lives, is dropped inside the crate's private `check_done_ok`; the stream is private too, so the command cannot be re-run by hand from outside.
+What survives is still a definitive acknowledgement, because `async-imap` turns any non-`OK` tagged response into an error, so a successful return means the server filed the message.
+`ImapSentMailbox::append` ([src/imap_client/sent.rs](../src/imap_client/sent.rs)) therefore recovers the UID with the same `UID SEARCH HEADER MESSAGE-ID` the dedup path runs and stores it on the row.
+Reading the real `APPENDUID` needs a patched or vendored `async-imap`; the `SentMailbox` seam is where that would land.

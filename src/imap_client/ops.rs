@@ -10,20 +10,6 @@ use crate::config::ImapConfig;
 use crate::parse::attachments_dir_for;
 use crate::types::InboxFrontmatter;
 
-pub async fn append_to_sent_folder(imap_config: &ImapConfig, raw_message: &[u8], sent_mailbox: &str) -> Result<()> {
-    info!("Appending sent email to IMAP folder '{}'", sent_mailbox);
-
-    let mut session = open_imap_session(imap_config).await?;
-
-    session.append(sent_mailbox, Some("(\\Seen)"), None, raw_message)
-        .await
-        .map_err(|e| anyhow!("Failed to APPEND to '{}': {}", sent_mailbox, e))?;
-
-    session.logout().await.ok();
-    info!("Successfully appended to '{}'", sent_mailbox);
-    Ok(())
-}
-
 pub async fn archive_email_on_server(imap_config: &ImapConfig, message_id: &str, archive_mailbox: &str) -> Result<()> {
     move_email_on_server(imap_config, message_id, "INBOX", archive_mailbox).await
 }

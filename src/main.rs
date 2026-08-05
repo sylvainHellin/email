@@ -448,7 +448,6 @@ async fn run_send_invite(
     smtp_config: &SmtpConfig,
     global_config: &GlobalConfig,
     signature: Option<&str>,
-    sent_dir: Option<&Path>,
     args: InviteArgs,
 ) -> Result<()> {
     // Graph accounts cannot send iMIP invites yet (Graph send is #0036, blocked
@@ -529,16 +528,14 @@ async fn run_send_invite(
     let event = email::calendar::parse_ics(ics.as_bytes())
         .map(|p| email::calendar::event_frontmatter(&p));
 
-    // Synthetic draft used for the send + local Sent persistence.
+    // Synthetic draft, used only to build the message: nothing is written to
+    // disk on this path any more (the Sent copy is the outbox's, #0037).
     let sent_at = chrono::Utc::now();
-    let filename = format!(
+    let draft_path = PathBuf::from(format!(
         "{}-invite-{}.md",
         sent_at.format("%Y%m%d-%H%M%S"),
         email::parse::slugify_subject(subject)
-    );
-    let draft_path = sent_dir
-        .map(|d| d.join(&filename))
-        .unwrap_or_else(|| PathBuf::from(&filename));
+    ));
 
     let draft = EmailDraft {
         path: draft_path.clone(),
@@ -582,8 +579,15 @@ async fn run_send_invite(
     }
 
     println!("Sending invitation...");
-    let (send_result, raw_message, message_id) =
-        send_email(&draft, smtp_config, &global_config.email, signature, Some(&ics)).await?;
+    let built = email::send::build_draft_message(
+        &draft,
+        &smtp_config.default_from,
+        &global_config.email,
+        signature,
+        Some(&ics),
+    )?;
+    let report = email::send::send_durably(&built, account_config, smtp_config).await?;
+    let send_result = &report.send_result;
 
     for r in send_result.succeeded() {
         println!("  {} {} ({})", "✓".green(), r.address, r.role);
@@ -605,36 +609,14 @@ async fn run_send_invite(
         ));
     }
 
-    // Persist the sent invite locally: the `.md` (with event: block) plus the
-    // sidecar invite.ics, so the #0027 parser recognises our own Sent copy.
-    update_status_to_sent(&draft, sent_dir, message_id.as_deref())?;
-    let sidecar_dir = email::parse::attachments_dir_for(&draft_path);
-    if let Err(e) = fs::create_dir_all(&sidecar_dir)
-        .and_then(|_| fs::write(sidecar_dir.join(email::parse::CALENDAR_SIDECAR_NAME), &ics))
-    {
-        warn!("Failed to write invite sidecar .ics: {}", e);
-    }
-
-    // IMAP APPEND to Sent (best-effort), matching the normal send path.
-    if let Ok(imap_config) = ImapConfig::load(account_config) {
-        let sent_mailbox = resolve_sent_mailbox(account_config);
-        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-            warn!("Failed to append invite to Sent folder: {}", e);
-            println!(
-                "  {} Could not copy invite to server Sent folder: {}",
-                "⚠".yellow(),
-                e
-            );
-        }
-    }
-
     email::contacts::hooks::bump_after_send(account_config, &draft);
 
     if send_result.all_succeeded() {
         println!(
-            "{} Invitation sent to all {} recipient(s)",
+            "{} Invitation sent to all {} recipient(s) [{}]",
             "✓".green().bold(),
-            send_result.results.len()
+            send_result.results.len(),
+            report.status_line()
         );
     } else {
         println!(
@@ -671,23 +653,13 @@ async fn run_invite_rsvp(
 
     println!("Sending {} reply...", rsvp.subject_verb().to_lowercase());
     let outcome =
-        email::send::send_rsvp(file, &account_address, rsvp, smtp_config).await?;
+        email::send::send_rsvp(file, account_config, &account_address, rsvp, smtp_config).await?;
 
     if !outcome.send_result.any_succeeded() {
         return Err(anyhow!(
             "Failed to send RSVP to organizer {}",
             outcome.organizer
         ));
-    }
-
-    // Best-effort IMAP APPEND to Sent, matching the normal send path.
-    if let Ok(imap_config) = ImapConfig::load(account_config) {
-        let sent_mailbox = resolve_sent_mailbox(account_config);
-        if let Err(e) =
-            append_to_sent_folder(&imap_config, &outcome.raw_message, &sent_mailbox).await
-        {
-            warn!("Failed to append RSVP reply to Sent folder: {}", e);
-        }
     }
 
     println!(
@@ -778,11 +750,6 @@ async fn main() -> Result<()> {
     };
 
     // Resolve directories from config (mailbox-based -> derived from data dir)
-    let sent_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .sent
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "sent"));
     let drafts_dir: Option<PathBuf> = Some(email::config::drafts_dir(&account_config.name));
     let inbox_dir: Option<PathBuf> = account_config
         .mailboxes
@@ -815,7 +782,6 @@ async fn main() -> Result<()> {
                     &smtp_config,
                     &global_config,
                     signature_content.as_deref(),
-                    sent_dir.as_deref(),
                     InviteArgs {
                         to,
                         cc,
@@ -897,13 +863,42 @@ async fn main() -> Result<()> {
                 }
 
                 let client = graph::GraphClient::new_async(&graph_config).await?;
-                client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data).await?;
+                let built = email::send::build_draft_message(
+                    &draft,
+                    &account_config.default_from,
+                    &global_config.email,
+                    signature_content.as_deref(),
+                    None,
+                )?;
+                // Graph files its own copy in Sent Items, so the outbox row
+                // never carries a target mailbox; what it buys here is
+                // exactly-once durability of the submission.
+                let report = email::send::send_durably_via(
+                    &built,
+                    &account_config,
+                    client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
+                )
+                .await?;
+                if !report.send_result.any_succeeded() {
+                    return Err(anyhow!(
+                        "{}",
+                        report
+                            .send_result
+                            .failed()
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "Graph send failed".to_string())
+                    ));
+                }
 
-                // Graph auto-copies to Sent Items, no IMAP APPEND needed
-                update_status_to_sent(&draft, sent_dir.as_deref(), None)?;
+                mark_draft_sent(&draft, Some(&built.message_id))?;
                 info!("Email sent via Graph and marked as sent: {}", draft.path.display());
                 email::contacts::hooks::bump_after_send(&account_config, &draft);
-                println!("{} Email sent successfully via Graph API", "✓".green().bold());
+                println!(
+                    "{} Email sent successfully via Graph API [{}]",
+                    "✓".green().bold(),
+                    report.status_line()
+                );
             } else {
                 // SMTP send path (existing)
                 preview_draft(
@@ -920,14 +915,16 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Sending email...");
-                let (send_result, raw_message, message_id) = send_email(
+                let built = email::send::build_draft_message(
                     &draft,
-                    &smtp_config,
+                    &smtp_config.default_from,
                     &global_config.email,
                     signature_content.as_deref(),
                     None,
-                )
-                .await?;
+                )?;
+                let report =
+                    email::send::send_durably(&built, &account_config, &smtp_config).await?;
+                let send_result = &report.send_result;
 
                 // Display per-recipient results
                 for r in &send_result.succeeded() {
@@ -949,31 +946,20 @@ async fn main() -> Result<()> {
                 }
 
                 if send_result.all_succeeded() {
-                    update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref())?;
+                    mark_draft_sent(&draft, Some(&built.message_id))?;
                     info!("Email marked as sent: {}", draft.path.display());
-
-                    // IMAP APPEND to Sent folder (best-effort)
-                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                            warn!("Failed to append to Sent folder: {}", e);
-                            println!(
-                                "  {} Could not copy to server Sent folder: {}",
-                                "⚠".yellow(), e
-                            );
-                        }
-                    }
 
                     // Incremental contacts-index update (best-effort, no-op if no cache)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
 
                     println!(
-                        "{} Email sent successfully to all {} recipient(s)",
+                        "{} Email sent successfully to all {} recipient(s) [{}]",
                         "✓".green().bold(),
-                        send_result.results.len()
+                        send_result.results.len(),
+                        report.status_line()
                     );
                 } else if send_result.any_succeeded() {
-                    update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref())?;
+                    mark_draft_sent(&draft, Some(&built.message_id))?;
                     warn!(
                         "Partial send: {} succeeded, {} failed for {}",
                         send_result.succeeded().len(),
@@ -981,26 +967,15 @@ async fn main() -> Result<()> {
                         draft.path.display()
                     );
 
-                    // IMAP APPEND to Sent folder (best-effort)
-                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                            warn!("Failed to append to Sent folder: {}", e);
-                            println!(
-                                "  {} Could not copy to server Sent folder: {}",
-                                "⚠".yellow(), e
-                            );
-                        }
-                    }
-
                     // Incremental contacts-index update (best-effort)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
 
                     println!(
-                        "{} Partial send: {} succeeded, {} failed (marked as sent -- see logs for details)",
+                        "{} Partial send: {} succeeded, {} failed [{}] (marked as sent -- see logs for details)",
                         "⚠".yellow().bold(),
                         send_result.succeeded().len().to_string().green(),
-                        send_result.failed().len().to_string().red()
+                        send_result.failed().len().to_string().red(),
+                        report.status_line()
                     );
                 } else {
                     error!("All recipients failed for {}", draft.path.display());
@@ -1081,21 +1056,45 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    match client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data).await {
-                        Ok(()) => {
-                            if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), None) {
-                                println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
-                            } else {
-                                email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                println!("{}", "✓".green());
-                            }
-                            sent_count += 1;
-                        }
+                    let built = match email::send::build_draft_message(
+                        &draft,
+                        &account_config.default_from,
+                        &global_config.email,
+                        signature_content.as_deref(),
+                        None,
+                    ) {
+                        Ok(built) => built,
                         Err(e) => {
                             println!("{} {}", "✗".red(), e);
-                            error!("Graph send error for {}: {}", draft.path.display(), e);
+                            error!("Failed to build {}: {}", draft.path.display(), e);
                             failed_count += 1;
+                            continue;
                         }
+                    };
+                    let report = email::send::send_durably_via(
+                        &built,
+                        &account_config,
+                        client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
+                    )
+                    .await?;
+                    if report.send_result.any_succeeded() {
+                        if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
+                            println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
+                        } else {
+                            email::contacts::hooks::bump_after_send(&account_config, &draft);
+                            println!("{} [{}]", "✓".green(), report.status_line());
+                        }
+                        sent_count += 1;
+                    } else {
+                        let err = report
+                            .send_result
+                            .failed()
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "Graph send failed".to_string());
+                        println!("{} {}", "✗".red(), err);
+                        error!("Graph send error for {}: {}", draft.path.display(), err);
+                        failed_count += 1;
                     }
                 }
             } else {
@@ -1103,52 +1102,41 @@ async fn main() -> Result<()> {
                     print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
                     io::stdout().flush()?;
 
-                    match send_email(
+                    let built = match email::send::build_draft_message(
                         &draft,
-                        &smtp_config,
+                        &smtp_config.default_from,
                         &global_config.email,
                         signature_content.as_deref(),
                         None,
-                    )
-                    .await
-                    {
-                        Ok((send_result, raw_message, message_id)) => {
-                            if send_result.all_succeeded() {
-                                if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref()) {
+                    ) {
+                        Ok(built) => built,
+                        Err(e) => {
+                            println!("{} {}", "✗".red(), e);
+                            error!("Failed to build {}: {}", draft.path.display(), e);
+                            failed_count += 1;
+                            continue;
+                        }
+                    };
+                    match email::send::send_durably(&built, &account_config, &smtp_config).await {
+                        Ok(report) => {
+                            let send_result = &report.send_result;
+                            if send_result.any_succeeded() {
+                                if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
                                     println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                                 } else {
-                                    // IMAP APPEND to Sent folder (best-effort)
-                                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                                            warn!("Failed to append to Sent folder: {}", e);
-                                        }
-                                    }
                                     // Incremental contacts-index update (best-effort)
                                     email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                    println!("{}", "✓".green());
-                                }
-                                sent_count += 1;
-                            } else if send_result.any_succeeded() {
-                                // Partial success -- mark as sent, warn about failures
-                                if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref()) {
-                                    println!("{} (partial send, failed to update status: {})", "⚠".yellow(), e);
-                                } else {
-                                    // IMAP APPEND to Sent folder (best-effort)
-                                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                                            warn!("Failed to append to Sent folder: {}", e);
-                                        }
+                                    if send_result.all_succeeded() {
+                                        println!("{} [{}]", "✓".green(), report.status_line());
+                                    } else {
+                                        println!(
+                                            "{} (partial: {}/{} recipients) [{}]",
+                                            "⚠".yellow(),
+                                            send_result.succeeded().len(),
+                                            send_result.results.len(),
+                                            report.status_line()
+                                        );
                                     }
-                                    // Incremental contacts-index update (best-effort)
-                                    email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                    println!(
-                                        "{} (partial: {}/{} recipients)",
-                                        "⚠".yellow(),
-                                        send_result.succeeded().len(),
-                                        send_result.results.len()
-                                    );
                                 }
                                 for r in &send_result.failed() {
                                     warn!(
@@ -1161,7 +1149,7 @@ async fn main() -> Result<()> {
                                 }
                                 sent_count += 1;
                             } else {
-                                println!("{} all recipients failed", "✗".red());
+                                println!("{} all recipients failed [{}]", "✗".red(), report.status_line());
                                 for r in &send_result.failed() {
                                     error!(
                                         "Failed recipient {} ({}) for {}: {}",
@@ -1501,6 +1489,21 @@ async fn main() -> Result<()> {
                     })
                     .collect()
             };
+
+            if !dry_run {
+                // Resume the outbox first: a message that reached the server
+                // before the last crash gets its Sent copy before this sync
+                // reads the mailbox it belongs in (#0037 item 5).
+                let drained = email::send::resume_outbox(&account_config).await;
+                if drained.completed > 0 || drained.still_open > 0 {
+                    println!(
+                        "  {} outbox: {} completed, {} still pending",
+                        "↻".dimmed(),
+                        drained.completed,
+                        drained.still_open + drained.awaiting_submission
+                    );
+                }
+            }
 
             let result = if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;

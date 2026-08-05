@@ -1,6 +1,6 @@
 use email::draft::{
     create_forward_draft, create_reply_draft, find_drafts, mark_as_approved, mark_as_draft,
-    parse_email_draft, update_status_to_sent, validate_draft,
+    mark_draft_sent, parse_email_draft, validate_draft,
 };
 use email::types::EmailStatus;
 use std::fs;
@@ -332,25 +332,22 @@ fn test_mark_as_draft_inbox_fails() {
 }
 
 #[test]
-fn test_update_status_to_sent() {
+fn test_mark_draft_sent() {
     let tmp = tempdir().unwrap();
     let drafts = tmp.path().join("drafts");
-    let sent = tmp.path().join("sent");
     fs::create_dir_all(&drafts).unwrap();
 
     let path = write_draft(&drafts, "draft.md", "alice@example.com", "Test", "Body", "approved");
     let draft = parse_email_draft(&path).unwrap();
 
-    update_status_to_sent(&draft, Some(sent.as_path()), Some("<msg123@example.com>")).unwrap();
+    mark_draft_sent(&draft, Some("<msg123@example.com>")).unwrap();
 
-    // Original should be removed
-    assert!(!path.exists());
+    // The draft is marked in place: there is no local sent `.md` any more,
+    // the Sent copy is the durable outbox's (#0037).
+    assert!(path.exists());
+    assert!(!tmp.path().join("sent").exists());
 
-    // Sent file should exist
-    let sent_file = sent.join("draft.md");
-    assert!(sent_file.exists());
-
-    let sent_draft = parse_email_draft(&sent_file).unwrap();
+    let sent_draft = parse_email_draft(&path).unwrap();
     assert_eq!(sent_draft.frontmatter.status, EmailStatus::Sent);
     assert!(sent_draft.frontmatter.sent_at.is_some());
     assert_eq!(sent_draft.frontmatter.message_id, Some("<msg123@example.com>".to_string()));
@@ -397,32 +394,16 @@ fn test_find_drafts_ignores_non_md_files() {
 }
 
 // -----------------------------------------------------------------------
-// update_status_to_sent edge cases
+// mark_draft_sent edge cases
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_update_status_to_sent_in_place() {
+fn test_mark_draft_sent_without_message_id() {
     let tmp = tempdir().unwrap();
     let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", "approved");
     let draft = parse_email_draft(&path).unwrap();
 
-    // No sent_dir: update in place
-    update_status_to_sent(&draft, None, Some("<msg@example.com>")).unwrap();
-
-    assert!(path.exists());
-    let updated = parse_email_draft(&path).unwrap();
-    assert_eq!(updated.frontmatter.status, EmailStatus::Sent);
-    assert!(updated.frontmatter.sent_at.is_some());
-    assert_eq!(updated.frontmatter.message_id, Some("<msg@example.com>".to_string()));
-}
-
-#[test]
-fn test_update_status_to_sent_without_message_id() {
-    let tmp = tempdir().unwrap();
-    let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", "approved");
-    let draft = parse_email_draft(&path).unwrap();
-
-    update_status_to_sent(&draft, None, None).unwrap();
+    mark_draft_sent(&draft, None).unwrap();
 
     let updated = parse_email_draft(&path).unwrap();
     assert_eq!(updated.frontmatter.status, EmailStatus::Sent);
@@ -430,10 +411,9 @@ fn test_update_status_to_sent_without_message_id() {
 }
 
 #[test]
-fn test_update_status_to_sent_cleans_companion_html() {
+fn test_mark_draft_sent_cleans_companion_html() {
     let tmp = tempdir().unwrap();
     let drafts = tmp.path().join("drafts");
-    let sent = tmp.path().join("sent");
     fs::create_dir_all(&drafts).unwrap();
 
     let path = write_draft(&drafts, "draft.md", "alice@example.com", "Test", "Body", "approved");
@@ -441,7 +421,7 @@ fn test_update_status_to_sent_cleans_companion_html() {
     fs::write(&html_path, "<p>companion</p>").unwrap();
 
     let draft = parse_email_draft(&path).unwrap();
-    update_status_to_sent(&draft, Some(sent.as_path()), None).unwrap();
+    mark_draft_sent(&draft, None).unwrap();
 
     // Companion HTML should be cleaned up
     assert!(!html_path.exists());

@@ -52,8 +52,23 @@ fn decrement_mutations(app: &mut App, account_index: usize) {
     }
 }
 
+/// Re-read one account's outbox counts for the status-bar badge (#0037).
+fn refresh_outbox(app: &mut App, account_index: usize) {
+    if let Some(acct) = app.accounts.get_mut(account_index) {
+        acct.outbox = crate::outbox::counts_for_account(&acct.account_config.name);
+    }
+}
+
 pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
     app.bg_count = app.bg_count.saturating_sub(1);
+    match &result {
+        BgResult::Send { account_index, .. }
+        | BgResult::SendApproved { account_index, .. }
+        | BgResult::Rsvp { account_index, .. }
+        | BgResult::Sync { account_index, .. }
+        | BgResult::Fetch { account_index, .. } => refresh_outbox(app, *account_index),
+        _ => {}
+    }
 
     match result {
         BgResult::Archive { account_index, result } => {

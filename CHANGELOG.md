@@ -15,6 +15,28 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **Durable outbox for sent mail (#0037).** Every outgoing message is committed
+  to the per-account store (raw bytes plus an `outbox` row) *before* SMTP runs,
+  and the transition to `sent_pending_append` is committed as soon as the server
+  returns 250. SMTP runs exactly once per row: an ambiguous failure parks the
+  row as `failed` for inspection and is never re-sent automatically, while a
+  clean pre-submission failure stays sendable. Retry drives only the Sent
+  `APPEND`, deduplicating through `UID SEARCH HEADER MESSAGE-ID` so a lost
+  acknowledgement cannot produce a second copy, and resumes on startup and on
+  every sync tick with backoff. A new per-account `save_to_sent` flag
+  (`auto` by default, `always` / `never` to override) skips the `APPEND` for
+  Gmail, Microsoft Graph and Proton accounts, whose servers file the copy
+  themselves. Non-`done` rows show as an `OUTBOX n` badge in the TUI status bar,
+  and `mp send` reports honestly: *sent + saved*, *sent + append pending*, or
+  *failed*.
+
+### Removed
+- **The local sent `.md` copy.** `update_status_to_sent` is now
+  `mark_draft_sent`: it marks the draft in place and no longer writes or moves a
+  file into `sent/`. The Sent copy lives on the server and in the store, put
+  there by the outbox (#0037).
+
+### Added
 - **Search by Message-ID (TECHLEV-6).** `mp search` accepts a
   `message-id:` prefix that resolves an RFC 5322 Message-ID to its message:
   `mp search 'message-id:<abc@example.com>'`. Angle brackets are optional on

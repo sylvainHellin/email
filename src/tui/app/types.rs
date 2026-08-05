@@ -266,6 +266,11 @@ pub struct AccountState {
     pub bg_mutations: usize,
     pub watcher_active: bool,
     pub has_unseen: bool,
+    /// Non-`done` outbox rows for this account (#0037 item 5). Refreshed at
+    /// startup and after every send or sync; rendered as a status-bar badge so
+    /// a message stuck between SMTP and its Sent copy is visible rather than
+    /// silent.
+    pub outbox: crate::outbox::OutboxCounts,
     /// In-memory index: local_dir -> {message_id -> file_path}.
     /// Initialised empty at startup and populated asynchronously by a
     /// background indexing thread (see `BgResult::IndexReady`); updated
@@ -311,6 +316,9 @@ impl AccountState {
             .unwrap_or("Archive")
             .to_string();
         let drafts_dir = Some(crate::config::drafts_dir(&account_config.name));
+        // Read once at startup so a message left mid-send by the last run is
+        // visible in the badge before any sync runs (#0037 item 5).
+        let outbox = crate::outbox::counts_for_account(&account_config.name);
         let inbox_dir = account_config
             .mailboxes
             .inbox
@@ -359,6 +367,7 @@ impl AccountState {
             bg_mutations: 0,
             watcher_active: false,
             has_unseen: false,
+            outbox,
             message_id_index,
             indexing: true,
         }
