@@ -211,3 +211,11 @@ The frontmatter key means two different things depending on which way the mail w
 On received mail it lists the file names saved into the sibling `<stem>_attachments/` directory, but on drafts and sent mail it holds whatever the sender typed, which is the *source path* of the file to attach: the real tree has entries like `/tmp/audio-scripts/sql-kg-rag/01-segment1-introduction.mp3` and one under `/home/sylvain`.
 Anything that treats the list as a set of names therefore leaks absolute paths, and any size lookup that joins the entry onto a directory silently resolves against the filesystem root instead (`Path::join` with an absolute argument discards the base).
 `mp dump-mailbox` reduces each entry to its file name before both the output and the size lookup ([src/dump.rs](../src/dump.rs)); the same normalisation is what the SQLite store will need to reproduce the dump.
+
+## FTS5 external content silently accepts a column the content table lacks (2026-08-06)
+
+The store's schema sketch declares `messages_fts USING fts5(subject, from_, body_text, content='messages')`, but `messages` has no `body_text` column because the body lives in a blob.
+`CREATE VIRTUAL TABLE` accepts that without complaint, and so do explicit `INSERT`s into the index and `MATCH` queries that only return `rowid`: FTS5 resolves content columns lazily, at the moment a query actually needs a column *value*.
+The failure surfaces later as `no such column: T.body_text` from `snippet()`, `highlight()`, `SELECT subject FROM messages_fts` and the `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')` command.
+So the search path must join the matched rowid back to `messages` for anything it wants to display, and the index has to be written by ingest rather than rebuilt from the content table.
+That is workable here only because a store that loses its index is dropped and refilled by the next sync ([src/store/schema.rs](../src/store/schema.rs)).

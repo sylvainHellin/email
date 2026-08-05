@@ -17,5 +17,6 @@ pub mod imap_client;
 pub mod draft;
 pub mod dump;
 pub mod send;
+pub mod store;
 pub mod sync;
 pub mod tui;

@@ -511,6 +511,17 @@ pub fn contacts_cache_path(account_name: &str) -> PathBuf {
     account_dir(account_name).join("contacts-cache.json")
 }
 
+/// `<account_dir>/store.sqlite3`, the per-account SQLite store (see
+/// `src/store/`).
+pub fn store_path(account_name: &str) -> PathBuf {
+    account_dir(account_name).join("store.sqlite3")
+}
+
+/// `<account_dir>/blobs/`, the content-addressed blob store root.
+pub fn blobs_dir(account_name: &str) -> PathBuf {
+    account_dir(account_name).join("blobs")
+}
+
 /// `<data_dir>/tokens/`
 pub fn tokens_dir() -> PathBuf {
     mailypoppins_data_dir().join("tokens")
@@ -1170,6 +1181,14 @@ name = "test"
         assert_eq!(
             contacts_cache_path("alice"),
             PathBuf::from("/tmp/x/accounts/alice/contacts-cache.json")
+        );
+        assert_eq!(
+            store_path("alice"),
+            PathBuf::from("/tmp/x/accounts/alice/store.sqlite3")
+        );
+        assert_eq!(
+            blobs_dir("alice"),
+            PathBuf::from("/tmp/x/accounts/alice/blobs")
         );
         assert_eq!(tokens_dir(), PathBuf::from("/tmp/x/tokens"));
         assert_eq!(logs_dir(), PathBuf::from("/tmp/x/logs"));
