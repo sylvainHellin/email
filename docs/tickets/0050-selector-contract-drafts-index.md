@@ -27,6 +27,9 @@ The whole contract lands in one commit, so it is never half-applied.
 6. The CLI rewrite. `mp archive`, `mp delete`, `mp open`, `mp save` and `mp invite accept|tentative|decline` take a received selector; `mp reply [--all]` and `mp forward` take a received selector and print the new draft selector; `mp send`, `mp mark-approved` and `mp mark-draft` take a draft selector; `mp validate` takes an optional draft selector and defaults to every draft on the account; `mp list` takes `[--status draft|approved|sent]` and no directory argument; `mp send-approved` takes `[--all-accounts]` and no directory argument; `mp new <name>` prints the selector; `mp path <selector>` prints the filesystem path and `mp edit <selector>` opens `$EDITOR`. No command dual-accepts a path and a selector.
 7. `Action::CopyPath` becomes `CopyMessageRef` and copies the canonical `mp://` selector, which pastes directly into the new CLI.
 
+Inherited from [#0038](0038-read-path-to-db.md), deliberately deferred to here: the clap help for `mp invite accept|tentative|decline` still reads "Path to the received invite email `.md`", and the `website/src/pages/commands.astro` rows for `mp invite`, `mp open`, `mp save`, `mp reply` and `mp forward` still advertise commands that decline today.
+Both are rewritten against the real selector syntax by this ticket rather than churned twice on an unreleased binary.
+
 `mp path` and `mp edit` are the only filesystem edge, and they are outputs of the selector, not path inputs.
 Linting a draft template that does not live in `drafts/` yet would need a separately named `mp validate-file <path>`, so that `mp validate <selector>` never dual-accepts; it is not part of this cut.
 

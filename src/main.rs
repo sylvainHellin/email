@@ -785,6 +785,30 @@ fn decline_invite_rsvp(file: &Path) -> anyhow::Error {
     )
 }
 
+/// The boundary line every path-taking command declines with (#0050).
+///
+/// `.md` messages are gone: what a path argument used to name is a row in the
+/// account database now. Every one of these commands declines *before* it
+/// touches the filesystem, so a stale path cannot produce a half-truth on its
+/// way to the same refusal: `list_attachments` on a dead `_attachments/` tree
+/// reports "no attachments" for a message that has them, and the draft
+/// builders report a bare I/O error. Both read as the command having worked on
+/// something.
+///
+/// `file` is the path the user named, or `None` for the interactive form that
+/// used to pick one out of the inbox tree. `meanwhile` names the way to do it
+/// today, so the message tells both halves of the truth.
+fn decline_message_path(file: Option<&Path>, meanwhile: &str) -> anyhow::Error {
+    let subject = match file {
+        Some(path) => format!("{} is not a message any more", path.display()),
+        None => "there is no message tree left to pick from".to_string(),
+    };
+    anyhow!(
+        "{subject}: mail is stored in the account database, and addressing a message on the \
+         command line lands with the selector contract (#0050). {meanwhile}"
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
@@ -860,11 +884,6 @@ async fn main() -> Result<()> {
 
     // Resolve directories from config (mailbox-based -> derived from data dir)
     let drafts_dir: Option<PathBuf> = Some(email::config::drafts_dir(&account_config.name));
-    let inbox_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .inbox
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "inbox"));
     match cli.command {
         Some(Commands::Send {
             file,
@@ -1431,65 +1450,26 @@ async fn main() -> Result<()> {
             println!("{} Created new draft: {}", "✓".green(), path.display());
         }
 
-        Some(Commands::Reply { file, all }) => {
-            let resolved = resolve_drafts_dir(Path::new("."), &drafts_dir);
-            let reply_drafts_dir: Option<PathBuf> = if resolved != Path::new(".").to_path_buf() {
-                Some(resolved)
-            } else {
-                None
-            };
-
-            let source_file = match file {
-                Some(f) => f,
-                None => {
-                    let dir = inbox_dir.as_ref().ok_or_else(|| {
-                        anyhow!("Inbox mailbox not configured. Check [mailboxes.inbox] in {}", config_path().display())
-                    })?;
-                    select_inbox_email(dir, "Select an email to reply to")?
-                }
-            };
-
-            let draft_path = create_reply_draft(
-                &source_file,
-                all,
-                &smtp_config.default_from,
-                reply_drafts_dir.as_deref(),
-            )?;
-            println!(
-                "{} Reply draft created: {}",
-                "✓".green(),
-                draft_path.display()
-            );
+        Some(Commands::Reply { file, all: _ }) => {
+            // The source message is a store row, not a `.md` file, and the
+            // draft this would write is the drafts index #0050 builds. Without
+            // the decline, `create_reply_draft` reaches `parse_email_draft` and
+            // fails on the missing file with a bare I/O error, and the
+            // interactive form walks an inbox tree that no longer exists.
+            return Err(decline_message_path(
+                file.as_deref(),
+                "Reply builds a draft from the source message; mp-legacy is the working \
+                 fallback meanwhile.",
+            ));
         }
 
         Some(Commands::Forward { file }) => {
-            let resolved = resolve_drafts_dir(Path::new("."), &drafts_dir);
-            let fwd_drafts_dir: Option<PathBuf> = if resolved != Path::new(".").to_path_buf() {
-                Some(resolved)
-            } else {
-                None
-            };
-
-            let source_file = match file {
-                Some(f) => f,
-                None => {
-                    let dir = inbox_dir.as_ref().ok_or_else(|| {
-                        anyhow!("Inbox mailbox not configured. Check [mailboxes.inbox] in {}", config_path().display())
-                    })?;
-                    select_inbox_email(dir, "Select an email to forward")?
-                }
-            };
-
-            let draft_path = create_forward_draft(
-                &source_file,
-                &smtp_config.default_from,
-                fwd_drafts_dir.as_deref(),
-            )?;
-            println!(
-                "{} Forward draft created: {}",
-                "✓".green(),
-                draft_path.display()
-            );
+            // Same edge as `Reply` above.
+            return Err(decline_message_path(
+                file.as_deref(),
+                "Forward builds a draft from the source message; mp-legacy is the working \
+                 fallback meanwhile.",
+            ));
         }
 
         Some(Commands::Invite { action }) => {
@@ -1704,86 +1684,23 @@ async fn main() -> Result<()> {
             // file. Naming a message on the command line is the selector
             // contract #0050 owns, so this declines instead of guessing which
             // row a path was meant to be.
-            return Err(anyhow!(
-                "{} is not a message any more: mail is stored in the account database, and \
-                 addressing a message on the command line lands with the selector contract \
-                 (#0050). Archive or delete from the TUI (`a` / `d`) meanwhile.",
-                file.display()
+            return Err(decline_message_path(
+                Some(&file),
+                "Archive or delete from the TUI (`a` / `d`) meanwhile.",
             ));
         }
 
-        Some(Commands::Open { file }) => {
-            let attachments = list_attachments(&file)?;
-            if attachments.is_empty() {
-                println!("No attachments found for {}", file.display());
-                return Ok(());
-            }
-            let path = if attachments.len() == 1 {
-                attachments.into_iter().next().expect("non-empty verified above")
-            } else {
-                let display_items: Vec<String> = attachments
-                    .iter()
-                    .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
-                    .collect();
-                let selection = dialoguer::FuzzySelect::new()
-                    .with_prompt("Select attachment to open")
-                    .items(&display_items)
-                    .default(0)
-                    .interact()
-                    .map_err(|e| anyhow!("Selection cancelled: {e}"))?;
-                attachments[selection].clone()
-            };
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            println!("Opening: {name}");
-            open_file_with_system(&path)?;
-        }
-
-        Some(Commands::Save { file, output }) => {
-            let attachments = list_attachments(&file)?;
-            if attachments.is_empty() {
-                println!("No attachments found for {}", file.display());
-                return Ok(());
-            }
-            let dest_dir = output.unwrap_or_else(|| PathBuf::from("."));
-
-            // Multi-select attachments
-            let display_items: Vec<String> = attachments
-                .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
-                .collect();
-
-            let selections = if attachments.len() == 1 {
-                vec![0]
-            } else {
-                let sel = dialoguer::MultiSelect::new()
-                    .with_prompt("Select attachment(s) to save")
-                    .items(&display_items)
-                    .interact()
-                    .map_err(|e| anyhow!("Selection cancelled: {e}"))?;
-                if sel.is_empty() {
-                    println!("No attachments selected.");
-                    return Ok(());
-                }
-                sel
-            };
-
-            for idx in &selections {
-                let source = &attachments[*idx];
-                match email::parse::save_attachment(source, &dest_dir) {
-                    Ok(dest) => {
-                        println!(
-                            "  {} Saved: {} -> {}",
-                            "\u{2713}".green(),
-                            source.file_name().unwrap_or_default().to_string_lossy(),
-                            dest.display()
-                        );
-                    }
-                    Err(e) => {
-                        let name = source.file_name().unwrap_or_default().to_string_lossy();
-                        println!("  {} Failed to save {}: {}", "\u{2717}".red(), name, e);
-                    }
-                }
-            }
+        Some(Commands::Open { file }) | Some(Commands::Save { file, .. }) => {
+            // Attachments are blobs in the account's blob store, keyed by row.
+            // `list_attachments` still walks the `<stem>_attachments/` tree
+            // ingest stopped writing, so it reports an empty list for a message
+            // that has attachments: a false success, exit 0 and all. Decline
+            // before that walk instead; naming the message is #0050's.
+            return Err(decline_message_path(
+                Some(&file),
+                "Attachments live in the account's blob store; mp-legacy is the working \
+                 fallback meanwhile.",
+            ));
         }
 
         Some(Commands::Search {

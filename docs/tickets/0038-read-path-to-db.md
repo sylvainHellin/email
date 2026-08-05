@@ -3,7 +3,7 @@ id: 0038
 title: Read path, calendar and reconcile on the store; cold start stops walking files
 type: perf
 priority: next
-status: open
+status: blocked
 created: 2026-07-14
 ---
 
@@ -53,6 +53,23 @@ The store is a droppable cache in front of the server (a schema mismatch rebuild
 That also closes [TKT-0047](TKT-0047-reconcile-walks-attachment-markdown.md)'s exposure by construction: the forged-`PARTSTAT` attack needed a `.md` walk to classify a sender-controlled attachment and a frontmatter writer to persist the result, and scope item 6 deletes both.
 An attachment blob is not a message row, and the invite listing selects rows joined to their own `invite.ics` blob, so there is nothing left for a crafted attachment to enter through.
 The ticket stays open and is formally resolved by [#0040](0040-drop-file-layer-cutover.md), which removes the last of the file layer it was written against.
+
+## Close-out
+
+Blocked, not done: scope items 1 to 7 are implemented and reviewed, and every acceptance criterion is met except one.
+The open criterion is the live envelope dump-parity check, the store-backed dump against the pre-nuke captures in `dumps/pre-nuke-<account>.ndjson`, which needs a full live sync of the three real accounts and is deferred pending the owner's go.
+The intended differences it will be read against are the one-line-per-difference list in [dump-allow-list](../dump-allow-list.md); anything else the check turns up is a regression.
+
+Commits, in order: `f1adc0c` (unit A, store-backed read path, counts and dump), `58e97dd` (unit B, lazy body loading and the FTS dedup fix), `e14c5a2` (unit C, calendar and reconcile on the store), `d3e1221` (unit D, optimistic store-backed mutations) and the review-fix commit `fix(cli): boundary declines and dump allow-list entries (#0038 review fixes)`.
+
+Deviation: the stale clap help for `mp invite` ("Path to the received invite email `.md`", `src/main.rs`) and the `website/src/pages/commands.astro` rows that still advertise `mp invite`, `mp open`, `mp save`, `mp reply` and `mp forward` as working are left as they are, owned by [#0050](0050-selector-contract-drafts-index.md), which rewrites both against the real selector syntax rather than churning an unreleased binary's docs twice.
+
+Residual risks, accepted at review:
+
+- A refused or offline delete is not rolled back locally: the row and the blob refcounts are gone until a later successful sync re-ingests the message from the server, where the pre-nuke build restored the local file on refusal.
+  [#0039](0039-pending-ops-queue.md)'s `pending_ops` queue revisits this.
+- `App::load_message_invite` lists every invite of the account and does one blob read plus one ics parse per invite on each cursor move onto an invite row, memoised per cursor position (account, message and list generation).
+  Optimise only if it shows up in `[TIMING]`.
 
 ## Unblocks
 

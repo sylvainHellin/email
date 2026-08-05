@@ -312,3 +312,9 @@ Every holder therefore drops it at the mutation: the list, the selection set and
 Moving a message locally is an `UPDATE messages SET mailbox = ?`, and the destination may already hold a row under the source's UID: uids are per-mailbox counters, so a collision is ordinary rather than exotic.
 The moved row parks on `uid = -id` instead, a value no backend produces (IMAP uids are unsigned and `ingest::graph_uid` clears the sign bit) and unique by construction, which reads as "moved locally, not yet seen there by a sync".
 The next sync of the destination finds the row through the `message_id` index and writes the real uid over it, which is the same rebind a UIDVALIDITY reset takes, so nothing extra is needed to converge (#0038 unit D).
+
+## A command that walks a tree the build no longer writes reports success, not absence
+
+`mp open` and `mp save` called `list_attachments` on the `<stem>_attachments/` directory ingest stopped writing, got an empty list, printed "No attachments found" and exited 0, for messages that do have attachments.
+An empty walk is indistinguishable from an empty result, so the moment a data source is decommissioned, every reader of it has to decline explicitly rather than be left to discover nothing there.
+The rule applied in #0038: path-taking commands fail with the `#0050` boundary line before any filesystem access, which is also what stops `mp reply` and `mp forward` from surfacing a bare I/O error from `parse_email_draft` as if the user had named a bad file.
