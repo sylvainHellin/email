@@ -43,7 +43,10 @@ pub(super) fn render_body(app: &App, frame: &mut Frame, area: Rect) {
         area
     };
 
-    let body = email.body.replace("{{SIGNATURE}}", "[signature]");
+    // The body is not part of the entry: it is loaded from the blob store for
+    // the selected message only and memoised in `App::preview_body`, refreshed
+    // at the top of the render pass (#0038 scope item 5).
+    let body = app.preview_body.text().replace("{{SIGNATURE}}", "[signature]");
     let inner_width = block.inner(body_area).width as usize;
     let lines: Vec<Line> = wrap_and_style_body(&body, inner_width);
 

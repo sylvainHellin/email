@@ -193,6 +193,11 @@ fn mailbox(label: &str, icon: &'static str, kind: MailboxKind) -> MailboxInfo {
 
 /// One frozen inbox entry. Every field is literal: no clock, no filesystem,
 /// no store -- `row` is the `messages.id` the entry would have carried.
+///
+/// No body: since #0038 the entry does not carry one and the preview loads it
+/// from the blob store when the cursor lands on the message. A fixture with no
+/// store primes that memo by hand instead, so only the bodies of the rows the
+/// frames actually park the cursor on exist ([`BODY_ROW_1`], [`BODY_ROW_2`]).
 #[allow(clippy::too_many_arguments)]
 fn email(
     row: i64,
@@ -202,7 +207,6 @@ fn email(
     read: bool,
     has_attachments: bool,
     event: Option<EventFrontmatter>,
-    body: &str,
 ) -> EmailEntry {
     EmailEntry {
         msg: Some(MessageRef::new(row)),
@@ -213,12 +217,18 @@ fn email(
         status: "inbox".to_string(),
         date_display: date.to_string(),
         date_sort: format!("{date}T09:00:00"),
-        body: body.to_string(),
         has_attachments,
         read,
         event,
     }
 }
+
+/// The body of the invite the default frames preview (row 1).
+const BODY_ROW_1: &str =
+    "Hallo Sylvain,\n\nanbei der Plan f\u{fc}r die \u{dc}bergabe.\n\n> Bitte bis Freitag best\u{e4}tigen.\n\nGr\u{fc}\u{df}e\n";
+
+/// The body of the row the selection frame parks the cursor on (row 2).
+const BODY_ROW_2: &str = "Danke, sieht gut aus.\n\nEin Punkt bleibt offen: der `export`-Schritt.\n";
 
 fn invite_frontmatter() -> EventFrontmatter {
     EventFrontmatter {
@@ -263,7 +273,6 @@ fn mail_fixture() -> App {
             false,
             true,
             Some(invite_frontmatter()),
-            "Hallo Sylvain,\n\nanbei der Plan f\u{fc}r die \u{dc}bergabe.\n\n> Bitte bis Freitag best\u{e4}tigen.\n\nGr\u{fc}\u{df}e\n",
         ),
         email(
             2,
@@ -273,7 +282,6 @@ fn mail_fixture() -> App {
             true,
             false,
             None,
-            "Danke, sieht gut aus.\n\nEin Punkt bleibt offen: der `export`-Schritt.\n",
         ),
         email(
             3,
@@ -283,7 +291,6 @@ fn mail_fixture() -> App {
             false,
             true,
             None,
-            "Automatischer Scan, siehe Anhang.\n",
         ),
         email(
             4,
@@ -293,7 +300,6 @@ fn mail_fixture() -> App {
             true,
             false,
             None,
-            "Die Themen der Woche.\n",
         ),
         email(
             5,
@@ -303,7 +309,6 @@ fn mail_fixture() -> App {
             true,
             true,
             None,
-            "Rechnung im Anhang.\n",
         ),
     ];
 
@@ -311,6 +316,7 @@ fn mail_fixture() -> App {
     app.email_cache = vec![Some(Arc::clone(&app.emails)), None, None, None];
     app.rebuild_visible();
     app.list_index = 0;
+    app.prime_preview_body(BODY_ROW_1);
     app
 }
 
@@ -407,6 +413,7 @@ fn golden_mail_view_with_selection() {
     // Cursor off the selection: the cursor fill and the selection foreground
     // are separate signals and must stay separable in the legend.
     app.list_index = 1;
+    app.prime_preview_body(BODY_ROW_2);
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 

@@ -464,7 +464,6 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
         status: String::new(),
         date_display,
         date_sort,
-        body: fetched.body_text.clone(),
         has_attachments: fetched.has_attachments,
         read: fetched.is_read,
         event: fetched.event.clone(),
@@ -787,7 +786,6 @@ mod tests {
         assert_eq!(entry.subject, "Grüße");
         assert_eq!(entry.to, "me@example.com");
         assert_eq!(entry.cc.as_deref(), Some("cc@example.com"));
-        assert_eq!(entry.body, "body text");
         assert!(entry.has_attachments);
         assert!(entry.read);
         assert!(entry.event.is_none());

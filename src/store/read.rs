@@ -17,9 +17,15 @@
 //!
 //! ## Blobs
 //!
-//! A row carries a `body_blob` hash, not the body. [`load_bodies`] resolves
-//! those hashes eagerly for now because the list and the preview share one
-//! `EmailEntry`; the lazy-body split is #0038 scope item 5.
+//! A row carries a `body_blob` hash, not the body, and the listing functions
+//! never resolve one: a mailbox load is rows only (#0038 scope item 5). The
+//! body is fetched when something actually needs it, by [`load_body`] for the
+//! previewed message and by [`load_bodies`] for the one batch that needs the
+//! whole mailbox at once (the body-search index).
+//!
+//! Both degrade an unreadable blob to an empty body rather than an error: the
+//! retention sweep is allowed to evict a body, and an evicted body must not
+//! blank a list or fail a search.
 
 use std::collections::HashMap;
 
@@ -252,35 +258,79 @@ pub fn is_invite(store: &Store, message_row: i64) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Resolve the body blobs of a batch of rows, keyed by row id.
+/// The body of one message, or `None` when the row itself is gone.
+///
+/// `Some("")` and `None` are different answers: the first is a row whose body
+/// blob is unreadable (evicted, or never written), the second is a reference
+/// to a row that no longer exists, which is a caller-side staleness bug rather
+/// than a storage state.
+pub fn load_body(store: &Store, blobs: &BlobStore, id: i64) -> Option<String> {
+    let hash: Option<String> = store
+        .conn()
+        .query_row("SELECT body_blob FROM messages WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!("[store] reading the body hash of message {id}: {e:#}");
+            None
+        })?;
+    Some(blob_text(blobs, id, hash.as_deref()))
+}
+
+/// Resolve the body blobs of a batch of messages, keyed by `messages.id`.
+///
+/// One prepared statement, one blob read per id: the batch shape exists for
+/// the body-search index, which needs every body of a mailbox at once and is
+/// built once per list generation rather than per keystroke. An id with no row
+/// is absent from the map; an unreadable blob maps to an empty body.
+pub fn load_bodies(store: &Store, blobs: &BlobStore, ids: &[i64]) -> HashMap<i64, String> {
+    let mut out = HashMap::with_capacity(ids.len());
+    let mut stmt = match store
+        .conn()
+        .prepare("SELECT body_blob FROM messages WHERE id = ?1")
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            warn!("[store] preparing the body-blob query: {e:#}");
+            return out;
+        }
+    };
+    for &id in ids {
+        let hash: Option<Option<String>> = stmt
+            .query_row([id], |row| row.get::<_, Option<String>>(0))
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!("[store] reading the body hash of message {id}: {e:#}");
+                None
+            });
+        let Some(hash) = hash else { continue };
+        out.insert(id, blob_text(blobs, id, hash.as_deref()));
+    }
+    out
+}
+
+/// Read one body blob as text, degrading to the empty string.
 ///
 /// A blob that cannot be read is reported as an empty body and logged, not
 /// propagated: the retention sweep is allowed to evict a body, and one evicted
 /// body must not blank the whole mailbox list.
-pub fn load_bodies(blobs: &BlobStore, rows: &[MessageRow]) -> HashMap<i64, String> {
-    let mut out = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let body = row
-            .body_blob
-            .as_deref()
-            .and_then(|h| match BlobHash::parse(h) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    warn!("[store] message {}: {e:#}", row.id);
-                    None
-                }
-            })
-            .and_then(|h| match blobs.read(&h) {
-                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-                Err(e) => {
-                    warn!("[store] message {}: body blob unreadable: {e:#}", row.id);
-                    None
-                }
-            })
-            .unwrap_or_default();
-        out.insert(row.id, body);
-    }
-    out
+fn blob_text(blobs: &BlobStore, id: i64, hash: Option<&str>) -> String {
+    hash.and_then(|h| match BlobHash::parse(h) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn!("[store] message {id}: {e:#}");
+            None
+        }
+    })
+    .and_then(|h| match blobs.read(&h) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) => {
+            warn!("[store] message {id}: body blob unreadable: {e:#}");
+            None
+        }
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -417,9 +467,32 @@ mod tests {
     fn bodies_come_back_from_the_blob_store() {
         let fx = fixture();
         ingest(&fx, "inbox", 1, &email("hello", "Mon, 01 Jan 2024 09:00:00 +0000"));
+        ingest(&fx, "inbox", 2, &email("second", "Mon, 01 Jan 2024 10:00:00 +0000"));
         let rows = list_mailbox(&fx.store, "alice", "inbox").unwrap();
-        let bodies = load_bodies(&fx.blobs, &rows);
-        assert_eq!(bodies.get(&rows[0].id).unwrap(), "body of hello");
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+
+        let bodies = load_bodies(&fx.store, &fx.blobs, &ids);
+        assert_eq!(bodies.len(), 2);
+        for row in &rows {
+            let expected = format!("body of {}", row.subject.as_deref().unwrap());
+            assert_eq!(bodies.get(&row.id).unwrap(), &expected);
+            assert_eq!(
+                load_body(&fx.store, &fx.blobs, row.id).unwrap(),
+                expected,
+                "the single read must agree with the batch"
+            );
+        }
+    }
+
+    /// A reference to a row that no longer exists is `None`, not an empty
+    /// body: the caller is holding a stale id, which is a different problem
+    /// from an evicted blob.
+    #[test]
+    fn a_missing_row_reads_back_as_none() {
+        let fx = fixture();
+        let id = ingest(&fx, "inbox", 1, &email("x", "Mon, 01 Jan 2024 09:00:00 +0000"));
+        assert_eq!(load_body(&fx.store, &fx.blobs, id + 999), None);
+        assert!(load_bodies(&fx.store, &fx.blobs, &[id + 999]).is_empty());
     }
 
     /// An unreadable body blob yields an empty body for that one row instead
@@ -427,11 +500,19 @@ mod tests {
     #[test]
     fn an_unreadable_body_blob_does_not_blank_the_list() {
         let fx = fixture();
-        ingest(&fx, "inbox", 1, &email("kept", "Mon, 01 Jan 2024 09:00:00 +0000"));
-        let mut rows = list_mailbox(&fx.store, "alice", "inbox").unwrap();
-        rows[0].body_blob = Some("not-a-hash".to_string());
-        let bodies = load_bodies(&fx.blobs, &rows);
-        assert_eq!(bodies.get(&rows[0].id).unwrap(), "");
+        let id = ingest(&fx, "inbox", 1, &email("kept", "Mon, 01 Jan 2024 09:00:00 +0000"));
+        fx.store
+            .conn()
+            .execute("UPDATE messages SET body_blob = 'not-a-hash' WHERE id = ?1", [id])
+            .unwrap();
+
+        assert_eq!(load_body(&fx.store, &fx.blobs, id).unwrap(), "");
+        assert_eq!(load_bodies(&fx.store, &fx.blobs, &[id]).get(&id).unwrap(), "");
+        assert_eq!(
+            list_mailbox(&fx.store, "alice", "inbox").unwrap().len(),
+            1,
+            "the listing itself is untouched by the unreadable blob"
+        );
     }
 
     /// The iMIP sidecar is an attachment blob but not a user-facing

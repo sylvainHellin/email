@@ -303,7 +303,7 @@ mod badge_tests {
             from: "a".into(), to: "b".into(), cc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
-            body: String::new(), has_attachments: has_att, read: false,
+            has_attachments: has_att, read: false,
             event: is_invite.then(|| EventFrontmatter {
                 uid: None, method: Some("REQUEST".into()), sequence: 0,
                 summary: None, start: None, end: None, location: None,

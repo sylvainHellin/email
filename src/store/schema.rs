@@ -1,4 +1,4 @@
-//! Schema v2 for the per-account store.
+//! Schema v3 for the per-account store.
 //!
 //! There is no migrator and there never will be one: the store is a cache in
 //! front of IMAP, so a version mismatch is answered by dropping the file and
@@ -15,9 +15,11 @@ use rusqlite::Connection;
 ///
 /// v2 added `message_blobs` for the ingest path (#0037 unit 4a), then
 /// `outbox.submission_started_at` and the `html` blob kind in the #0037 review
-/// pass. The version was not bumped for those two: no released build ever
-/// wrote a v2 store, and [`REQUIRED_COLUMNS`] rebuilds the branch-local ones.
-pub const SCHEMA_VERSION: i64 = 2;
+/// pass. v3 turned `messages_fts` from an external-content index into a
+/// contentless one with `contentless_delete=1` (#0038 unit B), which is a
+/// change to the virtual table's declaration and therefore a real version
+/// bump.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -26,8 +28,8 @@ pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// informational (it makes a stale store obvious in a bug report).
 pub const META_APP_VERSION: &str = "app_version";
 
-/// Tables that must exist for a store to count as a valid v2 file. Checked on
-/// open so that a file which is stamped v2 but structurally incomplete (a
+/// Tables that must exist for a store to count as a valid v3 file. Checked on
+/// open so that a file which is stamped v3 but structurally incomplete (a
 /// half-written create, a hand-edited database) is rebuilt rather than used.
 pub const REQUIRED_TABLES: &[&str] = &[
     "meta",
@@ -46,11 +48,10 @@ pub const REQUIRED_TABLES: &[&str] = &[
 ///
 /// The table list alone cannot see a schema that gained a *column* without a
 /// version bump, which is exactly what the #0037 review pass did to `outbox`.
-/// A store written by an earlier v2 build is structurally complete by table but
-/// would fail every outbox write, so it is dropped and rebuilt like any other
-/// unusable file. Empty again once a later change bumps the version.
-pub const REQUIRED_COLUMNS: &[(&str, &str)] =
-    &[("outbox", "submission_started_at"), ("outbox", "envelope")];
+/// The v3 bump makes every one of those stores unusable by version anyway, so
+/// the list is empty again; it fills up the next time a column is added
+/// without a bump.
+pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 
 /// The complete schema. Follows the sketch in `docs/plans/data-access-layer.md`.
 ///
@@ -93,14 +94,20 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] =
 ///   actually changed. `ON DELETE CASCADE` keeps the list from outliving its
 ///   message, but the *refcount* is only decremented by an explicit
 ///   [`super::blobs::BlobStore::release`], never by the cascade.
-/// - `messages_fts` is external-content over `messages`, as the plan sketches,
-///   with `body_text` as a third indexed column. `messages` has no `body_text`
-///   column (the body lives in a blob), so the index is written explicitly by
-///   whoever ingests, and only `rowid`-returning `MATCH` queries are usable:
-///   `snippet()`, `highlight()`, selecting a column value from the FTS table
-///   and the `'rebuild'` command all fail with `no such column: T.body_text`.
-///   Rebuilding from the content table is not needed anyway, because a store
-///   that loses its index is dropped and refilled by the next sync.
+/// - `messages_fts` is *contentless* (`content=''`) with `contentless_delete=1`,
+///   over `subject`, `from_` and `body_text`. It was external-content over
+///   `messages` until #0038 unit B, which is where the amendment comes from:
+///   `messages` has no `body_text` column (the body lives in a blob), so the
+///   index was already written by hand and never readable back, and the
+///   external-content `'delete'` command needs the *old* column values to undo
+///   an entry. Re-ingest could not always produce them (an evicted body blob),
+///   so it skipped the delete and left the row indexed twice (the #0037 known
+///   issue). `contentless_delete=1` makes `DELETE FROM messages_fts WHERE
+///   rowid = ?` legal without any column values, which is the whole fix.
+///   What stays true either way: only `rowid`-returning `MATCH` queries are
+///   usable (`snippet()`, `highlight()` and selecting a column value all fail),
+///   and there is nothing to rebuild from, because a store that loses its index
+///   is dropped and refilled by the next sync.
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
@@ -219,15 +226,16 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
     subject,
     from_,
     body_text,
-    content='messages'
+    content='',
+    contentless_delete=1
 );
 "#;
 
-/// Create every v2 object and stamp the version. Runs in one transaction so a
-/// crash mid-create leaves no half-built file behind.
+/// Create every schema object and stamp the version. Runs in one transaction
+/// so a crash mid-create leaves no half-built file behind.
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!("BEGIN;{SCHEMA_SQL}COMMIT;"))
-        .context("creating store schema v2")?;
+        .with_context(|| format!("creating store schema v{SCHEMA_VERSION}"))?;
     set_meta(conn, META_SCHEMA_VERSION, &SCHEMA_VERSION.to_string())?;
     set_meta(conn, META_APP_VERSION, env!("CARGO_PKG_VERSION"))?;
     Ok(())

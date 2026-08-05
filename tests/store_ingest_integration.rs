@@ -122,7 +122,7 @@ impl Fixture {
     }
 
     /// Row ids returned by an FTS query, which is the only usable shape for
-    /// this external-content index (see the schema doc comment).
+    /// this contentless index (see the schema doc comment).
     fn fts_hits(&self, query: &str) -> HashSet<i64> {
         let mut stmt = self
             .store
@@ -377,6 +377,58 @@ fn synthesised_message_ids_are_deterministic() {
 // ---------------------------------------------------------------------------
 // 3. Re-ingest: UPSERT, blob refs, FTS
 // ---------------------------------------------------------------------------
+
+/// Regression for the known issue #0037 left behind and #0038 unit B fixed:
+/// a re-ingest whose *previous* body blob is unreadable used to skip the FTS
+/// delete, because an external-content index can only undo an entry by
+/// replaying the old column values. The row ended up indexed twice, once under
+/// the old terms and once under the new ones. `messages_fts` is contentless
+/// with `contentless_delete=1` now, so the delete needs the rowid and nothing
+/// else, and the eviction cannot desynchronise the index.
+#[test]
+fn reingest_after_the_old_body_blob_is_evicted_leaves_one_fts_entry() {
+    let f = Fixture::new();
+    let first = message(
+        "From: a@example.com\r\n\
+         Subject: original subject\r\n\
+         Message-ID: <ev1@example.com>\r\n",
+        b"first body text\r\n",
+    );
+    let row = f.ingest_raw("inbox", 11, &first).row_id;
+    assert_eq!(f.fts_hits("original"), HashSet::from([row]));
+
+    // Evict the body blob the way a retention sweep would: unlink the file and
+    // leave the row pointing at it.
+    let hash = f.text(row, "body_blob");
+    std::fs::remove_file(f.blobs.path_for(&BlobHash::parse(&hash).unwrap())).unwrap();
+
+    let second = message(
+        "From: a@example.com\r\n\
+         Subject: corrected subject\r\n\
+         Message-ID: <ev1@example.com>\r\n",
+        b"second body text\r\n",
+    );
+    let again = f.ingest_raw("inbox", 11, &second);
+    assert_eq!(again.row_id, row, "still one row");
+    assert_eq!(f.message_rows(), 1);
+
+    assert!(
+        f.fts_hits("original").is_empty(),
+        "the entry built from the evicted body must still be deleted"
+    );
+    assert_eq!(f.fts_hits("corrected"), HashSet::from([row]));
+    assert_eq!(f.fts_hits("\"second body text\""), HashSet::from([row]));
+    let entries: i64 = f
+        .store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'corrected'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(entries, 1, "exactly one FTS entry for the row");
+}
 
 /// Re-ingesting the same UID updates the row instead of inserting a second one,
 /// and the FTS entry follows the new content instead of accumulating.

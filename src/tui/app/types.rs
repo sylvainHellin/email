@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 
 use crate::parse::FetchedEmail;
 use crate::store::read::{self, MessageRow};
-use crate::store::{BlobStore, Store};
+use crate::store::Store;
 
 // ---------------------------------------------------------------------------
 // MessageRef
@@ -60,6 +60,13 @@ impl std::fmt::Display for MessageRef {
 // ---------------------------------------------------------------------------
 
 /// Parsed email entry for display in the list and preview.
+///
+/// It carries no body. A mailbox load is rows only (#0038 scope item 5), and
+/// the body of the one message the preview shows is fetched from the blob
+/// store on demand and memoised in [`PreviewBody`]. The list is shared behind
+/// an `Arc` between the active mailbox and its cache slot, so a body parked
+/// here would be paid for by every message in the mailbox to serve the one on
+/// screen, and could not be refreshed without cloning the whole vector.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EmailEntry {
@@ -81,7 +88,6 @@ pub struct EmailEntry {
     pub status: String,
     pub date_display: String,
     pub date_sort: String,
-    pub body: String,
     pub has_attachments: bool,
     pub read: bool,
     /// Parsed `event:` frontmatter block when the email carries an iMIP
@@ -131,9 +137,10 @@ impl EmailEntry {
 /// A store that cannot be opened or queried logs and yields an empty list,
 /// which is what a mailbox that has never synced looks like anyway.
 ///
-/// Bodies are still resolved eagerly, one blob read per row, because the list
-/// and the preview share a single `EmailEntry`. Splitting them is #0038 scope
-/// item 5.
+/// One SQL query and no blob reads at all: the bodies are loaded lazily, one
+/// at a time behind the preview (see [`PreviewBody`]) and once per list
+/// generation behind body search. The `[TIMING]` span for a cold start
+/// therefore shows a single row-count mark and nothing else.
 pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
     let mut span = crate::timing::TimingSpan::with_context(
         "load_emails",
@@ -149,18 +156,11 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
             return Vec::new();
         }
     };
-    span.mark(&format!("{} row(s)", rows.len()));
-
-    let blobs = BlobStore::for_account(account);
-    let mut bodies = read::load_bodies(&blobs, &rows);
-    span.mark("bodies read");
+    span.mark(&format!("{} row(s), no blob reads", rows.len()));
 
     let status = status_for_mailbox(mailbox);
     rows.into_iter()
-        .map(|row| {
-            let body = bodies.remove(&row.id).unwrap_or_default();
-            entry_from_row(row, &status, body)
-        })
+        .map(|row| entry_from_row(row, &status))
         .collect()
 }
 
@@ -233,7 +233,8 @@ fn status_for_mailbox(mailbox: &str) -> String {
     }
 }
 
-/// Map one store row plus its already-resolved body into a display entry.
+/// Map one store row into a display entry. The body is not part of it and is
+/// not read here (#0038 scope item 5).
 ///
 /// Date display and sort keys are derived from the stored `Date:` header by
 /// the same [`resolve_date`] the file build used, so both stacks apply one
@@ -243,7 +244,7 @@ fn status_for_mailbox(mailbox: &str) -> String {
 /// `event` stays `None`: rendering an invite needs the ics blob parsed, which
 /// is the calendar flip (#0038 scope item 6). The list invite badge and the
 /// preview event card are dark until then.
-fn entry_from_row(row: MessageRow, status: &str, body: String) -> EmailEntry {
+fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     let (date_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
     let read = row.is_read();
     EmailEntry {
@@ -260,8 +261,112 @@ fn entry_from_row(row: MessageRow, status: &str, body: String) -> EmailEntry {
         date_sort,
         read,
         has_attachments: row.has_attachments,
-        body,
         event: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy bodies
+// ---------------------------------------------------------------------------
+
+/// What a memoised body belongs to: the account it was read for, the message,
+/// and the list generation that was current at the time.
+///
+/// The generation is the guard. `App::mailbox_load_generation` is bumped by
+/// every mailbox load request and by every optimistic list mutation, so a body
+/// read before a re-sync is discarded by the same counter that discards a
+/// stale background load. The account index is in the key because a
+/// [`MessageRef`] is only meaningful inside one account's store.
+pub(crate) type BodyKey = (usize, MessageRef, u64);
+
+/// One-slot memo of the body behind the preview pane.
+///
+/// One slot rather than a map: the preview shows exactly one message, and a
+/// map would grow to hold every body the user scrolled past, which is the
+/// eager load this ticket removed wearing a different hat. Moving the cursor
+/// costs one blob read; moving it back costs another.
+///
+/// It is refreshed from [`crate::tui::app::App::refresh_preview_body`] at the top of the
+/// render pass, where `&mut App` is available, so the renderer itself stays a
+/// pure function of state and needs no interior mutability.
+#[derive(Debug, Default, Clone)]
+pub struct PreviewBody {
+    key: Option<BodyKey>,
+    text: String,
+}
+
+impl PreviewBody {
+    /// The memoised body, empty when nothing is selected.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// True when the memo already answers for `key`.
+    pub(crate) fn holds(&self, key: Option<BodyKey>) -> bool {
+        self.key == key
+    }
+
+    /// Park `text` as the body for `key`.
+    pub(crate) fn fill(&mut self, key: Option<BodyKey>, text: String) {
+        self.key = key;
+        self.text = text;
+    }
+}
+
+/// The lowercased bodies of one mailbox, for body search (`\` mode).
+///
+/// Body search is a case-insensitive *substring* match, so it cannot be served
+/// by `messages_fts`: FTS5 matches whole tokens (and prefixes), which would
+/// change the visible result set for exactly the queries the mode exists for
+/// (a fragment inside a word, punctuation, a partial address). It is also
+/// OR-ed with the header fields and narrowed incrementally per keystroke,
+/// neither of which survives a translation to a MATCH expression. So the
+/// bodies are read in one batch from the blob store, once per list generation,
+/// and lowercased once instead of once per keystroke.
+#[derive(Debug, Default, Clone)]
+pub struct SearchBodies {
+    key: Option<(usize, usize, u64)>,
+    bodies: std::collections::HashMap<MessageRef, String>,
+}
+
+impl SearchBodies {
+    /// The lowercased body of one message, when the index holds it.
+    pub fn get(&self, msg: MessageRef) -> Option<&str> {
+        self.bodies.get(&msg).map(|s| s.as_str())
+    }
+
+    /// True when the index already covers `key`.
+    pub(crate) fn holds(&self, key: (usize, usize, u64)) -> bool {
+        self.key == Some(key)
+    }
+
+    /// Replace the index wholesale for `key`.
+    pub(crate) fn fill(
+        &mut self,
+        key: (usize, usize, u64),
+        bodies: std::collections::HashMap<MessageRef, String>,
+    ) {
+        self.key = Some(key);
+        self.bodies = bodies;
+    }
+
+    /// Build an index directly, for tests whose entries have no store behind
+    /// them. Bodies are lowercased on the way in, as the real build does.
+    #[cfg(test)]
+    pub(crate) fn for_tests(bodies: impl IntoIterator<Item = (MessageRef, String)>) -> Self {
+        Self {
+            key: None,
+            bodies: bodies
+                .into_iter()
+                .map(|(msg, body)| (msg, body.to_lowercase()))
+                .collect(),
+        }
+    }
+
+    /// Drop the index, e.g. when body search is switched off.
+    pub(crate) fn clear(&mut self) {
+        self.key = None;
+        self.bodies.clear();
     }
 }
 
@@ -1542,8 +1647,24 @@ mod tests {
         assert_eq!(entries.len(), 2, "the row survives its blob");
         assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
         let broken = entries.iter().find(|e| e.subject == "broken").unwrap();
-        assert_eq!(broken.body, "", "an evicted body degrades to empty");
         assert_eq!(broken.from, "Sender broken", "the envelope is intact");
+
+        // The body is no longer part of the entry, so the eviction is only
+        // visible where the body is actually wanted: the preview's on-demand
+        // read degrades to an empty body, one message wide.
+        let store = open_store("alice").unwrap();
+        let blobs = BlobStore::for_account("alice");
+        assert_eq!(
+            read::load_body(&store, &blobs, broken.msg.unwrap().row_id()).unwrap(),
+            "",
+            "an evicted body degrades to empty"
+        );
+        let good = entries.iter().find(|e| e.subject == "good").unwrap();
+        assert_eq!(
+            read::load_body(&store, &blobs, good.msg.unwrap().row_id()).unwrap(),
+            "body of good",
+            "the neighbouring body is untouched"
+        );
     }
 
     /// parity. The list is newest first, exactly as the file build sorted it,
@@ -1585,8 +1706,205 @@ mod tests {
         assert_eq!(entry.date_display, "2024-05-06", "display stays sender-local");
         assert_eq!(entry.date_sort, "2024-05-06T08:00:00", "the sort key is UTC");
         assert!(entry.read);
-        assert_eq!(entry.body, "body of x");
         assert_eq!(entry.status, "inbox", "status comes from the mailbox now");
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy bodies (#0038 scope item 5)
+    // -----------------------------------------------------------------------
+
+    /// An app parked on one store-backed mailbox, as `App::new` would leave it.
+    fn app_on_inbox() -> crate::tui::app::App {
+        let mut app = crate::tui::app::App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.mailboxes = vec![mb(
+            "Inbox",
+            crate::config::mailbox_dir("alice", "inbox"),
+            MailboxKind::Inbox,
+        )];
+        app.mailbox_counts = vec![0];
+        app.email_cache = vec![None];
+        app.emails = std::sync::Arc::new(load_emails("alice", "inbox"));
+        app.email_cache[0] = Some(std::sync::Arc::clone(&app.emails));
+        app.rebuild_visible();
+        app
+    }
+
+    /// The list load itself reads no blob at all, which is the cold-start
+    /// criterion: every body blob can be missing and the mailbox still lists,
+    /// counts and displays. Only a body actually asked for degrades, one
+    /// message wide.
+    #[test]
+    fn the_list_loads_with_every_body_blob_missing() {
+        let data = DataDir::new();
+        for i in 1..=3 {
+            ingest_fixture(
+                "inbox",
+                i,
+                &fixture_email(&format!("m{i}"), "Mon, 01 Jan 2024 09:00:00 +0000", false),
+            );
+        }
+        std::fs::remove_dir_all(BlobStore::for_account("alice").root()).unwrap();
+
+        let entries = load_emails("alice", "inbox");
+        assert_eq!(entries.len(), 3, "the rows are all the list needs");
+        assert!(entries.iter().all(|e| e.subject.starts_with('m')));
+        assert_eq!(
+            count_all_emails("alice", &[data.mailbox("Inbox", "inbox", MailboxKind::Inbox)]),
+            vec![3]
+        );
+
+        let mut app = app_on_inbox();
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "", "only the preview degrades");
+    }
+
+    /// The preview loads the body of the message the cursor is on, and follows
+    /// the cursor. Moving to another message reads that message's blob.
+    #[test]
+    fn the_preview_loads_the_body_of_the_selected_message() {
+        let _data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("newest", "Mon, 01 Jan 2024 12:00:00 +0000", false));
+        ingest_fixture("inbox", 2, &fixture_email("older", "Mon, 01 Jan 2024 09:00:00 +0000", false));
+
+        let mut app = app_on_inbox();
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "body of newest");
+
+        app.list_index = 1;
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "body of older");
+
+        // A frame that changes nothing re-reads nothing, and shows the same
+        // body: the memo answers from its key.
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "body of older");
+    }
+
+    /// A re-ingest that rewrites the body reaches the preview, because the
+    /// reload that publishes the new rows bumps the generation the memo is
+    /// keyed by. This is the case a body parked in `EmailEntry` could only
+    /// answer by cloning the whole shared list.
+    #[test]
+    fn the_preview_body_follows_a_reingest() {
+        let _data = DataDir::new();
+        ingest_fixture("inbox", 1, &fixture_email("subject", "Mon, 01 Jan 2024 12:00:00 +0000", false));
+
+        let mut app = app_on_inbox();
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "body of subject");
+
+        let mut rewritten = fixture_email("subject", "Mon, 01 Jan 2024 12:00:00 +0000", false);
+        rewritten.body_text = "a corrected body".to_string();
+        ingest_fixture("inbox", 1, &rewritten);
+
+        // The reload path the TUI takes after a sync: invalidate, request
+        // (which bumps the generation), then deliver off the background thread.
+        app.reload_current_mailbox();
+        let loaded = BgResult::MailboxLoaded {
+            account_index: app.active_account,
+            mailbox_idx: app.active_mailbox,
+            generation: app.mailbox_load_generation,
+            entries: load_emails("alice", "inbox"),
+        };
+        crate::tui::bg::handle_bg_result(&mut app, loaded);
+
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "a corrected body");
+    }
+
+    /// Body search (`\`) reads the mailbox's bodies from the blob store and
+    /// keeps the substring semantics it had when the body sat in the entry:
+    /// case-insensitive, matching inside a word, OR-ed with the header fields.
+    /// That is why it is a batch blob read and not an FTS query, which would
+    /// match tokens and silently drop the fragment matches below.
+    #[test]
+    fn body_search_matches_come_from_the_store() {
+        let _data = DataDir::new();
+        let corpus = [
+            ("Invoice March", "please pay"),
+            ("Invoice April", "reminder"),
+            ("Weekly report", "invoice attached"),
+            ("Holiday plans", "beach"),
+        ];
+        for (uid, (subject, body)) in corpus.iter().enumerate() {
+            let mut email = fixture_email(subject, "Mon, 01 Jan 2024 09:00:00 +0000", false);
+            email.body_text = body.to_string();
+            ingest_fixture("inbox", uid as i64 + 1, &email);
+        }
+
+        let mut app = app_on_inbox();
+        let subjects = |app: &crate::tui::app::App| -> Vec<String> {
+            app.visible_emails().map(|e| e.subject.clone()).collect()
+        };
+
+        // Header-only search: the body is not consulted.
+        app.search_query = "beach".to_string();
+        app.search_includes_body = false;
+        app.apply_search_filter(false);
+        assert!(subjects(&app).is_empty());
+
+        // Body search: the same query now hits the body.
+        app.search_includes_body = true;
+        app.apply_search_filter(false);
+        assert_eq!(subjects(&app), vec!["Holiday plans"]);
+
+        // Subject and body matches are OR-ed, in list order (the corpus shares
+        // one timestamp, so the newest row id leads).
+        app.search_query = "invoice".to_string();
+        app.apply_search_filter(false);
+        assert_eq!(
+            subjects(&app),
+            vec!["Weekly report", "Invoice April", "Invoice March"]
+        );
+
+        // A fragment inside a word matches, which is exactly what an FTS
+        // token match would not do.
+        app.search_query = "each".to_string();
+        app.apply_search_filter(false);
+        assert_eq!(subjects(&app), vec!["Holiday plans"]);
+
+        // And the index is dropped when the mode goes off again.
+        app.search_query = String::new();
+        app.search_includes_body = false;
+        app.rebuild_visible();
+        assert_eq!(subjects(&app).len(), 4);
+    }
+
+    /// A body the retention sweep evicted costs that one message its body
+    /// match; the search still runs and every other match still lands.
+    #[test]
+    fn body_search_survives_an_evicted_body() {
+        let _data = DataDir::new();
+        // Distinct bodies, because the blob store is content-addressed: two
+        // identical bodies would be one file, and evicting it would take both.
+        let mut kept = fixture_email("kept", "Mon, 01 Jan 2024 12:00:00 +0000", false);
+        kept.body_text = "a kept needle".to_string();
+        ingest_fixture("inbox", 1, &kept);
+        let mut evicted = fixture_email("evicted", "Mon, 01 Jan 2024 09:00:00 +0000", false);
+        evicted.body_text = "an evicted needle".to_string();
+        ingest_fixture("inbox", 2, &evicted);
+
+        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
+        let hash: String = store
+            .conn()
+            .query_row(
+                "SELECT body_blob FROM messages WHERE subject = 'evicted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(store);
+        let blobs = BlobStore::for_account("alice");
+        std::fs::remove_file(blobs.path_for(&crate::store::BlobHash::parse(&hash).unwrap()))
+            .unwrap();
+
+        let mut app = app_on_inbox();
+        app.search_query = "needle".to_string();
+        app.search_includes_body = true;
+        app.apply_search_filter(false);
+        let subjects: Vec<String> = app.visible_emails().map(|e| e.subject.clone()).collect();
+        assert_eq!(subjects, vec!["kept"]);
     }
 
     /// The mailbox key the store is queried with is the directory leaf, which

@@ -7,7 +7,7 @@ use super::{
     Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
     EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
-    RsvpOverlay, SearchOverlayFocus,
+    RsvpOverlay, SearchBodies, SearchOverlayFocus,
 };
 
 impl App {
@@ -1845,15 +1845,15 @@ impl App {
         if self.search_query.is_empty() {
             self.visible = (0..self.emails.len()).collect();
         } else {
+            self.sync_search_bodies();
             let kind = self.active_kind();
-            let includes_body = self.search_includes_body;
+            let bodies = self.search_includes_body.then_some(&self.search_bodies);
             if narrow {
                 let needle = self.search_query.to_lowercase();
-                narrow_visible(&self.emails, &mut self.visible, &needle, kind, includes_body);
+                narrow_visible(&self.emails, &mut self.visible, &needle, kind, bodies);
             } else {
                 // `filter_visible` lowercases the needle once internally.
-                self.visible =
-                    filter_visible(&self.emails, &self.search_query, kind, includes_body);
+                self.visible = filter_visible(&self.emails, &self.search_query, kind, bodies);
             }
         }
 
@@ -1879,11 +1879,17 @@ impl App {
 // ---------------------------------------------------------------------------
 
 /// Does `email` match the (already lowercased) search needle?
+///
+/// `bodies` is `Some` only in body-search mode (`\`), and holds the mailbox's
+/// bodies already lowercased, so the body test is the same substring test the
+/// entry used to answer from its own `body` field before it became lazy
+/// (#0038 scope item 5). An entry the index has no body for (no store row, or
+/// a blob the retention sweep evicted) simply does not match on body.
 fn email_matches(
     email: &EmailEntry,
     needle_lower: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) -> bool {
     email.subject.to_lowercase().contains(needle_lower)
         || email
@@ -1893,7 +1899,10 @@ fn email_matches(
         || email.date_display.to_lowercase().contains(needle_lower)
         || email.from.to_lowercase().contains(needle_lower)
         || email.to.to_lowercase().contains(needle_lower)
-        || (includes_body && email.body.to_lowercase().contains(needle_lower))
+        || bodies
+            .zip(email.msg)
+            .and_then(|(bodies, msg)| bodies.get(msg))
+            .is_some_and(|body| body.contains(needle_lower))
 }
 
 /// Build the visible-index view of `emails` for `query` from scratch.
@@ -1902,7 +1911,7 @@ pub(super) fn filter_visible(
     emails: &[EmailEntry],
     query: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) -> Vec<usize> {
     if query.is_empty() {
         return (0..emails.len()).collect();
@@ -1911,7 +1920,7 @@ pub(super) fn filter_visible(
     emails
         .iter()
         .enumerate()
-        .filter(|(_, e)| email_matches(e, &needle, kind, includes_body))
+        .filter(|(_, e)| email_matches(e, &needle, kind, bodies))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1924,12 +1933,12 @@ fn narrow_visible(
     visible: &mut Vec<usize>,
     needle_lower: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) {
     visible.retain(|&i| {
         emails
             .get(i)
-            .is_some_and(|e| email_matches(e, needle_lower, kind, includes_body))
+            .is_some_and(|e| email_matches(e, needle_lower, kind, bodies))
     });
 }
 
@@ -2092,7 +2101,7 @@ mod tests {
         MessageRef::new((h.finish() >> 1) as i64)
     }
 
-    fn entry(subject: &str, from: &str, body: &str) -> EmailEntry {
+    fn entry(subject: &str, from: &str) -> EmailEntry {
         EmailEntry {
             msg: Some(ref_for(subject)),
             from: from.to_string(),
@@ -2102,7 +2111,6 @@ mod tests {
             status: "inbox".to_string(),
             date_display: "2026-07-01".to_string(),
             date_sort: "2026-07-01T00:00:00".to_string(),
-            body: body.to_string(),
             has_attachments: false,
             read: false,
             event: None,
@@ -2111,11 +2119,31 @@ mod tests {
 
     fn sample() -> Vec<EmailEntry> {
         vec![
-            entry("Invoice March", "Alice", "please pay"),
-            entry("Invoice April", "Bob", "reminder"),
-            entry("Weekly report", "Alice", "invoice attached"),
-            entry("Holiday plans", "Carol", "beach"),
+            entry("Invoice March", "Alice"),
+            entry("Invoice April", "Bob"),
+            entry("Weekly report", "Alice"),
+            entry("Holiday plans", "Carol"),
         ]
+    }
+
+    /// The bodies of `sample()`, in the shape body search now takes them:
+    /// an index the store filled, keyed by the same `MessageRef` the entry
+    /// carries (#0038 scope item 5). These are the exact strings the entries
+    /// used to hold in an `EmailEntry.body` field.
+    fn sample_bodies() -> Vec<(MessageRef, String)> {
+        [
+            ("Invoice March", "please pay"),
+            ("Invoice April", "reminder"),
+            ("Weekly report", "invoice attached"),
+            ("Holiday plans", "beach"),
+        ]
+        .into_iter()
+        .map(|(subject, body)| (ref_for(subject), body.to_string()))
+        .collect()
+    }
+
+    fn sample_index() -> SearchBodies {
+        SearchBodies::for_tests(sample_bodies())
     }
 
     // -----------------------------------------------------------------------
@@ -2126,7 +2154,7 @@ mod tests {
     fn empty_query_yields_all_indices_in_order() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "", MailboxKind::Inbox, false),
+            filter_visible(&emails, "", MailboxKind::Inbox, None),
             vec![0, 1, 2, 3]
         );
     }
@@ -2135,7 +2163,7 @@ mod tests {
     fn filter_matches_subject_case_insensitively() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "INVOICE", MailboxKind::Inbox, false),
+            filter_visible(&emails, "INVOICE", MailboxKind::Inbox, None),
             vec![0, 1]
         );
     }
@@ -2145,7 +2173,7 @@ mod tests {
         let emails = sample();
         // Inbox displays `from`; Alice appears in entries 0 and 2.
         assert_eq!(
-            filter_visible(&emails, "alice", MailboxKind::Inbox, false),
+            filter_visible(&emails, "alice", MailboxKind::Inbox, None),
             vec![0, 2]
         );
     }
@@ -2154,11 +2182,11 @@ mod tests {
     fn body_matches_only_when_included() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "beach", MailboxKind::Inbox, false),
+            filter_visible(&emails, "beach", MailboxKind::Inbox, None),
             Vec::<usize>::new()
         );
         assert_eq!(
-            filter_visible(&emails, "beach", MailboxKind::Inbox, true),
+            filter_visible(&emails, "beach", MailboxKind::Inbox, Some(&sample_index())),
             vec![3]
         );
     }
@@ -2166,7 +2194,7 @@ mod tests {
     #[test]
     fn filter_indices_map_back_to_underlying_entries() {
         let emails = sample();
-        let visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, true);
+        let visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, Some(&sample_index()));
         // "invoice" hits subjects 0/1 and the body of 2 (content search).
         assert_eq!(visible, vec![0, 1, 2]);
         // Selecting position 2 of the view must resolve to "Weekly report":
@@ -2182,22 +2210,23 @@ mod tests {
     fn narrowing_equals_full_recompute_on_append() {
         let emails = sample();
         // Simulate typing "inv" then "invo": narrow from the "inv" view.
-        let mut visible = filter_visible(&emails, "inv", MailboxKind::Inbox, true);
-        narrow_visible(&emails, &mut visible, "invo", MailboxKind::Inbox, true);
+        let bodies = sample_index();
+        let mut visible = filter_visible(&emails, "inv", MailboxKind::Inbox, Some(&bodies));
+        narrow_visible(&emails, &mut visible, "invo", MailboxKind::Inbox, Some(&bodies));
         assert_eq!(
             visible,
-            filter_visible(&emails, "invo", MailboxKind::Inbox, true)
+            filter_visible(&emails, "invo", MailboxKind::Inbox, Some(&bodies))
         );
     }
 
     #[test]
     fn narrowing_removes_entries_that_stop_matching() {
         let emails = sample();
-        let mut visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, false);
+        let mut visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0, 1]);
-        narrow_visible(&emails, &mut visible, "invoice m", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice m", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0]);
-        narrow_visible(&emails, &mut visible, "invoice mx", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice mx", MailboxKind::Inbox, None);
         assert!(visible.is_empty());
     }
 
@@ -2206,7 +2235,7 @@ mod tests {
         let emails = sample();
         // A stale index beyond the list must be dropped, not panic.
         let mut visible = vec![0, 99];
-        narrow_visible(&emails, &mut visible, "invoice", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0]);
     }
 
@@ -2219,7 +2248,7 @@ mod tests {
         // would drop the entry forever; the fifth keystroke must fall
         // back to a full recompute and bring it back.
         let mut emails = sample();
-        emails.push(entry("θεοσφανια", "Dora", ""));
+        emails.push(entry("θεοσφανια", "Dora"));
         let theos_idx = emails.len() - 1;
         let mut app = app_with_emails(emails);
         app.focus = Focus::Search;
@@ -2243,6 +2272,9 @@ mod tests {
         app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
         app.mailbox_counts = vec![app.emails.len()];
         app.rebuild_visible();
+        // The fixture has no store behind it, so the index body search would
+        // have read from the blob store is primed instead.
+        app.prime_search_bodies(sample_bodies());
         app
     }
 
@@ -2347,7 +2379,7 @@ mod tests {
         let anchored = app.selected_email().unwrap().msg;
 
         // New inbox mail sorts above everything and shifts every row down.
-        let mut grown = vec![entry("Fresh arrival", "Dave", "just landed")];
+        let mut grown = vec![entry("Fresh arrival", "Dave")];
         grown.extend(sample());
         deliver_mailbox_load(&mut app, grown);
 
@@ -2384,8 +2416,8 @@ mod tests {
         // clamp (`min(list_index, len - 1)`) would have left the cursor at
         // row 3, two emails below the one the user was looking at.
         let mut emails = sample();
-        emails.push(entry("Team sync", "Dave", "agenda"));
-        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        emails.push(entry("Team sync", "Dave"));
+        emails.push(entry("Renewal notice", "Eve"));
         let mut app = app_with_emails(emails);
         app.list_index = 3; // "Holiday plans"
         let anchored = app.selected_email().unwrap().msg;
@@ -2405,8 +2437,8 @@ mod tests {
     #[test]
     fn batch_removal_including_the_cursor_lands_on_the_next_survivor() {
         let mut emails = sample();
-        emails.push(entry("Team sync", "Dave", "agenda"));
-        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        emails.push(entry("Team sync", "Dave"));
+        emails.push(entry("Renewal notice", "Eve"));
         let mut app = app_with_emails(emails);
         app.list_index = 3; // "Holiday plans"
 

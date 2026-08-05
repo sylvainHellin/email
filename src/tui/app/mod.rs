@@ -66,6 +66,14 @@ pub struct App {
     pub preview_scroll: u16,
     pub selection: HashSet<MessageRef>,
     pub email_cache: Vec<Option<Arc<Vec<EmailEntry>>>>,
+    /// The body behind the preview pane, loaded from the blob store on
+    /// selection and memoised (#0038 scope item 5). Refreshed by
+    /// [`App::refresh_preview_body`] at the top of the render pass.
+    pub preview_body: PreviewBody,
+    /// Lowercased bodies of the active mailbox, built only while body search
+    /// is on. See [`SearchBodies`] for why this is a blob batch read rather
+    /// than an FTS query.
+    pub search_bodies: SearchBodies,
     pub search_query: String,
     pub search_includes_body: bool,
     pub watcher_active: bool,
@@ -177,6 +185,8 @@ impl App {
             preview_scroll: 0,
             selection: HashSet::new(),
             email_cache: Vec::new(),
+            preview_body: PreviewBody::default(),
+            search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
@@ -268,6 +278,8 @@ impl App {
             preview_scroll: 0,
             selection: HashSet::new(),
             email_cache: Vec::new(),
+            preview_body: PreviewBody::default(),
+            search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
@@ -877,12 +889,128 @@ impl App {
     /// or structural mutation of `self.emails` so the view never holds
     /// dangling indices.
     pub(crate) fn rebuild_visible(&mut self) {
-        self.visible = keys::filter_visible(
-            &self.emails,
-            &self.search_query,
-            self.active_kind(),
-            self.search_includes_body,
+        self.sync_search_bodies();
+        let kind = self.active_kind();
+        let bodies = self.search_includes_body.then_some(&self.search_bodies);
+        self.visible = keys::filter_visible(&self.emails, &self.search_query, kind, bodies);
+    }
+
+    // ---------------------------------------------------------------
+    // Lazy bodies (#0038 scope item 5)
+    // ---------------------------------------------------------------
+
+    /// What the preview memo must answer to right now: the cursor's message
+    /// under the active account and the current list generation. `None` when
+    /// nothing is selected, or when the selected entry has no store row (a
+    /// server-search hit, which carries its own body).
+    fn preview_body_key(&self) -> Option<BodyKey> {
+        Some((
+            self.active_account,
+            self.selected_email()?.msg?,
+            self.mailbox_load_generation,
+        ))
+    }
+
+    /// Refresh the preview body memo, reading one blob when the cursor, the
+    /// account or the list generation moved under it.
+    ///
+    /// Called once at the top of the render pass, which is the only place that
+    /// knows a body is about to be shown and still holds `&mut App`. A frame
+    /// on an unchanged selection does no work at all.
+    pub(crate) fn refresh_preview_body(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_body.holds(key) {
+            return;
+        }
+        let text = match key {
+            Some((_, msg, _)) => self.load_message_body(msg).unwrap_or_default(),
+            None => String::new(),
+        };
+        self.preview_body.fill(key, text);
+    }
+
+    /// Read one message body from the active account's blob store.
+    ///
+    /// `None` means the row itself is gone, which is a stale reference rather
+    /// than an evicted body; the preview shows an empty body either way, and
+    /// the log says which happened.
+    fn load_message_body(&self, msg: MessageRef) -> Option<String> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        let body = crate::store::read::load_body(&store, &blobs, msg.row_id());
+        if body.is_none() {
+            log::warn!("[store] {msg} is not in the store; previewing an empty body");
+        }
+        body
+    }
+
+    /// Park `text` as the preview body of the current selection, exactly as a
+    /// load would have left it.
+    ///
+    /// The frozen fixtures (golden frames, unit tests) have no store, so they
+    /// prime the memo the same way they hand-build the rows.
+    #[cfg(test)]
+    pub(crate) fn prime_preview_body(&mut self, text: impl Into<String>) {
+        let key = self.preview_body_key();
+        self.preview_body.fill(key, text.into());
+    }
+
+    /// Make the body-search index match the mode: built and current for the
+    /// active mailbox while `\` search is on, empty while it is off.
+    ///
+    /// Building it is one batch of blob reads for the whole mailbox, paid once
+    /// per list generation rather than once per keystroke. It is the only
+    /// place the read path still loads bodies in bulk, and it only runs when
+    /// the user asked for a content search.
+    fn sync_search_bodies(&mut self) {
+        if !self.search_includes_body {
+            self.search_bodies.clear();
+            return;
+        }
+        let key = (
+            self.active_account,
+            self.active_mailbox,
+            self.mailbox_load_generation,
         );
+        if self.search_bodies.holds(key) {
+            return;
+        }
+
+        let account = self.account_config.name.clone();
+        let ids: Vec<i64> = self
+            .emails
+            .iter()
+            .filter_map(|e| e.msg)
+            .map(|m| m.row_id())
+            .collect();
+        let mut bodies = std::collections::HashMap::with_capacity(ids.len());
+        if let Some(store) = open_store(&account) {
+            let blobs = crate::store::BlobStore::for_account(&account);
+            for (id, body) in crate::store::read::load_bodies(&store, &blobs, &ids) {
+                bodies.insert(MessageRef::new(id), body.to_lowercase());
+            }
+        }
+        self.search_bodies.fill(key, bodies);
+    }
+
+    /// Prime the body-search index for the current mailbox, for fixtures that
+    /// have no store behind them.
+    #[cfg(test)]
+    pub(crate) fn prime_search_bodies(
+        &mut self,
+        bodies: impl IntoIterator<Item = (MessageRef, String)>,
+    ) {
+        let key = (
+            self.active_account,
+            self.active_mailbox,
+            self.mailbox_load_generation,
+        );
+        let lowered = bodies
+            .into_iter()
+            .map(|(msg, body)| (msg, body.to_lowercase()))
+            .collect();
+        self.search_bodies.fill(key, lowered);
     }
 
     /// Run a mutation against the full entry list of the active mailbox,

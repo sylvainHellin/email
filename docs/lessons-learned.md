@@ -268,3 +268,15 @@ The durable outbox therefore stores an `envelope` column (`from:` plus one `to:`
 The store has no migrator: a version mismatch or a missing table drops and rebuilds the file.
 A column added to an existing version is invisible to both checks, so a store written by an earlier build of the same version passes validation and then fails every write against the new column.
 `schema::REQUIRED_COLUMNS` exists for exactly that window and is checked beside `REQUIRED_TABLES` on open; it is emptied again whenever a change bumps `SCHEMA_VERSION` (#0037 review).
+
+## An external-content FTS5 index cannot be corrected without the old row values
+
+`messages_fts` was declared `content='messages'` over a `messages` table that has no `body_text` column, so the index was written by hand and the only way to undo an entry was the `'delete'` command replaying the *old* subject, from and body.
+Re-ingest read the old body back from its blob, and a blob the retention sweep had already evicted left it with nothing honest to say: it skipped the delete and the row stayed indexed twice (#0037 known issue).
+`content=''` with `contentless_delete=1` (FTS5, SQLite 3.43+; the bundled build is 3.46) makes `DELETE FROM messages_fts WHERE rowid = ?` legal with no column values at all, which removes the dependency instead of working around it.
+Nothing else changes: a contentless index was already the only thing the code could use, since `snippet()`, `highlight()` and column reads never worked on the external-content declaration either (#0038 unit B).
+
+## The blob store is content-addressed, so two identical bodies are one file
+
+A test that evicts "one message's body" by unlinking its blob evicts every message that happens to carry the same bytes, because the hash is the filename and the refcount is per hash.
+Fixtures that need one readable and one evicted body must give the two messages different text (#0038 unit B).

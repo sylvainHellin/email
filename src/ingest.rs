@@ -52,11 +52,16 @@
 //!
 //! ## FTS
 //!
-//! `messages_fts` is external-content over a `messages` table that has no
-//! `body_text` column, so `'rebuild'` and a plain `DELETE FROM messages_fts`
-//! both fail (see the schema doc comment). Ingest therefore maintains the
-//! index explicitly: the FTS `'delete'` command with the *old* column values,
-//! then a fresh insert, both inside the message's transaction.
+//! `messages_fts` is contentless with `contentless_delete=1` (see the schema
+//! doc comment), so there is nothing to rebuild from and ingest maintains the
+//! index explicitly: delete the previous entry by rowid, insert the new one,
+//! both inside the message's transaction.
+//!
+//! The delete needs the rowid and nothing else, which is what fixes the #0037
+//! known issue: while the index was external-content, undoing an entry meant
+//! replaying the *old* column values, and re-ingest of a message whose
+//! previous body blob had been evicted could not produce them, so it skipped
+//! the delete and left the row indexed twice.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -225,21 +230,15 @@ fn ingest_in_tx(
     let email = input.email;
 
     // 1. Find the row this message belongs in: by identity first, then
-    //    through the message_id index (UIDVALIDITY reset).
-    let existing: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+    //    through the message_id index (UIDVALIDITY reset). Its id and its
+    //    thread are all that is carried forward; the old envelope values are
+    //    not needed anywhere since the FTS delete became rowid-only.
+    let existing: Option<(i64, Option<String>)> = tx
         .query_row(
-            "SELECT id, thread_id, subject, from_, body_blob
+            "SELECT id, thread_id
              FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
             (input.account, input.mailbox, input.uid),
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .context("looking up the message by identity")?;
@@ -250,20 +249,12 @@ fn ingest_in_tx(
         None => {
             let by_mid = tx
                 .query_row(
-                    "SELECT id, thread_id, subject, from_, body_blob
+                    "SELECT id, thread_id
                      FROM messages
                      WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3
                      ORDER BY id LIMIT 1",
                     (input.account, input.mailbox, message_id),
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .context("looking up the message through the message_id index")?;
@@ -274,7 +265,7 @@ fn ingest_in_tx(
 
     // 2. Thread assignment: an existing row keeps the thread it was put in,
     //    a new one inherits from its parent and otherwise starts its own.
-    let thread_id = match existing.as_ref().and_then(|(_, thread, _, _, _)| thread.clone()) {
+    let thread_id = match existing.as_ref().and_then(|(_, thread)| thread.clone()) {
         Some(thread) => thread,
         None => resolve_thread_id(tx, input.account, message_id, in_reply_to, references)?,
     };
@@ -300,7 +291,7 @@ fn ingest_in_tx(
 
     // 3. Write the row.
     let row_id = match existing.as_ref() {
-        Some((id, _, _, _, _)) => {
+        Some((id, _)) => {
             tx.execute(
                 "UPDATE messages SET
                     uid = ?2, message_id = ?3, from_ = ?4, to_ = ?5, cc = ?6, subject = ?7,
@@ -371,44 +362,13 @@ fn ingest_in_tx(
         }
     };
 
-    // 4. Remove the previous FTS entry, explicitly and with the *old* column
-    //    values (see the module docs). This runs before the blob references
-    //    are re-pointed, because the old body text is read back from the old
-    //    body blob and the release below may unlink it.
-    if let Some((_, _, old_subject, old_from, old_body_blob)) = existing.as_ref() {
-        let old_body = old_body_blob
-            .as_deref()
-            .and_then(|h| BlobHash::parse(h).ok())
-            .and_then(|h| blobs.read(&h).ok())
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-        match old_body {
-            Some(body) => {
-                tx.execute(
-                    "INSERT INTO messages_fts (messages_fts, rowid, subject, from_, body_text)
-                     VALUES ('delete', ?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        row_id,
-                        old_subject.clone().unwrap_or_default(),
-                        old_from.clone().unwrap_or_default(),
-                        body
-                    ],
-                )
-                .context("removing the previous FTS row")?;
-            }
-            None => {
-                // The old body blob is gone (evicted, or never written), so the
-                // exact values the index was built from are unavailable and the
-                // FTS 'delete' command cannot be issued honestly. Leave the old
-                // entry in place rather than corrupt the index with a guess: a
-                // stale hit resolves to a row that is still correct, and the
-                // whole store is dropped and refilled if it ever matters.
-                warn!(
-                    "[ingest] message {row_id}: previous body blob unreadable, \
-                     leaving the stale FTS entry in place"
-                );
-            }
-        }
-    }
+    // 4. Remove the previous FTS entry. A contentless-delete index undoes an
+    //    entry from its rowid alone, so this holds whatever became of the old
+    //    body blob (see the module docs). Unconditional: a rowid that carries
+    //    no entry is a no-op delete.
+    tx.execute("DELETE FROM messages_fts WHERE rowid = ?1", [row_id])
+        .context("removing the previous FTS row")?;
+
     // 5. Re-point blob references. Acquire first, release second: a hash that
     //    both versions share must never pass through refcount zero, because
     //    `release` unlinks the file the moment it does.
