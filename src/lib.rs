@@ -16,6 +16,7 @@ pub mod calendar_cmd;
 pub mod imap_client;
 pub mod ingest;
 pub mod draft;
+pub mod selector;
 pub mod dump;
 pub mod outbox;
 pub mod send;

@@ -210,6 +210,7 @@ fn email(
 ) -> EmailEntry {
     EmailEntry {
         msg: Some(MessageRef::new(row)),
+        draft_id: None,
         from: from.to_string(),
         to: "sylvain@example.org".to_string(),
         cc: None,

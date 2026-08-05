@@ -299,6 +299,7 @@ mod badge_tests {
     fn entry(is_invite: bool, has_att: bool) -> EmailEntry {
         EmailEntry {
             msg: Some(crate::tui::app::MessageRef::new(1)),
+            draft_id: None,
             from: "a".into(), to: "b".into(), cc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),

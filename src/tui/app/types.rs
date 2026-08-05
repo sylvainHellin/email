@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 
 use crate::parse::FetchedEmail;
 use crate::store::read::{self, MessageRow};
-use crate::store::Store;
+use crate::store::{drafts, Store};
 
 // ---------------------------------------------------------------------------
 // MessageRef
@@ -81,6 +81,17 @@ pub struct EmailEntry {
     /// rather than act on some other message. A sentinel `MessageRef` would
     /// be a lie that could reach the selection set, so the absence is typed.
     pub msg: Option<MessageRef>,
+    /// Identity of the underlying drafts-index row: the `id:` frontmatter
+    /// field (#0050 scope item 4).
+    ///
+    /// A drafts entry has no `messages` row, so `msg` is `None` for it and
+    /// this carries its name instead. The two are mutually exclusive by
+    /// construction: `entry_from_row` fills `msg`, `entry_from_draft` fills
+    /// `draft_id`, and nothing fills both. Anything that needs to name the
+    /// selected entry (`Action::CopyMessageRef`) asks this first, because a
+    /// draft's canonical selector is `mp://<account>/drafts/<id>` and never
+    /// goes through the store.
+    pub draft_id: Option<String>,
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
@@ -133,6 +144,11 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
         "load_emails",
         format!("{account}/{mailbox}"),
     );
+    if mailbox == crate::selector::DRAFTS_MAILBOX {
+        let entries = load_drafts(account);
+        span.mark(&format!("{} draft(s) from the index", entries.len()));
+        return entries;
+    }
     let Some(store) = open_store(account) else {
         return Vec::new();
     };
@@ -151,14 +167,57 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
         .collect()
 }
 
+/// The Drafts mailbox, listed from the drafts index instead of `messages`
+/// (#0050 scope item 5).
+///
+/// Drafts are the one local-only thing in the product: they are `.md` files an
+/// agent or `$EDITOR` writes behind the application's back, so there is no
+/// `messages` row to list and the index is what the CLI and the TUI share.
+/// The refresh is paid here rather than assumed, because a mailbox load is
+/// exactly the moment the answer has to be current; the one-second fingerprint
+/// poll in the event loop is what notices a change *between* loads.
+///
+/// Every status is listed, `sent` included, which is the file build's
+/// behaviour: sending rewrites the draft's status in place and leaves the file
+/// in `drafts/`.
+fn load_drafts(account: &str) -> Vec<EmailEntry> {
+    // `Store::open` rather than `open_store`: a local-only account that has
+    // never synced has no store file, and its drafts still have to list.
+    let store = match Store::open(crate::config::store_path(account)) {
+        Ok(store) => store,
+        Err(e) => {
+            log::warn!("[drafts] could not open the store for {account}: {e:#}");
+            return Vec::new();
+        }
+    };
+    let dir = crate::config::drafts_dir(account);
+    if let Err(e) = drafts::refresh(&store, account, &dir) {
+        log::warn!("[drafts] refreshing the index of {account} failed: {e:#}");
+    }
+    match drafts::list(&store, account, None) {
+        Ok(rows) => rows.into_iter().map(entry_from_draft).collect(),
+        Err(e) => {
+            log::warn!("[drafts] listing the index of {account} failed: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 /// Per-mailbox message counts for the sidebar, as one grouped query.
 ///
 /// Index-aligned with `mailboxes`: a mailbox the store has no rows for counts
 /// zero, so a configured-but-never-synced mailbox keeps its slot rather than
 /// shifting every count after it.
+///
+/// Drafts are the exception, and have to be: they are not `messages` rows, so
+/// the grouped query cannot see them and the sidebar would show 0 next to a
+/// populated list. That count comes from the drafts index, which
+/// [`load_drafts`] has just refreshed if the mailbox was loaded at all.
 pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> {
-    let counts = open_store(account)
-        .and_then(|store| match read::mailbox_counts(&store, account) {
+    let store = open_store(account);
+    let counts = store
+        .as_ref()
+        .and_then(|store| match read::mailbox_counts(store, account) {
             Ok(counts) => Some(counts),
             Err(e) => {
                 log::warn!("[store] counting mailboxes for {account} failed: {e:#}");
@@ -166,10 +225,24 @@ pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> 
             }
         })
         .unwrap_or_default();
+    let draft_count = || {
+        store
+            .as_ref()
+            .and_then(|store| drafts::list(store, account, None).ok())
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    };
 
     mailboxes
         .iter()
-        .map(|mb| counts.get(&mailbox_key(mb)).copied().unwrap_or(0))
+        .map(|mb| {
+            let key = mailbox_key(mb);
+            if key == crate::selector::DRAFTS_MAILBOX {
+                draft_count()
+            } else {
+                counts.get(&key).copied().unwrap_or(0)
+            }
+        })
         .collect()
 }
 
@@ -236,6 +309,7 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     let read = row.is_read();
     EmailEntry {
         msg: Some(MessageRef::new(row.id)),
+        draft_id: None,
         from: extract_display_name(row.from.as_deref().unwrap_or_default()),
         to: extract_display_name(row.to.as_deref().unwrap_or_default()),
         cc: row.cc,
@@ -249,6 +323,37 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
         read,
         has_attachments: row.has_attachments,
         is_invite: row.is_invite,
+    }
+}
+
+/// Map one drafts-index row into a display entry.
+///
+/// `msg` stays `None`: there is no `messages` row behind a draft, and a
+/// sentinel would be a lie that could reach the selection set. `read` is true
+/// because a draft the user wrote is not unread mail, and the list renders
+/// unread rows bold.
+///
+/// The date falls back to the filename through the same [`resolve_date`] the
+/// file build used, so a draft whose frontmatter has no `date:` yet still
+/// sorts by its `YYYY-MM-DD-...` stem rather than collapsing to the bottom.
+fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
+    let (date_display, date_sort) = resolve_date(&row.date, &None, &row.path);
+    EmailEntry {
+        msg: None,
+        draft_id: Some(row.id),
+        from: String::new(),
+        to: extract_display_name(row.to.as_deref().unwrap_or_default()),
+        cc: row.cc,
+        subject: row
+            .subject
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(no subject)".to_string()),
+        status: row.status,
+        date_display,
+        date_sort,
+        read: true,
+        has_attachments: false,
+        is_invite: false,
     }
 }
 
@@ -1025,7 +1130,14 @@ pub enum Action {
     ToggleRead,
     MarkAsRead,
     BatchToggleRead(Vec<MessageRef>),
-    CopyPath,
+    /// Copy the canonical `mp://` selector of the selected entry to the system
+    /// clipboard (#0050 scope item 7).
+    ///
+    /// It replaced `CopyPath`, which copied the `.md` file the store stopped
+    /// writing with #0038. A selector is the better thing to hold anyway: it
+    /// survives a restart, a re-sync and a draft rename, and it pastes
+    /// straight into `mp archive`, `mp reply` or `mp send`.
+    CopyMessageRef,
     /// Open the newest log file from `logs_dir()` in `$EDITOR` (#0025).
     OpenLogFile,
     /// Open the global config file (`config_path()`) in `$EDITOR`. Changes
@@ -1591,6 +1703,84 @@ mod tests {
         assert_eq!(count_all_emails("alice", &mailboxes), vec![3, 1]);
         assert_eq!(load_emails("alice", "inbox").len(), 3);
         assert_eq!(load_emails("alice", "archive").len(), 1);
+    }
+
+    /// Write `body` as a draft `.md` into the account's drafts directory, the
+    /// way an agent or `$EDITOR` does: no id, no index entry, nothing told to
+    /// the application.
+    fn external_draft(name: &str, to: &str, subject: &str, status: &str) -> std::path::PathBuf {
+        let dir = crate::config::drafts_dir("alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("---\nto: {to}\nsubject: {subject}\nstatus: {status}\n---\n\nBody of {subject}\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The Drafts mailbox lists from the drafts index, not from `messages`
+    /// (#0050 scope item 5). This is the end of the stop-gate state in which
+    /// the mailbox rendered empty because ingest writes no row for a local
+    /// draft.
+    ///
+    /// The entries carry `draft_id` and no `MessageRef`, which is what
+    /// `Action::CopyMessageRef` and every row-dependent action branch on.
+    #[test]
+    fn the_drafts_mailbox_lists_from_the_drafts_index() {
+        let _data = DataDir::new();
+        external_draft("2026-07-01-note.md", "a@example.com", "Hello", "draft");
+        external_draft("2026-07-02-later.md", "b@example.com", "Later", "approved");
+
+        let entries = load_emails("alice", "drafts");
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert!(entry.msg.is_none(), "a draft has no messages row");
+            assert_eq!(entry.draft_id.as_ref().map(String::len), Some(16));
+            assert!(entry.read, "a draft the user wrote is not unread mail");
+        }
+        let subjects: HashSet<&str> = entries.iter().map(|e| e.subject.as_str()).collect();
+        assert_eq!(subjects, HashSet::from(["Hello", "Later"]));
+
+        // Every status is listed, `sent` included: sending rewrites the status
+        // in place and leaves the file in `drafts/`.
+        let statuses: HashSet<&str> = entries.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(statuses, HashSet::from(["draft", "approved"]));
+
+        // And the sidebar agrees with the list it is counting.
+        let mailboxes = vec![mb(
+            "Drafts",
+            crate::config::drafts_dir("alice"),
+            MailboxKind::Drafts,
+        )];
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
+    }
+
+    /// The [TKT-0045] scenario from the TUI's side: a draft written by another
+    /// process is listed by the next load, with no restart and no `mp`
+    /// command in between, because the load refreshes the index itself. The
+    /// one-second [`crate::store::drafts::fingerprint`] poll in the event loop
+    /// is what asks for that load.
+    #[test]
+    fn a_draft_written_externally_appears_on_the_next_load() {
+        let _data = DataDir::new();
+        external_draft("first.md", "a@example.com", "First", "draft");
+        let before = load_emails("alice", "drafts");
+        assert_eq!(before.len(), 1);
+        let fingerprint_before =
+            crate::store::drafts::fingerprint(&crate::config::drafts_dir("alice"));
+
+        external_draft("second.md", "b@example.com", "Second", "draft");
+
+        assert_ne!(
+            fingerprint_before,
+            crate::store::drafts::fingerprint(&crate::config::drafts_dir("alice")),
+            "the poll must see the new file"
+        );
+        let after = load_emails("alice", "drafts");
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().any(|e| e.subject == "Second"));
     }
 
     /// parity. A mailbox that was configured but never synced counts 0 rather

@@ -9,15 +9,32 @@ mod ui;
 
 use std::io;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, BgResult};
+use app::{App, BgResult, MailboxKind};
 use helpers::{
     graph_watcher_loop, init_terminal, install_panic_hook, restore_terminal, watcher_loop,
     WatchEvent,
 };
+
+use crate::store::drafts;
+
+/// How often the drafts directory is stat-scanned for writes made behind the
+/// application's back (#0050 scope item 5, closing [TKT-0045]).
+///
+/// Drafts are the one part of the model another process owns as much as we do:
+/// an agent writes a `.md` into `drafts/` and `$EDITOR` rewrites one while the
+/// TUI has it on screen. The IMAP watcher says nothing about either, so
+/// without this the Drafts list was only as fresh as the last restart.
+///
+/// One second, by a `max_depth(1)` stat scan of tens of files
+/// ([`drafts::fingerprint`]), rather than a `notify` watcher: the scan costs
+/// one `readdir` plus one `stat` per entry against a 250 ms event tick, and the
+/// watcher is a new dependency the ticket deliberately defers.
+const DRAFTS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Machine-readable dump of the TUI keymap (`mp dump-keys`), used to
 /// regenerate the website key table from the single `KEYMAP` source.
@@ -75,6 +92,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
 
     // Background task results channel
     let (bg_tx, bg_rx) = mpsc::channel::<BgResult>();
+
+    // Baseline for the drafts poll: whatever the directory looks like now is
+    // what the first listing will show, so the first change to react to is the
+    // next one.
+    let mut drafts_account = app.account_config.name.clone();
+    let mut drafts_fingerprint = drafts::fingerprint(&crate::config::drafts_dir(&drafts_account));
+    let mut last_drafts_poll = Instant::now();
 
     // The per-account message-ID index scan that used to run here is gone
     // (#0038): identity is the `messages` row and a cross-mailbox lookup is
@@ -157,6 +181,35 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
         // Check background task results (drain all available)
         while let Ok(result) = bg_rx.try_recv() {
             bg::handle_bg_result(&mut app, result);
+        }
+
+        // The drafts directory, scanned once a second (#0050). The fingerprint
+        // is stat-only, so an unchanged directory costs nothing beyond the
+        // walk; a change re-indexes and reloads the list the user is looking
+        // at, without a restart.
+        if last_drafts_poll.elapsed() >= DRAFTS_POLL_INTERVAL {
+            last_drafts_poll = Instant::now();
+            let account = app.account_config.name.clone();
+            let fingerprint = drafts::fingerprint(&crate::config::drafts_dir(&account));
+            if account != drafts_account {
+                // Account switch: adopt the new directory's state silently.
+                // The switch reloaded the mailboxes itself, so there is
+                // nothing here to react to.
+                drafts_account = account;
+                drafts_fingerprint = fingerprint;
+            } else if fingerprint != drafts_fingerprint {
+                drafts_fingerprint = fingerprint;
+                if let Err(e) = drafts::refresh_account(&drafts_account) {
+                    log::warn!("[drafts] refreshing the index of {drafts_account} failed: {e:#}");
+                }
+                if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
+                    app.invalidate_cache_idx(idx);
+                    if app.active_mailbox == idx {
+                        app.reload_current_mailbox();
+                    }
+                }
+                app.recount_all_mailboxes();
+            }
         }
 
         // Auto-execute queued action when all mutations complete

@@ -16,6 +16,7 @@
 //! can be taken in the same transaction as the row that holds the hash.
 
 pub mod blobs;
+pub mod drafts;
 pub mod read;
 pub mod schema;
 pub mod write;

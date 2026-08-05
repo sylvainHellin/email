@@ -226,6 +226,8 @@ mod tests {
         EmailDraft {
             path: PathBuf::from("/tmp/fake.md"),
             frontmatter: EmailFrontmatter {
+                id: None,
+                date: None,
                 to: to_opt,
                 cc: cc.map(|s| s.into()),
                 bcc: None,

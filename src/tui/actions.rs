@@ -62,6 +62,36 @@ fn store_for_mutation(app: &mut App, what: &str) -> Option<(crate::store::Store,
     }
 }
 
+/// The canonical `mp://` selector of the entry under the cursor (#0050 scope
+/// item 7), or `None` when the entry has no name to copy.
+///
+/// A drafts entry answers from its indexed `id:` without touching the store,
+/// because a draft has no `messages` row. A received entry answers from a
+/// lookup by row id, because the selector needs the Message-ID and the mailbox
+/// and the list carries neither: [`MessageRef`] is deliberately just the
+/// synthetic key. That is one indexed read per keypress, which is the right
+/// side of the trade against widening every list row.
+///
+/// `None` is the server-search hit that does not resolve locally: it has no
+/// store row, so there is no selector that would name it for the CLI.
+fn selected_selector(app: &App) -> Option<crate::selector::Selector> {
+    let account = &app.account_config.name;
+    let email = app.selected_email()?;
+    if let Some(id) = email.draft_id.as_deref() {
+        return Some(crate::selector::Selector::for_draft(account, id));
+    }
+    let msg = email.msg?;
+    let store = open_store(account)?;
+    let row = match crate::store::read::find_by_id(&store, msg.row_id()) {
+        Ok(row) => row?,
+        Err(e) => {
+            log::warn!("[store] reading {msg} for its selector failed: {e:#}");
+            return None;
+        }
+    };
+    Some(crate::selector::Selector::for_message(account, &row))
+}
+
 /// The backend the server op runs against, resolved before any optimistic
 /// write so a missing config leaves the store and the list untouched.
 fn backend_for_mutation(app: &mut App) -> Option<Backend> {
@@ -645,11 +675,22 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::CopyPath => {
-            // Becomes `CopyMessageRef` over the canonical `mp://` selector
-            // (#0050 scope item 7); there is no path to copy meanwhile.
-            app.set_status_level(needs_selector_contract("Copy path"), StatusLevel::Warning);
-        }
+        Action::CopyMessageRef => match selected_selector(app) {
+            Some(selector) => {
+                let text = selector.to_string();
+                match super::helpers::copy_to_clipboard(&text) {
+                    Ok(()) => app.set_status(format!("{text} copied to clipboard")),
+                    Err(e) => app.set_status_level(
+                        format!("Copy failed: {e}"),
+                        StatusLevel::Error,
+                    ),
+                }
+            }
+            None => app.set_status_level(
+                "That message is not in the local store, so it has no selector yet".to_string(),
+                StatusLevel::Warning,
+            ),
+        },
         Action::OpenLogFile => match crate::config::latest_log_file() {
             Some(path) => {
                 suspend_terminal(terminal)?;
@@ -1866,6 +1907,7 @@ mod tests {
     fn entry(subject: &str, id: i64, is_invite: bool) -> EmailEntry {
         EmailEntry {
             msg: Some(MessageRef::new(id)),
+            draft_id: None,
             from: "Sender <s@example.com>".to_string(),
             to: "me@example.com".to_string(),
             cc: None,

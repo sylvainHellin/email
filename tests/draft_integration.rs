@@ -544,6 +544,8 @@ fn test_validate_draft_missing_attachment_warning() {
     let draft = email::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
         frontmatter: email::types::EmailFrontmatter {
+            id: None,
+            date: None,
             to: Some("alice@example.com".to_string()),
             cc: None,
             bcc: None,
@@ -574,6 +576,8 @@ fn test_validate_draft_existing_attachment_no_warning() {
     let draft = email::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
         frontmatter: email::types::EmailFrontmatter {
+            id: None,
+            date: None,
             to: Some("alice@example.com".to_string()),
             cc: None,
             bcc: None,

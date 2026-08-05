@@ -11,11 +11,9 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Next
 
-> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them.
+> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them. Both have shipped; the stop-gate review is the next step.
 
 - [#0038 Read path, calendar and reconcile on the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(Stage 2, first half of the stop-gate pair)_
-- [#0050 Unified mp:// selector contract and drafts index](docs/tickets/0050-selector-contract-drafts-index.md) -- refactor _(Stage 2b, stop-gate after this one, subsumes TKT-0045)_
-- [#TKT-0045 Reload drafts](docs/tickets/TKT-0045-reload-drafts.md) -- bug _(resolved by #0050 above, no standalone fix)_
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature

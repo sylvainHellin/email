@@ -17,8 +17,36 @@ use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus, InboxFrontmatter};
 /// Frontmatter skeleton for a brand-new empty draft (CLI `mp new` and TUI `n`).
 /// `attachments:` is intentionally a bare key: it deserializes to `None` via the
 /// serde default, unlike `attachments: []` which yields `Some(vec![])`.
+///
+/// `subject: ""` is explicit rather than bare, because a file this build writes
+/// has to be readable by this build: a bare key is YAML null, and the draft
+/// `mp new` had just created was skipped by the index and unreachable through
+/// the selector `mp new` printed (#0050). The parser tolerates the bare form
+/// too (see [`crate::types::EmailFrontmatter`]), so an agent's draft still
+/// indexes; the file we write does not lean on that tolerance.
 pub fn new_draft_skeleton(from: &str, date: &str) -> String {
-    format!("---\nto:\ncc:\nbcc:\nsubject:\nstatus: draft\nfrom: {from}\ndate: {date}\nreply_to:\nattachments:\n---\n\n")
+    new_draft_skeleton_with_id(from, date, &crate::store::drafts::new_id())
+}
+
+/// [`new_draft_skeleton`] with the `id:` chosen by the caller, which is what
+/// lets `mp new` print the selector of the draft it just wrote without reading
+/// the file back.
+///
+/// `id:` is first so it survives an editor session that reorders nothing and a
+/// human eye that reads the top of the file; it is the draft's identity under
+/// #0050, and the whole point is that it is preserved rather than regenerated.
+pub fn new_draft_skeleton_with_id(from: &str, date: &str, id: &str) -> String {
+    format!("---\nid: {id}\nto:\ncc:\nbcc:\nsubject: \"\"\nstatus: draft\nfrom: {from}\ndate: {date}\nreply_to:\nattachments:\n---\n\n")
+}
+
+/// Write an `id:` into an existing draft's frontmatter, in place, preserving
+/// the body and every other field byte for byte.
+///
+/// This is the drafts index's only write to a draft file: a file an agent
+/// created without an `id:` is assigned one on the first refresh, so that the
+/// selector it is listed under is the selector the file itself carries.
+pub fn set_draft_id(path: &Path, id: &str) -> Result<()> {
+    rewrite_frontmatter_scalars_at(path, &[("id", FieldWrite::Set(id.to_string()))])
 }
 
 pub fn select_inbox_email(inbox_dir: &Path, prompt: &str) -> Result<PathBuf> {
@@ -81,20 +109,50 @@ pub fn select_inbox_email(inbox_dir: &Path, prompt: &str) -> Result<PathBuf> {
     Ok(entries[selection].0.clone())
 }
 
+/// The message a reply or a forward is built from, independent of where it
+/// came from.
+///
+/// #0050 is why this type exists: received mail is a store row now, not a
+/// `.md` file, so the draft builders cannot start by reading a path. They take
+/// this instead, and [`create_reply_draft`] / [`create_forward_draft`] are the
+/// thin file-shaped adapters the library tests (and nothing else) still use.
+#[derive(Debug, Clone, Default)]
+pub struct SourceMessage {
+    pub from: String,
+    pub to: String,
+    pub cc: Option<String>,
+    pub subject: String,
+    /// The `Date:` header verbatim, used in the attribution line.
+    pub date: Option<String>,
+    /// Plain-text body of the source message.
+    pub body: String,
+    /// Absolute paths of the attachments a forward should carry.
+    pub attachments: Vec<PathBuf>,
+    /// Rendered HTML of the source, when one exists, for the draft's companion
+    /// `.html` (the quoted block the send path inlines).
+    pub html: Option<String>,
+}
+
 pub fn create_reply_draft(
     source_path: &Path,
     reply_all: bool,
     default_from: &str,
     drafts_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    let content = fs::read_to_string(source_path)?;
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let inbox: InboxFrontmatter = parsed
-        .data
-        .ok_or_else(|| anyhow!("No frontmatter found"))?
-        .deserialize()?;
-    let original_body = parsed.content.trim();
+    let source = source_from_file(source_path, false)?;
+    create_reply_draft_from(&source, reply_all, default_from, drafts_dir)
+}
+
+/// Reply to a message that is not a file: the #0050 path, used by
+/// `mp reply <selector>` over a store row.
+pub fn create_reply_draft_from(
+    source: &SourceMessage,
+    reply_all: bool,
+    default_from: &str,
+    drafts_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let inbox = source;
+    let original_body = inbox.body.trim();
 
     // Build reply fields
     let reply_to = extract_email_address(&inbox.from);
@@ -210,9 +268,8 @@ pub fn create_reply_draft(
     fs::write(&dest, full_content)?;
 
     // Copy and wrap companion HTML for the draft if the original has one
-    let source_html = source_path.with_extension("html");
-    if source_html.exists() {
-        if let Ok(html_content) = fs::read_to_string(&source_html) {
+    {
+        if let Some(html_content) = inbox.html.clone() {
             let wrapped = format!(
                 "<p style=\"color:#666\">On {}, {} wrote:</p>\n\
                  <div style=\"margin:0;padding:0 0 0 1em;border-left:2px solid #ccc\">\n\
@@ -228,6 +285,95 @@ pub fn create_reply_draft(
     }
 
     Ok(dest)
+}
+
+/// Read a `.md` message into a [`SourceMessage`].
+///
+/// `with_attachments` resolves the forward's attachment paths, preferring the
+/// per-account stable store keyed by Message-ID so the draft survives the
+/// source email being archived (#0006), and lazy-hydrating it from the
+/// per-mailbox `_attachments/` directory for emails fetched before that scheme
+/// existed.
+fn source_from_file(source_path: &Path, with_attachments: bool) -> Result<SourceMessage> {
+    let content = fs::read_to_string(source_path)?;
+    let matter = Matter::<YAML>::new();
+    let parsed = matter.parse(&content);
+    let inbox: InboxFrontmatter = parsed
+        .data
+        .ok_or_else(|| anyhow!("No frontmatter found"))?
+        .deserialize()?;
+
+    let attachments = match (with_attachments, inbox.attachments.as_ref()) {
+        (true, Some(filenames)) => {
+            let per_mailbox_dir = attachments_dir_for(source_path);
+            let stable_dir = match (
+                account_dir_for_email(source_path),
+                inbox.message_id.as_deref(),
+            ) {
+                (Some(acct), Some(mid)) => Some(stable_attachments_dir(&acct, mid)),
+                _ => None,
+            };
+
+            if let Some(stable) = stable_dir.as_ref() {
+                // Ensure the stable mirror exists for every named attachment.
+                // Idempotent: link_or_copy is a no-op when dst already exists.
+                if let Err(e) = fs::create_dir_all(stable) {
+                    log::warn!(
+                        "failed to create stable attachments dir {}: {}",
+                        stable.display(),
+                        e
+                    );
+                } else {
+                    for name in filenames {
+                        let from = per_mailbox_dir.join(name);
+                        let to = stable.join(name);
+                        if from.exists() && !to.exists() {
+                            if let Err(e) = link_or_copy(&from, &to) {
+                                log::warn!(
+                                    "failed to hydrate stable attachment {}: {}",
+                                    to.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            filenames
+                .iter()
+                .filter_map(|name| {
+                    let candidate = stable_dir
+                        .as_ref()
+                        .map(|d| d.join(name))
+                        .filter(|p| p.exists())
+                        .or_else(|| {
+                            let p = per_mailbox_dir.join(name);
+                            p.exists().then_some(p)
+                        })?;
+                    candidate.canonicalize().ok()
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
+    let source_html = source_path.with_extension("html");
+    let html = source_html
+        .exists()
+        .then(|| fs::read_to_string(&source_html).ok())
+        .flatten();
+
+    Ok(SourceMessage {
+        from: inbox.from,
+        to: inbox.to,
+        cc: inbox.cc,
+        subject: inbox.subject,
+        date: inbox.date,
+        body: parsed.content.trim().to_string(),
+        attachments,
+        html,
+    })
 }
 
 /// Compute the `Fwd: ...` subject that would be used for a forward draft of
@@ -253,14 +399,19 @@ pub fn create_forward_draft(
     default_from: &str,
     drafts_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    let content = fs::read_to_string(source_path)?;
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let inbox: InboxFrontmatter = parsed
-        .data
-        .ok_or_else(|| anyhow!("No frontmatter found"))?
-        .deserialize()?;
-    let original_body = parsed.content.trim();
+    let source = source_from_file(source_path, true)?;
+    create_forward_draft_from(&source, default_from, drafts_dir)
+}
+
+/// Forward a message that is not a file: the #0050 path, used by
+/// `mp forward <selector>` over a store row.
+pub fn create_forward_draft_from(
+    source: &SourceMessage,
+    default_from: &str,
+    drafts_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let inbox = source;
+    let original_body = inbox.body.trim();
 
     // Build forward subject
     let fwd_subject = if inbox.subject.to_lowercase().starts_with("fwd: ") {
@@ -269,66 +420,12 @@ pub fn create_forward_draft(
         format!("Fwd: {}", inbox.subject)
     };
 
-    // Resolve attachment paths. Prefer the per-account stable store keyed by
-    // Message-ID so the draft survives the source email being archived
-    // (ticket #0006). Lazy-hydrate the stable dir from the per-mailbox
-    // `_attachments/` for emails fetched before this scheme existed.
-    let attachment_paths: Vec<String> = if let Some(ref filenames) = inbox.attachments {
-        let per_mailbox_dir = attachments_dir_for(source_path);
-        let stable_dir = match (
-            account_dir_for_email(source_path),
-            inbox.message_id.as_deref(),
-        ) {
-            (Some(acct), Some(mid)) => Some(stable_attachments_dir(&acct, mid)),
-            _ => None,
-        };
+    let attachment_paths: Vec<String> = inbox
+        .attachments
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
 
-        if let Some(stable) = stable_dir.as_ref() {
-            // Ensure the stable mirror exists for every named attachment.
-            // Idempotent: link_or_copy is a no-op when dst already exists.
-            if let Err(e) = fs::create_dir_all(stable) {
-                log::warn!(
-                    "failed to create stable attachments dir {}: {}",
-                    stable.display(),
-                    e
-                );
-            } else {
-                for name in filenames {
-                    let from = per_mailbox_dir.join(name);
-                    let to = stable.join(name);
-                    if from.exists() && !to.exists() {
-                        if let Err(e) = link_or_copy(&from, &to) {
-                            log::warn!(
-                                "failed to hydrate stable attachment {}: {}",
-                                to.display(),
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        filenames
-            .iter()
-            .filter_map(|name| {
-                let candidate = stable_dir
-                    .as_ref()
-                    .map(|d| d.join(name))
-                    .filter(|p| p.exists())
-                    .or_else(|| {
-                        let p = per_mailbox_dir.join(name);
-                        p.exists().then_some(p)
-                    })?;
-                candidate
-                    .canonicalize()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     // Build frontmatter
     let mut fm = String::from("---\n");
@@ -407,9 +504,8 @@ pub fn create_forward_draft(
     fs::write(&dest, full_content)?;
 
     // Create companion HTML for the forward
-    let source_html = source_path.with_extension("html");
-    if source_html.exists() {
-        if let Ok(html_content) = fs::read_to_string(&source_html) {
+    {
+        if let Some(html_content) = inbox.html.clone() {
             let wrapped = format!(
                 "<p style=\"color:#666\">---------- Forwarded message ----------<br/>\n\
                  From: {}<br/>\n\
@@ -1546,6 +1642,8 @@ mod tests {
         EmailDraft {
             path: PathBuf::from("test.md"),
             frontmatter: EmailFrontmatter {
+                id: None,
+                date: None,
                 to: to_opt,
                 cc: None,
                 bcc: None,
@@ -2133,15 +2231,34 @@ mod tests {
     #[test]
     fn test_new_draft_skeleton_attachments_none() {
         let skeleton = new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000");
-        // `subject` is a mandatory String, so the skeleton only parses once the
-        // user has filled it in; simulate that minimal edit.
-        let filled = skeleton.replace("subject:\n", "subject: Hello\n");
         let matter = Matter::<YAML>::new();
-        let parsed = matter.parse(&filled);
+        let parsed = matter.parse(&skeleton);
         let fm: EmailFrontmatter = parsed.data.unwrap().deserialize().unwrap();
         assert_eq!(fm.attachments, None);
         assert_eq!(fm.status, EmailStatus::Draft);
         assert_eq!(fm.from.as_deref(), Some("me@example.com"));
+        assert_eq!(fm.subject, "");
+    }
+
+    /// The skeleton parses as written, with no edit first (#0050). It used to
+    /// need `subject:` filled in before it could be read at all, which meant
+    /// the drafts index skipped the draft `mp new` had just created and the
+    /// selector `mp new` printed resolved to nothing.
+    #[test]
+    fn the_new_draft_skeleton_parses_without_being_edited_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fresh.md");
+        fs::write(
+            &path,
+            new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000"),
+        )
+        .unwrap();
+
+        let draft = parse_email_draft(&path).expect("a draft we just wrote must parse");
+        assert_eq!(draft.frontmatter.subject, "");
+        // Validation is still the place that says it is not sendable.
+        let err = validate_draft(&draft).unwrap_err().to_string();
+        assert!(err.contains("No recipients"), "{err}");
     }
 
     #[test]

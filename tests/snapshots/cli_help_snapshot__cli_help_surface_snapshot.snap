@@ -5,16 +5,18 @@ expression: out
 $ mp --help
 A CLI tool for sending emails from Markdown drafts with YAML frontmatter
 
-Usage: mp [OPTIONS] [FILE] [COMMAND]
+Usage: mp [OPTIONS] [SELECTOR] [COMMAND]
 
 Commands:
   send            Send a single approved email, or (with --invite) a calendar invitation
-  send-approved   Send all approved emails in a directory
-  list            List emails by status
-  validate        Validate YAML frontmatter in files
-  mark-approved   Mark an email as approved
+  send-approved   Send every approved draft of the account
+  list            List the account's drafts from the drafts index
+  validate        Validate a draft's frontmatter (default: every draft of the account)
+  mark-approved   Mark a draft as approved
   mark-draft      Demote an approved draft back to `draft` status (reverse of `mark-approved`)
-  new             Create a new email draft from template
+  new             Create a new email draft from template and print its selector
+  path            Print the filesystem path of a draft (the only selector-to-path edge)
+  edit            Open a draft in $EDITOR
   reply           Create a reply draft from a received email
   forward         Forward an email to new recipients
   invite          RSVP to a received calendar invitation (iMIP REPLY over SMTP)
@@ -22,10 +24,10 @@ Commands:
   fetch           Fetch emails from IMAP server
   sync            Sync mailboxes from the server into the local store
   watch           Watch a mailbox for changes using IMAP IDLE
-  archive         Archive an inbox email (server + local)
-  delete          Delete an inbox email (server + local)
-  open            Open an email's attachment in the default application
-  save            Save an email's attachment(s) to a directory
+  archive         Archive a received email (server + local)
+  delete          Delete a received email (server + local)
+  open            Open a received email's attachment in the default application
+  save            Save a received email's attachment(s) to a directory
   search          Search emails on the IMAP server
   config          Manage configuration
   contacts        Contact index operations
@@ -36,7 +38,7 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Arguments:
-  [FILE]  File to preview (dry-run mode)
+  [SELECTOR]  Draft selector to preview (dry-run mode)
 
 Options:
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
@@ -48,10 +50,10 @@ Options:
 $ mp send --help
 Send a single approved email, or (with --invite) a calendar invitation
 
-Usage: mp send [OPTIONS] [FILE]
+Usage: mp send [OPTIONS] [SELECTOR]
 
 Arguments:
-  [FILE]  Path to the email draft file (omit when using --invite)
+  [SELECTOR]  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id> (omit when using --invite)
 
 Options:
   -y, --yes                        Skip confirmation prompt
@@ -70,14 +72,12 @@ Options:
   -h, --help                       Print help
 
 $ mp send-approved --help
-Send all approved emails in a directory
+Send every approved draft of the account
 
-Usage: mp send-approved [OPTIONS] [DIR]
-
-Arguments:
-  [DIR]  Directory containing email drafts [default: .]
+Usage: mp send-approved [OPTIONS]
 
 Options:
+      --all-accounts           Send the approved drafts of every configured account
   -y, --yes                    Skip confirmation prompt
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
@@ -85,26 +85,24 @@ Options:
   -h, --help                   Print help
 
 $ mp list --help
-List emails by status
+List the account's drafts from the drafts index
 
-Usage: mp list [OPTIONS] [DIR]
-
-Arguments:
-  [DIR]  Directory to scan [default: .]
+Usage: mp list [OPTIONS]
 
 Options:
+      --status <STATUS>        Only list drafts with this status [possible values: draft, approved, sent]
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
 $ mp validate --help
-Validate YAML frontmatter in files
+Validate a draft's frontmatter (default: every draft of the account)
 
-Usage: mp validate [OPTIONS] <PATH>
+Usage: mp validate [OPTIONS] [SELECTOR]
 
 Arguments:
-  <PATH>  File or directory to validate
+  [SELECTOR]  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
 
 Options:
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
@@ -113,12 +111,12 @@ Options:
   -h, --help                   Print help
 
 $ mp mark-approved --help
-Mark an email as approved
+Mark a draft as approved
 
-Usage: mp mark-approved [OPTIONS] <FILE>
+Usage: mp mark-approved [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  File to mark as approved
+  <SELECTOR>  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
 
 Options:
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
@@ -129,10 +127,10 @@ Options:
 $ mp mark-draft --help
 Demote an approved draft back to `draft` status (reverse of `mark-approved`)
 
-Usage: mp mark-draft [OPTIONS] <FILE>
+Usage: mp mark-draft [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  File to mark as draft
+  <SELECTOR>  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
 
 Options:
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
@@ -141,7 +139,7 @@ Options:
   -h, --help                   Print help
 
 $ mp new --help
-Create a new email draft from template
+Create a new email draft from template and print its selector
 
 Usage: mp new [OPTIONS] <NAME>
 
@@ -154,16 +152,45 @@ Options:
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
+$ mp path --help
+Print the filesystem path of a draft (the only selector-to-path edge)
+
+Usage: mp path [OPTIONS] <SELECTOR>
+
+Arguments:
+  <SELECTOR>  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp edit --help
+Open a draft in $EDITOR
+
+Usage: mp edit [OPTIONS] <SELECTOR>
+
+Arguments:
+  <SELECTOR>  Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
 $ mp reply --help
 Create a reply draft from a received email
 
-Usage: mp reply [OPTIONS] [FILE]
+Usage: mp reply [OPTIONS] <SELECTOR>
 
 Arguments:
-  [FILE]  Path to the email to reply to (interactive selection if omitted)
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>, <mailbox>/<message-id> or <message-id>
 
 Options:
       --all                    Reply to all recipients
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
@@ -172,12 +199,13 @@ Options:
 $ mp forward --help
 Forward an email to new recipients
 
-Usage: mp forward [OPTIONS] [FILE]
+Usage: mp forward [OPTIONS] <SELECTOR>
 
 Arguments:
-  [FILE]  Path to the email to forward (interactive selection if omitted)
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>, <mailbox>/<message-id> or <message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
@@ -203,12 +231,13 @@ Options:
 $ mp invite accept --help
 Accept the invitation (PARTSTAT=ACCEPTED)
 
-Usage: mp invite accept [OPTIONS] <FILE>
+Usage: mp invite accept [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the received invite email `.md`
+  <SELECTOR>  Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
@@ -217,12 +246,13 @@ Options:
 $ mp invite tentative --help
 Tentatively accept the invitation (PARTSTAT=TENTATIVE)
 
-Usage: mp invite tentative [OPTIONS] <FILE>
+Usage: mp invite tentative [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the received invite email `.md`
+  <SELECTOR>  Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
@@ -231,12 +261,13 @@ Options:
 $ mp invite decline --help
 Decline the invitation (PARTSTAT=DECLINED)
 
-Usage: mp invite decline [OPTIONS] <FILE>
+Usage: mp invite decline [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the received invite email `.md`
+  <SELECTOR>  Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
@@ -302,57 +333,61 @@ Options:
   -h, --help                   Print help
 
 $ mp archive --help
-Archive an inbox email (server + local)
+Archive a received email (server + local)
 
-Usage: mp archive [OPTIONS] <FILE>
+Usage: mp archive [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the inbox email file
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
 $ mp delete --help
-Delete an inbox email (server + local)
+Delete a received email (server + local)
 
-Usage: mp delete [OPTIONS] <FILE>
+Usage: mp delete [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the inbox email file
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
 $ mp open --help
-Open an email's attachment in the default application
+Open a received email's attachment in the default application
 
-Usage: mp open [OPTIONS] <FILE>
+Usage: mp open [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the email file
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>
 
 Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
 $ mp save --help
-Save an email's attachment(s) to a directory
+Save a received email's attachment(s) to a directory
 
-Usage: mp save [OPTIONS] <FILE>
+Usage: mp save [OPTIONS] <SELECTOR>
 
 Arguments:
-  <FILE>  Path to the email file
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>
 
 Options:
   -o, --output <OUTPUT>        Output directory (default: current directory)
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

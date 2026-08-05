@@ -3,7 +3,7 @@ id: 0050
 title: Unified mp:// selector contract and the drafts index
 type: refactor
 priority: next
-status: open
+status: done
 created: 2026-07-31
 ---
 
@@ -45,3 +45,31 @@ Linting a draft template that does not live in `drafts/` yet would need a separa
 ## Unblocks
 
 - [TKT-0045](TKT-0045-reload-drafts.md) closes with this ticket.
+
+## Close-out
+
+Done, one commit, every acceptance criterion met.
+
+Two things the scope did not anticipate, both found by hand-testing the finished CLI and both fixed here rather than deferred:
+
+The draft skeleton wrote a bare `subject:` key, which is YAML null, and `EmailFrontmatter.subject` was a mandatory `String`.
+So `parse_email_draft` failed on the file `mp new` had just written, the index skipped it with a log line, and `mp new` printed a selector that `mp path`, `mp edit` and `mp list` could not resolve.
+The fix is both halves: the skeleton now writes `subject: ""`, so a file this build writes does not lean on parser leniency, and `subject` tolerates null and absence as the empty string, so an agent-written draft is listed rather than made invisible.
+`validate_draft` still refuses an empty subject, which moves the diagnosis from a silent index skip to `mp validate` naming what is missing.
+
+Ingest stores the `Message-ID` header verbatim, angle brackets included, while scope item 2 defines the selector key as the Message-ID *without* them.
+`Selector::for_message` now strips them and `resolve_received` asks for the bracketed form first and the bare one second, so a selector is typeable without shell quoting and a pasted mail header still resolves.
+
+The TUI's Drafts mailbox lists from the index (`load_emails` branches on the reserved `drafts` mailbox), which ends the documented empty-Drafts state, and the sidebar count comes from the same rows.
+`EmailEntry` carries `draft_id: Option<String>` beside `msg: Option<MessageRef>`; a draft has no `messages` row, so the two are mutually exclusive by construction.
+`Action::CopyPath` became `CopyMessageRef` and copies the canonical selector, one indexed lookup per keypress rather than a wider list row.
+Freshness in the TUI is a one-second `drafts::fingerprint` poll in the event loop, no `notify` dependency.
+
+The golden frames are byte-identical: the fixtures build `EmailEntry` values directly, so the new listing path changes no captured frame.
+
+Residual risks, accepted:
+
+- `source_from_row` reads the account name back out of the store path (`account_name_of`) to place forwarded attachments in the stable per-account mirror. It is correct for every path `config` builds, and it is the one place that inverts a path.
+- `mp open` materialises every attachment into a temp directory and opens all of them; the pre-#0038 build had an interactive picker.
+- `EmailStatus::{Inbox, Archived}` no longer appear in `mp list`, which now lists the drafts index only.
+- The other `#0050` stop-gates in the TUI (reply, forward, send, approve, attachments, `$EDITOR`) still decline: they need the mutation half, not the naming half, and are not in this ticket's scope.

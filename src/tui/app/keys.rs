@@ -541,9 +541,9 @@ impl App {
                     action: ConfirmAction::SendApproved,
                 });
             }
-            A::CopyPath => {
+            A::CopyMessageRef => {
                 self.pending_prefix = None;
-                self.push_action(Action::CopyPath);
+                self.push_action(Action::CopyMessageRef);
             }
             A::ToggleRead => {
                 self.pending_prefix = None;
@@ -2031,6 +2031,7 @@ mod tests {
     fn entry(subject: &str, from: &str) -> EmailEntry {
         EmailEntry {
             msg: Some(ref_for(subject)),
+            draft_id: None,
             from: from.to_string(),
             to: "me@example.com".to_string(),
             cc: None,
@@ -2203,6 +2204,19 @@ mod tests {
         // have read from the blob store is primed instead.
         app.prime_search_bodies(sample_bodies());
         app
+    }
+
+    /// `y` queues the selector copy, not the dead path copy (#0050 scope item
+    /// 7). Dispatch-level only, like the contacts copy test: the `arboard`
+    /// call lives in `actions.rs` and would touch the real system clipboard.
+    #[test]
+    fn copy_key_queues_the_selector_copy() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(
+            matches!(app.pending_actions.pop_front(), Some(Action::CopyMessageRef)),
+            "y must queue CopyMessageRef"
+        );
     }
 
     #[test]

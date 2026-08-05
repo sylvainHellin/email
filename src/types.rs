@@ -86,14 +86,42 @@ pub struct EventFrontmatter {
     pub attendees: Vec<EventAttendee>,
 }
 
+/// Read a string field that may be written as a bare key (YAML null) as the
+/// empty string. Paired with `#[serde(default)]`, which covers the field being
+/// absent altogether.
+fn null_as_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EmailFrontmatter {
+    /// Stable identity of a draft (#0050, DAL decision C). `mp new` writes it,
+    /// the drafts index assigns one to any agent-written file that lacks it,
+    /// and it is the key of every `mp://<account>/drafts/<key>` selector. It
+    /// survives a rename, which is exactly what the filename cannot do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
     pub cc: Option<String>,
     #[serde(default)]
     pub bcc: Option<String>,
+    /// The subject line. Tolerant of a bare `subject:` key (YAML null) and of
+    /// the field being absent, both of which read as the empty string (#0050).
+    ///
+    /// Agents write drafts into `drafts/` and the index assigns them ids, so a
+    /// field that failed to deserialize made such a draft *invisible*: skipped
+    /// by the index with a log line nobody reads, absent from `mp list` and
+    /// from the TUI. The empty subject is not thereby accepted as sendable;
+    /// [`crate::draft::validate_draft`] still refuses it, which moves the
+    /// diagnosis from a silent skip to `mp validate` saying what is missing.
+    /// Tolerance is scoped to this one field: genuinely malformed YAML still
+    /// fails to parse and is still skipped with a log line.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     pub subject: String,
     pub status: EmailStatus,
     #[serde(default)]
@@ -108,6 +136,10 @@ pub struct EmailFrontmatter {
     pub sent_via: Option<String>,
     #[serde(default)]
     pub message_id: Option<String>,
+    /// The `date:` line the draft skeleton writes. Carried so the drafts index
+    /// can list it; nothing in the send path reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<EventFrontmatter>,
 }
@@ -191,6 +223,8 @@ mod tests {
     #[test]
     fn test_email_frontmatter_serde_roundtrip() {
         let fm = EmailFrontmatter {
+            id: None,
+            date: None,
             to: Some("alice@example.com".to_string()),
             cc: Some("bob@example.com".to_string()),
             bcc: None,

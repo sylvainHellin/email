@@ -318,3 +318,17 @@ The next sync of the destination finds the row through the `message_id` index an
 `mp open` and `mp save` called `list_attachments` on the `<stem>_attachments/` directory ingest stopped writing, got an empty list, printed "No attachments found" and exited 0, for messages that do have attachments.
 An empty walk is indistinguishable from an empty result, so the moment a data source is decommissioned, every reader of it has to decline explicitly rather than be left to discover nothing there.
 The rule applied in #0038: path-taking commands fail with the `#0050` boundary line before any filesystem access, which is also what stops `mp reply` and `mp forward` from surfacing a bare I/O error from `parse_email_draft` as if the user had named a bad file.
+
+## A required frontmatter field that our own template leaves blank makes the file invisible
+
+`mp new` wrote the draft skeleton with a bare `subject:` key, which YAML reads as null, and `EmailFrontmatter.subject` was a mandatory `String`.
+The draft therefore failed to parse, the drafts index skipped it with a log line nobody reads, and `mp new` printed a selector that `mp path`, `mp edit` and `mp list` could not resolve: the command reported success and produced something unreachable.
+The fix has to be both halves, and the halves are not interchangeable.
+A file this build writes must parse in this build, so the skeleton writes `subject: ""` rather than leaning on parser leniency; and the field tolerates null and absence, because agents write drafts into `drafts/` by hand and a strict field turns their file into a silent skip instead of a visible error.
+`validate_draft` still refuses an empty subject, which is where an unsendable draft should be reported: an index that drops rows is a diagnosis nobody can reach, a validator that says "Missing 'subject' field" is one they can (#0050, [src/types.rs](../src/types.rs) and [src/draft.rs](../src/draft.rs)).
+
+## The Message-ID a header carries is not the key a selector uses
+
+Ingest stores the `Message-ID` header verbatim, angle brackets included, because that is what the wire format says.
+The `mp://` selector key is defined as the identifier without them, so `resolve_received` looking the key up as stored matched nothing at all, and `Selector::for_message` would otherwise have printed every selector with a trailing `%3E`.
+Delimiters are not part of an identifier: `Selector::for_message` strips them, and the resolver asks for the bracketed form first and the bare one second, so a pasted mail header and a hand-typed key both land on the same row ([src/selector.rs](../src/selector.rs), #0050).

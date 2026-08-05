@@ -15,6 +15,21 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **`mp://` selectors and the drafts index (#0050).** Every command that names a
+  message now takes a selector, `mp://<account>/<mailbox>/<key>`, and never a
+  file path. The key is the Message-ID without angle brackets for received mail
+  and the draft's `id:` frontmatter field for drafts, so renaming a draft file
+  keeps its selector working. Leading segments can be elided (`mp send <id>`),
+  a key that matches two mailboxes is reported with both full selectors instead
+  of being resolved by guesswork, and `--mailbox` picks one. `mp path` and
+  `mp edit` are the only edges back to the filesystem. `mp list` reads the new
+  drafts index, `mp send-approved` takes `--all-accounts`, and `mp new`,
+  `mp reply` and `mp forward` print the selector of the draft they created. In
+  the TUI, the Drafts mailbox lists from the index (it was empty since #0038),
+  a draft written by another process shows up within a second without a
+  restart (closes TKT-0045), and `y` copies the selector instead of a file path.
+
+### Added
 - **Durable outbox for sent mail (#0037).** Every outgoing message is committed
   to the per-account store (raw bytes plus an `outbox` row) *before* SMTP runs,
   and the transition to `sent_pending_append` is committed as soon as the server

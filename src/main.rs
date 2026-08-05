@@ -6,6 +6,8 @@ use email::draft::*;
 use email::send::*;
 use email::config_cmd::*;
 use email::graph;
+use email::selector::{Namespace, Selector};
+use email::store::Store;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,7 +16,6 @@ use log::{error, info, warn};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "mailypoppins")]
@@ -24,9 +25,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// File to preview (dry-run mode)
-    #[arg(value_name = "FILE")]
-    file: Option<PathBuf>,
+    /// Draft selector to preview (dry-run mode)
+    #[arg(value_name = "SELECTOR")]
+    selector: Option<String>,
 
     /// Signature to use (overrides config default)
     #[arg(short, long, global = true)]
@@ -45,8 +46,10 @@ struct Cli {
 enum Commands {
     /// Send a single approved email, or (with --invite) a calendar invitation
     Send {
-        /// Path to the email draft file (omit when using --invite)
-        file: Option<PathBuf>,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        /// (omit when using --invite)
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -81,53 +84,78 @@ enum Commands {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Send all approved emails in a directory
+    /// Send every approved draft of the account
     SendApproved {
-        /// Directory containing email drafts
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Send the approved drafts of every configured account
+        #[arg(long)]
+        all_accounts: bool,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// List emails by status
+    /// List the account's drafts from the drafts index
     List {
-        /// Directory to scan
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Only list drafts with this status
+        #[arg(long, value_name = "STATUS")]
+        status: Option<DraftStatusFilter>,
     },
-    /// Validate YAML frontmatter in files
+    /// Validate a draft's frontmatter (default: every draft of the account)
     Validate {
-        /// File or directory to validate
-        path: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
     },
-    /// Mark an email as approved
+    /// Mark a draft as approved
     MarkApproved {
-        /// File to mark as approved
-        file: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
     },
     /// Demote an approved draft back to `draft` status (reverse of `mark-approved`)
     MarkDraft {
-        /// File to mark as draft
-        file: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
     },
-    /// Create a new email draft from template
+    /// Create a new email draft from template and print its selector
     New {
         /// Name for the new draft file
         name: String,
     },
+    /// Print the filesystem path of a draft (the only selector-to-path edge)
+    Path {
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+    },
+    /// Open a draft in $EDITOR
+    Edit {
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+    },
     /// Create a reply draft from a received email
     Reply {
-        /// Path to the email to reply to (interactive selection if omitted)
-        file: Option<PathBuf>,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>,
+        /// <mailbox>/<message-id> or <message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
         /// Reply to all recipients
         #[arg(long)]
         all: bool,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Forward an email to new recipients
     Forward {
-        /// Path to the email to forward (interactive selection if omitted)
-        file: Option<PathBuf>,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>,
+        /// <mailbox>/<message-id> or <message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// RSVP to a received calendar invitation (iMIP REPLY over SMTP)
     Invite {
@@ -191,28 +219,44 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Archive an inbox email (server + local)
+    /// Archive a received email (server + local)
     Archive {
-        /// Path to the inbox email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Delete an inbox email (server + local)
+    /// Delete a received email (server + local)
     Delete {
-        /// Path to the inbox email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Open an email's attachment in the default application
+    /// Open a received email's attachment in the default application
     Open {
-        /// Path to the email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Save an email's attachment(s) to a directory
+    /// Save a received email's attachment(s) to a directory
     Save {
-        /// Path to the email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
         /// Output directory (default: current directory)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Search emails on the IMAP server
     Search {
@@ -322,25 +366,37 @@ enum CalendarAction {
     },
 }
 
-/// RSVP actions for `mp invite <accept|tentative|decline> <email-path>`.
-/// Whole-series only (v1); the target is a received invite `.md` with an
-/// `event:` block and a sidecar `invite.ics`.
+/// RSVP actions for `mp invite <accept|tentative|decline> <selector>`.
+/// Whole-series only (v1); the target is a received message whose store row
+/// carries an `invite.ics` blob.
 #[derive(Subcommand)]
 enum InviteAction {
     /// Accept the invitation (PARTSTAT=ACCEPTED)
     Accept {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Tentatively accept the invitation (PARTSTAT=TENTATIVE)
     Tentative {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Decline the invitation (PARTSTAT=DECLINED)
     Decline {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
 }
 
@@ -678,6 +734,8 @@ async fn run_send_invite(
     let draft = EmailDraft {
         path: draft_path.clone(),
         frontmatter: EmailFrontmatter {
+            id: None,
+            date: None,
             to: to_field.map(str::to_string),
             cc: cc_field.map(str::to_string),
             bcc: None,
@@ -768,45 +826,165 @@ async fn run_send_invite(
     Ok(())
 }
 
-/// RSVP to a received calendar invitation (`mp invite accept|tentative|decline`).
-///
-/// Declines, and does so before touching the filesystem. `file` names a `.md`
-/// path that no longer exists, and reading whatever is at that path as raw ics
-/// would let any file on the machine be parsed as an invitation on its way to
-/// the same refusal. Naming a message on the command line is the selector
-/// contract [#0050] owns; the TUI RSVP (`V`) reads the invite blob out of the
-/// store and works today.
-fn decline_invite_rsvp(file: &Path) -> anyhow::Error {
-    anyhow!(
-        "cannot RSVP to {}: mail is no longer stored as files, and addressing a message on \
-         the command line lands with the selector contract (#0050). RSVP from the TUI (`V`) \
-         meanwhile.",
-        file.display()
-    )
+// ---------------------------------------------------------------------------
+// The selector edge (#0050)
+// ---------------------------------------------------------------------------
+
+/// The store's mailbox key for the archive folder. `mp archive` is a move with
+/// a fixed destination, exactly as the TUI frames it.
+const ARCHIVE_MAILBOX: &str = "archive";
+
+/// `--status` values for `mp list`. A closed set rather than a free string, so
+/// a typo is a clap error instead of an empty listing.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DraftStatusFilter {
+    Draft,
+    Approved,
+    Sent,
 }
 
-/// The boundary line every path-taking command declines with (#0050).
+impl DraftStatusFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            DraftStatusFilter::Draft => "draft",
+            DraftStatusFilter::Approved => "approved",
+            DraftStatusFilter::Sent => "sent",
+        }
+    }
+}
+
+/// Open the account's store for a *received* lookup.
 ///
-/// `.md` messages are gone: what a path argument used to name is a row in the
-/// account database now. Every one of these commands declines *before* it
-/// touches the filesystem, so a stale path cannot produce a half-truth on its
-/// way to the same refusal: `list_attachments` on a dead `_attachments/` tree
-/// reports "no attachments" for a message that has them, and the draft
-/// builders report a bare I/O error. Both read as the command having worked on
-/// something.
+/// A missing file means the account has never synced, which is a different
+/// answer from "no such message" and is worth saying: resolving a selector
+/// against an empty index would otherwise report the message as unknown.
+fn received_store(account: &str) -> Result<Store> {
+    let path = email::config::store_path(account);
+    if !path.exists() {
+        return Err(anyhow!(
+            "{account} has no local store yet, so no received mail can be addressed; \
+             run `mp sync` first"
+        ));
+    }
+    Store::open(&path).with_context(|| format!("opening the store of {account}"))
+}
+
+/// Open the account's store and refresh its drafts index.
 ///
-/// `file` is the path the user named, or `None` for the interactive form that
-/// used to pick one out of the inbox tree. `meanwhile` names the way to do it
-/// today, so the message tells both halves of the truth.
-fn decline_message_path(file: Option<&Path>, meanwhile: &str) -> anyhow::Error {
-    let subject = match file {
-        Some(path) => format!("{} is not a message any more", path.display()),
-        None => "there is no message tree left to pick from".to_string(),
+/// This is the engine-start refresh of #0050 scope item 5, paid by every
+/// draft-facing command before it reads the table: a draft an agent wrote a
+/// second ago is in the index by the time the command lists or resolves it.
+fn drafts_store(account: &str) -> Result<Store> {
+    let store = Store::open(email::config::store_path(account))
+        .with_context(|| format!("opening the store of {account}"))?;
+    let dir = email::config::drafts_dir(account);
+    email::store::drafts::refresh(&store, account, &dir)
+        .with_context(|| format!("refreshing the drafts index of {account}"))?;
+    Ok(store)
+}
+
+/// Re-index the drafts directory after a command wrote a draft, so the next
+/// reader (the TUI, `mp list`, the next command) sees it without waiting for
+/// the one-second scan. Best-effort: the write already happened, and the scan
+/// would pick it up anyway.
+fn reindex_drafts(account: &str) {
+    if let Err(e) = drafts_store(account) {
+        warn!("could not refresh the drafts index of {account}: {e:#}");
+    }
+}
+
+/// Resolve a draft selector to its indexed row plus the canonical selector.
+fn resolve_draft_arg(
+    store: &Store,
+    selector: &str,
+    account: &str,
+) -> Result<(email::store::drafts::DraftRow, Selector)> {
+    let query = email::selector::parse_in(selector, Namespace::Drafts, account, None)?;
+    email::selector::resolve_draft(store, &query)
+}
+
+/// Resolve a received selector to its message row plus the canonical selector.
+fn resolve_received_arg(
+    store: &Store,
+    selector: &str,
+    account: &str,
+    mailbox: Option<&str>,
+) -> Result<(email::store::read::MessageRow, Selector)> {
+    let query = email::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
+    email::selector::resolve_received(store, &query)
+}
+
+/// Materialise one message's attachments into `dest`, returning the files
+/// written.
+///
+/// Attachments are blobs in the account's content-addressed store (#0037), so
+/// this is the one place that turns them back into files, for `mp save` and
+/// for `mp open`'s hand-off to the system opener.
+fn materialise_attachments(
+    store: &Store,
+    blobs: &email::store::BlobStore,
+    row_id: i64,
+    dest: &Path,
+) -> Result<Vec<PathBuf>> {
+    let attachments = email::store::read::attachments_for(store, row_id)?;
+    fs::create_dir_all(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut written = Vec::new();
+    for att in attachments {
+        let Some(bytes) = email::store::read::read_blob(blobs, row_id, &att.hash) else {
+            return Err(anyhow!(
+                "the blob for attachment {} is missing or unreadable",
+                att.name
+            ));
+        };
+        let out = dest.join(&att.name);
+        fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+        written.push(out);
+    }
+    Ok(written)
+}
+
+/// Build the source of a reply or a forward out of a store row.
+fn source_from_row(
+    store: &Store,
+    blobs: &email::store::BlobStore,
+    row: &email::store::read::MessageRow,
+    with_attachments: bool,
+) -> Result<email::draft::SourceMessage> {
+    let body = email::store::read::load_body(store, blobs, row.id).unwrap_or_default();
+    let attachments = if with_attachments && row.has_attachments {
+        // Forwarded attachments go to the stable per-account mirror keyed by
+        // Message-ID (#0006), so the draft keeps working after the source is
+        // archived or evicted.
+        let dest = email::parse::stable_attachments_dir(
+            &email::config::account_dir(&account_name_of(store)),
+            &row.message_id,
+        );
+        materialise_attachments(store, blobs, row.id, &dest)?
+    } else {
+        Vec::new()
     };
-    anyhow!(
-        "{subject}: mail is stored in the account database, and addressing a message on the \
-         command line lands with the selector contract (#0050). {meanwhile}"
-    )
+    Ok(email::draft::SourceMessage {
+        from: row.from.clone().unwrap_or_default(),
+        to: row.to.clone().unwrap_or_default(),
+        cc: row.cc.clone(),
+        subject: row.subject.clone().unwrap_or_default(),
+        date: row.date_display.clone(),
+        body,
+        attachments,
+        html: None,
+    })
+}
+
+/// The account a store belongs to, read back from its own path
+/// (`<data>/<account>/store.sqlite3`).
+fn account_name_of(store: &Store) -> String {
+    store
+        .path()
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[tokio::main]
@@ -882,11 +1060,9 @@ async fn main() -> Result<()> {
             .and_then(|s| load_signature(&account_config, Some(s)))
     };
 
-    // Resolve directories from config (mailbox-based -> derived from data dir)
-    let drafts_dir: Option<PathBuf> = Some(email::config::drafts_dir(&account_config.name));
     match cli.command {
         Some(Commands::Send {
-            file,
+            selector,
             yes,
             invite,
             to,
@@ -920,10 +1096,17 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let file = file.ok_or_else(|| {
-                anyhow!("`mp send` needs a draft file, or use `--invite` to send a calendar invitation")
+            let selector = selector.ok_or_else(|| {
+                anyhow!(
+                    "`mp send` needs a draft selector, or use `--invite` to send a calendar \
+                     invitation"
+                )
             })?;
-            let draft = parse_email_draft(&file)?;
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            println!("{} {}", "\u{2192}".dimmed(), canonical);
+            let draft = parse_email_draft(&row.path)?;
             validate_draft(&draft)?;
 
             if account_config.auth_method == AuthMethod::Graph {
@@ -1109,13 +1292,52 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::SendApproved { dir, yes }) => {
-            let dir = resolve_drafts_dir(&dir, &drafts_dir);
-            let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
+        Some(Commands::SendApproved { all_accounts, yes }) => {
+            // `--all-accounts` is a loop over the same body rather than a
+            // second code path: each account resolves its own SMTP config,
+            // signature and drafts index, so the per-account send is exactly
+            // what the single-account form does.
+            let accounts: Vec<email::config::AccountConfig> = if all_accounts {
+                global_config.accounts.clone()
+            } else {
+                vec![account_config.clone()]
+            };
+            if accounts.is_empty() {
+                return Err(anyhow!("No account configured (check `mp config show`)"));
+            }
+
+            for account_config in accounts {
+            let smtp_config = SmtpConfig::load(&account_config).unwrap_or_else(|e| {
+                eprintln!("{} Could not load SMTP config: {}", "\u{26a0}".yellow(), e);
+                smtp_config.clone()
+            });
+            let signature_content: Option<String> = if cli.no_signature {
+                None
+            } else if global_config.email.include_signature {
+                load_signature(&account_config, cli.signature.as_deref())
+            } else {
+                cli.signature
+                    .as_deref()
+                    .and_then(|s| load_signature(&account_config, Some(s)))
+            };
+            let store = drafts_store(&account_config.name)?;
+            let rows =
+                email::store::drafts::list(&store, &account_config.name, Some("approved"))?;
+            drop(store);
+            let drafts: Vec<EmailDraft> = rows
+                .iter()
+                .filter_map(|row| match parse_email_draft(&row.path) {
+                    Ok(draft) => Some(draft),
+                    Err(e) => {
+                        eprintln!("{} Skipping {}: {}", "\u{26a0}".yellow(), row.id, e);
+                        None
+                    }
+                })
+                .collect();
 
             if drafts.is_empty() {
-                println!("No approved emails found in {}", dir.display());
-                return Ok(());
+                println!("No approved drafts for {}", account_config.name);
+                continue;
             }
 
             println!(
@@ -1131,9 +1353,15 @@ async fn main() -> Result<()> {
                 );
             }
 
-            if !yes && !prompt_confirmation(&format!("\nSend all {} emails?", drafts.len())) {
+            if !yes
+                && !prompt_confirmation(&format!(
+                    "\nSend all {} emails for {}?",
+                    drafts.len(),
+                    account_config.name
+                ))
+            {
                 println!("Cancelled.");
-                return Ok(());
+                continue;
             }
 
             let mut sent_count = 0;
@@ -1293,105 +1521,91 @@ async fn main() -> Result<()> {
                 }
             }
 
+            reindex_drafts(&account_config.name);
             println!(
-                "\n{}: {} sent, {} failed",
+                "\n{} {}: {} sent, {} failed",
                 "Summary".bold(),
+                account_config.name,
                 sent_count.to_string().green(),
                 failed_count.to_string().red()
             );
+            }
         }
 
-        Some(Commands::List { dir }) => {
-            let dir = resolve_drafts_dir(&dir, &drafts_dir);
-            let drafts = find_drafts(&dir, None)?;
-
-            if drafts.is_empty() {
-                println!("No email drafts found in {}", dir.display());
+        Some(Commands::List { status }) => {
+            let store = drafts_store(&account_config.name)?;
+            let rows = email::store::drafts::list(
+                &store,
+                &account_config.name,
+                status.map(DraftStatusFilter::as_str),
+            )?;
+            if rows.is_empty() {
+                println!("No drafts for {}", account_config.name);
                 return Ok(());
             }
 
-            let mut draft_count = 0;
-            let mut approved_count = 0;
-            let mut sent_count = 0;
-            let mut inbox_count = 0;
-            let mut archived_count = 0;
-
-            println!("\n{}", "Email Drafts:".bold());
-            println!("{}", "─".repeat(60));
-
-            for draft in &drafts {
-                let status_colored = match draft.frontmatter.status {
-                    EmailStatus::Draft => "draft".yellow(),
-                    EmailStatus::Approved => "approved".green(),
-                    EmailStatus::Sent => "sent".dimmed(),
-                    EmailStatus::Inbox => "inbox".cyan(),
-                    EmailStatus::Archived => "archived".blue(),
+            println!("\n{}", "Drafts:".bold());
+            println!("{}", "\u{2500}".repeat(72));
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for row in &rows {
+                *counts.entry(row.status.clone()).or_default() += 1;
+                let status_colored = match row.status.as_str() {
+                    "draft" => "draft".yellow(),
+                    "approved" => "approved".green(),
+                    "sent" => "sent".dimmed(),
+                    other => other.normal(),
                 };
-
-                match draft.frontmatter.status {
-                    EmailStatus::Draft => draft_count += 1,
-                    EmailStatus::Approved => approved_count += 1,
-                    EmailStatus::Sent => sent_count += 1,
-                    EmailStatus::Inbox => inbox_count += 1,
-                    EmailStatus::Archived => archived_count += 1,
-                }
-
                 println!(
-                    "[{}] {} → {}",
+                    "[{}] {} \u{2192} {}",
                     status_colored,
-                    draft.path.file_name().unwrap_or_default().to_string_lossy(),
-                    draft.frontmatter.to.as_deref().unwrap_or("(bcc only)")
+                    Selector::for_draft(&account_config.name, &row.id),
+                    row.to.as_deref().unwrap_or("(bcc only)")
                 );
+                if let Some(subject) = row.subject.as_deref() {
+                    println!("      {}", subject.dimmed());
+                }
             }
-
-            println!("{}", "─".repeat(60));
-            println!(
-                "Total: {} | Draft: {} | Approved: {} | Sent: {} | Inbox: {} | Archived: {}",
-                drafts.len(),
-                draft_count.to_string().yellow(),
-                approved_count.to_string().green(),
-                sent_count.to_string().dimmed(),
-                inbox_count.to_string().cyan(),
-                archived_count.to_string().blue()
-            );
+            println!("{}", "\u{2500}".repeat(72));
+            let summary = counts
+                .iter()
+                .map(|(status, n)| format!("{status}: {n}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("Total: {} | {}", rows.len(), summary);
         }
 
-        Some(Commands::Validate { path }) => {
-            let files: Vec<PathBuf> = if path.is_dir() {
-                WalkDir::new(&path)
-                    .max_depth(1)
+        Some(Commands::Validate { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let targets: Vec<(Selector, PathBuf)> = match selector {
+                Some(ref sel) => {
+                    let (row, canonical) = resolve_draft_arg(&store, sel, &account_config.name)?;
+                    vec![(canonical, row.path)]
+                }
+                None => email::store::drafts::list(&store, &account_config.name, None)?
                     .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md")
-                    })
-                    .map(|e| e.path().to_path_buf())
-                    .collect()
-            } else {
-                vec![path.clone()]
+                    .map(|row| (Selector::for_draft(&account_config.name, &row.id), row.path))
+                    .collect(),
             };
+            if targets.is_empty() {
+                println!("No drafts to validate for {}", account_config.name);
+                return Ok(());
+            }
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
-
-            for file in &files {
-                match parse_email_draft(file) {
-                    Ok(draft) => match validate_draft(&draft) {
-                        Ok(warnings) => {
-                            print!("{} {}", "✓".green(), file.display());
-                            if !warnings.is_empty() {
-                                print!(" ({})", warnings.join(", ").yellow());
-                            }
-                            println!();
-                            valid_count += 1;
+            for (canonical, path) in &targets {
+                match parse_email_draft(path).and_then(|draft| validate_draft(&draft)) {
+                    Ok(warnings) => {
+                        print!("{} {}", "\u{2713}".green(), canonical);
+                        if !warnings.is_empty() {
+                            print!(" ({})", warnings.join(", ").yellow());
                         }
-                        Err(e) => {
-                            println!("{} {} - {}", "✗".red(), file.display(), e);
-                            invalid_count += 1;
-                        }
-                    },
+                        println!();
+                        valid_count += 1;
+                    }
                     Err(e) => {
-                        println!("{} {} - {}", "✗".red(), file.display(), e);
+                        println!("{} {} - {}", "\u{2717}".red(), canonical, e);
                         invalid_count += 1;
                     }
                 }
@@ -1408,78 +1622,170 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::MarkApproved { file }) => {
-            let msg = mark_as_approved(&file)?;
+        Some(Commands::MarkApproved { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let msg = mark_as_approved(&row.path)?;
+            reindex_drafts(&account_config.name);
             if msg.starts_with("Already") {
-                println!("{} {}", "ℹ".blue(), msg);
+                println!("{} {} is already approved", "\u{2139}".blue(), canonical);
             } else {
-                println!("{} {}", "✓".green(), msg);
+                println!("{} approved {}", "\u{2713}".green(), canonical);
             }
         }
 
-        Some(Commands::MarkDraft { file }) => {
-            let msg = mark_as_draft(&file)?;
+        Some(Commands::MarkDraft { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let msg = mark_as_draft(&row.path)?;
+            reindex_drafts(&account_config.name);
             if msg.starts_with("Already") {
-                println!("{} {}", "\u{2139}".blue(), msg);
+                println!("{} {} is already a draft", "\u{2139}".blue(), canonical);
             } else {
-                println!("{} {}", "\u{2713}".green(), msg);
+                println!("{} demoted {}", "\u{2713}".green(), canonical);
             }
         }
 
         Some(Commands::New { name }) => {
-            // Add .md extension if not present
             let file_name = if Path::new(&name).extension().is_some() {
                 name.clone()
             } else {
                 format!("{}.md", name)
             };
-            let dir = resolve_drafts_dir(Path::new("."), &drafts_dir);
+            let dir = email::config::drafts_dir(&account_config.name);
+            fs::create_dir_all(&dir)?;
             let path = dir.join(&file_name);
-
-            // Check if file already exists
             if path.exists() {
-                return Err(anyhow!("File already exists: {}", path.display()));
+                return Err(anyhow!("A draft already exists at {}", path.display()));
             }
 
-            // Create skeleton content with all frontmatter fields
+            // The id is minted here rather than by the index, so the selector
+            // printed below is the one in the file from the first byte.
+            let id = email::store::drafts::new_id();
             let now = chrono::Utc::now().to_rfc2822();
-            let from = &smtp_config.default_from;
-            let skeleton = new_draft_skeleton(from, &now);
-
+            let skeleton =
+                new_draft_skeleton_with_id(&smtp_config.default_from, &now, &id);
             fs::write(&path, skeleton)?;
-            println!("{} Created new draft: {}", "✓".green(), path.display());
+            reindex_drafts(&account_config.name);
+            println!(
+                "{} {}",
+                "\u{2713}".green(),
+                Selector::for_draft(&account_config.name, &id)
+            );
         }
 
-        Some(Commands::Reply { file, all: _ }) => {
-            // The source message is a store row, not a `.md` file, and the
-            // draft this would write is the drafts index #0050 builds. Without
-            // the decline, `create_reply_draft` reaches `parse_email_draft` and
-            // fails on the missing file with a bare I/O error, and the
-            // interactive form walks an inbox tree that no longer exists.
-            return Err(decline_message_path(
-                file.as_deref(),
-                "Reply builds a draft from the source message; mp-legacy is the working \
-                 fallback meanwhile.",
-            ));
+        Some(Commands::Path { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, _canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            println!("{}", row.path.display());
         }
 
-        Some(Commands::Forward { file }) => {
-            // Same edge as `Reply` above.
-            return Err(decline_message_path(
-                file.as_deref(),
-                "Forward builds a draft from the source message; mp-legacy is the working \
-                 fallback meanwhile.",
-            ));
+        Some(Commands::Edit { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "hx".to_string());
+            let status = std::process::Command::new(&editor)
+                .arg(&row.path)
+                .status()
+                .with_context(|| format!("running {editor}"))?;
+            reindex_drafts(&account_config.name);
+            if !status.success() {
+                return Err(anyhow!("{editor} exited with {status}"));
+            }
+            println!("{} {}", "\u{2713}".green(), canonical);
+        }
+
+        Some(Commands::Reply { selector, all, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let source = source_from_row(&store, &blobs, &row, false)?;
+            drop(store);
+
+            let dir = email::config::drafts_dir(&account_config.name);
+            let path = email::draft::create_reply_draft_from(
+                &source,
+                all,
+                &account_config.default_from,
+                Some(&dir),
+            )?;
+            let id = email::store::drafts::new_id();
+            email::draft::set_draft_id(&path, &id)?;
+            reindex_drafts(&account_config.name);
+            println!("{} reply to {}", "\u{2713}".green(), canonical);
+            println!("{}", Selector::for_draft(&account_config.name, &id));
+        }
+
+        Some(Commands::Forward { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let source = source_from_row(&store, &blobs, &row, true)?;
+            drop(store);
+
+            let dir = email::config::drafts_dir(&account_config.name);
+            let path = email::draft::create_forward_draft_from(
+                &source,
+                &account_config.default_from,
+                Some(&dir),
+            )?;
+            let id = email::store::drafts::new_id();
+            email::draft::set_draft_id(&path, &id)?;
+            reindex_drafts(&account_config.name);
+            println!("{} forward of {}", "\u{2713}".green(), canonical);
+            println!("{}", Selector::for_draft(&account_config.name, &id));
         }
 
         Some(Commands::Invite { action }) => {
-            let (file, rsvp) = match action {
-                InviteAction::Accept { file } => (file, email::invite::Rsvp::Accepted),
-                InviteAction::Tentative { file } => (file, email::invite::Rsvp::Tentative),
-                InviteAction::Decline { file } => (file, email::invite::Rsvp::Declined),
+            let (selector, mailbox, rsvp) = match action {
+                InviteAction::Accept { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Accepted)
+                }
+                InviteAction::Tentative { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Tentative)
+                }
+                InviteAction::Decline { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Declined)
+                }
             };
-            let _ = rsvp;
-            return Err(decline_invite_rsvp(&file));
+            if account_config.auth_method == AuthMethod::Graph {
+                return Err(anyhow!(
+                    "RSVP is not supported for Graph accounts yet (#0036, blocked on #0035)"
+                ));
+            }
+
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            // The invitation's own iMIP payload is the source of truth for the
+            // reply, and it is a blob on the row (#0038 item 6).
+            let ics = email::store::read::load_invite_ics(&store, &blobs, row.id)
+                .ok_or_else(|| anyhow!("{canonical} carries no invitation to reply to"))?;
+            drop(store);
+
+            let outcome = email::send::send_rsvp(
+                &ics,
+                &account_config,
+                &account_config.default_from,
+                rsvp,
+                &smtp_config,
+            )
+            .await?;
+            if !outcome.send_result.any_succeeded() {
+                return Err(anyhow!("Failed to send the RSVP to {}", outcome.organizer));
+            }
+            println!(
+                "{} {} \u{2014} replied to {}",
+                "\u{2713}".green(),
+                outcome.subject,
+                outcome.organizer
+            );
         }
 
         Some(Commands::ListMailboxes) => {
@@ -1678,29 +1984,88 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Archive { file }) | Some(Commands::Delete { file }) => {
-            // Both mutations are store-backed and server-backed now (#0038
-            // scope item 7), and both are addressed by row rather than by
-            // file. Naming a message on the command line is the selector
-            // contract #0050 owns, so this declines instead of guessing which
-            // row a path was meant to be.
-            return Err(decline_message_path(
-                Some(&file),
-                "Archive or delete from the TUI (`a` / `d`) meanwhile.",
-            ));
+        Some(Commands::Archive { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let source_server = find_server_name_for_role(&account_config, &row.mailbox);
+            let dest_server = find_server_name_for_role(&account_config, ARCHIVE_MAILBOX);
+
+            // Server first, then the row. The TUI writes the row first because
+            // a user is watching the list; a CLI invocation has nobody to keep
+            // responsive, so it takes the ordering that needs no rollback.
+            if account_config.auth_method == AuthMethod::Graph {
+                let graph_config = GraphConfig::load(&account_config)?;
+                graph::move_message_graph(&graph_config, &row.message_id, &dest_server).await?;
+            } else {
+                let imap_config = ImapConfig::load(&account_config)?;
+                imap_client::move_email_on_server(
+                    &imap_config,
+                    &row.message_id,
+                    &source_server,
+                    &dest_server,
+                )
+                .await?;
+            }
+            email::store::write::move_row(&store, row.id, ARCHIVE_MAILBOX)?;
+            println!("{} archived {}", "\u{2713}".green(), canonical);
+            println!(
+                "  {} {}",
+                "now".dimmed(),
+                Selector::new(&account_config.name, ARCHIVE_MAILBOX, &row.message_id)
+            );
         }
 
-        Some(Commands::Open { file }) | Some(Commands::Save { file, .. }) => {
-            // Attachments are blobs in the account's blob store, keyed by row.
-            // `list_attachments` still walks the `<stem>_attachments/` tree
-            // ingest stopped writing, so it reports an empty list for a message
-            // that has attachments: a false success, exit 0 and all. Decline
-            // before that walk instead; naming the message is #0050's.
-            return Err(decline_message_path(
-                Some(&file),
-                "Attachments live in the account's blob store; mp-legacy is the working \
-                 fallback meanwhile.",
-            ));
+        Some(Commands::Delete { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let source_server = find_server_name_for_role(&account_config, &row.mailbox);
+
+            if account_config.auth_method == AuthMethod::Graph {
+                let graph_config = GraphConfig::load(&account_config)?;
+                graph::delete_message_graph(&graph_config, &row.message_id).await?;
+            } else {
+                let imap_config = ImapConfig::load(&account_config)?;
+                imap_client::delete_email_on_server(&imap_config, &row.message_id, &source_server)
+                    .await?;
+            }
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            email::store::write::delete_row(&store, &blobs, row.id)?;
+            println!("{} deleted {}", "\u{2713}".green(), canonical);
+        }
+
+        Some(Commands::Open { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            // Attachments are blobs; the system opener needs files, so they are
+            // materialised into a temp directory keyed by the row.
+            let dir = std::env::temp_dir().join(format!("mailypoppins-{}", row.id));
+            let files = materialise_attachments(&store, &blobs, row.id, &dir)?;
+            if files.is_empty() {
+                return Err(anyhow!("{canonical} has no attachments"));
+            }
+            for file in &files {
+                email::parse::open_file_with_system(file)?;
+                println!("{} opened {}", "\u{2713}".green(), file.display());
+            }
+        }
+
+        Some(Commands::Save { selector, output, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let dest = output.unwrap_or_else(|| PathBuf::from("."));
+            let files = materialise_attachments(&store, &blobs, row.id, &dest)?;
+            if files.is_empty() {
+                return Err(anyhow!("{canonical} has no attachments"));
+            }
+            for file in &files {
+                println!("{} {}", "\u{2713}".green(), file.display());
+            }
         }
 
         Some(Commands::Search {
@@ -1876,9 +2241,13 @@ async fn main() -> Result<()> {
         }
 
         None => {
-            if let Some(file) = cli.file {
-                // Preview mode (dry run)
-                let draft = parse_email_draft(&file)?;
+            if let Some(ref selector) = cli.selector {
+                // Preview mode (dry run): a draft selector, never a path.
+                let store = drafts_store(&account_config.name)?;
+                let (row, _canonical) =
+                    resolve_draft_arg(&store, selector, &account_config.name)?;
+                drop(store);
+                let draft = parse_email_draft(&row.path)?;
                 preview_draft(
                     &draft,
                     &smtp_config,

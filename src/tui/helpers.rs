@@ -457,6 +457,7 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
 
     EmailEntry {
         msg,
+        draft_id: None,
         from: fetched.from.clone(),
         to: fetched.to.clone(),
         cc: fetched.cc.clone(),
