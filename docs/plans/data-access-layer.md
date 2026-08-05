@@ -236,14 +236,15 @@ Pausing there is viable; the only thing already promoted out of Stage 3 is send,
 The redesign is a greenfield rebuild on a long-lived branch, with delete-as-you-go: Stages 1 and 2 remove `src/sync.rs`, `src/imap_client/sync.rs` and the scanners as they replace them, and no dead code is carried forward for a fallback that will never be used.
 The safety net is not a code path, it is the preserved binary and the tagged tree.
 
-Capture both in Stage 0, before a line of greenfield code exists:
+Both were captured in Stage 0 ([#0049](../tickets/0049-pre-nuke-oracle-capture.md)), together with the envelope oracles, before a line of greenfield code existed:
 
-1. `cp "$(which mp)" ~/.local/bin/mp-legacy`, which keeps reading the existing `.md` tree and works forever against its own data; the redesign becomes the new `mp`.
-2. `git tag pre-dal-nuke` on the last files-as-truth commit, so the frozen reference is addressable rather than remembered.
+1. `~/.local/bin/mp-legacy`, copied from the cargo-installed `mp` built at the frozen commit; it keeps reading the existing `.md` tree and works forever against its own data, and the redesign becomes the new `mp`.
+2. The tag `pre-dal-nuke`, on the last files-as-truth commit, so the frozen reference is addressable rather than remembered.
+3. The real-account envelope dumps from `mp dump-mailbox --json`, in the git-ignored `dumps/` directory as `dumps/pre-nuke-<account>.ndjson` (assistant 312 records, tum 627, perso 450), kept out of git because they carry real mail metadata.
 
-Recorded here as the two facts a future session needs: the tag is `pre-dal-nuke` and the preserved binary is `~/.local/bin/mp-legacy`.
+Recorded here as the facts a future session needs: the tag is `pre-dal-nuke`, the preserved binary is `~/.local/bin/mp-legacy`, and the envelope oracles are local-only under `dumps/`.
 
-The one caution holds without exception: the old (files-as-truth) and new (store + blobs) versions must never point at the same account data directory, or the new version's wipe-and-resync will delete the `.md` files the old one treats as truth.
+The one caution holds without exception: `mp-legacy` (files-as-truth) and the rewritten `mp` (store + blobs) must never point at the same account data directory, or the new version's wipe-and-resync will delete the `.md` files the old one treats as truth.
 Use separate data dirs, or do not run both against one account.
 
 The alternative of keeping two crates compiling side by side was rejected: it is the dual-write cost wearing a different hat, and it pays for a fallback the branch already provides for free.

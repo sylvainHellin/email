@@ -3,7 +3,7 @@ id: 0049
 title: Pre-nuke oracle capture: golden frames, gap-list fixtures, envelope dumps, freeze
 type: chore
 priority: now
-status: open
+status: done
 created: 2026-07-31
 ---
 
@@ -72,6 +72,20 @@ Records are sorted by `(account, mailbox, date_sort, message_id, subject, file n
 The contract lives in [tests/dump_mailbox_integration.rs](../../tests/dump_mailbox_integration.rs) as the exact expected NDJSON of a fixture tree, plus a determinism check, all tagged `parity`.
 
 Two findings from the real capture: outgoing mail records the *source path* of an attachment in `attachments:` (`/tmp/audio/briefing.mp3`, and one under `/home/sylvain`), which is why names are reduced to their file name; and three messages across the three accounts have no Message-ID at all, so identity-less mail is not hypothetical.
+
+## Unit 0d freeze notes
+
+The three capture units landed on `main` first: golden frames in 55eb172 (unit 0a), gap-list oracles in 6bb764d (unit 0b), the `mp dump-mailbox --json` command in f15ed7d (unit 0c), with the real-account dumps taken at that point into the git-ignored `dumps/` directory.
+Unit 0d is this freeze, executed on the commit that closes the ticket.
+
+What the freeze leaves behind:
+
+- The tag `pre-dal-nuke`, on the commit that closes this ticket, which is the last files-as-truth commit.
+- `~/.local/bin/mp-legacy`, copied from the cargo-installed `mp` built at that commit.
+- The real-account envelope dumps in the git-ignored `dumps/` directory, one file per account (`dumps/pre-nuke-<account>.ndjson`): 312 records for assistant, 627 for tum, 450 for perso.
+  They stay out of git because they carry real mail metadata.
+
+`mp-legacy` and the rewritten `mp` must never point at the same account data directory: the new build's wipe-and-resync deletes the `.md` tree the old build treats as truth.
 
 ## Acceptance criteria
 

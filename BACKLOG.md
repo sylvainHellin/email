@@ -10,9 +10,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Next
 
-> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them.
+> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them.
 
-- [#0049 Pre-nuke oracle capture (golden frames, gap fixtures, envelope dumps, freeze)](docs/tickets/0049-pre-nuke-oracle-capture.md) -- chore _(Stage 0, blocks the rest of the arc)_
 - [#0037 Greenfield store + blob cache + store-only ingest + durable outbox](docs/tickets/0037-sqlite-store-engine-skeleton.md) -- refactor _(Stage 1)_
 - [#0038 Read path, calendar and reconcile on the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(Stage 2, first half of the stop-gate pair)_
 - [#0050 Unified mp:// selector contract and drafts index](docs/tickets/0050-selector-contract-drafts-index.md) -- refactor _(Stage 2b, stop-gate after this one, subsumes TKT-0045)_
