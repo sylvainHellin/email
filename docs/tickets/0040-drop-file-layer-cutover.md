@@ -1,31 +1,34 @@
 ---
 id: 0040
-title: Remove files-as-truth; received read-only; drafts local-only; wipe-and-resync cutover
-type: refactor
+title: Decommission the legacy .md tree; one-time draft import
+type: chore
 priority: later
 status: open
 created: 2026-07-14
 ---
 
-Stage 4 of the data-access-layer redesign. Plan: [data-access-layer](../plans/data-access-layer.md).
+Stage 4 of the data-access-layer redesign, shrunk 2026-07-31 for the complete nuke.
+The filename slug predates the rewritten title and is kept as a stable link target.
+Plan: [data-access-layer](../plans/data-access-layer.md).
+Foundation plan: [2026-07-31_dal-foundation-plan-v2](../../.agents/handoff/2026-07-31_dal-foundation-plan-v2.md), amendment 9.
 
-The paradigm flip, done as a clean resync rather than a migrator (honours the no-migrations-before-v1.0 rule).
+There is no file layer to delete: the greenfield build never had one, and [#0037](0037-sqlite-store-engine-skeleton.md) and [#0038](0038-read-path-to-db.md) removed the legacy modules as they replaced them.
+What is left is ending the transition period.
+
 Depends on [#0038](0038-read-path-to-db.md) and [#0039](0039-pending-ops-queue.md).
 
 ## Scope
 
-1. Delete the files-as-truth machinery: the two scanners (`src/parse.rs:756`, `:989`), `deduplicate_mailbox`, `count_all_emails`, the `MessageIdIndex` HashMap, and the `needs_reconciliation` heuristic (`src/imap_client/sync.rs:40`).
-2. Received mail becomes read-only: remove the edit-received-in-`$EDITOR` affordance; message bodies are checked out to an ephemeral temp file only for viewing.
-3. Drafts are local-only in `<account_dir>/drafts/`: the `$EDITOR` + agent-writable draft surface, never synced to the server. The agent-writes-a-file contract is preserved here.
-4. Cutover procedure: wipe the local `.md` tree, resync everything from the server into the store + blobs, one-time import of existing drafts (and any local-only sent records) into the new layout.
+1. Decommission the legacy tree: after the greenfield build has run against the real accounts for long enough to trust it, remove the old `.md` mailstore and retire the `mp-legacy` binary. The `pre-dal-nuke` tag stays; it costs nothing and it is the only remaining way back.
+2. One-time draft import: copy the drafts from the legacy tree into `<account_dir>/drafts/`, assigning an `id:` frontmatter field to any draft that does not have one, then let the index refresh pick them up. This is the only data that does not come back from the server, so it is the only import.
+3. Close TKT-0047 by construction and record why: `reconcile::build_index` no longer walks the account root, and there is no attachment `.md` on disk for a sender to forge frontmatter into. See [TKT-0047](TKT-0047-reconcile-walks-attachment-markdown.md), which is marked resolved-by this ticket.
 
 ## Acceptance criteria
 
-- No file walk or reconciliation heuristic remains in the codebase.
-- Received mail is not editable; drafts are, and never leave the machine.
-- A clean-machine cutover (wipe + resync + draft import) reproduces the account state from the server with no data loss beyond the intended draft-non-convergence.
-- File-layer tests removed or rewritten against the store.
+- No `.md` mailstore remains on any machine, and `mp-legacy` is gone from `~/.local/bin/`.
+- Every draft that existed in the legacy tree is present in the new `drafts/` directory with an `id:` field, appears in `mp list`, and resolves through its selector.
+- TKT-0047 is set to `done` with a one-line note pointing at this ticket.
 
 ## Unblocks
 
-- [#0041](0041-persistent-conn-condstore.md), [#0042](0042-graph-delta-sync.md), [#0043](0043-fts5-search.md) (Stage 5 protocol + search on a pure store base).
+- [#0041](0041-persistent-conn-condstore.md), [#0042](0042-graph-delta-sync.md), [#0043](0043-fts5-search.md) (Stage 5 protocol and search on a pure store base).

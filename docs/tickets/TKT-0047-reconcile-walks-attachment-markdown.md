@@ -7,6 +7,12 @@ status: open
 created: 2026-07-29
 ---
 
+Parked 2026-07-31 as an accepted risk, resolved by [#0040](0040-drop-file-layer-cutover.md).
+The exposure the owner accepted: a sender-controlled `.md` attachment can carry a forged `method: REPLY` that `reconcile::build_index` classifies and writes into a real invite's `PARTSTAT`, and the live mailstore holds 72 attachment `.md` files today, none of them carrying an `event:` block.
+No code is spent on it, because the data-access-layer rebuild deletes the walk it lives in: `src/reconcile.rs` moves onto store-backed sources in [#0038](0038-read-path-to-db.md) and there is no attachment `.md` on disk after the cutover.
+See [data-access-layer](../plans/data-access-layer.md), decision F.
+The analysis below stands as the record of the bug.
+
 `reconcile::build_index` (`src/reconcile.rs:205-209`) walks the account root with an unbounded `WalkDir` and classifies every `*.md` it finds.
 Inbound email attachments live under that same root: `parse.rs` writes them to `<mailbox>/<stem>_attachments/<name>.md` and mirrors them to `<account>/attachments/<message-id>/<name>.md`, and `sanitize_attachment_filename` preserves the `.md` extension.
 Those files are sender-controlled content, not our mail.

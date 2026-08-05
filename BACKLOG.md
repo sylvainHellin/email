@@ -10,23 +10,25 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Next
 
-> Data-access-layer redesign (DECIDED 2026-07-14): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Staged with a stop-gate after Stage 2 (#0038). Supersedes the old files-as-truth perf plan.
+> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them.
 
-- [#0037 SQLite store + blob cache + engine skeleton (dual-write)](docs/tickets/0037-sqlite-store-engine-skeleton.md) -- refactor _(Stage 1)_
-- [#0038 Read path reads the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(Stage 2, stop-gate)_
+- [#0049 Pre-nuke oracle capture (golden frames, gap fixtures, envelope dumps, freeze)](docs/tickets/0049-pre-nuke-oracle-capture.md) -- chore _(Stage 0, blocks the rest of the arc)_
+- [#0037 Greenfield store + blob cache + store-only ingest + durable outbox](docs/tickets/0037-sqlite-store-engine-skeleton.md) -- refactor _(Stage 1)_
+- [#0038 Read path, calendar and reconcile on the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(Stage 2, first half of the stop-gate pair)_
+- [#0050 Unified mp:// selector contract and drafts index](docs/tickets/0050-selector-contract-drafts-index.md) -- refactor _(Stage 2b, stop-gate after this one, subsumes TKT-0045)_
+- [#TKT-0045 Reload drafts](docs/tickets/TKT-0045-reload-drafts.md) -- bug _(resolved by #0050 above, no standalone fix)_
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
-- [#TKT-0045 Reload drafts](docs/tickets/TKT-0045-reload-drafts.md) -- bug
-- [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug
 - [#TKT-0048 Contacts/Calendar visual polish to match overlay quality](docs/tickets/TKT-0048-views-visual-polish.md) -- feature
 
 ## Later
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
-- [#0039 Durable pending_ops mutation queue](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3)_
-- [#0040 Drop files-as-truth; drafts local-only; wipe-and-resync cutover](docs/tickets/0040-drop-file-layer-cutover.md) -- refactor _(data layer, Stage 4)_
+- [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037)_
+- [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
+- [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_
 - [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5)_
 - [#0042 Graph /messages/delta + deltaLink](docs/tickets/0042-graph-delta-sync.md) -- perf _(data layer, Stage 5)_
 - [#0043 FTS5 full-text search](docs/tickets/0043-fts5-search.md) -- feature _(data layer, Stage 5)_

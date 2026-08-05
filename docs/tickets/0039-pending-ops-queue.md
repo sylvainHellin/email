@@ -1,33 +1,36 @@
 ---
 id: 0039
-title: Durable pending_ops mutation queue (archive/delete/move/mark-read/send) with retry
+title: Durable pending_ops queue for flag, move and delete mutations
 type: refactor
 priority: later
 status: open
 created: 2026-07-14
 ---
 
-Stage 3 of the data-access-layer redesign. Plan: [data-access-layer](../plans/data-access-layer.md).
+Stage 3 of the data-access-layer redesign, amended 2026-07-31 for the complete nuke.
+Plan: [data-access-layer](../plans/data-access-layer.md).
+Foundation plan: [2026-07-31_dal-foundation-plan-v2](../../.agents/handoff/2026-07-31_dal-foundation-plan-v2.md), amendment 8.
 
-Make every state-changing operation durable.
-Each mutation applies to the local store immediately, enqueues a `pending_ops` row, and the engine drains it against the server with retry and backoff, marking done or failed with feedback to the UI.
-This replaces today's fire-and-forget optimistic model and delivers the sent-durability fix (retried APPEND-to-Sent).
-Lands behind the still-present file layer so a queue bug cannot lose mail.
+The sent-durability half of this ticket has moved into [#0037](0037-sqlite-store-engine-skeleton.md) as the durable outbox, because the nuke removes the local sent `.md` on day one and leaving send best-effort until this stage would be a regression the owner has to live with in between.
+What remains here is the generic drain for the other mutations: archive, delete, move, and mark-read or mark-unread.
+
+The old mitigation ("lands behind the still-present file layer so a queue bug cannot lose mail") is void, since there is no file layer.
+The replacement mitigation is narrower and honest: these ops change server-side state that the server itself still holds, so a queue bug loses a flag change or delays a move, not a message.
 
 ## Scope
 
-1. `pending_ops(id, kind, target_message_id, payload, state, attempts, last_error, created)` drained by the engine; kinds: archive, delete, move, mark-read/unread, send.
-2. TUI `Action` handlers enqueue an op + apply the local store change, instead of spawning a per-op IMAP task. `BgResult` carries op state transitions back to `App::update`.
-3. Retry with exponential backoff; surfaced UI state for pending/failed ops (outbox semantics for send: "sent" = delivered + APPENDed).
-4. Crash-safety: ops replay on startup; guard against duplicate apply and stuck rows.
+1. `pending_ops(id, kind, target_message_id, payload, state, attempts, last_error, created)` drained by the engine; kinds: archive, delete, move, mark-read, mark-unread. Send is not a kind here; it lives in `outbox`.
+2. TUI `Action` handlers enqueue an op and apply the local store change, instead of spawning a per-op IMAP task. `BgResult` carries op state transitions back to `App::update`.
+3. Retry with exponential backoff; pending and failed ops surfaced in the UI.
+4. Crash-safety: ops replay on startup, with a guard against duplicate apply and against stuck rows.
 
 ## Acceptance criteria
 
 - A mutation reflects instantly in the UI and is confirmed or retried in the background with visible feedback.
 - Kill the process mid-op; on restart the op replays exactly once and converges.
-- Send failure and Sent-APPEND failure both retry rather than silently dropping.
-- Test harness decision made (IMAP mock vs accepted live-server validation) and documented.
+- A delete that the server rejects surfaces as a failed op with its error, and the local row returns to the server's state rather than staying optimistically changed.
+- Test harness decision made (IMAP mock versus accepted live-server validation) and documented.
 
 ## Unblocks
 
-- [#0040](0040-drop-file-layer-cutover.md) (file layer can be removed once mutations are durable in the store).
+- [#0040](0040-drop-file-layer-cutover.md) (the legacy tree can be retired once every mutation is durable).

@@ -1,9 +1,9 @@
 ---
 id: data-access-layer
 title: "Data-access-layer redesign: server-as-truth SQLite mirror + local-only drafts"
-status: DECIDED (2026-07-14) — implementer-facing plan, staged with a stop-gate
+status: DECIDED (2026-07-14), amended 2026-07-31 for the complete-nuke greenfield rebuild
 supersedes: ".agents/research/2026-07-12-architecture-rethink-decision-doc.md (Option choice), .agents/research/2026-07-12-perf-sync-improvement-plan.md (Phases 0-2)"
-next_free_ticket: 0037
+next_free_ticket: 0051
 ---
 
 # Data-access-layer redesign
@@ -41,18 +41,41 @@ What survives from the founding product, unchanged:
 - Agents (Claude / Robin) create and modify drafts as plain files the owner reviews and sends.
 - Send from the terminal after approval.
 
+### Decisions settled 2026-07-31
+
+Recorded after owner review of the foundation plan v2 ([2026-07-31_dal-foundation-plan-v2](../../.agents/handoff/2026-07-31_dal-foundation-plan-v2.md)) and the sent-durability research ([sent-folder-durability-in-mail-clients](../../.agents/research/sent-folder-durability-in-mail-clients.md)).
+These are settled and do not reopen.
+
+A. Complete nuke, greenfield on a long-lived branch with delete-as-you-go.
+   [#0037](../tickets/0037-sqlite-store-engine-skeleton.md) and [#0038](../tickets/0038-read-path-to-db.md) may delete `src/sync.rs`, `src/imap_client/sync.rs` and the scanners as they go; no dead code is carried forward.
+   The safety net is the `mp-legacy` binary plus the `pre-dal-nuke` tag, never a dual-write layer.
+B. Sent durability ships with the greenfield ingest slice ([#0037](../tickets/0037-sqlite-store-engine-skeleton.md)) as a durable outbox, per the research recommendation.
+   The `outbox` table holds the raw RFC822 blob with states `pending_send`, `sent_pending_append`, `done` and `failed`, and the blob and row are committed before SMTP.
+   SMTP is attempted exactly once per row: an ambiguous SMTP failure goes to `failed` for manual inspection and never to an automatic re-send.
+   Retry drives the APPEND only, guarded by a `UID SEARCH HEADER MESSAGE-ID` check in the Sent mailbox when the previous attempt was ambiguous, with `APPENDUID` as the definitive acknowledgement.
+   A per-account `save_to_sent` flag defaults to `auto`, which skips the APPEND on Gmail, Graph and Proton where the server already saves, and keeps it for generic IMAP.
+   Non-`done` rows are surfaced in the TUI with a count badge, and retry resumes on startup.
+C. Draft identity is an `id:` frontmatter field written by `mp new`, so a rename does not change the selector.
+   The `drafts` table is keyed by `(account, id)`, agents and automation are expected to preserve the field, and a draft file without one is assigned an id on the first index refresh.
+D. Golden frames stay lean: the mail view (sidebar, list, preview) and the calendar at 120x40, plus the help overlay.
+   The style-run legend is captured only where style carries meaning (unread bold, cursor row, selection), and there is no multi-size sweep, because a cosmetic snapshot catches no regression worth the churn.
+E. `mp dump-mailbox --json` may land on `main` before the freeze, since it is the only way the envelope-dump oracle exists at all.
+F. TKT-0047 is parked with an explicit accepted-risk note and marked resolved-by [#0040](../tickets/0040-drop-file-layer-cutover.md); no code is spent on the module the nuke deletes.
+G. `messages` carries a synthetic integer row id with `UNIQUE (account, mailbox, uid)` as the real identity and a non-unique index on `message_id`; ingest dedup is the UPSERT on that unique constraint, and a missing Message-ID is synthesised as `sha256-<hex16>@local.invalid`.
+H. One CLI contract, `mp://<account>/<mailbox>/<key>`, committed on landing: no path inputs anywhere in the CLI, `mp path` and `mp edit` are the only filesystem edge, no command ever dual-accepts a path and a selector, and TKT-0045 is resolved by the drafts index rather than fixed in the current build.
+
 ## Why files-as-truth is being retired (verified against the tree)
 
 The cost, measured against the current code, not asserted:
 
 - Cold start streams every byte of the tree.
-  `build_message_id_index` (`src/tui/app/types.rs:468`) walks 1327 files / 308 MB on the homeserver (thousands more on the Mac) at startup; `load_emails` (`types.rs:88`) full-parses a mailbox with `gray_matter`; `count_all_emails` (`types.rs:1038`) walks every directory a second time.
+  `build_message_id_index` (`src/tui/app/types.rs:475`) walks 1327 files / 308 MB on the homeserver (thousands more on the Mac) at startup; `load_emails` (`types.rs:88`) full-parses a mailbox with `gray_matter`; `count_all_emails` (`types.rs:1176`) walks every directory a second time.
 - Quick sync is slow because it does the maximum work every time.
-  Per mailbox it opens a fresh TCP + TLS + LOGIN (`open_imap_session`, `src/imap_client/mod.rs:175`), runs `UID SEARCH ALL`, then a full-window pass-1 header + FLAGS fetch that is deliberately never shrunk because flags have no delta channel (`src/imap_client/fetch.rs:167`, the #0004 constraint).
+  Per mailbox it opens a fresh TCP + TLS + LOGIN (`open_imap_session`, `src/imap_client/mod.rs:178`), runs `UID SEARCH ALL`, then a full-window pass-1 header + FLAGS fetch that is deliberately never shrunk because flags have no delta channel (`src/imap_client/fetch.rs:171`, the #0004 constraint).
   Multiply by mailboxes across four accounts.
   Apple Mail is smooth because it holds a persistent connection, uses IDLE push and CONDSTORE/QRESYNC deltas ("what changed since cursor N", one round trip, empty when nothing changed), and reads a local index instead of parsing files.
 - Reconciliation is heuristic and ambiguous.
-  `needs_reconciliation` (`src/imap_client/sync.rs:40`) guesses move/delete from EXISTS/UIDNEXT deltas, and out-of-band file edits collide with server truth with no principled winner.
+  `needs_reconciliation` (`src/imap_client/sync.rs:42`) guesses move/delete from EXISTS/UIDNEXT deltas, and out-of-band file edits collide with server truth with no principled winner.
 
 Under the new model none of these exist: the read path is a `SELECT`, sync is a cursor delta, and the only writers to state are the sync engine and the user's own actions, which removes the corruption surface the owner flagged.
 
@@ -66,7 +89,8 @@ This is the Mailspring / JMAP shape (research doc `.agents/workflow/2026-07-12-d
 ```
 <account_dir>/
   store.sqlite3        WAL, single writer: envelopes, flags, threading, mailboxes,
-                       sync_cursors, pending_ops, + FTS5 over subject/from/body-text
+                       sync_cursors, pending_ops, outbox, the drafts index,
+                       + FTS5 over subject/from/body-text
   store.sqlite3-wal
   store.sqlite3-shm
   blobs/
@@ -108,6 +132,7 @@ Implementation notes:
 - Re-fetch on open is a normal engine pull for one message by UID; the body arrives, the blob is rewritten, the row flips back to present.
 - The blob store needs a refcount or a periodic mark-and-sweep GC so a shared attachment is not unlinked while another message still references it.
 - Config lives in the existing config file; defaults must be sane (keep-all metadata, generous body/attachment horizons, a conservative disk cap) so a user who sets nothing still gets correct behaviour.
+- This is a new config schema, not an edit to an existing one: `src/config.rs` has zero occurrences of `retention`, `horizon` or `max_disk_bytes` today, so the three horizons, the per-account and global `max_disk_bytes`, their defaults and their round-trip tests are all new surface.
 
 ### SQLite schema (v1 sketch, drop-and-rebuild on version mismatch, never a migrator)
 
@@ -115,26 +140,40 @@ Implementation notes:
 meta(key PRIMARY KEY, value)                         -- schema_version, app_version
 mailboxes(account, name PRIMARY KEY, uidvalidity, uidnext, exists_count, unread_count)
 messages(
-  message_id PRIMARY KEY, account, mailbox, uid,
-  from_, to_, cc, subject, date_sort, date_display,
+  id INTEGER PRIMARY KEY, account, mailbox, uid,
+  message_id, from_, to_, cc, subject, date_sort, date_display,
   flags, in_reply_to, references_, thread_id,
-  snippet, has_attachments, body_blob, raw_blob, size, mtime
+  snippet, has_attachments, body_blob, raw_blob, size, mtime,
+  UNIQUE (account, mailbox, uid)
 )
+CREATE INDEX messages_message_id ON messages(message_id)   -- non-unique
+drafts(account, id PRIMARY KEY, slug, path, mtime, size, status, to_, cc, subject, date, snippet)
+outbox(id INTEGER PRIMARY KEY, account, target_mailbox, message_id, raw_blob,
+       state, attempts, last_error, created, updated)
 sync_cursors(mailbox PRIMARY KEY, uidvalidity, highest_modseq, deltalink)
 pending_ops(id PRIMARY KEY, kind, target_message_id, payload, state, attempts, last_error, created)
 messages_fts USING fts5(subject, from_, body_text, content='messages')
 ```
 
+The identity of a received message is `(account, mailbox, uid)`, not its Message-ID, and the row id is synthetic so a move or a UIDVALIDITY reset does not invalidate foreign references.
+Ingest dedup is the UPSERT on that unique constraint, so the `message_id` index is never on the hot ingest path.
+It exists for four things: resolving `In-Reply-To` and `References` to a parent row so `thread_id` can be assigned at ingest; idempotent re-ingest after cursor loss, so local-only state survives when the same message reappears under a new UID; cross-mailbox copy detection, so an already-archived message is a no-op rather than a second copy; and stale selector resolution, so a selector that no longer matches a `(mailbox, uid)` row is answered with the message's new location.
+Because Message-IDs are sender-controlled and can be absent, ingest synthesises `sha256-<hex16>@local.invalid` from the raw bytes when the header is missing, which keeps the column non-null and the selector total.
+
+`drafts` is a derived index over `<account_dir>/drafts/`, keyed by the `id:` frontmatter field that `mp new` writes; the file stays truth and the table is refreshed on engine start, after any `mp` command that writes a draft, and by a one-second mtime scan of that single directory.
+`outbox` is the durable sent path described in decision B.
+
 `rusqlite = { features = ["bundled"] }` is a new static dependency (bundled SQLite + FTS5, no system libsqlite), validated by meli in the research.
+Bundled SQLite compiles C, so the first store commit runs one `cargo build --target x86_64-unknown-linux-musl` to confirm the release target still builds before that becomes a release-day surprise.
 
 ### The engine
 
 - One long-lived task per account owns the store and the sync loop.
   The TUI reads the store and enqueues intents; it never touches IMAP or the schema directly (preserves the TUI-never-implements-email-logic invariant).
 - `pending_ops` is a durable two-phase queue.
-  Every mutation (archive, delete, move, mark-read, send) applies to the local store immediately, enqueues a remote op, and the engine drains it with retry and backoff, marking done or failed.
+  Every flag, move and delete mutation applies to the local store immediately, enqueues a remote op, and the engine drains it with retry and backoff, marking done or failed.
   This is the optimistic-mutation model the TUI already has via `Action` / `BgResult`, made durable instead of fire-and-forget.
-  Retried APPEND-to-Sent lives here, which is the sent-durability fix.
+  Send is not one of these kinds: it has its own `outbox` table with a stricter state machine, because SMTP is not retryable the way a flag change is.
 - Per-folder sync cursors drive incremental pull: QRESYNC where advertised, else CONDSTORE flag-delta with a persisted HIGHESTMODSEQ, else today's EXISTS/UIDNEXT heuristic; Graph accounts use `/messages/delta` with a persisted `deltaLink`.
 - The engine emits `BgResult` variants over the existing `mpsc` channel; `App::update` stays a pure state machine and only the source of `BgResult` changes.
   The existing TEA architecture is the asset that makes this a clean fit.
@@ -146,7 +185,10 @@ SQLite WAL already allows many concurrent readers plus one writer, with writes s
 That covers the store safely, but two processes each running their own sync engine (each holding IMAP connections and each writing) would double the server load and race on `pending_ops`.
 The rule: at most one engine per account across all processes.
 
-The mechanism is an advisory lock per account (a lockfile beside `store.sqlite3`, or SQLite's own locking):
+The mechanism is a non-blocking exclusive advisory lock (`flock`-style) on `<account_dir>/store.lock`, taken by whichever process runs the engine and released when that process exits or dies, which is what makes the takeover below automatic.
+The lock lands with the engine rather than with the store skeleton, because it is only meaningful once a second writer can exist, so [#0037](../tickets/0037-sqlite-store-engine-skeleton.md) defers both.
+SQLite's own locking is not the mechanism: its locks are scoped to a transaction, so they can serialise writes but cannot express "one engine per account for the lifetime of the process".
+The protocol around the lock:
 
 - The first process to open an account acquires the engine lock and runs the sync engine (IDLE, pulls, draining `pending_ops`).
 - A second process (the CLI while the TUI is open) opens the store read-only for queries and, for mutations, writes a `pending_ops` row and lets the lock-holding engine drain it. It does not open its own IMAP connection.
@@ -162,36 +204,49 @@ A later refinement (out of scope for the first cut) is a proper background daemo
 The RFC822 parser and MIME extraction (`src/parse.rs`), `markdown_to_html` and per-recipient SMTP send (`src/send.rs`), OAuth2 / XOAUTH2 and the encrypted secrets store, the Graph REST client (`src/graph.rs`), config loading, contacts mining (`src/contacts/`), IMAP session open and capability handling, `TimingSpan`, and the entire TEA / `Action` / `BgResult` scaffolding.
 What disappears (~25%) is the files-as-truth machinery: the two full-file scanners (`parse.rs:756`, `:989`), `deduplicate_mailbox`, `count_all_emails`, the `MessageIdIndex` HashMap, and the reconciliation heuristics.
 
-## Staged transition, with a stop-gate after Stage 2
+Two tree-walking modules the original split missed, both of which land in [#0038](../tickets/0038-read-path-to-db.md) rather than in the cutover:
 
-No big-bang and no long dual-write hell.
+- `src/tui/app/calendar_view.rs` (975 lines, `load_events_for_account:97`) reads iMIP events straight out of the mailbox directories, so the agenda is broken from the moment ingest stops writing `.md`.
+- `src/reconcile.rs` (491 lines, `build_index`) walks the account root to reconcile attendee replies, which is also where TKT-0047 lives.
+
+Both source invites from `messages` rows and ics blobs after the flip; neither is a Stage-4 afterthought.
+
+## Staged transition, with a stop-gate after Stage 2b
+
+No big-bang and no dual-write.
 The lever is the no-migrations-before-v1.0 rule: the cutover in Stage 4 is not a migration, it is wipe-the-local-tree-and-resync-from-the-server, with a one-time import of drafts.
 
 | Stage | Ticket | Ships | De-risks | Effort |
 |---|---|---|---|---|
-| 1 Store + engine skeleton, dual-write | [#0037](../tickets/0037-sqlite-store-engine-skeleton.md) | `src/store/` (schema, WAL, blob cache) + `src/engine/` (pull-loop skeleton). Fetch/save wkites the DB and blobs alongside files; reads still use files. | Schema, WAL single-writer discipline, blob store, all proven with zero user-visible change and a file fallback. | L |
-| 2 Read path flips to DB | [#0038](../tickets/0038-read-path-to-db.md) | `load_emails`, list render, counts, search read the store; cold start stops walking files. Files still written for safety. | List-render perf and envelope correctness. This banks the owner's headline win. STOP-GATE. | L |
-| 3 Mutations to `pending_ops` | [#0039](../tickets/0039-pending-ops-queue.md) | Archive/delete/move/mark-read/send become durable queue rows; engine drains with retry/backoff. | The op-queue, the genuinely new core infra and its new bug class. Lands behind the still-present file layer so a queue bug cannot lose mail. | L-XL |
-| 4 Drop file layer, cutover | [#0040](../tickets/0040-drop-file-layer-cutover.md) | Delete scanners/reconciler/`MessageIdIndex`; received mail read-only; drafts local-only in `drafts/`; cutover = wipe local + resync + one-time draft import. | The paradigm flip, done as a clean resync, not a migrator. | M-L |
+| 0 Pre-nuke oracle capture | [#0049](../tickets/0049-pre-nuke-oracle-capture.md) | Golden frames, gap-list fixtures, `mp dump-mailbox --json` envelope dumps, then the `pre-dal-nuke` tag and the `mp-legacy` binary. | The absence of an oracle. Nothing greenfield opens until this closes. | M |
+| 1 Greenfield store, ingest and outbox | [#0037](../tickets/0037-sqlite-store-engine-skeleton.md) | `src/store/` (schema v1, WAL, blob store, retention config) plus store-only ingest and the durable outbox. No `.md` is written on the ingest path; drafts stay file-truth. | Schema, WAL single-writer discipline, blob store, and sent durability, which the nuke would otherwise regress. | L |
+| 2 Read path on the store | [#0038](../tickets/0038-read-path-to-db.md) | `load_emails`, list render, counts, search, the calendar agenda and reconcile all read the store; cold start stops walking files. | List-render perf, envelope correctness and look-and-feel parity against the golden frames. | L-XL |
+| 2b Selector contract and drafts index | [#0050](../tickets/0050-selector-contract-drafts-index.md) | `mp://<account>/<mailbox>/<key>` everywhere, the `drafts` table and the CLI rewrite, in one commit. | The CLI contract, committed once rather than migrated. Subsumes TKT-0045. STOP-GATE, after this ticket and not after Stage 2 alone. | M-L |
+| 3 Remaining mutations to `pending_ops` | [#0039](../tickets/0039-pending-ops-queue.md) | Archive/delete/move/mark-read become durable queue rows; engine drains with retry/backoff. Send is already durable via the outbox. | The op-queue, the genuinely new core infra and its new bug class. | L |
+| 4 Legacy decommission | [#0040](../tickets/0040-drop-file-layer-cutover.md) | Retire the legacy `.md` tree and `mp-legacy`, one-time draft import assigning `id:` frontmatter, TKT-0047 closed. | The end of the transition period, not a code deletion (the greenfield build never had the file layer). | S-M |
 | 5 Persistent conn + protocol + FTS | [#0041](../tickets/0041-persistent-conn-condstore.md), [#0042](../tickets/0042-graph-delta-sync.md), [#0043](../tickets/0043-fts5-search.md) | Persistent authenticated connection, CONDSTORE/QRESYNC flag-delta, Graph `/messages/delta`, FTS5 search. | Sync smoothness and full-text search. | M-L |
 
-The stop-gate is real: after Stage 2 the owner has the perf win (cold start and quick-sync render both stop touching thousands of files) and can pause before funding Stages 3-4 if the convergence/durability wins are not worth it.
-That optionality is the point of the ordering.
+The stop-gate is still real, and it is what the greenfield ordering buys, but it sits after the Stage 2 and Stage 2b pair rather than after Stage 2 alone.
+Stage 2 moves the read path onto the store; Stage 2b is what puts the path-taking CLI commands and the drafts index back on a tree that no longer holds a `.md` mailstore, so the pause point is the pair and the CLI is not usable between them.
+After Stage 2b the owner has the perf win (cold start and quick-sync render both stop touching thousands of files) with mutations still optimistic and direct-to-server: Stage 2 updates the store row and fires the server op directly, which is exactly today's semantics and durability, and the durable queue behind those ops is Stage 3's scope.
+Pausing there is viable; the only thing already promoted out of Stage 3 is send, because the outbox ships in Stage 1.
 
-### A complete-nuke alternative to dual-write
+### The complete nuke (decided 2026-07-31)
 
-The staging above dual-writes files through Stage 2 as a safety net.
-The owner has accepted a harder cutover instead: a clean break, as long as a working copy of the current version stays runnable.
-That is straightforward because the current version is a git commit and a self-contained binary.
-Two ways to preserve it:
+The redesign is a greenfield rebuild on a long-lived branch, with delete-as-you-go: Stages 1 and 2 remove `src/sync.rs`, `src/imap_client/sync.rs` and the scanners as they replace them, and no dead code is carried forward for a fallback that will never be used.
+The safety net is not a code path, it is the preserved binary and the tagged tree.
 
-1. Keep the old binary: build the current `main` (HEAD `73b843d`) once and copy the binary aside under a distinct name, e.g. `cargo install --path . --root ~/.local/mp-stable` or `cp "$(which mp)" ~/.local/bin/mp-legacy`. It keeps reading the existing `.md` tree and works forever against its own data; the redesign is developed as the new `mp`.
-2. Do the redesign on the home server against a separate maildir/account data dir, and keep the Mac on the current working `mp` until the new version is proven, then switch.
+Capture both in Stage 0, before a line of greenfield code exists:
 
-The one caution: the old (files-as-truth) and new (store + blobs) versions must not point at the same account data directory at the same time, or the new version's wipe-and-resync cutover will delete the `.md` files the old one treats as truth.
-Use separate data dirs, or do not run both against one account concurrently.
+1. `cp "$(which mp)" ~/.local/bin/mp-legacy`, which keeps reading the existing `.md` tree and works forever against its own data; the redesign becomes the new `mp`.
+2. `git tag pre-dal-nuke` on the last files-as-truth commit, so the frozen reference is addressable rather than remembered.
 
-If the complete nuke is chosen, the dual-write in Stages 1-2 can be dropped (the new version writes only the store + blobs from the start), which simplifies those stages; the staged read/mutation ordering and the Stage 2 stop-gate still apply.
+Recorded here as the two facts a future session needs: the tag is `pre-dal-nuke` and the preserved binary is `~/.local/bin/mp-legacy`.
+
+The one caution holds without exception: the old (files-as-truth) and new (store + blobs) versions must never point at the same account data directory, or the new version's wipe-and-resync will delete the `.md` files the old one treats as truth.
+Use separate data dirs, or do not run both against one account.
+
+The alternative of keeping two crates compiling side by side was rejected: it is the dual-write cost wearing a different hat, and it pays for a fallback the branch already provides for free.
 
 ## Decision points already settled (do not re-ask)
 
@@ -212,8 +267,10 @@ Backing research: the sync mechanics explainer [imap-sync-internals-explainer](.
 
 ## Still open, to resolve during implementation
 
-- A large share of the 540 tests are file-layer (`tempdir()` scan/reconcile/dedup).
-  They get rewritten against the store or deleted; budget this as a first-order cost in Stage 2 and Stage 4, not a rounding error.
+- The suite is 656 tests (589 lib, 67 integration: 65 passing and 2 ignored) with 198 `tempdir()` usages, which is the file-layer blast radius, concentrated in `src/draft.rs` (34), `tests/draft_integration.rs` (28), `src/sync.rs` (23) and `src/parse.rs` (19).
+  The test audit classified the tests the rewrite has to decide on, and put them in three buckets: roughly 250 port unchanged because they compile against the library API rather than storage (iMIP, the parser and sanitiser, drafts, TUI key and filter invariants, contacts), roughly 15 are translated to a `Store` fixture (read/unread propagation, the #0004 snapshot-cutoff race, message-id idempotence), and roughly 130 file-layer tests are discarded rather than ported.
+  The three buckets are not a partition of the full suite; the remainder is trivial or out of scope for the rewrite and needs no decision.
+  Budget the translation and the discard as first-order costs in Stage 1 and Stage 2, not a rounding error.
 - Confirm tum is Dovecot with a live CAPABILITY probe before relying on its QRESYNC (the probe recipe is in the capability matrix doc).
 - Graph deltaLink expiry handling: treat an invalidated deltaLink like a UIDVALIDITY reset (full resync of that folder).
 
@@ -225,10 +282,10 @@ Do not carve before Stage 2 lands.
 
 ## Verified code anchors the implementation will touch
 
-- Read path: `src/tui/app/types.rs:88` (`load_emails`), `:468` (`build_message_id_index`), `:1038` (`count_all_emails`).
+- Read path: `src/tui/app/types.rs:88` (`load_emails`), `:475` (`build_message_id_index`), `:1176` (`count_all_emails`).
 - Scanners to delete: `src/parse.rs:756` (`scan_mailbox_message_ids`), `:989` (`deduplicate_mailbox`).
-- Reconciliation to replace: `src/imap_client/sync.rs:40` (`needs_reconciliation`), `:30` (`MailboxState`), `:86` (`mailbox-states.json` cache, the sibling-cache precedent).
-- Fetch to reshape into the engine: `src/imap_client/fetch.rs:167` (`fetch_new_emails_on_session`), pass-1 headers `:213`.
-- Session open to make persistent: `src/imap_client/mod.rs:175` (`open_imap_session`).
+- Reconciliation to replace: `src/imap_client/sync.rs:42` (`needs_reconciliation`), `:30` (`MailboxState`), `:86` (`mailbox-states.json` cache, the sibling-cache precedent).
+- Fetch to reshape into the engine: `src/imap_client/fetch.rs:171` (`fetch_new_emails_on_session`), pass-1 headers `:213`.
+- Session open to make persistent: `src/imap_client/mod.rs:178` (`open_imap_session`).
 - Invariant to rewrite in Stage 5: `docs/architecture.md:23` ("one session per operation").
 - TEA seam that stays: `Action` / `BgResult` in `src/tui/`, `App::update`.
