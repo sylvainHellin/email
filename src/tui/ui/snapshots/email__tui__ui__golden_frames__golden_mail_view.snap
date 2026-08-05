@@ -1,0 +1,58 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |╭ Mail ──────────────────────────────────╮╭ Headers ───────────────────────────────────────────────────────────────────╮
+01 |│> 󰅲 Inbox  5                            ││ From: Planung Muller <planung@example.org>                                 │
+02 |│  󰏫 Drafts  2                           ││ To: sylvain@example.org                                                    │
+03 |│  󰑫 Sent 41                             ││ Subj: Einladung: Baustellenübergabe — 会 議  ✓                               │
+04 |│  󰄼 Archive 128                         ││ Date: 2026-07-28  [inbox]                                                  │
+05 |│                                        ││                                                                            │
+06 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
+07 |╭ Inbox ─────────────────────────────────╮╭ 󰃭 Invitation ──────────────────────────────────────────────────────────────╮
+08 |│   DATE       SUBJECT                   ││Bauprojekt Ubergabe                                                         │
+09 |│  2026-07-28 󰃭  Einladung: Baustelle… ││When: 2026-08-03T09:00:00+02:00  →  2026-08-03T10:30:00+02:00               │
+10 |│   2026-07-27 Re: Statusbericht KW31    ││Where: Raum 2.14, Arcisstrasse                                              │
+11 |│  2026-07-26  Scan 2026-07-26 (3 Sei… ││Organizer: planung@example.org                                              │
+12 |│   2026-07-24 Wochenrückblick: sehr la… ││Your RSVP: No response yet                                                  │
+13 |│   2026-07-21  Rechnung 2026-0714      ││RSVP is emailed to the organizer; not synced to Exchange (no Graph in v1).  │
+14 |│                                        │╰────────────────────────────────────────────────────────────────────────────╯
+15 |│                                        │╭ Body ──────────────────────────────────────────────────────────────────────╮
+16 |│                                        ││Hallo Sylvain,                                                              │
+17 |│                                        ││                                                                            │
+18 |│                                        ││anbei der Plan für die Übergabe.                                            │
+19 |│                                        ││                                                                            │
+20 |│                                        │││ Bitte bis Freitag bestätigen.                                             │
+21 |│                                        ││                                                                            │
+22 |│                                        ││Grüße                                                                       │
+23 |│                                        ││                                                                            │
+24 |│                                        ││                                                                            │
+25 |│                                        ││                                                                            │
+26 |│                                        ││                                                                            │
+27 |│                                        ││                                                                            │
+28 |╰────────────────────────────────────────╯│                                                                            │
+29 |╭ Activity ──────────────────────────────╮│                                                                            │
+30 |│  No activity yet                       ││                                                                            │
+31 |│                                        ││                                                                            │
+32 |│                                        ││                                                                            │
+33 |│                                        ││                                                                            │
+34 |╰────────────────────────────────────────╯│                                                                            │
+35 |╭ View ──────────────────────────────────╮│                                                                            │
+36 |│     mail  |  contacts  |  calendar     ││                                                                            │
+37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
+38 | MAIL   j/k Navigate emails  v Toggle selection  Enter / e Open in editor  r / R Reply / Reply-all  a Archive  d Delete
+39 | ? help                                                                                            2 unread | Inbox 1/5
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+01 |bold@43..50
+02 |bold@43..48
+03 |bold@43..50
+04 |bold@43..50
+08 |bold@43..62
+09 |bg:surface+fg:selection+bold@1..41 bold@43..49
+10 |bold@43..50
+11 |bold@1..41 bold@43..54
+12 |bold@43..54
+36 |bold@5..11
+38 |bold@0..6 bg:surface@6..8 bg:surface+bold@8..11 bg:surface@11..29 bg:surface+bold@29..30 bg:surface@30..49 bg:surface+bold@49..58 bg:surface@58..75 bg:surface+bold@75..80 bg:surface@80..100 bg:surface+bold@100..101 bg:surface@101..111 bg:surface+bold@111..112 bg:surface@112..120
+39 |bg:surface@0..120

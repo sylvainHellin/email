@@ -2,6 +2,9 @@ mod activity;
 mod calendar;
 mod compose;
 mod contacts;
+/// Pre-rewrite golden-frame capture (#0049 unit 0a); tests only.
+#[cfg(test)]
+mod golden_frames;
 mod headers;
 mod list;
 mod overlays;

@@ -1,0 +1,54 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |╭ Mail ──────────────────────────────────╮╭ Headers ───────────────────────────────────────────────────────────────────╮
+01 |│> 󰅲 Inbox  5                      ╭ Help ──────────────────────────────────────────╮>                                 │
+02 |│  󰏫 Drafts  2                     │  GLOBAL                                        │                                  │
+03 |│  󰑫 Sent 41                       │  q           Quit                              │  ✓                               │
+04 |│  󰄼 Archive 128                   │  `           Switch account                    │                                  │
+05 |│                                  │  Ctrl+1-9    Jump to account                   │                                  │
+06 |╰──────────────────────────────────│  1-9         Jump to mailbox                   │──────────────────────────────────╯
+07 |╭ Inbox ───────────────────────────│  Tab         Cycle focus forward               │──────────────────────────────────╮
+08 |│   DATE       SUBJECT             │  Shift+Tab   Cycle focus backward              │                                  │
+09 |│  2026-07-28 󰃭  Einladung: Baust│  /           Filter by metadata                │8-03T10:30:00+02:00               │
+10 |│   2026-07-27 Re: Statusbericht KW│  \           Search email content              │                                  │
+11 |│  2026-07-26  Scan 2026-07-26 (3│  ?           Toggle this help                  │                                  │
+12 |│   2026-07-24 Wochenrückblick: seh│  !           Toggle activity log               │                                  │
+13 |│   2026-07-21  Rechnung 2026-0714│  L           Open activity log overlay         │ed to Exchange (no Graph in v1).  │
+14 |│                                  │  Ctrl+l      Open log file in $EDITOR          │──────────────────────────────────╯
+15 |│                                  │  Ctrl+e      Open config.toml in $EDITOR       │──────────────────────────────────╮
+16 |│                                  │  Space m     Switch to Mail view               │                                  │
+17 |│                                  │  Space c     Switch to Contacts view           │                                  │
+18 |│                                  │  Space a     Switch to Calendar view           │                                  │
+19 |│                                  │                                                │                                  │
+20 |│                                  │  SIDEBAR                                       │                                  │
+21 |│                                  │  j/k         Navigate mailboxes                │                                  │
+22 |│                                  │  Enter       Select mailbox                    │                                  │
+23 |│                                  │                                                │                                  │
+24 |│                                  │  EMAIL LIST                                    │                                  │
+25 |│                                  │  j/k         Navigate emails                   │                                  │
+26 |│                                  │  gg / G      Jump to top / bottom              │                                  │
+27 |│                                  │  v           Toggle selection                  │                                  │
+28 |╰──────────────────────────────────│  Ctrl+a      Select all visible                │                                  │
+29 |╭ Activity ────────────────────────│  Esc         Clear selection                   │                                  │
+30 |│  No activity yet                 │  Enter / e   Open in editor                    │                                  │
+31 |│                                  │  r / R       Reply / Reply-all                 │                                  │
+32 |│                                  │  w           Forward                           │                                  │
+33 |│                                  │  c           Edit recipients (Drafts only)     │                                  │
+34 |╰──────────────────────────────────│  a           Archive                           │                                  │
+35 |╭ View ────────────────────────────│  d           Delete                            │                                  │
+36 |│     mail  |  contacts  |  calenda│  m           Toggle read/unread                │                                  │
+37 |╰──────────────────────────────────│  M           Move to mailbox (fuzzy picker)    │──────────────────────────────────╯
+38 | HELP                              ╰─────────────────── 1-36/94 ────────────────────╯
+39 | ? help                                                                                            2 unread | Inbox 1/5
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+02 |bold@36..44
+09 |bg:surface+fg:selection+bold@1..35
+11 |bold@1..35
+20 |bold@36..45
+24 |bold@36..48
+36 |bold@5..11
+38 |bold@0..6 bg:surface@6..35 bg:surface@85..120
+39 |bg:surface@0..120

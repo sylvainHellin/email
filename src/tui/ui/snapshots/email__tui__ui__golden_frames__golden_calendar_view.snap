@@ -1,0 +1,54 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |╭ Mail ──────────────────────────────────╮╭ Calendar (3 upcoming) ──────────╮╭ Event ──────────────────────────────────╮
+01 |│> 󰅲 Inbox  5                            ││▸ 2026-08-03 09 Bau… accepted    ││Baustellenübergabe                       │
+02 |│  󰏫 Drafts  2                           ││  2026-08-04 10 Abg… cancelled   ││When: 2026-08-03T07:00:00+02:00          │
+03 |│  󰑫 Sent 41                             ││  2026-08-06 15 PhD… organizer   ││Where: Raum 2.14                         │
+04 |│  󰄼 Archive 128                         ││                                 ││Organizer: planung@example.org           │
+05 |│                                        ││                                 ││Your RSVP: Accepted                      │
+06 |╰────────────────────────────────────────╯│                                 ││RSVP is emailed to the organizer; not    │
+07 |                                          │                                 ││synced to Exchange (no Graph in v1).     │
+08 |                                          │                                 ││Press V to respond.                      │
+09 |                                          │                                 ││                                         │
+10 |                                          │                                 ││                                         │
+11 |                                          │                                 ││                                         │
+12 |                                          │                                 ││                                         │
+13 |                                          │                                 ││                                         │
+14 |                                          │                                 ││                                         │
+15 |                                          │                                 ││                                         │
+16 |                                          │                                 ││                                         │
+17 |                                          │                                 ││                                         │
+18 |                                          │                                 ││                                         │
+19 |                                          │                                 ││                                         │
+20 |                                          │                                 ││                                         │
+21 |                                          │                                 ││                                         │
+22 |                                          │                                 ││                                         │
+23 |                                          │                                 ││                                         │
+24 |                                          │                                 ││                                         │
+25 |                                          │                                 ││                                         │
+26 |                                          │                                 ││                                         │
+27 |                                          │                                 ││                                         │
+28 |                                          │                                 ││                                         │
+29 |                                          │                                 ││                                         │
+30 |                                          │                                 ││                                         │
+31 |                                          │                                 ││                                         │
+32 |                                          │                                 ││                                         │
+33 |                                          │                                 ││                                         │
+34 |                                          │Only events that arrived by email││                                         │
+35 |╭ View ──────────────────────────────────╮│are shown; Outlook-created events││                                         │
+36 |│     mail  |  contacts  |  calendar     ││need Graph sync (#0036).         ││                                         │
+37 |╰────────────────────────────────────────╯╰─────────────────────────────────╯╰─────────────────────────────────────────╯
+38 | CALENDAR   j/k Navigate events  Enter / e Open the invite email in $EDITOR  V RSVP to invitation (Accept/Tentative/Decl
+39 | ? help                                                                                            2 unread | Inbox 1/5
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+01 |bg:selection+bold@43..64 bg:selection+fg:selection+bold@64..72 bg:selection+bold@72..76 bold@78..96
+02 |strike@45..58 strike@59..63 bold@78..84
+03 |bold@78..85
+04 |bold@78..89
+05 |bold@78..89 fg:selection@89..97
+36 |bold@27..37
+38 |bold@0..10 bg:surface@10..12 bg:surface+bold@12..15 bg:surface@15..33 bg:surface+bold@33..42 bg:surface@42..77 bg:surface+bold@77..78 bg:surface@78..120
+39 |bg:surface@0..120
