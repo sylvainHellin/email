@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
@@ -24,25 +24,145 @@ use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
 // ---------------------------------------------------------------------------
-// The TUI mutation half (#0052)
+// Files materialised out of the store (#0052 scope items 8, 9 and 10)
 // ---------------------------------------------------------------------------
 
-/// The status line an action shows while its TUI flow has not been ported.
+/// The directory `mp open` materialises a row's attachments into: one per
+/// message row, under the system temp dir.
 ///
-/// The mutations moved onto the store with #0038 scope item 7 and the naming
-/// half landed with #0050, which is what these used to wait on. Units A and B
-/// of #0052 took the drafting, sending and status flows off the file layer;
-/// what is left are the flows that still want a file on disk that no longer
-/// exists: an attachment to write somewhere, a rendered `.html` to open in a
-/// browser, an `.ics` to hand the calendar. Their CLI counterparts already run
-/// on the store and the selector, and [#0052] is the ticket that ports the
-/// rest of the TUI onto the same substrate.
+/// The CLI's own name, deliberately. Opening the same message from both halves
+/// of the product then puts the same files in the same place, and the bytes
+/// are rewritten before every open, so a directory two accounts share (row ids
+/// are per-account) never hands the opener a stale file: only the paths just
+/// written are returned.
+fn attachment_temp_dir(row_id: i64) -> PathBuf {
+    std::env::temp_dir().join(format!("mailypoppins-{row_id}"))
+}
+
+/// The message under the cursor for a flow that reads its blobs, or `None`
+/// with the status line saying why there is not one.
 ///
-/// `what` names the operation ("Open in browser", "Attachments"). The message tells the
-/// user both halves of the truth: this build will do it soon, and there is a
-/// working way to do it right now.
-pub(super) fn needs_tui_mutation_half(what: &str) -> String {
-    format!("{what} lands with the TUI mutation half (#0052); mp-legacy is the working fallback meanwhile")
+/// Same shape as [`cursor_message`], different explanation: a draft's
+/// attachments are the paths in its own `attachments:` list, not blobs of a
+/// received message, so there is nothing here to materialise for it.
+fn cursor_message_for_files(app: &mut App, what: &str) -> Option<MessageRef> {
+    if let Some(msg) = app.selected_email_ref() {
+        return Some(msg);
+    }
+    if app.selected_email().is_some() {
+        app.set_status_level(
+            format!("{what} needs a received message; a draft carries its own in `attachments:`"),
+            StatusLevel::Warning,
+        );
+    }
+    None
+}
+
+/// The attachments of the row under the cursor, materialised into files
+/// (#0052 scope item 8).
+///
+/// This is `mp open` / `mp save`'s own read: [`materialise_attachments`]
+/// writes the row's blobs into the temp directory keyed by the row and hands
+/// back the paths. The picker and the save pipeline above it still address
+/// files, which they always did; what changed is where the bytes come from.
+///
+/// An empty vector is a message with no attachments, which is the caller's
+/// status line to write. `None` is a failure already on the status line.
+pub(super) fn cursor_attachment_files(app: &mut App) -> Option<Vec<PathBuf>> {
+    let msg = cursor_message_for_files(app, "Attachments")?;
+    row_attachment_files(app, msg.row_id())
+}
+
+/// [`cursor_attachment_files`] for a row named directly, which is the
+/// server-search hit that resolved to one.
+pub(super) fn row_attachment_files(app: &mut App, row_id: i64) -> Option<Vec<PathBuf>> {
+    let (store, blobs) = store_for_mutation(app, "Attachments")?;
+    let dest = attachment_temp_dir(row_id);
+    match crate::store::read::materialise_attachments(&store, &blobs, row_id, &dest) {
+        Ok(files) => Some(files),
+        Err(e) => {
+            app.set_status_level(format!("Attachments failed: {e:#}"), StatusLevel::Error);
+            None
+        }
+    }
+}
+
+/// The attachments of a server-search hit that resolved to no local row: the
+/// bytes the overlay is already holding, written where the store-backed ones
+/// go so the picker sees files either way (#0052 scope item 11).
+///
+/// Keyed by the hit's position in the result list rather than by a row id it
+/// does not have. The filename is sanitised the way ingest sanitises it, so a
+/// hostile `../` in a Content-Disposition cannot escape the temp directory.
+pub(super) fn fetched_attachment_files(
+    app: &mut App,
+    fetched: &crate::parse::FetchedEmail,
+    index: usize,
+) -> Option<Vec<PathBuf>> {
+    let dest = std::env::temp_dir().join(format!("mailypoppins-search-{index}"));
+    match write_fetched_attachments(fetched, &dest) {
+        Ok(files) => Some(files),
+        Err(e) => {
+            app.set_status_level(format!("Attachments failed: {e:#}"), StatusLevel::Error);
+            None
+        }
+    }
+}
+
+fn write_fetched_attachments(
+    fetched: &crate::parse::FetchedEmail,
+    dest: &Path,
+) -> Result<Vec<PathBuf>> {
+    if fetched.attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut written = Vec::new();
+    for att in &fetched.attachments {
+        let out = dest.join(crate::parse::sanitize_attachment_filename(&att.filename));
+        std::fs::write(&out, &att.content)?;
+        written.push(out);
+    }
+    Ok(written)
+}
+
+/// The HTML rendition of a message, written to a file a browser can open
+/// (#0052 scope item 9).
+///
+/// The file build wrote a `.html` beside every received `.md` and the browser
+/// opened that one; after #0037 the markup is a blob, or the html part of the
+/// raw message, so it is materialised on demand into the same temp area the
+/// attachments use. `stem` names the file: the row id for a stored message,
+/// the hit's position for one that is not stored.
+fn html_temp_file(html: &str, stem: &str) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("mailypoppins-{stem}.html"));
+    std::fs::write(&path, html)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// The browser rendition of a stored row, or `None` with the status line
+/// saying why: a message whose sender wrote no markup has none, which is not
+/// an error.
+pub(super) fn html_rendition_for_row(app: &mut App, row_id: i64) -> Option<PathBuf> {
+    let (store, blobs) = store_for_mutation(app, "Open in browser")?;
+    let Some(html) = crate::store::read::load_html(&store, &blobs, row_id) else {
+        app.set_status("No HTML version available".to_string());
+        return None;
+    };
+    html_rendition(app, &html, &row_id.to_string())
+}
+
+/// [`html_rendition_for_row`] over markup already in hand, which is the
+/// server-search hit that resolved to no row.
+pub(super) fn html_rendition(app: &mut App, html: &str, stem: &str) -> Option<PathBuf> {
+    match html_temp_file(html, stem) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            app.set_status_level(format!("Open failed: {e:#}"), StatusLevel::Error);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,8 +1845,51 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::OpenEventSource { msg: _ } => {
-            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
+        Action::OpenEventSource { msg } => {
+            // The agenda row carries its own [`MessageRef`] (the invite may
+            // live in any mailbox of the account), so this does not go through
+            // the mail cursor like `Action::EditCurrent`.
+            //
+            // What `$EDITOR` gets is the invite's `.ics` blob written to a temp
+            // file (#0052 scope item 10), where the file build handed it the
+            // message's `.md`. Edits to that copy reach nothing, which is why
+            // `Action::EditCurrent` declines on a received row rather than
+            // doing the same thing: this flow is inspecting an artifact the
+            // message carries, not composing, and the `.ics` is worth reading.
+            let row_id = msg.row_id();
+            // The store connection is scoped to the read: `$EDITOR` owns the
+            // terminal for as long as the user wants it, and holding SQLite
+            // open across that is pointless.
+            let ics = {
+                let Some((store, blobs)) = store_for_mutation(app, "Open event source") else {
+                    return Ok(());
+                };
+                crate::store::read::load_invite_ics(&store, &blobs, row_id)
+            };
+            let Some(ics) = ics else {
+                app.set_status_level(
+                    "That event has no ics source in the store".to_string(),
+                    StatusLevel::Warning,
+                );
+                return Ok(());
+            };
+            let path = std::env::temp_dir().join(format!("mailypoppins-{row_id}.ics"));
+            if let Err(e) = std::fs::write(&path, &ics) {
+                app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error);
+                return Ok(());
+            }
+            suspend_terminal(terminal)?;
+            let result = edit_file(&path);
+            resume_terminal(terminal)?;
+            match result {
+                Ok(()) => app.set_status(
+                    "Returned from the event source (a copy of the ics; edits do not reach the message)"
+                        .to_string(),
+                ),
+                Err(e) => {
+                    app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error)
+                }
+            }
         }
         Action::ComposeWizardCancel => {
             app.close_overlay();
@@ -2192,10 +2355,11 @@ fn slugify_subject_for_filename(subject: &str) -> String {
 /// The overlay's own action set: a server-search hit is not a list row, so it
 /// has its own Open / Save / Reply / Forward / Archive.
 ///
-/// Four of the five address the hit as a file (an editor, a browser rendition,
-/// a draft), which is #0052's ground. The fifth is a mutation, and it runs on
-/// the store like every other one, for the hits that resolved to a row: a hit
-/// the account has never synced has nothing local to archive, and says so.
+/// All of them run off the store for a hit that resolved to a row, and off the
+/// fetch the overlay is already rendering for one that did not, with two
+/// exceptions. Archive needs a local row to move and says so when there is
+/// none. Open needs a file that no longer exists at all, and declines the way
+/// `Action::EditCurrent` declines on a received row.
 fn handle_search_result_action(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2204,14 +2368,46 @@ fn handle_search_result_action(
 ) -> Result<()> {
     match action {
         Action::SearchResultOpen => {
-            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
+            // The file build saved the hit as a `.md` and opened that in
+            // `$EDITOR`; after #0037 nothing saves a hit to a file, and
+            // `mp edit` takes draft selectors only, so there is no CLI
+            // behaviour to port and nothing honest to open. It declines
+            // permanently, for the same reason `Action::EditCurrent` declines
+            // on a received row, and the overlay is already showing the
+            // headers and the body that editor window used to hold.
+            app.set_status_level(
+                "Open in $EDITOR needs a draft; a search hit is a message on the server, not a file"
+                    .to_string(),
+                StatusLevel::Warning,
+            );
         }
 
         Action::SearchResultOpenInBrowser => {
-            app.set_status_level(
-                needs_tui_mutation_half("Open in browser"),
-                StatusLevel::Warning,
-            );
+            let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+                return Ok(());
+            };
+            // A hit that resolved reads its markup out of `message_blobs`, the
+            // same as the list flow; one that did not has the html part of the
+            // fetch the overlay is rendering, and that is what the browser
+            // gets rather than a decline.
+            let index = app.server_search_index;
+            let path = match hit.entry.msg {
+                Some(msg) => html_rendition_for_row(app, msg.row_id()),
+                None => match hit.fetched.html_body.clone() {
+                    Some(html) => html_rendition(app, &html, &format!("search-{index}")),
+                    None => {
+                        app.set_status("No HTML version available".to_string());
+                        None
+                    }
+                },
+            };
+            let Some(path) = path else {
+                return Ok(());
+            };
+            match crate::parse::open_file_with_system(&path) {
+                Ok(()) => app.set_status("Opened in browser".to_string()),
+                Err(e) => app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error),
+            }
         }
 
         Action::SearchResultReply(all) => {
@@ -2524,23 +2720,6 @@ mod tests {
             read: false,
             is_invite,
         }
-    }
-
-    /// The decline message names both the future (the TUI mutation half) and
-    /// the present (mp-legacy), so a user who hits it knows what to do now.
-    ///
-    /// The ticket it names must be an open one: #0038 and #0050 have landed,
-    /// and a message pointing at a done ticket tells the user to wait for
-    /// something that already happened. The operation is one that still
-    /// declines, because the ones #0052 has landed no longer show this line
-    /// at all.
-    #[test]
-    fn the_decline_message_points_at_the_working_fallback() {
-        let msg = needs_tui_mutation_half("Attachments");
-        assert!(msg.starts_with("Attachments "), "{msg}");
-        assert!(msg.contains("#0052"), "{msg}");
-        assert!(!msg.contains("#0050"), "{msg}");
-        assert!(msg.contains("mp-legacy"), "{msg}");
     }
 
     /// The agenda is only rebuilt when a mutation actually touched an invite,
@@ -3270,5 +3449,230 @@ mod store_backed_mutations {
         let status = app.status_message.clone().unwrap();
         assert_eq!(status, "Open in $EDITOR needs a draft");
         assert!(!status.contains("#0052"), "{status}");
+    }
+}
+
+/// The store-backed file flows (#0052 unit C), over the same fixture:
+/// attachments, the browser rendition and the invite source.
+///
+/// Every one of them used to read a file the ingest wrote beside a `.md`.
+/// What is pinned here is that the bytes now come out of `message_blobs` and
+/// land where the CLI puts them, that the naming a save collision produces is
+/// the pre-nuke one, and that a server-search hit with no local row is served
+/// from the fetch rather than declined.
+#[cfg(test)]
+mod store_backed_files {
+    use super::store_backed_drafts::{fixture_email, Fixture};
+    use super::*;
+    use crate::parse::{AttachmentData, FetchedEmail};
+    use crate::store::read::MessageRow;
+    use crate::tui::app::EmailEntry;
+
+    fn attachment(name: &str, bytes: &[u8]) -> AttachmentData {
+        AttachmentData {
+            filename: name.to_string(),
+            content: bytes.to_vec(),
+            content_id: None,
+        }
+    }
+
+    /// An app whose cursor sits on the list row for `row`.
+    fn app_on_row(row: &MessageRow) -> App {
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.emails = std::sync::Arc::new(vec![EmailEntry {
+            msg: Some(MessageRef::new(row.id)),
+            draft_id: None,
+            from: row.from.clone().unwrap_or_default(),
+            to: row.to.clone().unwrap_or_default(),
+            cc: None,
+            subject: row.subject.clone().unwrap_or_default(),
+            status: "inbox".to_string(),
+            date_display: row.date_display.clone().unwrap_or_default(),
+            date_sort: String::new(),
+            has_attachments: true,
+            read: true,
+            is_invite: false,
+        }]);
+        app.rebuild_visible();
+        app
+    }
+
+    /// `o` and `O` on a received row resolve the row's blobs into the same
+    /// files `mp open` materialises, under the same temp directory name.
+    #[test]
+    fn the_cursor_row_materialises_its_blobs_where_mp_open_puts_them() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("With files");
+        email.has_attachments = true;
+        email.attachments = vec![
+            attachment("notes.txt", b"notes"),
+            attachment("report.pdf", b"%PDF-1.4"),
+        ];
+        let row = fx.ingest(&email);
+        let mut app = app_on_row(&row);
+
+        let files = cursor_attachment_files(&mut app).unwrap();
+
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files[0].parent().unwrap(), attachment_temp_dir(row.id));
+        let by_name: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(by_name, vec!["notes.txt", "report.pdf"]);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"notes");
+        assert_eq!(std::fs::read(&files[1]).unwrap(), b"%PDF-1.4");
+    }
+
+    /// A message with no attachments is not an error: the empty list is what
+    /// the picker turns into "No attachments".
+    #[test]
+    fn a_row_without_attachments_resolves_to_an_empty_list() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Bare"));
+        let mut app = app_on_row(&row);
+
+        assert_eq!(cursor_attachment_files(&mut app), Some(Vec::new()));
+        assert!(app.status_message.is_none(), "{:?}", app.status_message);
+    }
+
+    /// A Drafts row has no `messages` row behind it, so there are no blobs to
+    /// materialise, and the status line says what it does have instead.
+    #[test]
+    fn a_draft_row_says_where_its_own_attachments_live() {
+        let _fx = Fixture::new();
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.emails = std::sync::Arc::new(vec![EmailEntry {
+            msg: None,
+            draft_id: Some("some-draft".to_string()),
+            from: String::new(),
+            to: "alice@example.com".to_string(),
+            cc: None,
+            subject: "Re: Hello".to_string(),
+            status: "draft".to_string(),
+            date_display: "2026-07-01".to_string(),
+            date_sort: "2026-07-01T00:00:00".to_string(),
+            has_attachments: false,
+            read: true,
+            is_invite: false,
+        }]);
+        app.rebuild_visible();
+
+        assert_eq!(cursor_attachment_files(&mut app), None);
+        let status = app.status_message.clone().unwrap();
+        assert_eq!(
+            status,
+            "Attachments needs a received message; a draft carries its own in `attachments:`"
+        );
+        assert!(!status.contains("#0052"), "{status}");
+    }
+
+    /// Save writes the materialised file into the chosen directory, and a
+    /// second save of the same name does not overwrite the first: the
+    /// `_1` suffix is the pre-nuke collision rule, unchanged because the save
+    /// half still copies files.
+    #[test]
+    fn saving_the_same_attachment_twice_keeps_both_copies() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("Twice");
+        email.has_attachments = true;
+        email.attachments = vec![attachment("notes.txt", b"notes")];
+        let row = fx.ingest(&email);
+        let mut app = app_on_row(&row);
+        let files = cursor_attachment_files(&mut app).unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let first = crate::parse::save_attachment(&files[0], dest.path()).unwrap();
+        let second = crate::parse::save_attachment(&files[0], dest.path()).unwrap();
+
+        assert_eq!(first, dest.path().join("notes.txt"));
+        assert_eq!(second, dest.path().join("notes_1.txt"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"notes");
+        assert_eq!(std::fs::read(&second).unwrap(), b"notes");
+    }
+
+    /// `b` writes the html blob to a file and hands the browser that: the
+    /// markup is the sender's own, not a re-render of the plain text.
+    #[test]
+    fn the_browser_gets_the_html_blob_written_to_a_file() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Rich"));
+        let mut app = app_on_row(&row);
+
+        let path = html_rendition_for_row(&mut app, row.id).unwrap();
+
+        assert_eq!(path.extension().unwrap(), "html");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "<p>Rich body</p>");
+    }
+
+    /// A sender who wrote no markup has no rendition, which is a status line
+    /// rather than an error or an empty page.
+    #[test]
+    fn a_message_without_html_says_so_instead_of_opening_an_empty_page() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("Plain");
+        email.html_body = None;
+        let row = fx.ingest(&email);
+        let mut app = app_on_row(&row);
+
+        assert_eq!(html_rendition_for_row(&mut app, row.id), None);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No HTML version available")
+        );
+    }
+
+    /// The server-search hit that resolved to no local row: its attachments
+    /// and its markup are the bytes the overlay is already holding, written
+    /// out so the picker and the browser see files either way.
+    #[test]
+    fn an_unresolved_search_hit_is_served_from_the_fetch() {
+        let _fx = Fixture::new();
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        let fetched = FetchedEmail {
+            attachments: vec![attachment("../escape.txt", b"payload")],
+            has_attachments: true,
+            ..fixture_email("Never synced")
+        };
+
+        let files = fetched_attachment_files(&mut app, &fetched, 7).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].file_name().unwrap().to_string_lossy(),
+            ".._escape.txt",
+            "the filename is sanitised, so a hostile one cannot escape the temp dir"
+        );
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"payload");
+
+        let html = fetched.html_body.clone().unwrap();
+        let page = html_rendition(&mut app, &html, "search-7").unwrap();
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "<p>Rich body</p>");
+    }
+
+    /// The agenda's Open-source reads the invite's own ics blob off the row
+    /// the `CalendarEvent` carries, which is what the action writes to the
+    /// file `$EDITOR` is handed.
+    #[test]
+    fn the_event_source_resolves_the_invites_ics_blob() {
+        let fx = Fixture::new();
+        let ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+        let mut email = fixture_email("Standup");
+        email.calendar_ics = Some(ics.to_vec());
+        let row = fx.ingest(&email);
+
+        let store = fx.store();
+        let blobs = BlobStore::for_account("alice");
+        let source = crate::store::read::load_invite_ics(&store, &blobs, row.id).unwrap();
+
+        assert_eq!(source, ics.to_vec());
+        // A message that carries no invite has no source to open.
+        let plain = fx.ingest(&fixture_email("Receipt"));
+        assert_eq!(
+            crate::store::read::load_invite_ics(&store, &blobs, plain.id),
+            None
+        );
     }
 }

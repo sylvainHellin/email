@@ -15,6 +15,20 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **Every TUI mutation runs off the store and the selector (#0052).** Reply,
+  Reply-all, Forward, Send, Approve, Mark-draft, their batch forms, Edit
+  recipients, `$EDITOR` on a draft, attachment open and save, Open in browser
+  and the calendar's Open event source all work again instead of declining with
+  a status line, and each takes the same path its `mp` counterpart takes: the
+  quote and the HTML companion come from the message's blobs, drafts are found
+  through the drafts index, sends go through the durable outbox, and
+  attachments are materialised out of `message_blobs` where `mp open` and
+  `mp save` put them. The server-search overlay gets the same treatment on both
+  halves of a hit: one that resolved to a local message reads the store, one
+  that never synced is served from the fetch the overlay is already showing.
+  Two flows decline permanently and say why: `$EDITOR` on a received message
+  and Open on a search hit, both of which used to open a `.md` file that no
+  longer exists.
 - **`mp://` selectors and the drafts index (#0050).** Every command that names a
   message now takes a selector, `mp://<account>/<mailbox>/<key>`, and never a
   file path. The key is the Message-ID without angle brackets for received mail

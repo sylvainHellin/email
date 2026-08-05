@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    Action, App, AttachmentPickerMode, ComposeField, ComposeMode,
+    Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
     EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
     RsvpOverlay, SearchBodies, SearchOverlayFocus,
@@ -602,12 +603,16 @@ impl App {
             }
             A::OpenInBrowser => {
                 self.pending_prefix = None;
-                if self.selected_email_ref().is_some() {
-                    // The rendered HTML is written next to a `.md` file, so
-                    // opening it needs the store-backed rendition #0052 ports.
-                    self.set_status(crate::tui::actions::needs_tui_mutation_half(
-                        "Open in browser",
-                    ));
+                // The markup is a blob (or the html part of the raw message),
+                // not a `.html` beside a `.md`, so it is written to a temp
+                // file on demand and that is what the browser opens (#0052
+                // scope item 9).
+                if let Some(msg) = self.selected_email_ref() {
+                    if let Some(path) =
+                        crate::tui::actions::html_rendition_for_row(self, msg.row_id())
+                    {
+                        self.push_action(Action::OpenHtmlInBrowser(path));
+                    }
                 }
             }
             A::ToggleSelect => {
@@ -1572,22 +1577,69 @@ impl App {
 
     /// Helper to open the attachment picker in the given mode.
     ///
-    /// Attachments live in the blob store, but the picker and the save/open
-    /// pipeline below it address them as files under `_attachments/`, which is
-    /// the file edge #0052 ports onto `message_blobs`.
+    /// The files come out of `message_blobs` (#0052 scope item 8): the row
+    /// under the cursor is materialised into a temp directory the way
+    /// `mp open` and `mp save` do it, and the picker and the save pipeline
+    /// below it address those files, as they always did.
     fn open_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        let _ = mode;
-        if self.selected_email_ref().is_some() {
-            self.set_status(crate::tui::actions::needs_tui_mutation_half("Attachments"));
-        }
+        let Some(files) = crate::tui::actions::cursor_attachment_files(self) else {
+            return;
+        };
+        self.present_attachments(files, mode);
     }
 
-    /// Helper to open the attachment picker for a search result: the same
-    /// file edge as [`Self::open_attachment_picker`], and the same #0052
-    /// boundary.
+    /// Helper to open the attachment picker for a search result.
+    ///
+    /// A hit that resolved to a local row is [`Self::open_attachment_picker`]
+    /// exactly; one that did not has the attachment bytes of the fetch the
+    /// overlay is rendering, which are written out to the same temp area, so
+    /// neither half declines (#0052 scope item 11).
     fn open_search_result_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        let _ = mode;
-        self.set_status(crate::tui::actions::needs_tui_mutation_half("Attachments"));
+        let Some(hit) = self.server_search_results.get(self.server_search_index) else {
+            return;
+        };
+        let msg = hit.entry.msg;
+        let index = self.server_search_index;
+        // Cloned only for the unresolved hit, which is the one case that needs
+        // the fetched payload while `self` is borrowed mutably below.
+        let fetched = msg.is_none().then(|| hit.fetched.clone());
+        let files = match (msg, fetched) {
+            (Some(msg), _) => crate::tui::actions::row_attachment_files(self, msg.row_id()),
+            (None, Some(fetched)) => {
+                crate::tui::actions::fetched_attachment_files(self, &fetched, index)
+            }
+            (None, None) => None,
+        };
+        let Some(files) = files else {
+            return;
+        };
+        self.present_attachments(files, mode);
+    }
+
+    /// Put a materialised attachment list in front of the user: nothing to
+    /// show says so, one file skips the picker (`o` opens it, `O` goes
+    /// straight to the directory picker), several open the picker.
+    ///
+    /// The pre-store build's own branching, kept: only the origin of the files
+    /// changed. `mp open`'s CLI shortcut of opening every attachment at once
+    /// stays CLI-only, because a TUI that opened six windows on one keypress
+    /// would be the surprising half of the two.
+    fn present_attachments(&mut self, files: Vec<PathBuf>, mode: AttachmentPickerMode) {
+        match files.len() {
+            0 => self.set_status("No attachments".to_string()),
+            1 if mode == AttachmentPickerMode::Open => {
+                self.push_action(Action::OpenAttachment(files.into_iter().next().unwrap()));
+            }
+            1 => self.open_dir_picker(files),
+            _ => {
+                self.overlay = Overlay::Attachment(AttachmentPicker {
+                    files,
+                    selected: 0,
+                    mode,
+                    selected_set: HashSet::new(),
+                });
+            }
+        }
     }
 
     /// Open the directory picker overlay with the given source files.

@@ -359,3 +359,10 @@ When a list holds two kinds of row, any set keyed on one of them is a dead end f
 The approved-status requirement lives in `send::build_draft_message`, which refuses anything whose `status:` is not `approved` before the outbox row is written.
 Porting the TUI's send by mirroring the validator alone would therefore have shipped a `s` key that sends unapproved drafts, which is the one thing the draft/approved split exists to prevent.
 Mirroring a CLI path means calling the same functions in the same order, not reproducing the checks that look like checks ([src/send.rs](../src/send.rs), #0052).
+
+## An editor window over a copy nothing reads back is a false affordance
+
+The file build's TUI opened a received message, and a server-search hit, in `$EDITOR` by handing it the `.md` the ingest had written.
+After #0037 there is no such file, and the tempting port is to materialise the message into a temp file and open that: the window looks the same, the keystroke works again, and no status line says "cannot".
+It is worse than a decline, because the user's edits are accepted, saved, and dropped on the floor, which is the same family as a send that reports success on a failed submission.
+The rule the branch settled on: port a flow only where the artifact behind it is real, decline permanently and say why where it is not, and let a materialised copy carry a flow only when the flow is inspection rather than composition (the calendar's Open event source hands `$EDITOR` a copy of the invite's `.ics`, which is worth reading and was never meant to be written back) ([src/tui/actions.rs](../src/tui/actions.rs), #0052).
