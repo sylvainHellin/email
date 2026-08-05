@@ -129,16 +129,18 @@ cargo install --path .`}
       </p>
       <CodeBlock
         lang="bash"
-        code={`# Create a new draft
+        code={`# Create a new draft. It prints the draft's selector:
+# mp://work/drafts/9f2c1ab30d5e4471
 mp new meeting-followup
 
-# Open and edit the file in your editor -- fill in recipients, subject, body
+# Open it in your editor -- fill in recipients, subject, body
+mp edit mp://work/drafts/9f2c1ab30d5e4471
 
 # Mark it as reviewed and ready to send
-mp mark-approved ~/notes/email/drafts/meeting-followup.md
+mp mark-approved mp://work/drafts/9f2c1ab30d5e4471
 
-# Send it
-mp send ~/notes/email/drafts/meeting-followup.md`}
+# Send it (the id alone works too, the rest is filled in from your config)
+mp send 9f2c1ab30d5e4471`}
       />
       <p>Or from the TUI:</p>
       <ol class="steps">

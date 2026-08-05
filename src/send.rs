@@ -41,6 +41,10 @@ pub struct RecipientResult {
     pub role: RecipientRole,
     pub success: bool,
     pub error: Option<String>,
+    /// True when the failure leaves it unknown whether the server accepted the
+    /// message (a dropped connection, a timeout). Drives the outbox's
+    /// never-auto-re-send rule; see [`SendResult::submit_outcome`].
+    pub ambiguous: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +68,57 @@ impl SendResult {
     pub fn failed(&self) -> Vec<&RecipientResult> {
         self.results.iter().filter(|r| !r.success).collect()
     }
+
+    /// How the durable outbox must read this result (#0037 item 5).
+    ///
+    /// One 250 is enough to call the message submitted: the per-recipient loop
+    /// sends the same bytes in separate envelopes, so a partial result still
+    /// means the server holds the message and the Sent copy is owed. With no
+    /// acceptance at all the question becomes whether a copy might exist
+    /// anyway, which is exactly [`RecipientResult::ambiguous`].
+    pub fn submit_outcome(&self) -> crate::outbox::SubmitOutcome {
+        use crate::outbox::SubmitOutcome;
+        if self.any_succeeded() {
+            return SubmitOutcome::Accepted;
+        }
+        let detail = self
+            .failed()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {}",
+                    r.address,
+                    r.error.as_deref().unwrap_or("unknown error")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let detail = if detail.is_empty() {
+            "no recipients were attempted".to_string()
+        } else {
+            detail
+        };
+        if self.results.iter().any(|r| r.ambiguous) {
+            SubmitOutcome::Ambiguous(detail)
+        } else {
+            SubmitOutcome::CleanPreSubmission(detail)
+        }
+    }
+}
+
+/// Whether an SMTP failure leaves it unknown that the message was not
+/// accepted.
+///
+/// A response error is the server saying no in words, and a client-side error
+/// (bad address, TLS setup, no connection) happens before any bytes could be
+/// accepted: both are clean. A timeout or a connection that dies mid-
+/// conversation is not, because the 250 may simply have been lost on the way
+/// back.
+fn smtp_failure_is_ambiguous(err: &lettre::transport::smtp::Error) -> bool {
+    if err.is_timeout() {
+        return true;
+    }
+    !(err.is_response() || err.is_client() || err.is_tls())
 }
 
 pub fn markdown_to_html(
@@ -223,6 +278,7 @@ mod tests {
                 role: RecipientRole::To,
                 success: true,
                 error: None,
+                ambiguous: false,
             });
         }
         for addr in failures {
@@ -231,6 +287,7 @@ mod tests {
                 role: RecipientRole::To,
                 success: false,
                 error: Some("SMTP error".to_string()),
+                ambiguous: false,
             });
         }
         SendResult { results }
@@ -375,7 +432,7 @@ mod tests {
 
     #[test]
     fn normalize_extracts_email_via_mailbox_for_envelope() {
-        // Regression for "Partial: 1/2 succeeded": send_email's per-recipient
+        // Regression for "Partial: 1/2 succeeded": `submit`'s per-recipient
         // RCPT TO loop parses the address again to extract `mbox.email` for
         // the SMTP envelope. If we forget to normalize there, lettre rejects
         // bracketed display names and that recipient silently fails while
@@ -676,8 +733,8 @@ pub fn build_invite_mime_body(plain: &str, html: String, ics: &str) -> MultiPart
 
 /// Build the SMTP transport (implicit TLS on :465, STARTTLS otherwise),
 /// honouring the account's OAuth2/password auth and `accept_invalid_certs`
-/// opt-in. Shared by `send_email` and `send_reply` so both apply identical
-/// transport policy.
+/// opt-in. The single transport builder behind [`submit`], so every SMTP
+/// submission applies identical transport policy.
 fn build_smtp_transport(
     smtp_config: &SmtpConfig,
 ) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
@@ -753,16 +810,15 @@ pub fn build_reply_mime_body(plain: &str, ics: &str) -> MultiPart {
 /// `ATTENDEE`); `organizer` is the single recipient. `reply_ics` is the
 /// `METHOD:REPLY` payload from [`crate::invite::build_reply_ics`]. `subject`
 /// follows the Outlook convention (`Accepted:`/`Tentative:`/`Declined: <summary>`).
-/// Returns the send outcome plus the raw message bytes (for an optional IMAP
-/// APPEND to Sent) and the generated Message-ID.
-pub async fn send_reply(
+/// The reply is built here and submitted through the durable outbox by
+/// [`send_rsvp`], like any other outgoing message.
+pub fn build_reply_message(
     from: &str,
     organizer: &str,
     subject: &str,
     plain_body: &str,
     reply_ics: &str,
-    smtp_config: &SmtpConfig,
-) -> Result<(SendResult, Vec<u8>, Option<String>)> {
+) -> Result<BuiltMessage> {
     let from_mailbox: Mailbox = normalize_address_for_smtp(from)
         .parse()
         .context("Invalid 'from' address for RSVP reply")?;
@@ -770,7 +826,7 @@ pub async fn send_reply(
         .parse()
         .context("Invalid ORGANIZER address for RSVP reply")?;
 
-    info!("Sending RSVP reply: subject=\"{}\", from={}, to={}", subject, from, organizer);
+    info!("Building RSVP reply: subject=\"{}\", from={}, to={}", subject, from, organizer);
 
     let message = Message::builder()
         .from(from_mailbox.clone())
@@ -781,47 +837,20 @@ pub async fn send_reply(
         .context("Failed to build RSVP reply message")?;
 
     let raw_message = message.formatted();
-    let message_id = mailparse::parse_headers(&raw_message)
-        .ok()
-        .and_then(|(headers, _)| {
-            headers
-                .iter()
-                .find(|h| h.get_key().eq_ignore_ascii_case("Message-ID"))
-                .map(|h| h.get_value().trim().to_string())
-        });
-
-    let mailer = build_smtp_transport(smtp_config)?;
-    let envelope = Envelope::new(Some(from_mailbox.email), vec![organizer_mailbox.email])
-        .context("Failed to build RSVP reply envelope")?;
-
-    let results = match mailer.send_raw(&envelope, &raw_message).await {
-        Ok(_) => {
-            info!("RSVP reply sent to organizer {}", organizer);
-            vec![RecipientResult {
-                address: organizer.to_string(),
-                role: RecipientRole::To,
-                success: true,
-                error: None,
-            }]
-        }
-        Err(e) => {
-            let err_msg = format!("{}", e);
-            error!("Failed to send RSVP reply to {}: {}", organizer, err_msg);
-            vec![RecipientResult {
-                address: organizer.to_string(),
-                role: RecipientRole::To,
-                success: false,
-                error: Some(err_msg),
-            }]
-        }
-    };
-
-    Ok((SendResult { results }, raw_message, message_id))
+    Ok(BuiltMessage {
+        message_id: message_id_of(&raw_message),
+        raw: raw_message,
+        recipients: vec![(organizer.to_string(), RecipientRole::To)],
+        from: from.to_string(),
+    })
 }
 
-/// Outcome of an RSVP send, carried back to the caller so it can do the
-/// optional IMAP APPEND to Sent and surface a status line.
+/// Outcome of an RSVP send, carried back to the caller so it can surface a
+/// status line. The Sent copy is the outbox's business, not the caller's.
 pub struct RsvpOutcome {
+    /// Where the reply's outbox row ended up, or `None` when the store could
+    /// not be opened and the reply was submitted without a durable record.
+    pub outbox_state: Option<crate::outbox::OutboxState>,
     pub send_result: SendResult,
     pub raw_message: Vec<u8>,
     pub message_id: Option<String>,
@@ -834,15 +863,22 @@ pub struct RsvpOutcome {
 /// End-to-end attendee RSVP to a received invite (#0029), shared by the CLI
 /// and the TUI so both run identical logic (no subprocess).
 ///
-/// Steps: read the invite email's sidecar `invite.ics` (source of truth for
-/// `UID`/`SEQUENCE`), build a `METHOD:REPLY` with the account's `PARTSTAT`,
-/// email it to the `ORGANIZER`, and — only on a successful send — flip the
-/// local `event.rsvp` frontmatter. The sidecar is never rewritten.
+/// Steps: build a `METHOD:REPLY` from the invitation's own iMIP payload (the
+/// source of truth for `UID`/`SEQUENCE`) carrying the account's `PARTSTAT`,
+/// and email it to the `ORGANIZER`. The payload itself is never rewritten.
 ///
-/// `email_path` is the received invite `.md`; `account_address` is the
-/// responding account's primary address (the REPLY `ATTENDEE`).
+/// Nothing local is flipped afterwards, and there is nothing to flip: the
+/// reply goes out through the durable outbox, which appends it to the server
+/// Sent mailbox and ingests that copy into the store during the send, so our
+/// own `PARTSTAT` is derived from that row the next time an invite is
+/// rendered (#0038 scope item 6, `crate::reconcile::own_rsvp`).
+///
+/// `ics` is the invitation's `invite.ics` bytes, read from the message's blob
+/// by the caller; `account_address` is the responding account's primary
+/// address (the REPLY `ATTENDEE`).
 pub async fn send_rsvp(
-    email_path: &Path,
+    ics: &[u8],
+    account_config: &crate::config::AccountConfig,
     account_address: &str,
     rsvp: crate::invite::Rsvp,
     smtp_config: &SmtpConfig,
@@ -852,17 +888,7 @@ pub async fn send_rsvp(
         return Err(anyhow!("Account has no usable address to RSVP as"));
     }
 
-    // Locate and read the sidecar .ics colocated with the email's attachments.
-    let sidecar = crate::parse::attachments_dir_for(email_path)
-        .join(crate::parse::CALENDAR_SIDECAR_NAME);
-    let ics_bytes = fs::read(&sidecar).with_context(|| {
-        format!(
-            "No calendar sidecar found at {} (is this a received invite?)",
-            sidecar.display()
-        )
-    })?;
-
-    let ctx = crate::invite::reply_context_from_ics(&ics_bytes)?;
+    let ctx = crate::invite::reply_context_from_ics(ics)?;
     let reply_ics = crate::invite::build_reply_ics(&ctx, &account_address, rsvp)?;
 
     let summary = ctx.summary.as_deref().unwrap_or("(no subject)");
@@ -873,28 +899,21 @@ pub async fn send_rsvp(
         summary
     );
 
-    let (send_result, raw_message, message_id) = send_reply(
+    let built = build_reply_message(
         &account_address,
         &ctx.organizer,
         &subject,
         &plain_body,
         &reply_ics,
-        smtp_config,
-    )
-    .await?;
+    )?;
 
-    // Update local state only after the reply actually left the machine.
-    if send_result.any_succeeded() {
-        if let Err(e) = crate::draft::set_event_rsvp(email_path, rsvp.frontmatter_status()) {
-            log::warn!(
-                "RSVP sent but failed to update event.rsvp in {}: {}",
-                email_path.display(),
-                e
-            );
-        }
-    }
+    let report = send_durably(&built, account_config, smtp_config).await?;
+    let send_result = report.send_result;
+    let raw_message = built.raw;
+    let message_id = Some(built.message_id);
 
     Ok(RsvpOutcome {
+        outbox_state: report.state,
         send_result,
         raw_message,
         message_id,
@@ -903,13 +922,478 @@ pub async fn send_rsvp(
     })
 }
 
-pub async fn send_email(
-    draft: &EmailDraft,
+// ---------------------------------------------------------------------------
+// The durable send path (#0037 item 5)
+// ---------------------------------------------------------------------------
+
+/// What one durable send did, end to end.
+pub struct SendReport {
+    /// The SMTP (or Graph) result, per recipient.
+    pub send_result: SendResult,
+    /// Where the outbox row ended up. `None` when the store could not be
+    /// opened at all, in which case the message was still submitted but has no
+    /// durable record.
+    pub state: Option<crate::outbox::OutboxState>,
+    /// The outbox row id, for a status line or a later retry.
+    pub row_id: Option<i64>,
+}
+
+impl SendReport {
+    /// One honest line about where the message actually is, for `mp send` and
+    /// the TUI status bar.
+    pub fn status_line(&self) -> String {
+        use crate::outbox::OutboxState;
+        match self.state {
+            Some(OutboxState::Done) => "sent + saved".to_string(),
+            Some(OutboxState::SentPendingAppend) => "sent + append pending".to_string(),
+            Some(OutboxState::Failed) => "failed (see the outbox)".to_string(),
+            Some(OutboxState::PendingSend) => "queued, not sent".to_string(),
+            None => {
+                if self.send_result.any_succeeded() {
+                    "sent (no local record)".to_string()
+                } else {
+                    "not sent".to_string()
+                }
+            }
+        }
+    }
+}
+
+/// A submission in flight: the outbox row exists, SMTP has not run yet.
+///
+/// Held by the caller across the submission so the Graph path and the SMTP
+/// path share one state machine. See [`crate::outbox`] for the invariants.
+pub struct DurableSend {
+    store: crate::store::Store,
+    blobs: crate::store::BlobStore,
+    account: crate::config::AccountConfig,
+    row_id: i64,
+}
+
+impl DurableSend {
+    /// Commit the raw bytes and the `pending_send` row. Must be called before
+    /// the message is submitted.
+    pub fn begin(account: &crate::config::AccountConfig, built: &BuiltMessage) -> Result<Self> {
+        let store = crate::store::Store::open_account(&account.name)?;
+        let blobs = crate::store::BlobStore::for_account(&account.name);
+        // `None` when the server files its own copy (Gmail, Graph, Proton) or
+        // the user said `save_to_sent = "never"`: the row then goes straight
+        // from `pending_send` to `done` on a 250, with no APPEND ever.
+        let target = crate::config::appends_to_sent(account)
+            .then(|| crate::config::resolve_sent_mailbox(account));
+        let row_id = crate::outbox::enqueue(
+            &store,
+            &blobs,
+            &account.name,
+            target.as_deref(),
+            &built.message_id,
+            &built.raw,
+            &crate::outbox::Envelope {
+                from: built.from.clone(),
+                recipients: built.recipients.clone(),
+            },
+        )?;
+        Ok(Self {
+            store,
+            blobs,
+            account: account.clone(),
+            row_id,
+        })
+    }
+
+    pub fn row_id(&self) -> i64 {
+        self.row_id
+    }
+
+    /// Commit "the transport is about to be entered" for this row.
+    ///
+    /// Called immediately before the submission, and never batched with
+    /// anything else: the marker is what tells a later resume whether a
+    /// `pending_send` row it finds was ever attempted (see
+    /// [`crate::outbox::sweep_pending_sends`]). A failure to write it is
+    /// logged, not propagated, because refusing to send over a bookkeeping
+    /// error would be a worse outcome than the ambiguity it protects against.
+    pub fn mark_started(&self) {
+        if let Err(e) = crate::outbox::mark_submission_started(&self.store, self.row_id) {
+            error!(
+                "[outbox] could not mark row {} as entering submission: {e:#}",
+                self.row_id
+            );
+        }
+    }
+
+    /// Record what the submission did, committing the transition immediately.
+    pub fn record(&self, outcome: &crate::outbox::SubmitOutcome) -> Result<crate::outbox::OutboxState> {
+        crate::outbox::record_submission(&self.store, &self.blobs, self.row_id, outcome)
+    }
+
+    /// Drive the outstanding APPENDs for this account, this row included, and
+    /// report where this row ended up.
+    ///
+    /// A row that cannot be appended now stays `sent_pending_append` and is
+    /// picked up by the next startup or sync tick; the message is already on
+    /// the server either way.
+    pub async fn settle(&self) -> Result<crate::outbox::OutboxState> {
+        drain_account(&self.store, &self.blobs, &self.account).await;
+        Ok(crate::outbox::load(&self.store, self.row_id)?
+            .map(|row| row.state)
+            .unwrap_or(crate::outbox::OutboxState::Done))
+    }
+}
+
+/// Build, commit, submit over SMTP, record, append: the whole durable path for
+/// an already-built message.
+pub async fn send_durably(
+    built: &BuiltMessage,
+    account: &crate::config::AccountConfig,
     smtp_config: &SmtpConfig,
+) -> Result<SendReport> {
+    let durable = match DurableSend::begin(account, built) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            // A store that will not open must not stop the user sending mail;
+            // it only costs the durability of this one submission.
+            error!("[outbox] could not queue the message durably: {e:#}");
+            None
+        }
+    };
+
+    if let Some(durable) = durable.as_ref() {
+        durable.mark_started();
+    }
+    let send_result = submit(built, smtp_config).await?;
+
+    let Some(durable) = durable else {
+        return Ok(SendReport {
+            send_result,
+            state: None,
+            row_id: None,
+        });
+    };
+
+    let mut state = durable.record(&send_result.submit_outcome())?;
+    if state == crate::outbox::OutboxState::SentPendingAppend {
+        state = durable.settle().await?;
+    }
+    Ok(SendReport {
+        send_result,
+        state: Some(state),
+        row_id: Some(durable.row_id()),
+    })
+}
+
+/// The durable path for a submission that is not SMTP (Microsoft Graph).
+///
+/// `submission` is the API call, handed over as a future so the outbox row is
+/// committed before it is polled. Graph files its own copy in Sent Items, so
+/// with `save_to_sent = "auto"` the row never carries a target mailbox and
+/// goes straight from `pending_send` to `done`; the durability being bought
+/// here is of the submission itself.
+pub async fn send_durably_via<F>(
+    built: &BuiltMessage,
+    account: &crate::config::AccountConfig,
+    submission: F,
+) -> Result<SendReport>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let durable = match DurableSend::begin(account, built) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            error!("[outbox] could not queue the message durably: {e:#}");
+            None
+        }
+    };
+
+    if let Some(durable) = durable.as_ref() {
+        durable.mark_started();
+    }
+    let submitted = submission.await;
+    let outcome = match &submitted {
+        Ok(()) => crate::outbox::SubmitOutcome::Accepted,
+        Err(e) => crate::outbox::classify_submission_error(e),
+    };
+    let send_result = SendResult {
+        results: built
+            .recipients
+            .iter()
+            .map(|(addr, role)| RecipientResult {
+                address: addr.clone(),
+                role: *role,
+                success: submitted.is_ok(),
+                error: submitted.as_ref().err().map(|e| format!("{e:#}")),
+                ambiguous: matches!(outcome, crate::outbox::SubmitOutcome::Ambiguous(_)),
+            })
+            .collect(),
+    };
+
+    let Some(durable) = durable else {
+        return Ok(SendReport {
+            send_result,
+            state: None,
+            row_id: None,
+        });
+    };
+    let mut state = durable.record(&outcome)?;
+    if state == crate::outbox::OutboxState::SentPendingAppend {
+        state = durable.settle().await?;
+    }
+    Ok(SendReport {
+        send_result,
+        state: Some(state),
+        row_id: Some(durable.row_id()),
+    })
+}
+
+/// Run every outstanding APPEND for one account, best effort.
+///
+/// Shared by the post-send settle, the startup resume and the sync tick. Never
+/// returns an error: a Sent copy that has to wait for the next tick is not a
+/// reason to fail whatever the caller was doing.
+pub async fn drain_account(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    account: &crate::config::AccountConfig,
+) -> crate::outbox::DrainResult {
+    let counts = match crate::outbox::counts(store, &account.name) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[outbox] could not read the outbox for {}: {e:#}", account.name);
+            return crate::outbox::DrainResult::default();
+        }
+    };
+    if counts.open == 0 {
+        return crate::outbox::DrainResult::default();
+    }
+
+    let imap_config = match crate::config::ImapConfig::load(account) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "[outbox] {} has {} row(s) waiting for an APPEND but no usable IMAP config: {e:#}",
+                account.name,
+                counts.open
+            );
+            return crate::outbox::DrainResult::default();
+        }
+    };
+
+    let mut mailbox = crate::imap_client::ImapSentMailbox::new(imap_config);
+    let result = crate::outbox::drain(
+        store,
+        blobs,
+        &account.name,
+        &mut mailbox,
+        crate::outbox::unix_now(),
+    )
+    .await;
+    mailbox.close().await;
+    match result {
+        Ok(result) => result,
+        Err(e) => {
+            log::warn!("[outbox] draining {} failed: {e:#}", account.name);
+            crate::outbox::DrainResult::default()
+        }
+    }
+}
+
+/// Resume the outbox for one account: the startup and sync-tick entry point.
+///
+/// Opens the account's store only when there is one, so a fresh account costs
+/// nothing. Three things happen, in this order and for this reason:
+///
+/// 1. [`crate::outbox::sweep_pending_sends`] reads the exactly-once marker on
+///    every `pending_send` row. A row that died inside its SMTP session is
+///    parked in `failed` for a human and never re-sent.
+/// 2. The rows that provably never reached the transport are submitted here,
+///    which is the half of the crash story the driver cannot do: it needs the
+///    credentials and the envelope, and both live on this side.
+/// 3. [`drain_account`] finishes the outstanding APPENDs, this pass's included.
+pub async fn resume_outbox(account: &crate::config::AccountConfig) -> crate::outbox::DrainResult {
+    let path = crate::config::store_path(&account.name);
+    if !path.exists() {
+        return crate::outbox::DrainResult::default();
+    }
+    let store = match crate::store::Store::open(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::warn!("[outbox] could not open the store for {}: {e:#}", account.name);
+            return crate::outbox::DrainResult::default();
+        }
+    };
+    let blobs = crate::store::BlobStore::for_account(&account.name);
+    resubmit_pending(&store, &blobs, account).await;
+    drain_account(&store, &blobs, account).await
+}
+
+/// Send the `pending_send` rows that a crash left behind, exactly once each.
+///
+/// Never returns an error: this runs on startup and on the sync tick, where a
+/// server that is still down must not fail the caller. A row that cannot be
+/// submitted now stays `pending_send` and is tried again next time, under the
+/// same backoff the APPEND retries use.
+async fn resubmit_pending(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    account: &crate::config::AccountConfig,
+) {
+    let sweep = match crate::outbox::sweep_pending_sends(store, &account.name) {
+        Ok(sweep) => sweep,
+        Err(e) => {
+            log::warn!(
+                "[outbox] could not classify the pending sends for {}: {e:#}",
+                account.name
+            );
+            return;
+        }
+    };
+    if !sweep.stranded.is_empty() {
+        log::warn!(
+            "[outbox] {} submission(s) for {} died mid-SMTP and are parked as failed; \
+             inspect them with `mp outbox list`",
+            sweep.stranded.len(),
+            account.name
+        );
+    }
+    if sweep.resubmittable.is_empty() {
+        return;
+    }
+
+    if account.auth_method == crate::config::AuthMethod::Graph {
+        // The Graph transport sends a structured JSON message, not the RFC822
+        // bytes the row holds, so there is nothing here to resubmit from. The
+        // rows stay visible in `mp outbox list` for a human to discard or to
+        // re-send from the draft.
+        log::warn!(
+            "[outbox] {} has {} queued message(s) that were never submitted, and the Graph \
+             transport cannot resend stored RFC822 bytes; see `mp outbox list`",
+            account.name,
+            sweep.resubmittable.len()
+        );
+        return;
+    }
+
+    let smtp_config = match SmtpConfig::load(account) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "[outbox] {} has {} queued message(s) but no usable SMTP config: {e:#}",
+                account.name,
+                sweep.resubmittable.len()
+            );
+            return;
+        }
+    };
+
+    let now = crate::outbox::unix_now();
+    for row in sweep.resubmittable {
+        if row.updated + crate::outbox::backoff_secs(row.attempts) > now {
+            // A previous clean failure (no transport, a rejected address) bumped
+            // the counter; wait it out rather than hammer the server.
+            continue;
+        }
+        if let Err(e) = resubmit_row(store, blobs, &row, &smtp_config).await {
+            log::warn!("[outbox] could not resubmit row {}: {e:#}", row.id);
+        }
+    }
+}
+
+/// Submit one never-attempted row, marker first.
+async fn resubmit_row(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    row: &crate::outbox::OutboxRow,
+    smtp_config: &SmtpConfig,
+) -> Result<crate::outbox::OutboxState> {
+    let Some(envelope) = row.envelope.clone().filter(|e| e.is_submittable()) else {
+        // Without an envelope there is no honest way to address the message,
+        // and guessing from the headers would drop the blind recipients.
+        crate::outbox::record_submission(
+            store,
+            blobs,
+            row.id,
+            &crate::outbox::SubmitOutcome::Ambiguous(
+                "the queued submission has no usable envelope; it cannot be resent \
+                 automatically"
+                    .to_string(),
+            ),
+        )?;
+        return Ok(crate::outbox::OutboxState::Failed);
+    };
+    let raw = blobs
+        .read(&row.raw_blob)
+        .with_context(|| format!("reading the queued message of outbox row {}", row.id))?;
+    let built = BuiltMessage {
+        raw,
+        message_id: row.message_id.clone(),
+        recipients: envelope.recipients,
+        from: envelope.from,
+    };
+
+    info!("[outbox] resubmitting row {} ({})", row.id, row.message_id);
+    crate::outbox::mark_submission_started(store, row.id)?;
+    let result = submit(&built, smtp_config).await?;
+    crate::outbox::record_submission(store, blobs, row.id, &result.submit_outcome())
+}
+
+/// A message that is fully built and not yet submitted.
+///
+/// The split between building and submitting is what the durable outbox is
+/// made of: these bytes are committed to the store *before* the SMTP
+/// conversation opens, so no crash window can lose a message that the server
+/// might already have accepted.
+#[derive(Debug, Clone)]
+pub struct BuiltMessage {
+    /// The RFC822 bytes, exactly as they go to SMTP and into the blob store.
+    pub raw: Vec<u8>,
+    /// The `Message-ID` header, synthesised when the builder produced none.
+    /// The outbox's dedup search keys on it, so it is never optional.
+    pub message_id: String,
+    /// Every recipient with its role, deduplicated, in header order.
+    pub recipients: Vec<(String, RecipientRole)>,
+    /// The envelope sender.
+    pub from: String,
+}
+
+/// The `Message-ID` of a built message.
+///
+/// lettre generates one for every message it builds, so the fallback only
+/// fires for bytes that came from somewhere else; it reuses the ingest path's
+/// synthesis so the same message gets the same id on both sides.
+pub fn message_id_of(raw: &[u8]) -> String {
+    let header = mailparse::parse_headers(raw).ok().and_then(|(headers, _)| {
+        headers
+            .iter()
+            .find(|h| h.get_key().eq_ignore_ascii_case("Message-ID"))
+            .map(|h| h.get_value().trim().to_string())
+            .filter(|v| !v.is_empty())
+    });
+    match header {
+        Some(id) => id,
+        None => match crate::parse::parse_rfc822_to_fetched_email(raw) {
+            Some(email) => crate::ingest::synthesize_message_id(&email, Some(raw)),
+            None => {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(raw);
+                let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                format!("<sha256-{hex}@local.invalid>")
+            }
+        },
+    }
+}
+
+/// Build the message a draft describes, without touching the network.
+///
+/// `default_from` is the account's address, used when the draft names no
+/// `from:` of its own. It is passed in rather than read off the SMTP config so
+/// the Graph path, which has no SMTP config, builds identical bytes.
+pub fn build_draft_message(
+    draft: &EmailDraft,
+    default_from: &str,
     email_config: &EmailSettings,
     signature: Option<&str>,
     invite_ics: Option<&str>,
-) -> Result<(SendResult, Vec<u8>, Option<String>)> {
+) -> Result<BuiltMessage> {
     // Check status
     if draft.frontmatter.status != EmailStatus::Approved {
         return Err(anyhow!(
@@ -921,8 +1405,8 @@ pub async fn send_email(
     let from_address = draft
         .frontmatter
         .from
-        .as_ref()
-        .unwrap_or(&smtp_config.default_from);
+        .as_deref()
+        .unwrap_or(default_from);
 
     let from_mailbox: Mailbox = normalize_address_for_smtp(from_address)
         .parse()
@@ -1102,17 +1586,22 @@ pub async fn send_email(
     // Get raw message bytes for send_raw and IMAP APPEND
     let raw_message = message.formatted();
 
-    // Extract Message-ID from the raw message headers
-    let message_id = mailparse::parse_headers(&raw_message)
-        .ok()
-        .and_then(|(headers, _)| {
-            headers.iter()
-                .find(|h| h.get_key().eq_ignore_ascii_case("Message-ID"))
-                .map(|h| h.get_value().trim().to_string())
-        });
+    Ok(BuiltMessage {
+        message_id: message_id_of(&raw_message),
+        raw: raw_message,
+        recipients,
+        from: from_address.to_string(),
+    })
+}
 
+/// Submit an already-built message over SMTP, one envelope per recipient.
+///
+/// Never called before the message is committed to the outbox: see
+/// [`crate::outbox`] for why the ordering is the whole design.
+pub async fn submit(built: &BuiltMessage, smtp_config: &SmtpConfig) -> Result<SendResult> {
     // Parse from address for envelope
-    let from_addr: lettre::Address = from_address
+    let from_addr: lettre::Address = built
+        .from
         .parse::<Mailbox>()
         .context("Invalid 'from' address")?
         .email;
@@ -1120,10 +1609,9 @@ pub async fn send_email(
     // Create SMTP transport (branching on auth method / TLS mode).
     let mailer = build_smtp_transport(smtp_config)?;
 
-    // Send to each recipient individually
-    let mut results = Vec::with_capacity(recipients.len());
+    let mut results = Vec::with_capacity(built.recipients.len());
 
-    for (addr, role) in &recipients {
+    for (addr, role) in &built.recipients {
         let rcpt_addr: lettre::Address = match normalize_address_for_smtp(addr).parse::<Mailbox>() {
             Ok(mbox) => mbox.email,
             Err(e) => {
@@ -1134,6 +1622,7 @@ pub async fn send_email(
                     role: *role,
                     success: false,
                     error: Some(err_msg),
+                    ambiguous: false,
                 });
                 continue;
             }
@@ -1149,12 +1638,13 @@ pub async fn send_email(
                     role: *role,
                     success: false,
                     error: Some(err_msg),
+                    ambiguous: false,
                 });
                 continue;
             }
         };
 
-        match mailer.send_raw(&envelope, &raw_message).await {
+        match mailer.send_raw(&envelope, &built.raw).await {
             Ok(_) => {
                 info!("Sent to {} ({})", addr, role);
                 results.push(RecipientResult {
@@ -1162,6 +1652,7 @@ pub async fn send_email(
                     role: *role,
                     success: true,
                     error: None,
+                    ambiguous: false,
                 });
             }
             Err(e) => {
@@ -1171,11 +1662,12 @@ pub async fn send_email(
                     address: addr.clone(),
                     role: *role,
                     success: false,
+                    ambiguous: smtp_failure_is_ambiguous(&e),
                     error: Some(err_msg),
                 });
             }
         }
     }
 
-    Ok((SendResult { results }, raw_message, message_id))
+    Ok(SendResult { results })
 }

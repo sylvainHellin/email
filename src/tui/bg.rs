@@ -1,8 +1,7 @@
 use super::app::{
-    Action, App, BgResult, MailboxInfo, MailboxKind, SearchOverlayFocus, SearchResultEntry,
+    App, BgResult, MailboxKind, SearchOverlayFocus, SearchResultEntry,
     StatusLevel,
 };
-use crate::imap_client::{save_mailbox_states_cache, update_read_status_locally};
 
 /// Whether a `BgResult::MailboxLoaded` may be applied or must be dropped
 /// as stale (P1 step 2). A background walk is only valid if the user is
@@ -21,21 +20,6 @@ fn mailbox_loaded_is_current(
     account_index == active_account
         && mailbox_idx == active_mailbox
         && generation == current_generation
-}
-
-/// Map the local directories a sync actually touched to mailbox indices.
-/// Used after a fetch to invalidate only the affected mailbox caches
-/// instead of all of them.
-fn mailbox_indices_for_dirs(
-    mailboxes: &[MailboxInfo],
-    touched: &[std::path::PathBuf],
-) -> Vec<usize> {
-    mailboxes
-        .iter()
-        .enumerate()
-        .filter(|(_, mb)| touched.contains(&mb.dir))
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// After a failed move the on-disk rollback may leave both the SOURCE
@@ -58,20 +42,6 @@ fn move_failure_invalidation(
     (indices, reload_current)
 }
 
-/// Persist the account's `mailbox_states` cache to disk. Best-effort: logs
-/// and continues on failure (the cache only buys us a faster first quick
-/// sync; sync correctness does not depend on it).
-fn persist_mailbox_states(acct: &super::app::AccountState) {
-    let root = crate::config::account_dir(&acct.account_config.name);
-    if let Err(e) = save_mailbox_states_cache(&root, &acct.mailbox_states) {
-        log::warn!(
-            "Failed to persist mailbox states for '{}': {}",
-            acct.account_config.name,
-            e,
-        );
-    }
-}
-
 /// Decrement bg_mutations on the correct account.
 fn decrement_mutations(app: &mut App, account_index: usize) {
     if account_index == app.active_account {
@@ -81,8 +51,23 @@ fn decrement_mutations(app: &mut App, account_index: usize) {
     }
 }
 
+/// Re-read one account's outbox counts for the status-bar badge (#0037).
+fn refresh_outbox(app: &mut App, account_index: usize) {
+    if let Some(acct) = app.accounts.get_mut(account_index) {
+        acct.outbox = crate::outbox::counts_for_account(&acct.account_config.name);
+    }
+}
+
 pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
     app.bg_count = app.bg_count.saturating_sub(1);
+    match &result {
+        BgResult::Send { account_index, .. }
+        | BgResult::SendApproved { account_index, .. }
+        | BgResult::Rsvp { account_index, .. }
+        | BgResult::Sync { account_index, .. }
+        | BgResult::Fetch { account_index, .. } => refresh_outbox(app, *account_index),
+        _ => {}
+    }
 
     match result {
         BgResult::Archive { account_index, result } => {
@@ -137,12 +122,10 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                     };
                     app.set_status_level(text, StatusLevel::Success);
                     if account_index == app.active_account {
-                        // The source list was already updated optimistically;
-                        // only the destination cache went stale.
+                        // The source list and every sidebar count were already
+                        // updated when the row moved (#0038 item 7); only the
+                        // destination's cached list is still stale.
                         app.invalidate_cache_idx(dest_mailbox_idx);
-                        if let Some(count) = app.mailbox_counts.get_mut(dest_mailbox_idx) {
-                            *count += 1;
-                        }
                     } else {
                         app.invalidate_all_caches_on(account_index);
                     }
@@ -224,12 +207,16 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "RSVP sent".into() } else { msg };
                     app.set_status_level(text, StatusLevel::Success);
-                    // The invite's local event.rsvp frontmatter changed on
-                    // disk; refresh the open mailbox so the preview card and
-                    // list badge reflect the new own-RSVP state.
+                    // Our own reply is now a row in `sent` (the outbox
+                    // ingests the appended copy during the send), so the
+                    // derived own-RSVP has changed: refresh the open mailbox
+                    // and rebuild the agenda from it (#0038 item 6).
                     if account_index == app.active_account {
                         app.invalidate_cache_idx(app.active_mailbox);
                         app.reload_current_mailbox();
+                        if app.calendar_view.loaded {
+                            app.refresh_calendar();
+                        }
                     } else {
                         app.invalidate_all_caches_on(account_index);
                     }
@@ -262,9 +249,6 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
         BgResult::Fetch {
             account_index,
             result,
-            new_index,
-            new_mailbox_states,
-            touched_dirs,
             new_inbox_mail,
         } => {
             match result {
@@ -274,7 +258,7 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                     // Desktop notification for genuinely new inbox mail
                     // (#0009). Opt-in via `notifications = true` in
                     // config.toml; no-op when the list is empty (read-flag
-                    // updates and reconciliation never populate it).
+                    // updates never populate it).
                     if app.global_config.notifications && !new_inbox_mail.is_empty() {
                         let account_name = app
                             .accounts
@@ -283,138 +267,47 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                             .unwrap_or("");
                         crate::notify::notify_new_mail(account_name, &new_inbox_mail);
                     }
-                    // Merge updated index and mailbox states back into AccountState
-                    if let Some(acct) = app.accounts.get_mut(account_index) {
-                        if let Some(index) = new_index {
-                            acct.message_id_index = index;
-                        }
-                        if let Some(states) = new_mailbox_states {
-                            acct.mailbox_states = states;
-                            persist_mailbox_states(acct);
-                        }
-                    }
-                    match touched_dirs {
-                        // No-op sync: nothing changed on disk (common for
-                        // IDLE-triggered fetches). Skip cache invalidation
-                        // and the mailbox reload entirely.
-                        Some(dirs) if dirs.is_empty() => {}
-                        // Sync reported exactly which local dirs it modified
-                        // (saves, read-flag updates, dedup, reconciliation
-                        // moves/removals -- moves list both source and
-                        // destination). Invalidate only those caches.
-                        Some(dirs) => {
-                            if account_index == app.active_account {
-                                let indices =
-                                    mailbox_indices_for_dirs(&app.mailboxes, &dirs);
-                                let reload_current = indices.contains(&app.active_mailbox);
-                                for idx in indices {
-                                    app.invalidate_cache_idx(idx);
-                                }
-                                if reload_current {
-                                    app.reload_current_mailbox();
-                                }
-                            } else {
-                                let indices = app
-                                    .accounts
-                                    .get(account_index)
-                                    .map(|acct| {
-                                        mailbox_indices_for_dirs(&acct.mailboxes, &dirs)
-                                    })
-                                    .unwrap_or_default();
-                                for idx in indices {
-                                    app.invalidate_cache_idx_on(account_index, idx);
-                                }
-                            }
-                        }
-                        // Unknown which dirs changed -- fall back to the
-                        // conservative full invalidation.
-                        None => {
-                            if account_index == app.active_account {
-                                app.invalidate_all_caches();
-                                app.reload_current_mailbox();
-                            } else {
-                                app.invalidate_all_caches_on(account_index);
-                            }
-                        }
-                    }
+                    // Ingest writes no `.md`, so a sync never changes what the
+                    // list is reading and there is nothing to invalidate. The
+                    // tree goes stale until the read path moves onto the store
+                    // in #0038.
                 }
                 Err(e) => app.set_status_level(format!("Fetch failed: {e}"), StatusLevel::Error),
             }
         }
 
-        BgResult::Sync { account_index, result, new_index, new_mailbox_states } => {
+        BgResult::Sync { account_index: _, result } => {
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Sync complete".into() } else { msg };
                     app.set_status_level(text, StatusLevel::Success);
-                    // Merge updated index and mailbox states back into AccountState
-                    if let Some(acct) = app.accounts.get_mut(account_index) {
-                        if let Some(index) = new_index {
-                            acct.message_id_index = index;
-                        }
-                        if let Some(states) = new_mailbox_states {
-                            acct.mailbox_states = states;
-                            persist_mailbox_states(acct);
-                        }
-                    }
-                    if account_index == app.active_account {
-                        // Full sync may move emails between mailboxes via reconciliation
-                        app.invalidate_all_caches();
-                        app.reload_current_mailbox();
-                        app.recount_all_mailboxes();
-                    } else {
-                        app.invalidate_all_caches_on(account_index);
-                    }
                 }
                 Err(e) => app.set_status_level(format!("Sync failed: {e}"), StatusLevel::Error),
             }
         }
 
-        BgResult::ToggleRead { account_index, path, new_read_state, result } => {
+        BgResult::ToggleRead { account_index, msg, new_read_state, result } => {
             // ToggleRead does NOT use bg_mutations -- it doesn't block fetch/sync
             match result {
                 Ok(_) => { /* Server confirmed, local already updated optimistically */ }
                 Err(e) => {
-                    // Rollback local state
+                    // Roll back both halves: the store row that carries the
+                    // flag, and the in-memory list the user is looking at.
                     let reverted = !new_read_state;
-                    update_read_status_locally(&path, reverted).ok();
+                    let account = app
+                        .accounts
+                        .get(account_index)
+                        .map(|a| a.account_config.name.clone());
+                    if let Some(account) = account {
+                        super::mutations::rollback_read_flag(&account, msg, reverted);
+                    }
                     if account_index == app.active_account {
                         // Updates both the in-memory list and the shared
                         // cache slot (they are the same Arc).
-                        app.set_email_read(&path, reverted);
+                        app.set_email_read(msg, reverted);
                     }
                     app.push_status(format!("Read status sync failed: {e}"), StatusLevel::Warning);
                 }
-            }
-        }
-
-        BgResult::IndexReady { account_index, index } => {
-            let mut should_auto_fetch = false;
-            if let Some(acct) = app.accounts.get_mut(account_index) {
-                acct.message_id_index = index;
-                acct.indexing = false;
-                // Trigger the per-account startup auto-fetch (#0001) iff
-                // the account has a remote source configured. Local-only
-                // accounts (no IMAP, no Graph) get nothing to fetch.
-                should_auto_fetch =
-                    acct.imap_config.is_some() || acct.graph_config.is_some();
-            }
-            // Clear status only when the LAST account finishes. Each
-            // account spawns its own indexing thread; we want the
-            // "Indexing..." spinner to remain visible until they all
-            // arrive. The per-thread `bg_count` decrement above keeps
-            // the spinner spinning; setting a Success message here on
-            // the final arrival mirrors the other bg-result UX.
-            if !app.accounts.iter().any(|a| a.indexing) {
-                app.set_status_level("Index ready".to_string(), StatusLevel::Success);
-            }
-            // Push *after* the status update so the per-account
-            // "Quick sync (...)" message wins over "Index ready". Use
-            // `push_action` rather than `push_action_dedup` -- different
-            // `FetchAccount(idx)` values share a discriminant and would
-            // otherwise be falsely deduplicated.
-            if should_auto_fetch {
-                app.push_action(Action::FetchAccount(account_index));
             }
         }
 
@@ -439,8 +332,8 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             // reload re-sorts (an approved draft changes status/date) and
             // grows (new inbox mail shifts every row down), so the bare
             // `list_index` would land on a different email. Anchor on the
-            // path, fall back to the clamped index when that email is
-            // gone from the fresh list.
+            // message ref, fall back to the clamped index when that email
+            // is gone from the fresh list.
             let anchor = app.cursor_anchor();
             let fallback = app.list_index;
             let entries = std::sync::Arc::new(entries);
@@ -450,6 +343,10 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 *slot = Some(std::sync::Arc::clone(&entries));
             }
             app.emails = entries;
+            // A key the fresh list no longer holds must leave the selection
+            // with it (#0052): an externally deleted draft is gone from the
+            // index, not just from the screen.
+            app.scrub_selection();
             // Reapply the active search filter (if any) to the fresh
             // entries, then put the cursor back on the anchored email.
             app.rebuild_visible();
@@ -475,7 +372,6 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                         .map(|hit| SearchResultEntry {
                             entry: hit.entry,
                             fetched: hit.fetched,
-                            saved_path: None,
                             source_label: hit.source_label,
                             source_local_dir: hit.source_local_dir,
                             source_status: hit.source_status,
@@ -504,70 +400,6 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn mb(label: &str, dir: &str, kind: MailboxKind) -> MailboxInfo {
-        MailboxInfo {
-            label: label.to_string(),
-            icon: "",
-            dir: PathBuf::from(dir),
-            kind,
-            server_name: None,
-        }
-    }
-
-    fn sample_mailboxes() -> Vec<MailboxInfo> {
-        vec![
-            mb("Inbox", "/mail/acct/inbox", MailboxKind::Inbox),
-            mb("Drafts", "/mail/acct/drafts", MailboxKind::Drafts),
-            mb("Sent", "/mail/acct/sent", MailboxKind::Sent),
-            mb("Archive", "/mail/acct/archive", MailboxKind::Archive),
-        ]
-    }
-
-    #[test]
-    fn no_touched_dirs_maps_to_no_indices() {
-        let mailboxes = sample_mailboxes();
-        assert!(mailbox_indices_for_dirs(&mailboxes, &[]).is_empty());
-    }
-
-    #[test]
-    fn single_touched_dir_maps_to_its_mailbox_only() {
-        let mailboxes = sample_mailboxes();
-        let touched = vec![PathBuf::from("/mail/acct/inbox")];
-        assert_eq!(mailbox_indices_for_dirs(&mailboxes, &touched), vec![0]);
-    }
-
-    /// A reconciliation move touches both source and destination; both
-    /// mailbox caches must be invalidated.
-    #[test]
-    fn move_touches_source_and_destination() {
-        let mailboxes = sample_mailboxes();
-        let touched = vec![
-            PathBuf::from("/mail/acct/inbox"),
-            PathBuf::from("/mail/acct/archive"),
-        ];
-        assert_eq!(mailbox_indices_for_dirs(&mailboxes, &touched), vec![0, 3]);
-    }
-
-    /// A touched dir not shown in the sidebar (e.g. a mailbox removed from
-    /// config between syncs) is simply ignored -- no panic, no bogus index.
-    #[test]
-    fn unknown_touched_dir_is_ignored() {
-        let mailboxes = sample_mailboxes();
-        let touched = vec![PathBuf::from("/mail/acct/junk")];
-        assert!(mailbox_indices_for_dirs(&mailboxes, &touched).is_empty());
-    }
-
-    #[test]
-    fn order_follows_mailbox_list_not_touched_list() {
-        let mailboxes = sample_mailboxes();
-        let touched = vec![
-            PathBuf::from("/mail/acct/archive"),
-            PathBuf::from("/mail/acct/inbox"),
-        ];
-        assert_eq!(mailbox_indices_for_dirs(&mailboxes, &touched), vec![0, 3]);
-    }
 
     // -----------------------------------------------------------------------
     // mailbox_loaded_is_current (P1 step 2: background mailbox loads)

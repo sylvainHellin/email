@@ -287,8 +287,10 @@ fn render_search_result_body(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let entry = &result.unwrap().entry;
-    let content = Paragraph::new(entry.body.as_str())
+    // A server-search hit renders the body it was fetched with, not one from
+    // the store: the hit may not be a local message at all (see
+    // `helpers::fetched_to_email_entry`).
+    let content = Paragraph::new(result.unwrap().fetched.body_text.as_str())
         .style(Style::default().fg(theme::active().text))
         .block(block)
         .wrap(Wrap { trim: false })

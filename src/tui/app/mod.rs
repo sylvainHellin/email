@@ -1,4 +1,4 @@
-mod calendar_view;
+pub(crate) mod calendar_view;
 mod keymap;
 mod keys;
 mod types;
@@ -64,8 +64,19 @@ pub struct App {
     pub pending_prefix: Option<char>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
-    pub selection: HashSet<PathBuf>,
+    pub selection: HashSet<EntryKey>,
     pub email_cache: Vec<Option<Arc<Vec<EmailEntry>>>>,
+    /// The body behind the preview pane, loaded from the blob store on
+    /// selection and memoised (#0038 scope item 5). Refreshed by
+    /// [`App::refresh_preview_body`] at the top of the render pass.
+    pub preview_body: PreviewBody,
+    /// The parsed invite behind the preview pane's event card, memoised the
+    /// same way (#0038 scope item 6). See [`PreviewInvite`].
+    pub preview_invite: PreviewInvite,
+    /// Lowercased bodies of the active mailbox, built only while body search
+    /// is on. See [`SearchBodies`] for why this is a blob batch read rather
+    /// than an FTS query.
+    pub search_bodies: SearchBodies,
     pub search_query: String,
     pub search_includes_body: bool,
     pub watcher_active: bool,
@@ -177,6 +188,9 @@ impl App {
             preview_scroll: 0,
             selection: HashSet::new(),
             email_cache: Vec::new(),
+            preview_body: PreviewBody::default(),
+            preview_invite: PreviewInvite::default(),
+            search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
@@ -223,7 +237,11 @@ impl App {
 
         app.load_from_account(0);
         if !app.mailboxes.is_empty() {
-            let loaded = Arc::new(load_emails(&app.mailboxes[0].dir));
+            let account_name = app.account_config.name.clone();
+            let loaded = Arc::new(load_emails(
+                &account_name,
+                &mailbox_key(&app.mailboxes[0]),
+            ));
             app.email_cache[0] = Some(Arc::clone(&loaded));
             app.emails = loaded;
             app.rebuild_visible();
@@ -264,6 +282,9 @@ impl App {
             preview_scroll: 0,
             selection: HashSet::new(),
             email_cache: Vec::new(),
+            preview_body: PreviewBody::default(),
+            preview_invite: PreviewInvite::default(),
+            search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
@@ -314,13 +335,13 @@ impl App {
     // ---------------------------------------------------------------
 
     pub(crate) fn save_to_account(&mut self) {
-        let cursor_path = self.cursor_anchor();
+        let cursor_ref = self.cursor_anchor();
         if let Some(acct) = self.accounts.get_mut(self.active_account) {
             acct.sidebar_index = self.sidebar_index;
             acct.active_mailbox = self.active_mailbox;
             acct.mailbox_counts = self.mailbox_counts.clone();
             acct.list_index = self.list_index;
-            acct.cursor_path = cursor_path;
+            acct.cursor_ref = cursor_ref;
             acct.headers_scroll = self.headers_scroll;
             acct.preview_scroll = self.preview_scroll;
             acct.selection = self.selection.clone();
@@ -487,32 +508,31 @@ impl App {
     // -- Calendar view (#0034) -------------------------------------------
 
     /// Lazily build the active account's agenda the first time the Calendar
-    /// view is shown. The walk is the same one `mp calendar rebuild` performs
-    /// (measured at ~100 ms on the largest local account), so it runs
-    /// synchronously on the UI thread like the Contacts cache load.
+    /// view is shown. One indexed query plus one small blob read per invite
+    /// row (#0038 scope item 6), so it runs synchronously on the UI thread
+    /// like the Contacts cache load, and never at startup.
     pub fn ensure_calendar_loaded(&mut self) {
         if self.calendar_view.loaded {
             return;
         }
-        self.calendar_view.events = match self.calendar_account_root() {
-            Some(root) => calendar_view::load_events_for_account(&root),
-            None => Vec::new(),
-        };
+        self.calendar_view.events = self.load_calendar_events();
         self.calendar_view.loaded = true;
         self.calendar_view.list_index = 0;
         self.recompute_calendar_visible();
     }
 
-    /// The account root to walk for events, or `None` when no account is
-    /// configured. Guarded on a non-empty name because `account_dir("")` is the
-    /// shared `accounts/` parent -- walking it would mix every account's events
-    /// into one agenda.
-    fn calendar_account_root(&self) -> Option<PathBuf> {
-        let name = self.account_config.name.trim();
-        if name.is_empty() {
-            return None;
+    /// Build the agenda from the active account's store, or an empty agenda
+    /// when there is no account or no store yet.
+    fn load_calendar_events(&self) -> Vec<CalendarEvent> {
+        let account = self.account_config.name.trim().to_string();
+        if account.is_empty() {
+            return Vec::new();
         }
-        Some(crate::config::account_dir(name))
+        let Some(store) = open_store(&account) else {
+            return Vec::new();
+        };
+        let blobs = crate::store::BlobStore::for_account(&account);
+        calendar_view::load_events_for_account(&store, &blobs, &account, &self.self_address())
     }
 
     /// Drop the loaded agenda (events are per-account, so the view reloads
@@ -521,16 +541,30 @@ impl App {
         self.calendar_view = CalendarView::default();
     }
 
-    /// Re-walk the account for events (manual refresh key).
+    /// Rebuild the agenda from the store (manual refresh key), picking up
+    /// invites and replies that arrived since it was last built.
     pub fn refresh_calendar(&mut self) {
-        self.calendar_view.events = match self.calendar_account_root() {
-            Some(root) => calendar_view::load_events_for_account(&root),
-            None => Vec::new(),
-        };
+        self.calendar_view.events = self.load_calendar_events();
         self.calendar_view.loaded = true;
         self.recompute_calendar_visible();
         let count = self.calendar_view.visible.len();
         self.set_status(format!("Calendar refreshed ({count} events)"));
+    }
+
+    /// Rebuild the agenda in place when the view is holding one, and say
+    /// nothing.
+    ///
+    /// The agenda is a snapshot of the invite rows, so a mutation that moved or
+    /// deleted one leaves it wrong until it is rebuilt (#0038 scope item 7).
+    /// This is [`Self::refresh_calendar`] without the status line, because the
+    /// mutation that triggers it has already written its own ("Archiving...")
+    /// and replacing that with a calendar count would hide what is in flight.
+    pub fn rebuild_calendar_if_loaded(&mut self) {
+        if !self.calendar_view.loaded {
+            return;
+        }
+        self.calendar_view.events = self.load_calendar_events();
+        self.recompute_calendar_visible();
     }
 
     /// Recompute the visible agenda rows for the current scope, clamping the
@@ -735,7 +769,7 @@ impl App {
         let anchor = self
             .accounts
             .get(idx)
-            .and_then(|acct| acct.cursor_path.clone());
+            .and_then(|acct| acct.cursor_ref);
         let am = self.active_mailbox;
         if let Some(cached) = self.email_cache.get(am).and_then(|c| c.as_ref()) {
             self.emails = Arc::clone(cached);
@@ -839,26 +873,27 @@ impl App {
     /// `list_index` is a bare position into `visible`, so any rebuild that
     /// re-sorts or grows the entry list silently moves the cursor to a
     /// different email (a draft approved at the top of Drafts, new inbox
-    /// mail shifting everything down). The file path is the de-facto
-    /// stable key of an entry (`selection`, `set_email_read` already key
-    /// on it), so we anchor on it and restore with `restore_cursor`.
-    pub(crate) fn cursor_anchor(&self) -> Option<PathBuf> {
-        self.selected_email().map(|e| e.path.clone())
+    /// mail shifting everything down). The `MessageRef` is the stable key
+    /// of an entry (`selection`, `set_email_read` key on it too), so we
+    /// anchor on it and restore with `restore_cursor`. An entry with no
+    /// store row cannot be anchored and falls back to the index.
+    pub(crate) fn cursor_anchor(&self) -> Option<MessageRef> {
+        self.selected_email().and_then(|e| e.msg)
     }
 
     /// Restore the cursor to `anchor` after `visible` was rebuilt. Falls
     /// back to the clamped `fallback` index when the anchored email is
     /// gone (archived, deleted, filtered out, moved to another mailbox).
-    pub(crate) fn restore_cursor(&mut self, anchor: Option<PathBuf>, fallback: usize) {
+    pub(crate) fn restore_cursor(&mut self, anchor: Option<MessageRef>, fallback: usize) {
         if self.visible.is_empty() {
             self.list_index = 0;
             return;
         }
-        if let Some(p) = anchor {
+        if let Some(m) = anchor {
             if let Some(pos) = self
                 .visible
                 .iter()
-                .position(|&i| self.emails.get(i).is_some_and(|e| e.path == p))
+                .position(|&i| self.emails.get(i).is_some_and(|e| e.msg == Some(m)))
             {
                 self.list_index = pos;
                 return;
@@ -872,12 +907,198 @@ impl App {
     /// or structural mutation of `self.emails` so the view never holds
     /// dangling indices.
     pub(crate) fn rebuild_visible(&mut self) {
-        self.visible = keys::filter_visible(
-            &self.emails,
-            &self.search_query,
-            self.active_kind(),
-            self.search_includes_body,
+        self.sync_search_bodies();
+        let kind = self.active_kind();
+        let bodies = self.search_includes_body.then_some(&self.search_bodies);
+        self.visible = keys::filter_visible(&self.emails, &self.search_query, kind, bodies);
+    }
+
+    // ---------------------------------------------------------------
+    // Lazy bodies (#0038 scope item 5)
+    // ---------------------------------------------------------------
+
+    /// What the preview memo must answer to right now: the cursor's message
+    /// under the active account and the current list generation. `None` when
+    /// nothing is selected, or when the selected entry has no store row (a
+    /// server-search hit, which carries its own body).
+    fn preview_body_key(&self) -> Option<BodyKey> {
+        Some((
+            self.active_account,
+            self.selected_email()?.msg?,
+            self.mailbox_load_generation,
+        ))
+    }
+
+    /// Refresh the preview body memo, reading one blob when the cursor, the
+    /// account or the list generation moved under it.
+    ///
+    /// Called once at the top of the render pass, which is the only place that
+    /// knows a body is about to be shown and still holds `&mut App`. A frame
+    /// on an unchanged selection does no work at all.
+    pub(crate) fn refresh_preview_body(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_body.holds(key) {
+            return;
+        }
+        let text = match key {
+            Some((_, msg, _)) => self.load_message_body(msg).unwrap_or_default(),
+            None => String::new(),
+        };
+        self.preview_body.fill(key, text);
+    }
+
+    /// Refresh the preview invite memo, reading and parsing one ics blob when
+    /// the cursor, the account or the list generation moved under it.
+    ///
+    /// Runs beside [`Self::refresh_preview_body`] at the top of the render
+    /// pass, and does nothing at all for the common case of a message that is
+    /// not an invite: the flag on the row answers that without a blob read.
+    pub(crate) fn refresh_preview_invite(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_invite.holds(key) {
+            return;
+        }
+        let is_invite = self.selected_email().is_some_and(|e| e.is_invite);
+        let event = match (key, is_invite) {
+            (Some((_, msg, _)), true) => self.load_message_invite(msg),
+            _ => None,
+        };
+        self.preview_invite.fill(key, event);
+    }
+
+    /// Parse one message's ics blob into the event the card renders, with the
+    /// store's REPLY rows folded in so the card and the agenda agree.
+    ///
+    /// `None` when the row is gone, carries no iMIP payload, or the payload
+    /// does not parse; the preview then shows no card, which is what a
+    /// non-invite looks like.
+    pub(crate) fn load_message_invite(
+        &self,
+        msg: MessageRef,
+    ) -> Option<crate::types::EventFrontmatter> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        let ics = crate::store::read::load_invite_ics(&store, &blobs, msg.row_id())?;
+        let parsed = crate::calendar::parse_ics(&ics)?;
+        let mut event = crate::calendar::event_frontmatter(&parsed);
+        let uid = parsed
+            .uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        let invites = crate::reconcile::load_invites(&store, &blobs, account);
+        let replies = crate::reconcile::fold_replies(&invites);
+        let by_addr = uid.as_deref().and_then(|uid| replies.get(uid));
+        crate::reconcile::apply_replies(&mut event, parsed.sequence, by_addr);
+        event.rsvp = crate::reconcile::own_rsvp(&event, &self.self_address(), by_addr);
+        Some(event)
+    }
+
+    /// The raw `invite.ics` bytes of one message, for the RSVP reply builder.
+    pub(crate) fn load_message_ics(&self, msg: MessageRef) -> Option<Vec<u8>> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        crate::store::read::load_invite_ics(&store, &blobs, msg.row_id())
+    }
+
+    /// The active account's own address, as the iMIP `ATTENDEE` spells it.
+    pub(crate) fn self_address(&self) -> String {
+        crate::parse::extract_email_address(&self.account_config.default_from)
+    }
+
+    /// Read one message body from the active account's blob store.
+    ///
+    /// `None` means the row itself is gone, which is a stale reference rather
+    /// than an evicted body; the preview shows an empty body either way, and
+    /// the log says which happened.
+    fn load_message_body(&self, msg: MessageRef) -> Option<String> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        let body = crate::store::read::load_body(&store, &blobs, msg.row_id());
+        if body.is_none() {
+            log::warn!("[store] {msg} is not in the store; previewing an empty body");
+        }
+        body
+    }
+
+    /// Park `text` as the preview body of the current selection, exactly as a
+    /// load would have left it.
+    ///
+    /// The frozen fixtures (golden frames, unit tests) have no store, so they
+    /// prime the memo the same way they hand-build the rows.
+    #[cfg(test)]
+    pub(crate) fn prime_preview_body(&mut self, text: impl Into<String>) {
+        let key = self.preview_body_key();
+        self.preview_body.fill(key, text.into());
+    }
+
+    /// Park `event` as the preview invite of the current selection, exactly as
+    /// a load would have left it, for fixtures that have no store.
+    #[cfg(test)]
+    pub(crate) fn prime_preview_invite(&mut self, event: crate::types::EventFrontmatter) {
+        let key = self.preview_body_key();
+        self.preview_invite.fill(key, Some(event));
+    }
+
+    /// Make the body-search index match the mode: built and current for the
+    /// active mailbox while `\` search is on, empty while it is off.
+    ///
+    /// Building it is one batch of blob reads for the whole mailbox, paid once
+    /// per list generation rather than once per keystroke. It is the only
+    /// place the read path still loads bodies in bulk, and it only runs when
+    /// the user asked for a content search.
+    fn sync_search_bodies(&mut self) {
+        if !self.search_includes_body {
+            self.search_bodies.clear();
+            return;
+        }
+        let key = (
+            self.active_account,
+            self.active_mailbox,
+            self.mailbox_load_generation,
         );
+        if self.search_bodies.holds(key) {
+            return;
+        }
+
+        let account = self.account_config.name.clone();
+        let ids: Vec<i64> = self
+            .emails
+            .iter()
+            .filter_map(|e| e.msg)
+            .map(|m| m.row_id())
+            .collect();
+        let mut bodies = std::collections::HashMap::with_capacity(ids.len());
+        if let Some(store) = open_store(&account) {
+            let blobs = crate::store::BlobStore::for_account(&account);
+            for (id, body) in crate::store::read::load_bodies(&store, &blobs, &ids) {
+                bodies.insert(MessageRef::new(id), body.to_lowercase());
+            }
+        }
+        self.search_bodies.fill(key, bodies);
+    }
+
+    /// Prime the body-search index for the current mailbox, for fixtures that
+    /// have no store behind them.
+    #[cfg(test)]
+    pub(crate) fn prime_search_bodies(
+        &mut self,
+        bodies: impl IntoIterator<Item = (MessageRef, String)>,
+    ) {
+        let key = (
+            self.active_account,
+            self.active_mailbox,
+            self.mailbox_load_generation,
+        );
+        let lowered = bodies
+            .into_iter()
+            .map(|(msg, body)| (msg, body.to_lowercase()))
+            .collect();
+        self.search_bodies.fill(key, lowered);
     }
 
     /// Run a mutation against the full entry list of the active mailbox,
@@ -914,25 +1135,59 @@ impl App {
         r
     }
 
-    /// Optimistically set the read flag of one entry (by path) in both
-    /// the in-memory list and the cache slot. No-op if the path is not
-    /// in the active mailbox's list.
-    pub(crate) fn set_email_read(&mut self, path: &Path, read: bool) {
+    /// Optimistically set the read flag of one entry (by message ref) in
+    /// both the in-memory list and the cache slot. No-op if the message is
+    /// not in the active mailbox's list.
+    pub(crate) fn set_email_read(&mut self, msg: MessageRef, read: bool) {
         self.with_emails_mut(|entries| {
-            if let Some(e) = entries.iter_mut().find(|e| e.path == path) {
+            if let Some(e) = entries.iter_mut().find(|e| e.msg == Some(msg)) {
                 e.read = read;
             }
         });
     }
 
-    pub fn selected_email_path(&self) -> Option<PathBuf> {
-        self.selected_email().map(|e| e.path.clone())
+    /// The `MessageRef` of the cursor email, when it has a store row.
+    pub fn selected_email_ref(&self) -> Option<MessageRef> {
+        self.selected_email().and_then(|e| e.msg)
     }
 
-    pub fn remove_selected_from_list(&mut self) -> Option<PathBuf> {
-        let path = self.selected_email()?.path.clone();
+    /// Whether this list entry is in the multi-select set (#0052).
+    ///
+    /// Asked once per rendered row, so the received case is a hash lookup and
+    /// only a draft pays a scan of the (small) selection, rather than every
+    /// row paying an allocation to build the key it would look up.
+    pub fn is_selected(&self, email: &EmailEntry) -> bool {
+        match (email.msg, email.draft_id.as_deref()) {
+            (Some(msg), _) => self.selection.contains(&EntryKey::Msg(msg)),
+            (None, Some(id)) => self.selection.iter().any(|k| k.draft() == Some(id)),
+            (None, None) => false,
+        }
+    }
+
+    /// Drop every selection key the freshly loaded list no longer holds.
+    ///
+    /// The mutation paths scrub the ids they free themselves
+    /// ([`Self::remove_selected_from_list`] and its batch twin); this covers
+    /// the writes this application did not make, which is how a draft leaves:
+    /// a file deleted behind the TUI's back disappears from the index at the
+    /// next poll, and its id must not linger in the set as a member the batch
+    /// would then count as a failure.
+    pub(crate) fn scrub_selection(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let live: HashSet<EntryKey> = self.emails.iter().filter_map(|e| e.key()).collect();
+        self.selection.retain(|key| live.contains(key));
+    }
+
+    pub fn remove_selected_from_list(&mut self) -> Option<MessageRef> {
+        let msg = self.selected_email()?.msg?;
         let fallback = self.list_index;
-        self.with_emails_mut(|entries| entries.retain(|e| e.path != path));
+        self.with_emails_mut(|entries| entries.retain(|e| e.msg != Some(msg)));
+        // A removed row's id must not survive in the selection: a delete frees
+        // it, and a re-ingest of the same message mints a new one, so a held
+        // reference would either miss or, worse, name a different message.
+        self.selection.remove(&EntryKey::Msg(msg));
         self.invalidate_pending_mailbox_loads();
 
         // Underlying indices shifted -- recompute the view, then park the
@@ -949,29 +1204,38 @@ impl App {
         self.headers_scroll = 0;
         self.preview_scroll = 0;
 
-        Some(path)
+        Some(msg)
     }
 
-    pub fn remove_selected_from_list_batch(&mut self, paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
-        let removed: Vec<PathBuf> = self
+    pub fn remove_selected_from_list_batch(
+        &mut self,
+        msgs: &HashSet<MessageRef>,
+    ) -> Vec<MessageRef> {
+        let removed: Vec<MessageRef> = self
             .emails
             .iter()
-            .filter(|e| paths.contains(&e.path))
-            .map(|e| e.path.clone())
+            .filter_map(|e| e.msg)
+            .filter(|m| msgs.contains(m))
             .collect();
 
         // The cursor's own row may or may not be part of the batch. Anchor
         // on it when it survives; otherwise fall back to the number of
         // surviving rows ABOVE the old cursor, so removing rows above it
         // does not drag the cursor down the list.
-        let anchor = self.cursor_anchor().filter(|p| !paths.contains(p));
+        let anchor = self.cursor_anchor().filter(|m| !msgs.contains(m));
         let fallback = self
             .visible_emails()
             .take(self.list_index)
-            .filter(|e| !paths.contains(&e.path))
+            .filter(|e| !e.msg.is_some_and(|m| msgs.contains(&m)))
             .count();
 
-        self.with_emails_mut(|entries| entries.retain(|e| !paths.contains(&e.path)));
+        self.with_emails_mut(|entries| {
+            entries.retain(|e| !e.msg.is_some_and(|m| msgs.contains(&m)))
+        });
+        // See `remove_selected_from_list`: the ids are dead, so nothing may
+        // keep holding them.
+        self.selection
+            .retain(|key| !key.msg().is_some_and(|m| msgs.contains(&m)));
         self.invalidate_pending_mailbox_loads();
 
         self.rebuild_visible();
@@ -985,35 +1249,6 @@ impl App {
         self.preview_scroll = 0;
 
         removed
-    }
-
-    /// Remove a message_id from the in-memory index for the active account.
-    /// Called optimistically when archiving/deleting an email.
-    pub fn remove_from_message_index(&mut self, file_path: &std::path::Path, message_id: &str) {
-        if let Some(acct) = self.accounts.get_mut(self.active_account) {
-            for dir_map in acct.message_id_index.values_mut() {
-                if dir_map.get(message_id).is_some_and(|p| p == file_path) {
-                    dir_map.remove(message_id);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Insert a message_id into the in-memory index for the active account.
-    /// Used when archiving (file moves to archive dir).
-    pub fn insert_into_message_index(
-        &mut self,
-        dir: &std::path::Path,
-        message_id: String,
-        file_path: std::path::PathBuf,
-    ) {
-        if let Some(acct) = self.accounts.get_mut(self.active_account) {
-            acct.message_id_index
-                .entry(dir.to_path_buf())
-                .or_default()
-                .insert(message_id, file_path);
-        }
     }
 
     /// Surface a persistent error that requires explicit dismissal.
@@ -1178,10 +1413,10 @@ impl App {
         self.restore_cursor(anchor, fallback);
     }
 
-    /// Recount all mailbox sizes by walking every directory.
+    /// Recount all mailbox sizes with one grouped query (#0038).
     /// Only needed after full sync/reconciliation that moves emails between mailboxes.
     pub fn recount_all_mailboxes(&mut self) {
-        self.mailbox_counts = count_all_emails(&self.mailboxes);
+        self.mailbox_counts = count_all_emails(&self.account_config.name, &self.mailboxes);
     }
 
     pub(crate) fn switch_mailbox(&mut self, idx: usize) {

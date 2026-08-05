@@ -28,6 +28,10 @@ pub struct GlobalConfig {
     pub notifications: bool,
     #[serde(default)]
     pub email: EmailSettings,
+    /// Global retention defaults for the local cache. Every field is optional
+    /// and falls back to the constants documented on [`RetentionPolicy`].
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
     /// Where to store SMTP/IMAP passwords and OAuth2 token caches.
@@ -62,7 +66,7 @@ pub struct OAuth2Settings {
     pub tenant_id: String,
 }
 
-/// Per-account configuration (one entry in [[accounts]]).
+/// Per-account configuration (one entry in `[[accounts]]`).
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AccountConfig {
     #[serde(default)]
@@ -81,6 +85,34 @@ pub struct AccountConfig {
     pub mailboxes: MailboxesConfig,
     #[serde(default)]
     pub signatures: SignaturesConfig,
+    /// Per-account retention overrides. Unset fields inherit the global
+    /// `[retention]` table, which itself falls back to the defaults.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    /// Whether a sent message is copied into the server's Sent mailbox by this
+    /// client. See [`SaveToSent`]; `auto` is almost always right.
+    #[serde(default)]
+    pub save_to_sent: SaveToSent,
+}
+
+/// Whether the client APPENDs its own copy of a sent message to the Sent
+/// mailbox (#0037 item 5).
+///
+/// Getting this wrong costs duplicate Sent items, the Thunderbird bug 1427619
+/// failure mode, so the default detects the account type instead of guessing a
+/// fixed answer: Gmail, Microsoft Graph and Proton save the message themselves
+/// on submission, generic IMAP does not.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SaveToSent {
+    /// Skip the APPEND for accounts whose server already saves the copy, keep
+    /// it for everything else. See [`server_saves_to_sent`].
+    #[default]
+    Auto,
+    /// Always APPEND, even when the server may also save a copy.
+    Always,
+    /// Never APPEND. The Sent mailbox is then entirely the server's business.
+    Never,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -177,6 +209,149 @@ pub struct SignatureEntry {
     #[serde(default)]
     pub name: Option<String>,
     pub path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Retention and disk budget (see docs/plans/data-access-layer.md)
+// ---------------------------------------------------------------------------
+//
+// The local store is a cache in front of the server, so evicting a body or an
+// attachment is not deletion: the envelope row stays and the bytes are
+// re-fetched on open. That is what makes retention a safe, user-facing knob.
+//
+// This is the parsing and defaults surface only. Nothing here evicts anything;
+// the pruning pass lands with the eviction work.
+
+/// Default metadata horizon: keep every envelope row, forever, so the message
+/// list and search always render the full history. Envelopes are cheap.
+pub const DEFAULT_METADATA_HORIZON_DAYS: u32 = 0;
+
+/// Default body horizon: one year of full message bodies.
+pub const DEFAULT_BODY_HORIZON_DAYS: u32 = 365;
+
+/// Default attachment horizon: 90 days. Shorter than the body horizon because
+/// attachments dominate disk use.
+pub const DEFAULT_ATTACHMENT_HORIZON_DAYS: u32 = 90;
+
+/// Default disk budget per account: 5 GB, a conservative cap that overrides
+/// the horizons when the two disagree.
+pub const DEFAULT_MAX_DISK_BYTES: u64 = 5_000_000_000;
+
+/// Upper bound on any horizon: 36500 days (100 years). Larger values are a
+/// typo, and `0` already means keep-all.
+pub const MAX_HORIZON_DAYS: u32 = 36_500;
+
+/// Lower bound on the disk budget: 10 MB. Below this the cache cannot hold a
+/// useful working set and the evictor would thrash.
+pub const MIN_MAX_DISK_BYTES: u64 = 10_000_000;
+
+/// Upper bound on the disk budget: 1 TB.
+pub const MAX_MAX_DISK_BYTES: u64 = 1_000_000_000_000;
+
+/// Retention settings as written in the config file, global or per account.
+///
+/// Every field is optional so that an account can override one horizon without
+/// restating the others; [`RetentionPolicy::resolve`] fills the gaps.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How far back to keep envelope rows, in days. `0` means keep all.
+    #[serde(default)]
+    pub metadata_horizon_days: Option<u32>,
+    /// How far back to keep message bodies, in days. `0` means keep all.
+    #[serde(default)]
+    pub body_horizon_days: Option<u32>,
+    /// How far back to keep attachment blobs, in days. `0` means keep all.
+    #[serde(default)]
+    pub attachment_horizon_days: Option<u32>,
+    /// Disk budget for this account's store and blobs, in bytes.
+    #[serde(default)]
+    pub max_disk_bytes: Option<u64>,
+}
+
+/// A fully resolved retention policy: no optionals, every value validated.
+///
+/// The horizons express intent ("keep bodies for a year") and
+/// `max_disk_bytes` is the hard cap that overrides them when the two disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub metadata_horizon_days: u32,
+    pub body_horizon_days: u32,
+    pub attachment_horizon_days: u32,
+    pub max_disk_bytes: u64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            metadata_horizon_days: DEFAULT_METADATA_HORIZON_DAYS,
+            body_horizon_days: DEFAULT_BODY_HORIZON_DAYS,
+            attachment_horizon_days: DEFAULT_ATTACHMENT_HORIZON_DAYS,
+            max_disk_bytes: DEFAULT_MAX_DISK_BYTES,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Layer `account` over `global` over the defaults, field by field, then
+    /// validate. An account that sets only `attachment_horizon_days` keeps the
+    /// global (or default) value for everything else.
+    pub fn resolve(global: &RetentionConfig, account: &RetentionConfig) -> Result<Self> {
+        let defaults = Self::default();
+        let policy = Self {
+            metadata_horizon_days: account
+                .metadata_horizon_days
+                .or(global.metadata_horizon_days)
+                .unwrap_or(defaults.metadata_horizon_days),
+            body_horizon_days: account
+                .body_horizon_days
+                .or(global.body_horizon_days)
+                .unwrap_or(defaults.body_horizon_days),
+            attachment_horizon_days: account
+                .attachment_horizon_days
+                .or(global.attachment_horizon_days)
+                .unwrap_or(defaults.attachment_horizon_days),
+            max_disk_bytes: account
+                .max_disk_bytes
+                .or(global.max_disk_bytes)
+                .unwrap_or(defaults.max_disk_bytes),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Reject values that cannot mean what the user typed, naming the field,
+    /// the offending value and the allowed range.
+    pub fn validate(&self) -> Result<()> {
+        for (field, days) in [
+            ("metadata_horizon_days", self.metadata_horizon_days),
+            ("body_horizon_days", self.body_horizon_days),
+            ("attachment_horizon_days", self.attachment_horizon_days),
+        ] {
+            if days > MAX_HORIZON_DAYS {
+                return Err(anyhow::anyhow!(
+                    "[retention] {field} = {days} is out of range: expected 0 to {MAX_HORIZON_DAYS} days \
+                     (0 means keep everything)."
+                ));
+            }
+        }
+        if self.max_disk_bytes < MIN_MAX_DISK_BYTES || self.max_disk_bytes > MAX_MAX_DISK_BYTES {
+            return Err(anyhow::anyhow!(
+                "[retention] max_disk_bytes = {} is out of range: expected {} to {} bytes \
+                 (10 MB to 1 TB).",
+                self.max_disk_bytes,
+                MIN_MAX_DISK_BYTES,
+                MAX_MAX_DISK_BYTES
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The retention policy in force for one account: its own overrides layered
+/// over the global `[retention]` table.
+pub fn retention_for(config: &GlobalConfig, account: &AccountConfig) -> Result<RetentionPolicy> {
+    RetentionPolicy::resolve(&config.retention, &account.retention)
+        .with_context(|| format!("invalid retention config for account '{}'", account.name))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +503,21 @@ pub fn load_global_config() -> Result<GlobalConfig> {
     reject_legacy_keys(&content, &path)?;
     let config: GlobalConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    validate_retention(&config)
+        .with_context(|| format!("Invalid config file: {}", path.display()))?;
     debug!("Loaded global config from {}", path.display());
     Ok(config)
+}
+
+/// Reject out-of-range retention values at load time rather than at the first
+/// eviction pass. The global table is checked on its own so a config with no
+/// accounts still fails loudly.
+fn validate_retention(config: &GlobalConfig) -> Result<()> {
+    RetentionPolicy::resolve(&config.retention, &RetentionConfig::default())?;
+    for account in &config.accounts {
+        retention_for(config, account)?;
+    }
+    Ok(())
 }
 
 /// Refuse to parse legacy configs containing `[accounts.directories]` or
@@ -471,6 +659,20 @@ impl ImapConfig {
 // Override with the `MAILYPOPPINS_DATA_DIR` env var (for tests, or for power
 // users running mailypoppins from a portable location).
 
+/// Serialise tests that mutate `MAILYPOPPINS_DATA_DIR`.
+///
+/// One lock for the whole crate: several modules point the data dir at a
+/// tempdir for the duration of a test, and per-module locks do not serialise
+/// against each other.
+#[cfg(test)]
+pub(crate) fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Root data directory for all app-owned files.
 pub fn mailypoppins_data_dir() -> PathBuf {
     if let Ok(p) = std::env::var("MAILYPOPPINS_DATA_DIR") {
@@ -511,6 +713,17 @@ pub fn contacts_cache_path(account_name: &str) -> PathBuf {
     account_dir(account_name).join("contacts-cache.json")
 }
 
+/// `<account_dir>/store.sqlite3`, the per-account SQLite store (see
+/// `src/store/`).
+pub fn store_path(account_name: &str) -> PathBuf {
+    account_dir(account_name).join("store.sqlite3")
+}
+
+/// `<account_dir>/blobs/`, the content-addressed blob store root.
+pub fn blobs_dir(account_name: &str) -> PathBuf {
+    account_dir(account_name).join("blobs")
+}
+
 /// `<data_dir>/tokens/`
 pub fn tokens_dir() -> PathBuf {
     mailypoppins_data_dir().join("tokens")
@@ -537,6 +750,45 @@ pub fn latest_log_file() -> Option<PathBuf> {
                 .unwrap_or(false)
         })
         .max()
+}
+
+/// True when the account's *server* files a copy of every submitted message in
+/// Sent, so a client-side APPEND would duplicate it.
+///
+/// Three families do this, and they are recognised by what the config already
+/// carries rather than by a new setting:
+///
+/// - Microsoft Graph, where `sendMail` writes to Sent Items as part of the API
+///   call (recognised by `auth_method = "graph"`);
+/// - Gmail, which files SMTP submissions in `[Gmail]/Sent Mail` (recognised by
+///   the `gmail.com` / `googlemail.com` SMTP or IMAP host);
+/// - Proton, whose Bridge does the same for the SMTP it exposes (recognised by
+///   a `proton` hostname; a Bridge configured against bare `127.0.0.1` cannot
+///   be told apart from any other local relay and needs
+///   `save_to_sent = "never"`).
+pub fn server_saves_to_sent(account: &AccountConfig) -> bool {
+    if account.auth_method == AuthMethod::Graph {
+        return true;
+    }
+    let hosts = [account.smtp.host.as_str(), account.imap.host.as_str()];
+    hosts.iter().any(|host| {
+        let host = host.to_ascii_lowercase();
+        host.ends_with("gmail.com")
+            || host.ends_with("googlemail.com")
+            || host.contains("protonmail")
+            || host.contains("proton.me")
+    })
+}
+
+/// Whether this client should APPEND its own copy of a sent message to the
+/// Sent mailbox: the `save_to_sent` setting, with `auto` resolved through
+/// [`server_saves_to_sent`].
+pub fn appends_to_sent(account: &AccountConfig) -> bool {
+    match account.save_to_sent {
+        SaveToSent::Always => true,
+        SaveToSent::Never => false,
+        SaveToSent::Auto => !server_saves_to_sent(account),
+    }
 }
 
 /// Resolve the sent mailbox server name from config
@@ -1125,15 +1377,6 @@ name = "test"
     // mailypoppins_data_dir + derived path helpers
     // -----------------------------------------------------------------------
 
-    /// Serialize tests that mutate `MAILYPOPPINS_DATA_DIR` so they don't race.
-    fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     #[test]
     fn data_dir_env_override() {
         let _g = data_dir_lock();
@@ -1170,6 +1413,14 @@ name = "test"
         assert_eq!(
             contacts_cache_path("alice"),
             PathBuf::from("/tmp/x/accounts/alice/contacts-cache.json")
+        );
+        assert_eq!(
+            store_path("alice"),
+            PathBuf::from("/tmp/x/accounts/alice/store.sqlite3")
+        );
+        assert_eq!(
+            blobs_dir("alice"),
+            PathBuf::from("/tmp/x/accounts/alice/blobs")
         );
         assert_eq!(tokens_dir(), PathBuf::from("/tmp/x/tokens"));
         assert_eq!(logs_dir(), PathBuf::from("/tmp/x/logs"));
@@ -1325,6 +1576,162 @@ server = "Newsletters"
     fn test_default_account_empty() {
         let config = GlobalConfig::default();
         assert!(default_account(&config).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Retention config
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn retention_absent_section_yields_documented_defaults() {
+        let toml_str = r#"
+[[accounts]]
+name = "test"
+
+[accounts.smtp]
+host = "smtp.example.com"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retention, RetentionConfig::default());
+
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(policy, RetentionPolicy::default());
+        assert_eq!(policy.metadata_horizon_days, 0, "metadata defaults to keep-all");
+        assert_eq!(policy.body_horizon_days, 365);
+        assert_eq!(policy.attachment_horizon_days, 90);
+        assert_eq!(policy.max_disk_bytes, 5_000_000_000);
+    }
+
+    #[test]
+    fn retention_every_field_round_trips() {
+        let toml_str = r#"
+[retention]
+metadata_horizon_days = 3650
+body_horizon_days = 180
+attachment_horizon_days = 30
+max_disk_bytes = 2000000000
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retention.metadata_horizon_days, Some(3650));
+        assert_eq!(config.retention.body_horizon_days, Some(180));
+        assert_eq!(config.retention.attachment_horizon_days, Some(30));
+        assert_eq!(config.retention.max_disk_bytes, Some(2_000_000_000));
+
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(
+            policy,
+            RetentionPolicy {
+                metadata_horizon_days: 3650,
+                body_horizon_days: 180,
+                attachment_horizon_days: 30,
+                max_disk_bytes: 2_000_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn retention_account_overrides_the_global_field_by_field() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 180
+max_disk_bytes = 2000000000
+
+[[accounts]]
+name = "inherits"
+
+[[accounts]]
+name = "overrides"
+
+[accounts.retention]
+attachment_horizon_days = 7
+max_disk_bytes = 500000000
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+
+        let inherits = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(inherits.body_horizon_days, 180);
+        assert_eq!(inherits.attachment_horizon_days, 90, "falls back to the default");
+        assert_eq!(inherits.max_disk_bytes, 2_000_000_000);
+
+        let overrides = retention_for(&config, &config.accounts[1]).unwrap();
+        assert_eq!(overrides.attachment_horizon_days, 7);
+        assert_eq!(overrides.max_disk_bytes, 500_000_000);
+        assert_eq!(
+            overrides.body_horizon_days, 180,
+            "unset account fields keep the global value"
+        );
+        assert_eq!(overrides.metadata_horizon_days, 0);
+    }
+
+    #[test]
+    fn retention_zero_horizon_means_keep_all() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 0
+attachment_horizon_days = 0
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        let policy = retention_for(&config, &config.accounts[0]).unwrap();
+        assert_eq!(policy.body_horizon_days, 0);
+        assert_eq!(policy.attachment_horizon_days, 0);
+    }
+
+    #[test]
+    fn retention_out_of_range_horizon_is_rejected_clearly() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = 40000
+
+[[accounts]]
+name = "test"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        let err = validate_retention(&config).unwrap_err().to_string();
+        assert!(err.contains("body_horizon_days"), "missing field name: {err}");
+        assert!(err.contains("40000"), "missing offending value: {err}");
+        assert!(err.contains("36500"), "missing allowed range: {err}");
+    }
+
+    #[test]
+    fn retention_out_of_range_disk_budget_is_rejected_clearly() {
+        for value in ["1000", "9000000000000"] {
+            let toml_str = format!(
+                "[[accounts]]\nname = \"test\"\n\n[accounts.retention]\nmax_disk_bytes = {value}\n"
+            );
+            let config: GlobalConfig = toml::from_str(&toml_str).unwrap();
+            let err = validate_retention(&config).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("max_disk_bytes"), "missing field name: {msg}");
+            assert!(msg.contains(value), "missing offending value: {msg}");
+            assert!(msg.contains("test"), "missing account name: {msg}");
+        }
+    }
+
+    #[test]
+    fn retention_negative_value_is_rejected_at_parse_time() {
+        let toml_str = r#"
+[retention]
+body_horizon_days = -1
+"#;
+        let err = toml::from_str::<GlobalConfig>(toml_str).unwrap_err().to_string();
+        assert!(
+            err.contains("body_horizon_days"),
+            "parse error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn retention_global_is_validated_without_any_account() {
+        let toml_str = "[retention]\nmax_disk_bytes = 1\n";
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.accounts.is_empty());
+        assert!(validate_retention(&config).is_err());
     }
 
     #[test]

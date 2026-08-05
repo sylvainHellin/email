@@ -262,7 +262,7 @@ pub enum KeyAction {
     MarkDraft,
     Send,
     SendAll,
-    CopyPath,
+    CopyMessageRef,
     OpenAttachment,
     SaveAttachment,
     OpenInBrowser,
@@ -333,7 +333,7 @@ pub struct KeyBinding {
     /// This is the display form used by help/hint/website.
     pub keys: &'static str,
     /// The physical chord the runtime resolver matches (continuation key for
-    /// prefixed bindings). [`Chord::Manual`] for hand-dispatched rows.
+    /// prefixed bindings). `Chord::Manual` for hand-dispatched rows.
     pub chord: Chord,
     /// Optional leader prefix that must be pressed first (`' '` for the Space
     /// view switcher, `'g'` for the List `gg`/`G` jumps).
@@ -457,7 +457,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     bg("D", Chord::Char('D'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MarkDraft, "Mark approved as draft (reverse A)", false),
     bg("x / X", Chord::Char('x'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Send, "Send / Send all approved", false),
     bg("", Chord::Char('X'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SendAll, "", false),
-    bg("y", Chord::Char('y'), KeyCtx::List, Guard::NonEmptyList, KeyAction::CopyPath, "Copy file path", false),
+    bg("y", Chord::Char('y'), KeyCtx::List, Guard::NonEmptyList, KeyAction::CopyMessageRef, "Copy selector (mp://)", false),
     bg("o", Chord::Char('o'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenAttachment, "Open attachment", false),
     bg("O", Chord::Char('O'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SaveAttachment, "Save attachment to disk", false),
     bg("b", Chord::Char('b'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenInBrowser, "Open HTML in browser", false),

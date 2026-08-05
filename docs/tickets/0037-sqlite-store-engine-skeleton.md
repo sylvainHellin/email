@@ -3,7 +3,7 @@ id: 0037
 title: Greenfield store, blob cache, store-only ingest and the durable outbox
 type: refactor
 priority: next
-status: open
+status: done
 created: 2026-07-14
 ---
 
@@ -22,7 +22,8 @@ Evidence: [sent-folder-durability-in-mail-clients](../../.agents/research/sent-f
 ## Scope
 
 1. New `src/store/` module: per-account `store.sqlite3` (WAL, `busy_timeout=5000`, `synchronous=NORMAL`), schema v1, version-stamped, dropped and rebuilt on version mismatch or `integrity_check` failure. Never a migrator.
-2. Schema v1 is `meta`, `mailboxes`, `messages`, `drafts`, `outbox`, `sync_cursors`, `pending_ops`, `messages_fts`. `messages` carries a synthetic integer row id, `UNIQUE (account, mailbox, uid)` as the real identity and a non-unique index on `message_id`; `drafts` is keyed by `(account, id)` where `id` is the frontmatter field described in [#0050](0050-selector-contract-drafts-index.md). See the plan's schema sketch for the columns and for the four purposes the `message_id` index serves.
+2. Schema v1 is `meta`, `mailboxes`, `messages`, `message_blobs`, `blobs`, `drafts`, `outbox`, `sync_cursors`, `pending_ops`, `messages_fts`.
+   `message_blobs(message_row, kind, ordinal, hash, filename, size)` is the per-message list of blob references and the source of truth for refcounting (`messages.body_blob` / `raw_blob` are a convenience denormalisation), added in unit 4a because retention evicts attachment and body blobs on separate horizons and re-ingest must release exactly the references whose content changed. `messages` carries a synthetic integer row id, `UNIQUE (account, mailbox, uid)` as the real identity and a non-unique index on `message_id`; `drafts` is keyed by `(account, id)` where `id` is the frontmatter field described in [#0050](0050-selector-contract-drafts-index.md). See the plan's schema sketch for the columns and for the four purposes the `message_id` index serves.
 3. Content-addressed blob store under `<account_dir>/blobs/ab/cd/<sha256>`: write returns a hash, read by hash re-hashes to verify, dedup by existence check, refcount so a shared blob is only unlinked at zero. `sha2` is already a dependency.
 4. Store-only ingest: fetch to parse to a `messages` row plus body, raw and attachment blobs. No `.md` is written anywhere on this path. Re-ingesting a UID is an UPSERT on the unique constraint; re-ingesting under a new UID after a UIDVALIDITY reset finds the prior row through the `message_id` index and keeps its thread assignment and blob refs. A missing Message-ID is synthesised as `sha256-<hex16>@local.invalid`.
 5. Durable outbox: the `outbox` table holds the raw RFC822 blob, account, target mailbox, `message_id`, state (`pending_send`, `sent_pending_append`, `done`, `failed`), attempts, last error and timestamps. The blob and the row are committed before SMTP; the transition to `sent_pending_append` is committed as soon as SMTP returns 250. SMTP runs exactly once per row, and an ambiguous SMTP failure goes to `failed` for manual inspection, never to an automatic re-send. Retry drives the APPEND only, and when the previous attempt was ambiguous it first runs `UID SEARCH HEADER MESSAGE-ID` in the Sent mailbox and skips the APPEND on a hit. `APPENDUID` (UIDPLUS) is the definitive acknowledgement and its UID is stored on the row. A per-account `save_to_sent` flag defaults to `auto`, skipping the APPEND for Gmail, Graph and Proton accounts where the server already saves, and keeping it for generic IMAP. Non-`done` rows are surfaced in the TUI with a count badge, and retry resumes on startup.
@@ -45,3 +46,35 @@ Out of scope: `src/engine/` as a standalone skeleton, which is dead code until t
 ## Unblocks
 
 - [#0038](0038-read-path-to-db.md) (read path, calendar and reconcile move onto the store).
+
+## Close-out (2026-08-02)
+
+Shipped as four unit commits plus one fix commit on `dal-greenfield`:
+
+- `7103ac2` schema and store open path (unit 1)
+- `988e145` content-addressed blob store and retention config (units 2 + 3)
+- `5358e0a` store-only ingest, legacy sync deleted (unit 4a)
+- `07e4ebc` durable outbox and send path rewrite (unit 4b)
+- the fix commit for this ticket's independent review (UIDVALIDITY reset detection, outbox resume semantics, review minors)
+
+Supervisor-approved deviations from the scope above:
+
+- **Schema v2, not v1.** `message_blobs` was added in unit 4a, and the review pass added `outbox.submission_started_at` and `outbox.envelope` plus an `html` blob kind in place.
+  There is still no migrator: a store that predates a change is dropped and rebuilt, and `REQUIRED_COLUMNS` in `src/store/schema.rs` catches the in-place amendments the version stamp cannot see.
+- **`message_blobs` as the refcount source of truth**, with `messages.body_blob` / `raw_blob` as a convenience denormalisation, because retention evicts body and attachment blobs on separate horizons.
+- **Retention lands as config surface only**: the TOML shape, defaults and validation, with no eviction pass behind it.
+- **`APPENDUID` is recovered with a `UID SEARCH`**, because async-imap 0.11 drops the response code; the UID on the row is that search's answer, not a parsed `APPENDUID`.
+- **The `pending_send` marker design** (review pass): `submission_started_at` is committed immediately before the SMTP session opens, so on resume a NULL marker means "never attempted, submit it" and a non-NULL marker means "ambiguous, park it in `failed`".
+  `outbox.envelope` stores the recipients because lettre drops the `Bcc` header when it builds, so a resumed submission rebuilt from the message bytes would silently lose every blind recipient.
+  `mp outbox list|retry|discard` is the operator surface for the rows automation must not touch.
+
+Accepted risks, named rather than fixed:
+
+- **Graph messages carry an envelope-derived UID** (`graph_uid`, a hash of the Message-ID), since Graph has no UIDs.
+- **The first sync of an account downloads every message in the window**, because the store starts empty.
+- **Retention is parsed but unenforced**: nothing evicts blobs yet.
+- **Graph submissions cannot be auto-resubmitted.**
+  The Graph transport sends structured JSON, not the RFC822 bytes the outbox row holds, so a never-attempted Graph row stays `pending_send` with a warning and is visible in `mp outbox list` for a human.
+
+The musl criterion (`cargo build --target x86_64-unknown-linux-musl`) is **unverified locally**: this machine has no `x86_64-linux-musl-gcc`, so the target cannot be linked here.
+In CI it is covered: `.github/workflows/release.yml` runs an `Install musl toolchain` step (`apt-get install -y musl-tools`) for the `x86_64-unknown-linux-musl` matrix leg and builds it with the `vendored-openssl` feature, so the release path exercises bundled SQLite on musl at tag time.

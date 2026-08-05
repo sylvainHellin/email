@@ -27,38 +27,16 @@ pub struct NewMailMeta {
 /// Maximum characters kept per sanitized field (sender, subject).
 const MAX_FIELD_CHARS: usize = 120;
 
-/// Extract `NewMailMeta` for the emails a save actually wrote to disk.
-/// `saved_paths` comes from `save_fetched_emails_with_known_ids`; matching
-/// on the written message IDs ensures duplicates the save skipped don't
-/// produce phantom notifications. Emails without a Message-ID are always
-/// written by the save, so they are budgeted by count.
-pub fn collect_new_mail_meta(
-    fetched: &[crate::parse::FetchedEmail],
-    saved_paths: &crate::parse::SavedEmailPaths,
-) -> Vec<NewMailMeta> {
-    let saved_mids: std::collections::HashSet<&str> = saved_paths
-        .iter()
-        .filter_map(|(mid, _)| mid.as_deref())
-        .collect();
-    let mut no_mid_budget = saved_paths.iter().filter(|(mid, _)| mid.is_none()).count();
-    fetched
-        .iter()
-        .filter(|e| match &e.message_id {
-            Some(mid) => saved_mids.contains(mid.as_str()),
-            None => {
-                if no_mid_budget > 0 {
-                    no_mid_budget -= 1;
-                    true
-                } else {
-                    false
-                }
-            }
-        })
-        .map(|e| NewMailMeta {
-            from: e.from.clone(),
-            subject: e.subject.clone(),
-        })
-        .collect()
+impl NewMailMeta {
+    /// Metadata for one newly-ingested message. Ingest reports exactly the
+    /// messages it wrote a row for, so there is no phantom-notification
+    /// filtering left to do here.
+    pub fn new(from: &str, subject: &str) -> Self {
+        Self {
+            from: from.to_string(),
+            subject: subject.to_string(),
+        }
+    }
 }
 
 /// Strip control characters, collapse surrounding whitespace, cap the
@@ -291,55 +269,12 @@ mod tests {
         assert!(body.ends_with('\u{2026}'));
     }
 
-    // -- collect_new_mail_meta -----------------------------------------
-
-    fn fetched(mid: Option<&str>, from: &str, subject: &str) -> crate::parse::FetchedEmail {
-        crate::parse::FetchedEmail {
-            from: from.to_string(),
-            to: String::new(),
-            cc: None,
-            subject: subject.to_string(),
-            date: String::new(),
-            body_text: String::new(),
-            html_body: None,
-            has_attachments: false,
-            message_id: mid.map(|s| s.to_string()),
-            attachments: Vec::new(),
-            is_read: false,
-            calendar_ics: None,
-            event: None,
-        }
-    }
+    // -- NewMailMeta::new ----------------------------------------------
 
     #[test]
-    fn collect_includes_only_actually_saved_emails() {
-        let emails = vec![
-            fetched(Some("m1"), "alice", "saved"),
-            fetched(Some("m2"), "bob", "skipped duplicate"),
-        ];
-        let saved_paths = vec![(Some("m1".to_string()), std::path::PathBuf::from("/x"))];
-        let metas = collect_new_mail_meta(&emails, &saved_paths);
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].from, "alice");
-        assert_eq!(metas[0].subject, "saved");
-    }
-
-    #[test]
-    fn collect_budgets_emails_without_message_id() {
-        // Two fetched without Message-ID, but only one written: budget by count.
-        let emails = vec![
-            fetched(None, "a", "first"),
-            fetched(None, "b", "second"),
-        ];
-        let saved_paths = vec![(None, std::path::PathBuf::from("/x"))];
-        let metas = collect_new_mail_meta(&emails, &saved_paths);
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].subject, "first");
-    }
-
-    #[test]
-    fn collect_empty_when_nothing_saved() {
-        let emails = vec![fetched(Some("m1"), "a", "s")];
-        assert!(collect_new_mail_meta(&emails, &Vec::new()).is_empty());
+    fn new_mail_meta_carries_sender_and_subject() {
+        let m = NewMailMeta::new("alice", "saved");
+        assert_eq!(m.from, "alice");
+        assert_eq!(m.subject, "saved");
     }
 }

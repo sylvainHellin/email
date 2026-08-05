@@ -23,10 +23,13 @@ The replacement mitigation is narrower and honest: these ops change server-side 
 2. TUI `Action` handlers enqueue an op and apply the local store change, instead of spawning a per-op IMAP task. `BgResult` carries op state transitions back to `App::update`.
 3. Retry with exponential backoff; pending and failed ops surfaced in the UI.
 4. Crash-safety: ops replay on startup, with a guard against duplicate apply and against stuck rows.
+5. Kill the "Quick sync queued (N ops pending...)" pattern, owner directive 2026-08-05 from first live use of the branch build: a quick sync requested while a background job runs is queued and each request logs its own Activity line, stacking duplicates.
+   With ops in a durable queue drained by the engine there is nothing for the user-visible sync to wait behind: mutations enqueue silently, the drain reports per-op state transitions, and the Activity log gets one consolidated line per state change instead of one per keypress.
 
 ## Acceptance criteria
 
 - A mutation reflects instantly in the UI and is confirmed or retried in the background with visible feedback.
+- No "Quick sync queued" stacking: requesting a sync during a background job either coalesces into the running drain or replaces the queued request; duplicate Activity lines for the same pending state are gone.
 - Kill the process mid-op; on restart the op replays exactly once and converges.
 - A delete that the server rejects surfaces as a failed op with its error, and the local row returns to the server's state rather than staying optimistically changed.
 - Test harness decision made (IMAP mock versus accepted live-server validation) and documented.

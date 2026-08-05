@@ -15,6 +15,93 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **The read path, calendar and reconcile run off the SQLite store; cold start
+  stops walking files (#0038).** The TUI list, body pane, counts, calendar and
+  iMIP reconcile all read `store.sqlite3` and the content-addressed blob store
+  instead of a `.md` tree; sync ingests raw RFC822 keyed by UID in two passes
+  (flags over the window, bodies only for new UIDs). `mp dump-mailbox --json`
+  dumps store truth, verified live against the pre-nuke oracle captures with
+  every difference classified in `docs/dump-allow-list.md`.
+- **Every TUI mutation runs off the store and the selector (#0052).** Reply,
+  Reply-all, Forward, Send, Approve, Mark-draft, their batch forms, Edit
+  recipients, `$EDITOR` on a draft, attachment open and save, Open in browser
+  and the calendar's Open event source all work again instead of declining with
+  a status line, and each takes the same path its `mp` counterpart takes: the
+  quote and the HTML companion come from the message's blobs, drafts are found
+  through the drafts index, sends go through the durable outbox, and
+  attachments are materialised out of `message_blobs` where `mp open` and
+  `mp save` put them. The server-search overlay gets the same treatment on both
+  halves of a hit: one that resolved to a local message reads the store, one
+  that never synced is served from the fetch the overlay is already showing.
+  Two flows decline permanently and say why: `$EDITOR` on a received message
+  and Open on a search hit, both of which used to open a `.md` file that no
+  longer exists. The temp directories those files are materialised into are
+  created private to the user (0700) and refused if something else already
+  holds the path, so a predictable name under a shared `/tmp` cannot be used to
+  intercept message bytes; and `A` / `D` over a received-mail selection now say
+  the selection holds no draft instead of asking to approve N drafts and then
+  approving none.
+- **`mp://` selectors and the drafts index (#0050).** Every command that names a
+  message now takes a selector, `mp://<account>/<mailbox>/<key>`, and never a
+  file path. The key is the Message-ID without angle brackets for received mail
+  and the draft's `id:` frontmatter field for drafts, so renaming a draft file
+  keeps its selector working. Leading segments can be elided (`mp send <id>`),
+  a key that matches two mailboxes is reported with both full selectors instead
+  of being resolved by guesswork, and `--mailbox` picks one. `mp path` and
+  `mp edit` are the only edges back to the filesystem. `mp list` reads the new
+  drafts index, `mp send-approved` takes `--all-accounts`, and `mp new`,
+  `mp reply` and `mp forward` print the selector of the draft they created. In
+  the TUI, the Drafts mailbox lists from the index (it was empty since #0038),
+  a draft written by another process shows up within a second without a
+  restart (closes TKT-0045), and `y` copies the selector instead of a file path.
+
+### Fixed
+- **Selector keys ending in `.md`, quoted HTML in replies, duplicate draft ids
+  and the drafts count (#0050 review).** The filesystem-path heuristic now runs
+  only on unqualified input, so a Message-ID on a `.md` ccTLD and a draft id
+  ending `.md` survive their own canonical form. `mp reply` and `mp forward`
+  quote the sender's HTML again, read from the message's html blob or its raw
+  message. Two draft files carrying one `id:` still collapse to one index row,
+  but the reindex now picks a deterministic winner and names both paths instead
+  of losing one silently. The TUI sidebar counts drafts through the same read
+  the Drafts list uses, so an account that has never synced no longer lists
+  drafts and counts zero.
+
+### Added
+- **Durable outbox for sent mail (#0037).** Every outgoing message is committed
+  to the per-account store (raw bytes plus an `outbox` row) *before* SMTP runs,
+  and the transition to `sent_pending_append` is committed as soon as the server
+  returns 250. SMTP runs exactly once per row: an ambiguous failure parks the
+  row as `failed` for inspection and is never re-sent automatically, while a
+  clean pre-submission failure stays sendable. Retry drives only the Sent
+  `APPEND`, deduplicating through `UID SEARCH HEADER MESSAGE-ID` so a lost
+  acknowledgement cannot produce a second copy, and resumes on startup and on
+  every sync tick with backoff. A new per-account `save_to_sent` flag
+  (`auto` by default, `always` / `never` to override) skips the `APPEND` for
+  Gmail, Microsoft Graph and Proton accounts, whose servers file the copy
+  themselves. Non-`done` rows show as an `OUTBOX n` badge in the TUI status bar,
+  and `mp send` reports honestly: *sent + saved*, *sent + append pending*, or
+  *failed*. A crash before the SMTP session opens no longer strands the
+  message: the row records the moment submission starts, so the next startup or
+  sync sends the ones that provably never reached the transport and parks the
+  ones that died inside it. `mp outbox list` shows every queued, retrying and
+  failed submission, `mp outbox retry <id>` sends a failed one again after you
+  have checked it did not arrive, and `mp outbox discard <id>` drops it and
+  releases its bytes.
+- **UIDVALIDITY reset detection on sync (#0037).** A server that renumbers a
+  mailbox hands the same low UIDs to different messages. The sync now compares
+  the server's `UIDVALIDITY` against the stored cursor and refetches the whole
+  window when they differ, instead of skipping bodies it has never seen;
+  messages that only moved are rebound through their `Message-ID`, keeping
+  their thread assignment and stored blobs.
+
+### Removed
+- **The local sent `.md` copy.** `update_status_to_sent` is now
+  `mark_draft_sent`: it marks the draft in place and no longer writes or moves a
+  file into `sent/`. The Sent copy lives on the server and in the store, put
+  there by the outbox (#0037).
+
+### Added
 - **Search by Message-ID (TECHLEV-6).** `mp search` accepts a
   `message-id:` prefix that resolves an RFC 5322 Message-ID to its message:
   `mp search 'message-id:<abc@example.com>'`. Angle brackets are optional on

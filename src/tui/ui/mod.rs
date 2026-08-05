@@ -70,6 +70,15 @@ fn split_left_column(app: &App, area: ratatui::layout::Rect, sidebar_height: u16
 pub fn view(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
+    // The preview body is not carried by the list entry; it is read from the
+    // blob store for the selected message only (#0038 scope item 5). This is
+    // the one place that holds `&mut App` immediately before a frame, so it is
+    // where the memo is brought up to date. An unchanged selection costs a
+    // key comparison. The invite behind the event card is memoised beside it
+    // (#0038 scope item 6) and costs nothing for a message that is not one.
+    app.refresh_preview_body();
+    app.refresh_preview_invite();
+
     // Bottom rows: a herdr-style mode/hint bar (#0032) above the status bar.
     let outer = Layout::default()
         .direction(Direction::Vertical)

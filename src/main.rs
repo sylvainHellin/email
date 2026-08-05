@@ -4,9 +4,11 @@ use email::parse::*;
 use email::imap_client::{self, *};
 use email::draft::*;
 use email::send::*;
-use email::sync::*;
 use email::config_cmd::*;
 use email::graph;
+use email::selector::{Namespace, Selector};
+use email::store::read::materialise_attachments;
+use email::store::Store;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,7 +17,6 @@ use log::{error, info, warn};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "mailypoppins")]
@@ -25,9 +26,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// File to preview (dry-run mode)
-    #[arg(value_name = "FILE")]
-    file: Option<PathBuf>,
+    /// Draft selector to preview (dry-run mode)
+    #[arg(value_name = "SELECTOR")]
+    selector: Option<String>,
 
     /// Signature to use (overrides config default)
     #[arg(short, long, global = true)]
@@ -46,8 +47,10 @@ struct Cli {
 enum Commands {
     /// Send a single approved email, or (with --invite) a calendar invitation
     Send {
-        /// Path to the email draft file (omit when using --invite)
-        file: Option<PathBuf>,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        /// (omit when using --invite)
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -82,53 +85,78 @@ enum Commands {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Send all approved emails in a directory
+    /// Send every approved draft of the account
     SendApproved {
-        /// Directory containing email drafts
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Send the approved drafts of every configured account
+        #[arg(long)]
+        all_accounts: bool,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// List emails by status
+    /// List the account's drafts from the drafts index
     List {
-        /// Directory to scan
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+        /// Only list drafts with this status
+        #[arg(long, value_name = "STATUS")]
+        status: Option<DraftStatusFilter>,
     },
-    /// Validate YAML frontmatter in files
+    /// Validate a draft's frontmatter (default: every draft of the account)
     Validate {
-        /// File or directory to validate
-        path: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
     },
-    /// Mark an email as approved
+    /// Mark a draft as approved
     MarkApproved {
-        /// File to mark as approved
-        file: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
     },
     /// Demote an approved draft back to `draft` status (reverse of `mark-approved`)
     MarkDraft {
-        /// File to mark as draft
-        file: PathBuf,
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
     },
-    /// Create a new email draft from template
+    /// Create a new email draft from template and print its selector
     New {
         /// Name for the new draft file
         name: String,
     },
+    /// Print the filesystem path of a draft (the only selector-to-path edge)
+    Path {
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+    },
+    /// Open a draft in $EDITOR
+    Edit {
+        /// Draft selector: mp://<account>/drafts/<id>, drafts/<id> or <id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+    },
     /// Create a reply draft from a received email
     Reply {
-        /// Path to the email to reply to (interactive selection if omitted)
-        file: Option<PathBuf>,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>,
+        /// <mailbox>/<message-id> or <message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
         /// Reply to all recipients
         #[arg(long)]
         all: bool,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Forward an email to new recipients
     Forward {
-        /// Path to the email to forward (interactive selection if omitted)
-        file: Option<PathBuf>,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>,
+        /// <mailbox>/<message-id> or <message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// RSVP to a received calendar invitation (iMIP REPLY over SMTP)
     Invite {
@@ -171,7 +199,7 @@ enum Commands {
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
     },
-    /// Sync local mailbox folders with IMAP server
+    /// Sync mailboxes from the server into the local store
     Sync {
         /// Max messages per mailbox (default: 50)
         #[arg(short = 'n', long, default_value = "50")]
@@ -179,10 +207,7 @@ enum Commands {
         /// Mailboxes to sync (default: INBOX, Archive, Sent)
         #[arg(long)]
         mailbox: Option<Vec<String>>,
-        /// Reconcile local files against server (detect moves/deletes)
-        #[arg(long)]
-        reconcile: bool,
-        /// Show what would change without making any modifications
+        /// Show what would be ingested without writing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -195,28 +220,44 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Archive an inbox email (server + local)
+    /// Archive a received email (server + local)
     Archive {
-        /// Path to the inbox email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Delete an inbox email (server + local)
+    /// Delete a received email (server + local)
     Delete {
-        /// Path to the inbox email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Open an email's attachment in the default application
+    /// Open a received email's attachment in the default application
     Open {
-        /// Path to the email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
-    /// Save an email's attachment(s) to a directory
+    /// Save a received email's attachment(s) to a directory
     Save {
-        /// Path to the email file
-        file: PathBuf,
+        /// Received selector: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
         /// Output directory (default: current directory)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Search emails on the IMAP server
     Search {
@@ -248,6 +289,11 @@ enum Commands {
     Calendar {
         #[command(subcommand)]
         action: CalendarAction,
+    },
+    /// Inspect and unblock the durable send queue
+    Outbox {
+        #[command(subcommand)]
+        action: OutboxAction,
     },
     /// Dump the TUI key bindings from the single KEYMAP source of truth.
     ///
@@ -285,12 +331,35 @@ enum Commands {
     },
 }
 
+/// Operator commands for the durable outbox (#0037).
+///
+/// The outbox drives itself: queued messages are submitted and their Sent copy
+/// appended on the next startup or sync. These are for the one case it cannot
+/// decide alone, a submission that died without a verdict and may or may not
+/// have been delivered.
+#[derive(Subcommand)]
+enum OutboxAction {
+    /// List every queued, retrying or failed submission for the account
+    List,
+    /// Send a failed submission again (only after checking it did not arrive)
+    Retry {
+        /// Outbox row id, as shown by `mp outbox list`
+        id: i64,
+    },
+    /// Drop a submission and release the message bytes it holds
+    Discard {
+        /// Outbox row id, as shown by `mp outbox list`
+        id: i64,
+    },
+}
+
 /// Organizer-side calendar operations (#0030).
 #[derive(Subcommand)]
 enum CalendarAction {
-    /// Reconcile locally-stored invites against attendee REPLY emails,
-    /// recomputing `event.attendees[].status` from the whole mailstore.
-    /// Idempotent and safe to re-run; rebuilds derived state from IMAP alone.
+    /// Report what the stored attendee REPLY emails resolve on the stored
+    /// invitations. Writes nothing: attendee statuses are derived from the
+    /// `invite.ics` payloads wherever they are displayed, so there is no
+    /// cached copy to rebuild.
     Rebuild {
         /// Account name (default: all configured accounts)
         #[arg(long)]
@@ -298,25 +367,37 @@ enum CalendarAction {
     },
 }
 
-/// RSVP actions for `mp invite <accept|tentative|decline> <email-path>`.
-/// Whole-series only (v1); the target is a received invite `.md` with an
-/// `event:` block and a sidecar `invite.ics`.
+/// RSVP actions for `mp invite <accept|tentative|decline> <selector>`.
+/// Whole-series only (v1); the target is a received message whose store row
+/// carries an `invite.ics` blob.
 #[derive(Subcommand)]
 enum InviteAction {
     /// Accept the invitation (PARTSTAT=ACCEPTED)
     Accept {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Tentatively accept the invitation (PARTSTAT=TENTATIVE)
     Tentative {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
     /// Decline the invitation (PARTSTAT=DECLINED)
     Decline {
-        /// Path to the received invite email `.md`
-        file: PathBuf,
+        /// Received selector of the invitation: mp://<account>/<mailbox>/<message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
     },
 }
 
@@ -441,18 +522,127 @@ struct InviteArgs {
     yes: bool,
 }
 
+/// `mp outbox <list|retry|discard>`: the operator surface of the durable send
+/// queue (#0037 item 5).
+///
+/// Everything here is deliberately manual. A submission that died without a
+/// verdict may or may not have been delivered, and no automatic rule can tell
+/// the difference, so the row waits in `failed` until a human has looked in the
+/// recipient's mailbox and decided between `retry` and `discard`.
+async fn cmd_outbox(
+    account_config: &email::config::AccountConfig,
+    action: OutboxAction,
+) -> Result<()> {
+    use email::outbox::{self, OutboxState};
+
+    let path = email::config::store_path(&account_config.name);
+    if !path.exists() {
+        println!("  {} nothing has been queued for {} yet", "·".dimmed(), account_config.name);
+        return Ok(());
+    }
+    let store = email::store::Store::open(&path)?;
+    let blobs = email::store::BlobStore::for_account(&account_config.name);
+
+    match action {
+        OutboxAction::List => {
+            let rows = outbox::unfinished_rows(&store, &account_config.name)?;
+            if rows.is_empty() {
+                println!(
+                    "  {} the outbox for {} is clear",
+                    "\u{2713}".green(),
+                    account_config.name
+                );
+                return Ok(());
+            }
+            for row in &rows {
+                let state = match row.state {
+                    OutboxState::Failed => row.state.to_string().red(),
+                    OutboxState::PendingSend => row.state.to_string().yellow(),
+                    _ => row.state.to_string().normal(),
+                };
+                println!(
+                    "  {:>4}  {:<20} {}  {}",
+                    row.id,
+                    state,
+                    format_unix_time(row.updated).dimmed(),
+                    row.message_id
+                );
+                if let Some(target) = row.target_mailbox.as_deref() {
+                    println!("        {} {target}", "sent copy ->".dimmed());
+                }
+                if row.state == OutboxState::PendingSend && row.submission_started_at.is_none() {
+                    println!("        {}", "never submitted; the next sync sends it".dimmed());
+                }
+                if let Some(err) = row.last_error.as_deref() {
+                    println!("        {} {err}", "last error:".dimmed());
+                }
+            }
+            let counts = outbox::counts(&store, &account_config.name)?;
+            println!(
+                "  {} {} working, {} failed",
+                "\u{21bb}".dimmed(),
+                counts.open,
+                counts.failed
+            );
+        }
+        OutboxAction::Retry { id } => {
+            outbox::retry(&store, id)?;
+            println!(
+                "  {} row {id} is queued again; sending it now",
+                "\u{21bb}".dimmed()
+            );
+            // Drop the handle first: the resume path opens the store itself.
+            drop(store);
+            let result = email::send::resume_outbox(account_config).await;
+            let store = email::store::Store::open(&path)?;
+            match outbox::load(&store, id)? {
+                Some(row) => println!("  {} row {id} is now {}", "\u{2713}".green(), row.state),
+                None => println!("  {} row {id} is gone", "\u{2713}".green()),
+            }
+            if result.completed > 0 {
+                println!("  {} {} sent copy/copies filed", "\u{2713}".green(), result.completed);
+            }
+        }
+        OutboxAction::Discard { id } => {
+            let Some(row) = outbox::load(&store, id)? else {
+                return Err(anyhow!("no outbox row {id}"));
+            };
+            outbox::discard(&store, &blobs, id)?;
+            println!(
+                "  {} discarded row {id} ({}); its bytes are released",
+                "\u{2713}".green(),
+                row.message_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A unix timestamp as local `YYYY-MM-DD HH:MM`, or `-` when it is unset.
+fn format_unix_time(ts: i64) -> String {
+    if ts <= 0 {
+        return "-".to_string();
+    }
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
 /// Send an iMIP calendar invitation (`METHOD:REQUEST`) over SMTP.
 ///
 /// Builds the `VEVENT` (via `email::invite`), assembles the iMIP MIME tree
-/// (via `send_email(..., Some(ics))`), sends it, and persists the sent invite
-/// locally as an email `.md` with an `event:` block plus a sidecar `invite.ics`
-/// so the #0027 receive path (and #0030 reconciliation) can pick it up.
+/// (via `build_draft_message(..., Some(ics))`) and submits it through the
+/// durable outbox, which also files the local Sent copy so the #0027 receive
+/// path (and #0030 reconciliation) can pick it up.
 async fn run_send_invite(
     account_config: &email::config::AccountConfig,
     smtp_config: &SmtpConfig,
     global_config: &GlobalConfig,
     signature: Option<&str>,
-    sent_dir: Option<&Path>,
     args: InviteArgs,
 ) -> Result<()> {
     // Graph accounts cannot send iMIP invites yet (Graph send is #0036, blocked
@@ -533,20 +723,20 @@ async fn run_send_invite(
     let event = email::calendar::parse_ics(ics.as_bytes())
         .map(|p| email::calendar::event_frontmatter(&p));
 
-    // Synthetic draft used for the send + local Sent persistence.
+    // Synthetic draft, used only to build the message: nothing is written to
+    // disk on this path any more (the Sent copy is the outbox's, #0037).
     let sent_at = chrono::Utc::now();
-    let filename = format!(
+    let draft_path = PathBuf::from(format!(
         "{}-invite-{}.md",
         sent_at.format("%Y%m%d-%H%M%S"),
         email::parse::slugify_subject(subject)
-    );
-    let draft_path = sent_dir
-        .map(|d| d.join(&filename))
-        .unwrap_or_else(|| PathBuf::from(&filename));
+    ));
 
     let draft = EmailDraft {
         path: draft_path.clone(),
         frontmatter: EmailFrontmatter {
+            id: None,
+            date: None,
             to: to_field.map(str::to_string),
             cc: cc_field.map(str::to_string),
             bcc: None,
@@ -586,8 +776,15 @@ async fn run_send_invite(
     }
 
     println!("Sending invitation...");
-    let (send_result, raw_message, message_id) =
-        send_email(&draft, smtp_config, &global_config.email, signature, Some(&ics)).await?;
+    let built = email::send::build_draft_message(
+        &draft,
+        &smtp_config.default_from,
+        &global_config.email,
+        signature,
+        Some(&ics),
+    )?;
+    let report = email::send::send_durably(&built, account_config, smtp_config).await?;
+    let send_result = &report.send_result;
 
     for r in send_result.succeeded() {
         println!("  {} {} ({})", "✓".green(), r.address, r.role);
@@ -609,36 +806,14 @@ async fn run_send_invite(
         ));
     }
 
-    // Persist the sent invite locally: the `.md` (with event: block) plus the
-    // sidecar invite.ics, so the #0027 parser recognises our own Sent copy.
-    update_status_to_sent(&draft, sent_dir, message_id.as_deref())?;
-    let sidecar_dir = email::parse::attachments_dir_for(&draft_path);
-    if let Err(e) = fs::create_dir_all(&sidecar_dir)
-        .and_then(|_| fs::write(sidecar_dir.join(email::parse::CALENDAR_SIDECAR_NAME), &ics))
-    {
-        warn!("Failed to write invite sidecar .ics: {}", e);
-    }
-
-    // IMAP APPEND to Sent (best-effort), matching the normal send path.
-    if let Ok(imap_config) = ImapConfig::load(account_config) {
-        let sent_mailbox = resolve_sent_mailbox(account_config);
-        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-            warn!("Failed to append invite to Sent folder: {}", e);
-            println!(
-                "  {} Could not copy invite to server Sent folder: {}",
-                "⚠".yellow(),
-                e
-            );
-        }
-    }
-
     email::contacts::hooks::bump_after_send(account_config, &draft);
 
     if send_result.all_succeeded() {
         println!(
-            "{} Invitation sent to all {} recipient(s)",
+            "{} Invitation sent to all {} recipient(s) [{}]",
             "✓".green().bold(),
-            send_result.results.len()
+            send_result.results.len(),
+            report.status_line()
         );
     } else {
         println!(
@@ -652,60 +827,98 @@ async fn run_send_invite(
     Ok(())
 }
 
-/// RSVP to a received calendar invitation (`mp invite accept|tentative|decline`).
-///
-/// Reads the invite email's sidecar `invite.ics`, builds a `METHOD:REPLY`
-/// with the account's `PARTSTAT`, emails it to the `ORGANIZER`, and flips the
-/// local `event.rsvp` on success. Appends the reply to the server Sent folder
-/// best-effort. Graph accounts are rejected (Graph RSVP is #0036).
-async fn run_invite_rsvp(
-    account_config: &email::config::AccountConfig,
-    smtp_config: &SmtpConfig,
-    file: &Path,
-    rsvp: email::invite::Rsvp,
-) -> Result<()> {
-    if account_config.auth_method == AuthMethod::Graph {
-        return Err(anyhow!(
-            "`mp invite` RSVP is not supported for Graph accounts yet (Graph calendar RSVP \
-             is tracked by #0036, blocked on #0035). Use an SMTP-configured account."
-        ));
-    }
+// ---------------------------------------------------------------------------
+// The selector edge (#0050)
+// ---------------------------------------------------------------------------
 
-    let account_address = email::parse::extract_email_address(&account_config.default_from);
+/// The store's mailbox key for the archive folder. `mp archive` is a move with
+/// a fixed destination, exactly as the TUI frames it.
+const ARCHIVE_MAILBOX: &str = "archive";
 
-    println!("Sending {} reply...", rsvp.subject_verb().to_lowercase());
-    let outcome =
-        email::send::send_rsvp(file, &account_address, rsvp, smtp_config).await?;
+/// `--status` values for `mp list`. A closed set rather than a free string, so
+/// a typo is a clap error instead of an empty listing.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DraftStatusFilter {
+    Draft,
+    Approved,
+    Sent,
+}
 
-    if !outcome.send_result.any_succeeded() {
-        return Err(anyhow!(
-            "Failed to send RSVP to organizer {}",
-            outcome.organizer
-        ));
-    }
-
-    // Best-effort IMAP APPEND to Sent, matching the normal send path.
-    if let Ok(imap_config) = ImapConfig::load(account_config) {
-        let sent_mailbox = resolve_sent_mailbox(account_config);
-        if let Err(e) =
-            append_to_sent_folder(&imap_config, &outcome.raw_message, &sent_mailbox).await
-        {
-            warn!("Failed to append RSVP reply to Sent folder: {}", e);
+impl DraftStatusFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            DraftStatusFilter::Draft => "draft",
+            DraftStatusFilter::Approved => "approved",
+            DraftStatusFilter::Sent => "sent",
         }
     }
+}
 
-    println!(
-        "{} {} — replied to {}",
-        "✓".green().bold(),
-        outcome.subject,
-        outcome.organizer
-    );
-    println!(
-        "  {} Local RSVP updated. Note: not synced to the Exchange server calendar (no Graph in v1).",
-        "ℹ".blue()
-    );
+/// Open the account's store for a *received* lookup.
+///
+/// A missing file means the account has never synced, which is a different
+/// answer from "no such message" and is worth saying: resolving a selector
+/// against an empty index would otherwise report the message as unknown.
+fn received_store(account: &str) -> Result<Store> {
+    let path = email::config::store_path(account);
+    if !path.exists() {
+        return Err(anyhow!(
+            "{account} has no local store yet, so no received mail can be addressed; \
+             run `mp sync` first"
+        ));
+    }
+    Store::open(&path).with_context(|| format!("opening the store of {account}"))
+}
 
-    Ok(())
+/// Open the account's store and refresh its drafts index.
+///
+/// This is the engine-start refresh of #0050 scope item 5, paid by every
+/// draft-facing command before it reads the table: a draft an agent wrote a
+/// second ago is in the index by the time the command lists or resolves it.
+fn drafts_store(account: &str) -> Result<Store> {
+    let store = Store::open(email::config::store_path(account))
+        .with_context(|| format!("opening the store of {account}"))?;
+    let dir = email::config::drafts_dir(account);
+    let (_, collisions) = email::store::drafts::refresh_reporting(&store, account, &dir)
+        .with_context(|| format!("refreshing the drafts index of {account}"))?;
+    // Two files claiming one id means one of them is unaddressable. The index
+    // cannot decide which the user meant, so it says so rather than dropping
+    // the loser in silence.
+    for collision in &collisions {
+        eprintln!("{} {collision}", "⚠".yellow());
+    }
+    Ok(store)
+}
+
+/// Re-index the drafts directory after a command wrote a draft, so the next
+/// reader (the TUI, `mp list`, the next command) sees it without waiting for
+/// the one-second scan. Best-effort: the write already happened, and the scan
+/// would pick it up anyway.
+fn reindex_drafts(account: &str) {
+    if let Err(e) = drafts_store(account) {
+        warn!("could not refresh the drafts index of {account}: {e:#}");
+    }
+}
+
+/// Resolve a draft selector to its indexed row plus the canonical selector.
+fn resolve_draft_arg(
+    store: &Store,
+    selector: &str,
+    account: &str,
+) -> Result<(email::store::drafts::DraftRow, Selector)> {
+    let query = email::selector::parse_in(selector, Namespace::Drafts, account, None)?;
+    email::selector::resolve_draft(store, &query)
+}
+
+/// Resolve a received selector to its message row plus the canonical selector.
+fn resolve_received_arg(
+    store: &Store,
+    selector: &str,
+    account: &str,
+    mailbox: Option<&str>,
+) -> Result<(email::store::read::MessageRow, Selector)> {
+    let query = email::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
+    email::selector::resolve_received(store, &query)
 }
 
 #[tokio::main]
@@ -781,27 +994,9 @@ async fn main() -> Result<()> {
             .and_then(|s| load_signature(&account_config, Some(s)))
     };
 
-    // Resolve directories from config (mailbox-based -> derived from data dir)
-    let sent_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .sent
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "sent"));
-    let drafts_dir: Option<PathBuf> = Some(email::config::drafts_dir(&account_config.name));
-    let inbox_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .inbox
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "inbox"));
-    let archive_dir: Option<PathBuf> = account_config
-        .mailboxes
-        .archive
-        .as_ref()
-        .map(|_| email::config::mailbox_dir(&account_config.name, "archive"));
-
     match cli.command {
         Some(Commands::Send {
-            file,
+            selector,
             yes,
             invite,
             to,
@@ -819,7 +1014,6 @@ async fn main() -> Result<()> {
                     &smtp_config,
                     &global_config,
                     signature_content.as_deref(),
-                    sent_dir.as_deref(),
                     InviteArgs {
                         to,
                         cc,
@@ -836,10 +1030,17 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let file = file.ok_or_else(|| {
-                anyhow!("`mp send` needs a draft file, or use `--invite` to send a calendar invitation")
+            let selector = selector.ok_or_else(|| {
+                anyhow!(
+                    "`mp send` needs a draft selector, or use `--invite` to send a calendar \
+                     invitation"
+                )
             })?;
-            let draft = parse_email_draft(&file)?;
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            println!("{} {}", "\u{2192}".dimmed(), canonical);
+            let draft = parse_email_draft(&row.path)?;
             validate_draft(&draft)?;
 
             if account_config.auth_method == AuthMethod::Graph {
@@ -901,13 +1102,42 @@ async fn main() -> Result<()> {
                 }
 
                 let client = graph::GraphClient::new_async(&graph_config).await?;
-                client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data).await?;
+                let built = email::send::build_draft_message(
+                    &draft,
+                    &account_config.default_from,
+                    &global_config.email,
+                    signature_content.as_deref(),
+                    None,
+                )?;
+                // Graph files its own copy in Sent Items, so the outbox row
+                // never carries a target mailbox; what it buys here is
+                // exactly-once durability of the submission.
+                let report = email::send::send_durably_via(
+                    &built,
+                    &account_config,
+                    client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
+                )
+                .await?;
+                if !report.send_result.any_succeeded() {
+                    return Err(anyhow!(
+                        "{}",
+                        report
+                            .send_result
+                            .failed()
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "Graph send failed".to_string())
+                    ));
+                }
 
-                // Graph auto-copies to Sent Items, no IMAP APPEND needed
-                update_status_to_sent(&draft, sent_dir.as_deref(), None)?;
+                mark_draft_sent(&draft, Some(&built.message_id))?;
                 info!("Email sent via Graph and marked as sent: {}", draft.path.display());
                 email::contacts::hooks::bump_after_send(&account_config, &draft);
-                println!("{} Email sent successfully via Graph API", "✓".green().bold());
+                println!(
+                    "{} Email sent successfully via Graph API [{}]",
+                    "✓".green().bold(),
+                    report.status_line()
+                );
             } else {
                 // SMTP send path (existing)
                 preview_draft(
@@ -924,14 +1154,16 @@ async fn main() -> Result<()> {
                 }
 
                 println!("Sending email...");
-                let (send_result, raw_message, message_id) = send_email(
+                let built = email::send::build_draft_message(
                     &draft,
-                    &smtp_config,
+                    &smtp_config.default_from,
                     &global_config.email,
                     signature_content.as_deref(),
                     None,
-                )
-                .await?;
+                )?;
+                let report =
+                    email::send::send_durably(&built, &account_config, &smtp_config).await?;
+                let send_result = &report.send_result;
 
                 // Display per-recipient results
                 for r in &send_result.succeeded() {
@@ -953,31 +1185,20 @@ async fn main() -> Result<()> {
                 }
 
                 if send_result.all_succeeded() {
-                    update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref())?;
+                    mark_draft_sent(&draft, Some(&built.message_id))?;
                     info!("Email marked as sent: {}", draft.path.display());
-
-                    // IMAP APPEND to Sent folder (best-effort)
-                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                            warn!("Failed to append to Sent folder: {}", e);
-                            println!(
-                                "  {} Could not copy to server Sent folder: {}",
-                                "⚠".yellow(), e
-                            );
-                        }
-                    }
 
                     // Incremental contacts-index update (best-effort, no-op if no cache)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
 
                     println!(
-                        "{} Email sent successfully to all {} recipient(s)",
+                        "{} Email sent successfully to all {} recipient(s) [{}]",
                         "✓".green().bold(),
-                        send_result.results.len()
+                        send_result.results.len(),
+                        report.status_line()
                     );
                 } else if send_result.any_succeeded() {
-                    update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref())?;
+                    mark_draft_sent(&draft, Some(&built.message_id))?;
                     warn!(
                         "Partial send: {} succeeded, {} failed for {}",
                         send_result.succeeded().len(),
@@ -985,26 +1206,15 @@ async fn main() -> Result<()> {
                         draft.path.display()
                     );
 
-                    // IMAP APPEND to Sent folder (best-effort)
-                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                            warn!("Failed to append to Sent folder: {}", e);
-                            println!(
-                                "  {} Could not copy to server Sent folder: {}",
-                                "⚠".yellow(), e
-                            );
-                        }
-                    }
-
                     // Incremental contacts-index update (best-effort)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
 
                     println!(
-                        "{} Partial send: {} succeeded, {} failed (marked as sent -- see logs for details)",
+                        "{} Partial send: {} succeeded, {} failed [{}] (marked as sent -- see logs for details)",
                         "⚠".yellow().bold(),
                         send_result.succeeded().len().to_string().green(),
-                        send_result.failed().len().to_string().red()
+                        send_result.failed().len().to_string().red(),
+                        report.status_line()
                     );
                 } else {
                     error!("All recipients failed for {}", draft.path.display());
@@ -1016,13 +1226,52 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::SendApproved { dir, yes }) => {
-            let dir = resolve_drafts_dir(&dir, &drafts_dir);
-            let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
+        Some(Commands::SendApproved { all_accounts, yes }) => {
+            // `--all-accounts` is a loop over the same body rather than a
+            // second code path: each account resolves its own SMTP config,
+            // signature and drafts index, so the per-account send is exactly
+            // what the single-account form does.
+            let accounts: Vec<email::config::AccountConfig> = if all_accounts {
+                global_config.accounts.clone()
+            } else {
+                vec![account_config.clone()]
+            };
+            if accounts.is_empty() {
+                return Err(anyhow!("No account configured (check `mp config show`)"));
+            }
+
+            for account_config in accounts {
+            let smtp_config = SmtpConfig::load(&account_config).unwrap_or_else(|e| {
+                eprintln!("{} Could not load SMTP config: {}", "\u{26a0}".yellow(), e);
+                smtp_config.clone()
+            });
+            let signature_content: Option<String> = if cli.no_signature {
+                None
+            } else if global_config.email.include_signature {
+                load_signature(&account_config, cli.signature.as_deref())
+            } else {
+                cli.signature
+                    .as_deref()
+                    .and_then(|s| load_signature(&account_config, Some(s)))
+            };
+            let store = drafts_store(&account_config.name)?;
+            let rows =
+                email::store::drafts::list(&store, &account_config.name, Some("approved"))?;
+            drop(store);
+            let drafts: Vec<EmailDraft> = rows
+                .iter()
+                .filter_map(|row| match parse_email_draft(&row.path) {
+                    Ok(draft) => Some(draft),
+                    Err(e) => {
+                        eprintln!("{} Skipping {}: {}", "\u{26a0}".yellow(), row.id, e);
+                        None
+                    }
+                })
+                .collect();
 
             if drafts.is_empty() {
-                println!("No approved emails found in {}", dir.display());
-                return Ok(());
+                println!("No approved drafts for {}", account_config.name);
+                continue;
             }
 
             println!(
@@ -1038,9 +1287,15 @@ async fn main() -> Result<()> {
                 );
             }
 
-            if !yes && !prompt_confirmation(&format!("\nSend all {} emails?", drafts.len())) {
+            if !yes
+                && !prompt_confirmation(&format!(
+                    "\nSend all {} emails for {}?",
+                    drafts.len(),
+                    account_config.name
+                ))
+            {
                 println!("Cancelled.");
-                return Ok(());
+                continue;
             }
 
             let mut sent_count = 0;
@@ -1085,21 +1340,45 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    match client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data).await {
-                        Ok(()) => {
-                            if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), None) {
-                                println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
-                            } else {
-                                email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                println!("{}", "✓".green());
-                            }
-                            sent_count += 1;
-                        }
+                    let built = match email::send::build_draft_message(
+                        &draft,
+                        &account_config.default_from,
+                        &global_config.email,
+                        signature_content.as_deref(),
+                        None,
+                    ) {
+                        Ok(built) => built,
                         Err(e) => {
                             println!("{} {}", "✗".red(), e);
-                            error!("Graph send error for {}: {}", draft.path.display(), e);
+                            error!("Failed to build {}: {}", draft.path.display(), e);
                             failed_count += 1;
+                            continue;
                         }
+                    };
+                    let report = email::send::send_durably_via(
+                        &built,
+                        &account_config,
+                        client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
+                    )
+                    .await?;
+                    if report.send_result.any_succeeded() {
+                        if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
+                            println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
+                        } else {
+                            email::contacts::hooks::bump_after_send(&account_config, &draft);
+                            println!("{} [{}]", "✓".green(), report.status_line());
+                        }
+                        sent_count += 1;
+                    } else {
+                        let err = report
+                            .send_result
+                            .failed()
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "Graph send failed".to_string());
+                        println!("{} {}", "✗".red(), err);
+                        error!("Graph send error for {}: {}", draft.path.display(), err);
+                        failed_count += 1;
                     }
                 }
             } else {
@@ -1107,52 +1386,41 @@ async fn main() -> Result<()> {
                     print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
                     io::stdout().flush()?;
 
-                    match send_email(
+                    let built = match email::send::build_draft_message(
                         &draft,
-                        &smtp_config,
+                        &smtp_config.default_from,
                         &global_config.email,
                         signature_content.as_deref(),
                         None,
-                    )
-                    .await
-                    {
-                        Ok((send_result, raw_message, message_id)) => {
-                            if send_result.all_succeeded() {
-                                if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref()) {
+                    ) {
+                        Ok(built) => built,
+                        Err(e) => {
+                            println!("{} {}", "✗".red(), e);
+                            error!("Failed to build {}: {}", draft.path.display(), e);
+                            failed_count += 1;
+                            continue;
+                        }
+                    };
+                    match email::send::send_durably(&built, &account_config, &smtp_config).await {
+                        Ok(report) => {
+                            let send_result = &report.send_result;
+                            if send_result.any_succeeded() {
+                                if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
                                     println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                                 } else {
-                                    // IMAP APPEND to Sent folder (best-effort)
-                                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                                            warn!("Failed to append to Sent folder: {}", e);
-                                        }
-                                    }
                                     // Incremental contacts-index update (best-effort)
                                     email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                    println!("{}", "✓".green());
-                                }
-                                sent_count += 1;
-                            } else if send_result.any_succeeded() {
-                                // Partial success -- mark as sent, warn about failures
-                                if let Err(e) = update_status_to_sent(&draft, sent_dir.as_deref(), message_id.as_deref()) {
-                                    println!("{} (partial send, failed to update status: {})", "⚠".yellow(), e);
-                                } else {
-                                    // IMAP APPEND to Sent folder (best-effort)
-                                    if let Ok(imap_config) = ImapConfig::load(&account_config) {
-                                        let sent_mailbox = resolve_sent_mailbox(&account_config);
-                                        if let Err(e) = append_to_sent_folder(&imap_config, &raw_message, &sent_mailbox).await {
-                                            warn!("Failed to append to Sent folder: {}", e);
-                                        }
+                                    if send_result.all_succeeded() {
+                                        println!("{} [{}]", "✓".green(), report.status_line());
+                                    } else {
+                                        println!(
+                                            "{} (partial: {}/{} recipients) [{}]",
+                                            "⚠".yellow(),
+                                            send_result.succeeded().len(),
+                                            send_result.results.len(),
+                                            report.status_line()
+                                        );
                                     }
-                                    // Incremental contacts-index update (best-effort)
-                                    email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                    println!(
-                                        "{} (partial: {}/{} recipients)",
-                                        "⚠".yellow(),
-                                        send_result.succeeded().len(),
-                                        send_result.results.len()
-                                    );
                                 }
                                 for r in &send_result.failed() {
                                     warn!(
@@ -1165,7 +1433,7 @@ async fn main() -> Result<()> {
                                 }
                                 sent_count += 1;
                             } else {
-                                println!("{} all recipients failed", "✗".red());
+                                println!("{} all recipients failed [{}]", "✗".red(), report.status_line());
                                 for r in &send_result.failed() {
                                     error!(
                                         "Failed recipient {} ({}) for {}: {}",
@@ -1187,105 +1455,91 @@ async fn main() -> Result<()> {
                 }
             }
 
+            reindex_drafts(&account_config.name);
             println!(
-                "\n{}: {} sent, {} failed",
+                "\n{} {}: {} sent, {} failed",
                 "Summary".bold(),
+                account_config.name,
                 sent_count.to_string().green(),
                 failed_count.to_string().red()
             );
+            }
         }
 
-        Some(Commands::List { dir }) => {
-            let dir = resolve_drafts_dir(&dir, &drafts_dir);
-            let drafts = find_drafts(&dir, None)?;
-
-            if drafts.is_empty() {
-                println!("No email drafts found in {}", dir.display());
+        Some(Commands::List { status }) => {
+            let store = drafts_store(&account_config.name)?;
+            let rows = email::store::drafts::list(
+                &store,
+                &account_config.name,
+                status.map(DraftStatusFilter::as_str),
+            )?;
+            if rows.is_empty() {
+                println!("No drafts for {}", account_config.name);
                 return Ok(());
             }
 
-            let mut draft_count = 0;
-            let mut approved_count = 0;
-            let mut sent_count = 0;
-            let mut inbox_count = 0;
-            let mut archived_count = 0;
-
-            println!("\n{}", "Email Drafts:".bold());
-            println!("{}", "─".repeat(60));
-
-            for draft in &drafts {
-                let status_colored = match draft.frontmatter.status {
-                    EmailStatus::Draft => "draft".yellow(),
-                    EmailStatus::Approved => "approved".green(),
-                    EmailStatus::Sent => "sent".dimmed(),
-                    EmailStatus::Inbox => "inbox".cyan(),
-                    EmailStatus::Archived => "archived".blue(),
+            println!("\n{}", "Drafts:".bold());
+            println!("{}", "\u{2500}".repeat(72));
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for row in &rows {
+                *counts.entry(row.status.clone()).or_default() += 1;
+                let status_colored = match row.status.as_str() {
+                    "draft" => "draft".yellow(),
+                    "approved" => "approved".green(),
+                    "sent" => "sent".dimmed(),
+                    other => other.normal(),
                 };
-
-                match draft.frontmatter.status {
-                    EmailStatus::Draft => draft_count += 1,
-                    EmailStatus::Approved => approved_count += 1,
-                    EmailStatus::Sent => sent_count += 1,
-                    EmailStatus::Inbox => inbox_count += 1,
-                    EmailStatus::Archived => archived_count += 1,
-                }
-
                 println!(
-                    "[{}] {} → {}",
+                    "[{}] {} \u{2192} {}",
                     status_colored,
-                    draft.path.file_name().unwrap_or_default().to_string_lossy(),
-                    draft.frontmatter.to.as_deref().unwrap_or("(bcc only)")
+                    Selector::for_draft(&account_config.name, &row.id),
+                    row.to.as_deref().unwrap_or("(bcc only)")
                 );
+                if let Some(subject) = row.subject.as_deref() {
+                    println!("      {}", subject.dimmed());
+                }
             }
-
-            println!("{}", "─".repeat(60));
-            println!(
-                "Total: {} | Draft: {} | Approved: {} | Sent: {} | Inbox: {} | Archived: {}",
-                drafts.len(),
-                draft_count.to_string().yellow(),
-                approved_count.to_string().green(),
-                sent_count.to_string().dimmed(),
-                inbox_count.to_string().cyan(),
-                archived_count.to_string().blue()
-            );
+            println!("{}", "\u{2500}".repeat(72));
+            let summary = counts
+                .iter()
+                .map(|(status, n)| format!("{status}: {n}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("Total: {} | {}", rows.len(), summary);
         }
 
-        Some(Commands::Validate { path }) => {
-            let files: Vec<PathBuf> = if path.is_dir() {
-                WalkDir::new(&path)
-                    .max_depth(1)
+        Some(Commands::Validate { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let targets: Vec<(Selector, PathBuf)> = match selector {
+                Some(ref sel) => {
+                    let (row, canonical) = resolve_draft_arg(&store, sel, &account_config.name)?;
+                    vec![(canonical, row.path)]
+                }
+                None => email::store::drafts::list(&store, &account_config.name, None)?
                     .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md")
-                    })
-                    .map(|e| e.path().to_path_buf())
-                    .collect()
-            } else {
-                vec![path.clone()]
+                    .map(|row| (Selector::for_draft(&account_config.name, &row.id), row.path))
+                    .collect(),
             };
+            if targets.is_empty() {
+                println!("No drafts to validate for {}", account_config.name);
+                return Ok(());
+            }
 
             let mut valid_count = 0;
             let mut invalid_count = 0;
-
-            for file in &files {
-                match parse_email_draft(file) {
-                    Ok(draft) => match validate_draft(&draft) {
-                        Ok(warnings) => {
-                            print!("{} {}", "✓".green(), file.display());
-                            if !warnings.is_empty() {
-                                print!(" ({})", warnings.join(", ").yellow());
-                            }
-                            println!();
-                            valid_count += 1;
+            for (canonical, path) in &targets {
+                match parse_email_draft(path).and_then(|draft| validate_draft(&draft)) {
+                    Ok(warnings) => {
+                        print!("{} {}", "\u{2713}".green(), canonical);
+                        if !warnings.is_empty() {
+                            print!(" ({})", warnings.join(", ").yellow());
                         }
-                        Err(e) => {
-                            println!("{} {} - {}", "✗".red(), file.display(), e);
-                            invalid_count += 1;
-                        }
-                    },
+                        println!();
+                        valid_count += 1;
+                    }
                     Err(e) => {
-                        println!("{} {} - {}", "✗".red(), file.display(), e);
+                        println!("{} {} - {}", "\u{2717}".red(), canonical, e);
                         invalid_count += 1;
                     }
                 }
@@ -1302,116 +1556,170 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::MarkApproved { file }) => {
-            let msg = mark_as_approved(&file)?;
+        Some(Commands::MarkApproved { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let msg = mark_as_approved(&row.path)?;
+            reindex_drafts(&account_config.name);
             if msg.starts_with("Already") {
-                println!("{} {}", "ℹ".blue(), msg);
+                println!("{} {} is already approved", "\u{2139}".blue(), canonical);
             } else {
-                println!("{} {}", "✓".green(), msg);
+                println!("{} approved {}", "\u{2713}".green(), canonical);
             }
         }
 
-        Some(Commands::MarkDraft { file }) => {
-            let msg = mark_as_draft(&file)?;
+        Some(Commands::MarkDraft { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let msg = mark_as_draft(&row.path)?;
+            reindex_drafts(&account_config.name);
             if msg.starts_with("Already") {
-                println!("{} {}", "\u{2139}".blue(), msg);
+                println!("{} {} is already a draft", "\u{2139}".blue(), canonical);
             } else {
-                println!("{} {}", "\u{2713}".green(), msg);
+                println!("{} demoted {}", "\u{2713}".green(), canonical);
             }
         }
 
         Some(Commands::New { name }) => {
-            // Add .md extension if not present
             let file_name = if Path::new(&name).extension().is_some() {
                 name.clone()
             } else {
                 format!("{}.md", name)
             };
-            let dir = resolve_drafts_dir(Path::new("."), &drafts_dir);
+            let dir = email::config::drafts_dir(&account_config.name);
+            fs::create_dir_all(&dir)?;
             let path = dir.join(&file_name);
-
-            // Check if file already exists
             if path.exists() {
-                return Err(anyhow!("File already exists: {}", path.display()));
+                return Err(anyhow!("A draft already exists at {}", path.display()));
             }
 
-            // Create skeleton content with all frontmatter fields
+            // The id is minted here rather than by the index, so the selector
+            // printed below is the one in the file from the first byte.
+            let id = email::store::drafts::new_id();
             let now = chrono::Utc::now().to_rfc2822();
-            let from = &smtp_config.default_from;
-            let skeleton = new_draft_skeleton(from, &now);
-
+            let skeleton =
+                new_draft_skeleton_with_id(&smtp_config.default_from, &now, &id);
             fs::write(&path, skeleton)?;
-            println!("{} Created new draft: {}", "✓".green(), path.display());
+            reindex_drafts(&account_config.name);
+            println!(
+                "{} {}",
+                "\u{2713}".green(),
+                Selector::for_draft(&account_config.name, &id)
+            );
         }
 
-        Some(Commands::Reply { file, all }) => {
-            let resolved = resolve_drafts_dir(Path::new("."), &drafts_dir);
-            let reply_drafts_dir: Option<PathBuf> = if resolved != Path::new(".").to_path_buf() {
-                Some(resolved)
-            } else {
-                None
-            };
+        Some(Commands::Path { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, _canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            println!("{}", row.path.display());
+        }
 
-            let source_file = match file {
-                Some(f) => f,
-                None => {
-                    let dir = inbox_dir.as_ref().ok_or_else(|| {
-                        anyhow!("Inbox mailbox not configured. Check [mailboxes.inbox] in {}", config_path().display())
-                    })?;
-                    select_inbox_email(dir, "Select an email to reply to")?
-                }
-            };
+        Some(Commands::Edit { selector }) => {
+            let store = drafts_store(&account_config.name)?;
+            let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
+            drop(store);
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "hx".to_string());
+            let status = std::process::Command::new(&editor)
+                .arg(&row.path)
+                .status()
+                .with_context(|| format!("running {editor}"))?;
+            reindex_drafts(&account_config.name);
+            if !status.success() {
+                return Err(anyhow!("{editor} exited with {status}"));
+            }
+            println!("{} {}", "\u{2713}".green(), canonical);
+        }
 
-            let draft_path = create_reply_draft(
-                &source_file,
+        Some(Commands::Reply { selector, all, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let source = source_from_row(&store, &blobs, &row, false)?;
+            drop(store);
+
+            let dir = email::config::drafts_dir(&account_config.name);
+            let path = email::draft::create_reply_draft_from(
+                &source,
                 all,
-                &smtp_config.default_from,
-                reply_drafts_dir.as_deref(),
+                &account_config.default_from,
+                Some(&dir),
             )?;
-            println!(
-                "{} Reply draft created: {}",
-                "✓".green(),
-                draft_path.display()
-            );
+            let id = email::store::drafts::new_id();
+            email::draft::set_draft_id(&path, &id)?;
+            reindex_drafts(&account_config.name);
+            println!("{} reply to {}", "\u{2713}".green(), canonical);
+            println!("{}", Selector::for_draft(&account_config.name, &id));
         }
 
-        Some(Commands::Forward { file }) => {
-            let resolved = resolve_drafts_dir(Path::new("."), &drafts_dir);
-            let fwd_drafts_dir: Option<PathBuf> = if resolved != Path::new(".").to_path_buf() {
-                Some(resolved)
-            } else {
-                None
-            };
+        Some(Commands::Forward { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let source = source_from_row(&store, &blobs, &row, true)?;
+            drop(store);
 
-            let source_file = match file {
-                Some(f) => f,
-                None => {
-                    let dir = inbox_dir.as_ref().ok_or_else(|| {
-                        anyhow!("Inbox mailbox not configured. Check [mailboxes.inbox] in {}", config_path().display())
-                    })?;
-                    select_inbox_email(dir, "Select an email to forward")?
-                }
-            };
-
-            let draft_path = create_forward_draft(
-                &source_file,
-                &smtp_config.default_from,
-                fwd_drafts_dir.as_deref(),
+            let dir = email::config::drafts_dir(&account_config.name);
+            let path = email::draft::create_forward_draft_from(
+                &source,
+                &account_config.default_from,
+                Some(&dir),
             )?;
-            println!(
-                "{} Forward draft created: {}",
-                "✓".green(),
-                draft_path.display()
-            );
+            let id = email::store::drafts::new_id();
+            email::draft::set_draft_id(&path, &id)?;
+            reindex_drafts(&account_config.name);
+            println!("{} forward of {}", "\u{2713}".green(), canonical);
+            println!("{}", Selector::for_draft(&account_config.name, &id));
         }
 
         Some(Commands::Invite { action }) => {
-            let (file, rsvp) = match action {
-                InviteAction::Accept { file } => (file, email::invite::Rsvp::Accepted),
-                InviteAction::Tentative { file } => (file, email::invite::Rsvp::Tentative),
-                InviteAction::Decline { file } => (file, email::invite::Rsvp::Declined),
+            let (selector, mailbox, rsvp) = match action {
+                InviteAction::Accept { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Accepted)
+                }
+                InviteAction::Tentative { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Tentative)
+                }
+                InviteAction::Decline { selector, mailbox } => {
+                    (selector, mailbox, email::invite::Rsvp::Declined)
+                }
             };
-            run_invite_rsvp(&account_config, &smtp_config, &file, rsvp).await?;
+            if account_config.auth_method == AuthMethod::Graph {
+                return Err(anyhow!(
+                    "RSVP is not supported for Graph accounts yet (#0036, blocked on #0035)"
+                ));
+            }
+
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            // The invitation's own iMIP payload is the source of truth for the
+            // reply, and it is a blob on the row (#0038 item 6).
+            let ics = email::store::read::load_invite_ics(&store, &blobs, row.id)
+                .ok_or_else(|| anyhow!("{canonical} carries no invitation to reply to"))?;
+            drop(store);
+
+            let outcome = email::send::send_rsvp(
+                &ics,
+                &account_config,
+                &account_config.default_from,
+                rsvp,
+                &smtp_config,
+            )
+            .await?;
+            if !outcome.send_result.any_succeeded() {
+                return Err(anyhow!("Failed to send the RSVP to {}", outcome.organizer));
+            }
+            println!(
+                "{} {} \u{2014} replied to {}",
+                "\u{2713}".green(),
+                outcome.subject,
+                outcome.organizer
+            );
         }
 
         Some(Commands::ListMailboxes) => {
@@ -1457,7 +1765,6 @@ async fn main() -> Result<()> {
             full,
             mailbox,
         }) => {
-            let mailbox_for_save = mailbox.clone();
 
             let emails = if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
@@ -1482,92 +1789,74 @@ async fn main() -> Result<()> {
 
             display_fetched_emails(&emails, full);
 
-            // Determine save directory and status from the mailbox
-            let (save_dir, status) = match resolve_mailbox_dir(&account_config, &mailbox_for_save) {
-                Ok(dir) => {
-                    (Some(dir), mailbox_status(&mailbox_for_save))
-                }
-                Err(_) => {
-                    // Fallback to inbox_dir for unknown mailboxes
-                    (inbox_dir.clone(), "inbox")
-                }
-            };
-
-            if let Some(ref save_dir) = save_dir {
-                if !emails.is_empty() {
-                    match save_fetched_emails(&emails, save_dir, status) {
-                        Ok((saved, skipped)) => {
-                            if saved > 0 {
-                                println!(
-                                    "\n{} Saved {} email(s) to {}",
-                                    "✓".green(),
-                                    saved,
-                                    save_dir.display()
-                                );
-                            }
-                            if skipped > 0 {
-                                println!(
-                                    "{} Skipped {} duplicate(s)",
-                                    "ℹ".blue(),
-                                    skipped
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("{} Failed to save emails: {}", "✗".red(), e);
-                        }
-                    }
-                }
-            } else if !emails.is_empty() {
-                println!(
-                    "\n{} No local directory configured for mailbox '{}'. Check [mailboxes] in {}.",
-                    "ℹ".blue(),
-                    mailbox_for_save,
-                    config_path().display()
-                );
-            }
+            // `mp fetch` is a lookup, not an ingest: it prints what the server
+            // has and writes nothing. Messages enter the store through
+            // `mp sync` (#0037), which is the only path that fetches by UID
+            // and can key a row.
         }
 
-        Some(Commands::Sync { limit, mailbox, reconcile, dry_run }) => {
+        Some(Commands::Sync { limit, mailbox, dry_run }) => {
             let targets: Vec<imap_client::SyncTarget> = if let Some(ref user_mailboxes) = mailbox {
-                user_mailboxes.iter().map(|mb| {
-                    imap_client::SyncTarget {
+                user_mailboxes
+                    .iter()
+                    .map(|mb| imap_client::SyncTarget {
                         role: mb.clone(),
                         server_name: find_server_name_for_role(&account_config, mb),
-                        local_dir: resolve_mailbox_dir(&account_config, mb)
-                            .unwrap_or_else(|_| PathBuf::from(mb)),
-                        status: mailbox_status(mb).to_string(),
-                    }
-                }).collect()
+                    })
+                    .collect()
             } else {
-                all_configured_mailboxes(&account_config).iter().map(|(role, mapping)| {
-                    imap_client::SyncTarget {
+                all_configured_mailboxes(&account_config)
+                    .iter()
+                    .map(|(role, mapping)| imap_client::SyncTarget {
                         role: role.clone(),
                         server_name: mapping.server.clone(),
-                        local_dir: email::config::mailbox_dir(&account_config.name, role),
-                        status: mailbox_status(role).to_string(),
-                    }
-                }).collect()
+                    })
+                    .collect()
             };
+
+            if !dry_run {
+                // Resume the outbox first: a message that reached the server
+                // before the last crash gets its Sent copy before this sync
+                // reads the mailbox it belongs in (#0037 item 5).
+                let drained = email::send::resume_outbox(&account_config).await;
+                if drained.completed > 0 || drained.still_open > 0 {
+                    println!(
+                        "  {} outbox: {} completed, {} still pending",
+                        "↻".dimmed(),
+                        drained.completed,
+                        drained.still_open + drained.awaiting_submission
+                    );
+                }
+            }
 
             let result = if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
-                graph::sync_mailboxes_graph(&graph_config, &targets, limit, reconcile, dry_run).await?
+                graph::sync_mailboxes_graph(
+                    &graph_config,
+                    &account_config.name,
+                    &targets,
+                    limit,
+                    dry_run,
+                )
+                .await?
             } else {
                 let imap_config = ImapConfig::load(&account_config)?;
-                sync_mailboxes(&imap_config, &targets, limit, reconcile, dry_run, None, None).await?
+                sync_mailboxes(
+                    &imap_config,
+                    &account_config.name,
+                    &targets,
+                    limit,
+                    dry_run,
+                )
+                .await?
             };
 
-            // Incremental contacts-index update (best-effort, no-op on dry_run).
             if !dry_run {
+                // Incremental contacts-index update (best-effort).
                 email::contacts::hooks::bump_after_sync(
                     &account_config,
                     &result.fresh_observations,
                 );
-                // Organizer-side REPLY reconciliation (#0030): only walks the
-                // mailstore when this sync saved a METHOD:REPLY invite.
-                let account_root = email::config::account_dir(&account_config.name);
-                email::reconcile::bump_after_sync(&account_root, result.saw_reply_invite);
             }
 
             let prefix = if dry_run { "[dry-run] " } else { "" };
@@ -1586,24 +1875,25 @@ async fn main() -> Result<()> {
                     "✓".green(),
                     prefix,
                     result.saved,
-                    if dry_run { "to download" } else { "saved" },
+                    if dry_run { "to download" } else { "ingested" },
                 );
             }
 
-            if reconcile {
-                if result.moved > 0 || result.removed > 0 {
-                    println!(
-                        "{} {}Reconciled: {} {}, {} {}",
-                        "ℹ".blue(),
-                        prefix,
-                        result.moved,
-                        if dry_run { "to move" } else { "moved" },
-                        result.removed,
-                        if dry_run { "to remove" } else { "removed" },
-                    );
-                } else {
-                    println!("{} {}Reconciled: already in sync", "✓".green(), prefix);
-                }
+            if result.read_updated > 0 {
+                println!(
+                    "{} {}Read status updated on {} message(s)",
+                    "ℹ".blue(),
+                    prefix,
+                    result.read_updated,
+                );
+            }
+            if result.uid_rebound > 0 {
+                println!(
+                    "{} {}Rebound {} message(s) to new UIDs after a UIDVALIDITY reset",
+                    "ℹ".blue(),
+                    prefix,
+                    result.uid_rebound,
+                );
             }
         }
 
@@ -1628,138 +1918,89 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Archive { file }) => {
-            let dir = archive_dir.as_ref().ok_or_else(|| {
-                anyhow!("Archive mailbox not configured. Check [mailboxes.archive] in {}", config_path().display())
-            })?;
-            let archive_server_name = account_config.mailboxes.archive.as_ref()
-                .map(|m| m.server.as_str())
-                .unwrap_or("Archive");
+        Some(Commands::Archive { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let source_server = find_server_name_for_role(&account_config, &row.mailbox);
+            let dest_server = find_server_name_for_role(&account_config, ARCHIVE_MAILBOX);
 
-            let result = if account_config.auth_method == AuthMethod::Graph {
+            // Server first, then the row. The TUI writes the row first because
+            // a user is watching the list; a CLI invocation has nobody to keep
+            // responsive, so it takes the ordering that needs no rollback.
+            if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
-                graph::archive_email_graph(&graph_config, dir, &file, archive_server_name).await
+                graph::move_message_graph(&graph_config, &row.message_id, &dest_server).await?;
             } else {
                 let imap_config = ImapConfig::load(&account_config)?;
-                archive_email_locally(&imap_config, dir, &file, archive_server_name).await
-            };
-
-            match result {
-                Ok(()) => {
-                    println!(
-                        "{} Archived: {}",
-                        "✓".green(),
-                        file.display()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to archive {}: {}",
-                        "✗".red(),
-                        file.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
+                imap_client::move_email_on_server(
+                    &imap_config,
+                    &row.message_id,
+                    &source_server,
+                    &dest_server,
+                )
+                .await?;
             }
+            email::store::write::move_row(&store, row.id, ARCHIVE_MAILBOX)?;
+            println!("{} archived {}", "\u{2713}".green(), canonical);
+            println!(
+                "  {} {}",
+                "now".dimmed(),
+                Selector::new(&account_config.name, ARCHIVE_MAILBOX, &row.message_id)
+            );
         }
 
-        Some(Commands::Delete { file }) => {
-            let result = if account_config.auth_method == AuthMethod::Graph {
+        Some(Commands::Delete { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let source_server = find_server_name_for_role(&account_config, &row.mailbox);
+
+            if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
-                graph::delete_email_graph(&graph_config, &file).await
+                graph::delete_message_graph(&graph_config, &row.message_id).await?;
             } else {
                 let imap_config = ImapConfig::load(&account_config)?;
-                delete_email_locally(&imap_config, &file).await
-            };
+                imap_client::delete_email_on_server(&imap_config, &row.message_id, &source_server)
+                    .await?;
+            }
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            email::store::write::delete_row(&store, &blobs, row.id)?;
+            println!("{} deleted {}", "\u{2713}".green(), canonical);
+        }
 
-            match result {
-                Ok(()) => {
-                    println!("{} Deleted: {}", "✓".green(), file.display());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to delete {}: {}",
-                        "✗".red(),
-                        file.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
+        Some(Commands::Open { selector, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            // Attachments are blobs; the system opener needs files, so they are
+            // materialised into a temp directory keyed by the row. The TUI's
+            // `o` comes through the same helper, so both put them in the same
+            // private place.
+            let dir = email::parse::materialisation_dir(&row.id.to_string())?;
+            let files = materialise_attachments(&store, &blobs, row.id, &dir)?;
+            if files.is_empty() {
+                return Err(anyhow!("{canonical} has no attachments"));
+            }
+            for file in &files {
+                email::parse::open_file_with_system(file)?;
+                println!("{} opened {}", "\u{2713}".green(), file.display());
             }
         }
 
-        Some(Commands::Open { file }) => {
-            let attachments = list_attachments(&file)?;
-            if attachments.is_empty() {
-                println!("No attachments found for {}", file.display());
-                return Ok(());
+        Some(Commands::Save { selector, output, mailbox }) => {
+            let store = received_store(&account_config.name)?;
+            let (row, canonical) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let dest = output.unwrap_or_else(|| PathBuf::from("."));
+            let files = materialise_attachments(&store, &blobs, row.id, &dest)?;
+            if files.is_empty() {
+                return Err(anyhow!("{canonical} has no attachments"));
             }
-            let path = if attachments.len() == 1 {
-                attachments.into_iter().next().expect("non-empty verified above")
-            } else {
-                let display_items: Vec<String> = attachments
-                    .iter()
-                    .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
-                    .collect();
-                let selection = dialoguer::FuzzySelect::new()
-                    .with_prompt("Select attachment to open")
-                    .items(&display_items)
-                    .default(0)
-                    .interact()
-                    .map_err(|e| anyhow!("Selection cancelled: {e}"))?;
-                attachments[selection].clone()
-            };
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            println!("Opening: {name}");
-            open_file_with_system(&path)?;
-        }
-
-        Some(Commands::Save { file, output }) => {
-            let attachments = list_attachments(&file)?;
-            if attachments.is_empty() {
-                println!("No attachments found for {}", file.display());
-                return Ok(());
-            }
-            let dest_dir = output.unwrap_or_else(|| PathBuf::from("."));
-
-            // Multi-select attachments
-            let display_items: Vec<String> = attachments
-                .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
-                .collect();
-
-            let selections = if attachments.len() == 1 {
-                vec![0]
-            } else {
-                let sel = dialoguer::MultiSelect::new()
-                    .with_prompt("Select attachment(s) to save")
-                    .items(&display_items)
-                    .interact()
-                    .map_err(|e| anyhow!("Selection cancelled: {e}"))?;
-                if sel.is_empty() {
-                    println!("No attachments selected.");
-                    return Ok(());
-                }
-                sel
-            };
-
-            for idx in &selections {
-                let source = &attachments[*idx];
-                match email::parse::save_attachment(source, &dest_dir) {
-                    Ok(dest) => {
-                        println!(
-                            "  {} Saved: {} -> {}",
-                            "\u{2713}".green(),
-                            source.file_name().unwrap_or_default().to_string_lossy(),
-                            dest.display()
-                        );
-                    }
-                    Err(e) => {
-                        let name = source.file_name().unwrap_or_default().to_string_lossy();
-                        println!("  {} Failed to save {}: {}", "\u{2717}".red(), name, e);
-                    }
-                }
+            for file in &files {
+                println!("{} {}", "\u{2713}".green(), file.display());
             }
         }
 
@@ -1878,6 +2119,10 @@ async fn main() -> Result<()> {
             }
         },
 
+        Some(Commands::Outbox { action }) => {
+            cmd_outbox(&account_config, action).await?;
+        }
+
         Some(Commands::DumpKeys { json }) => {
             if json {
                 print!("{}", email::tui::dump_keys_json());
@@ -1932,9 +2177,13 @@ async fn main() -> Result<()> {
         }
 
         None => {
-            if let Some(file) = cli.file {
-                // Preview mode (dry run)
-                let draft = parse_email_draft(&file)?;
+            if let Some(ref selector) = cli.selector {
+                // Preview mode (dry run): a draft selector, never a path.
+                let store = drafts_store(&account_config.name)?;
+                let (row, _canonical) =
+                    resolve_draft_arg(&store, selector, &account_config.name)?;
+                drop(store);
+                let draft = parse_email_draft(&row.path)?;
                 preview_draft(
                     &draft,
                     &smtp_config,

@@ -1,88 +1,12 @@
-use std::collections::{HashMap, HashSet};
-
 use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
-use log::info;
+use log::{info, warn};
 
 use super::{ImapSession, search::{FetchCriteria, build_imap_search_query}, open_imap_session};
 use crate::config::ImapConfig;
+use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
 use crate::timing::TimingSpan;
-
-/// Extract Message-ID from raw header bytes (from BODY.PEEK[HEADER.FIELDS (Message-ID)]).
-pub(super) fn parse_message_id_from_header_bytes(header_bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(header_bytes).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // Case-insensitive prefix check: some servers use MESSAGE-ID, MESSAGE-Id, etc.
-        if trimmed.len() >= 11 && trimmed.as_bytes()[10] == b':' {
-            let prefix = &trimmed[..10];
-            if prefix.eq_ignore_ascii_case("Message-ID") {
-                let id = trimmed[11..].trim();
-                if !id.is_empty() {
-                    return Some(id.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Fetch only Message-IDs from a mailbox on an existing session (lightweight, no body download).
-pub async fn fetch_server_message_ids_on_session(
-    session: &mut ImapSession,
-    mailbox: &str,
-) -> Result<HashSet<String>> {
-    session
-        .select(mailbox)
-        .await
-        .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
-
-    let uids = session
-        .uid_search("ALL")
-        .await
-        .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
-
-    if uids.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    let mut uid_list: Vec<u32> = uids.into_iter().collect();
-    uid_list.sort();
-    let uid_set = compress_uid_set(&uid_list);
-
-    let fetched: Vec<_> = session
-        .uid_fetch(&uid_set, "BODY.PEEK[HEADER.FIELDS (Message-ID)]")
-        .await
-        .map_err(|e| anyhow!("Failed to fetch Message-IDs: {}", e))?
-        .try_collect()
-        .await
-        .map_err(|e| anyhow!("Failed to collect Message-IDs: {}", e))?;
-
-    let mut ids = HashSet::new();
-    for msg in fetched.iter() {
-        if let Some(header_bytes) = msg.header() {
-            if let Some(mid) = parse_message_id_from_header_bytes(header_bytes) {
-                ids.insert(mid);
-            }
-        }
-    }
-
-    Ok(ids)
-}
-
-/// Fetch only Message-IDs from a mailbox (lightweight, no body download).
-/// Opens and closes its own IMAP session.
-pub async fn fetch_server_message_ids(
-    imap_config: &ImapConfig,
-    mailbox: &str,
-) -> Result<HashSet<String>> {
-    info!("Fetching Message-IDs from mailbox '{}'", mailbox);
-    let mut session = open_imap_session(imap_config).await?;
-    let ids = fetch_server_message_ids_on_session(&mut session, mailbox).await?;
-    session.logout().await.ok();
-    Ok(ids)
-}
 
 /// Fetch emails on an existing session using search criteria and optional limit.
 pub async fn fetch_emails_on_session(
@@ -156,113 +80,157 @@ pub async fn fetch_emails(
     Ok(emails)
 }
 
-/// Two-pass fetch: first fetch Message-ID headers + FLAGS (lightweight), then only
-/// download full RFC822 for emails not already present locally.
-/// Returns (new_emails, num_already_known_in_window, read_flags_for_known_emails).
-/// The third element maps message_id -> is_seen for emails that already exist locally,
-/// enabling the caller to sync read status from the server.
+// ---------------------------------------------------------------------------
+// Store ingest fetch
+// ---------------------------------------------------------------------------
+
+/// One message downloaded for ingest, with the identity the store keys on.
+pub struct FetchedRaw {
+    pub uid: u32,
+    pub raw: Vec<u8>,
+    pub is_read: bool,
+}
+
+/// What the SELECT response said about the mailbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailboxState {
+    pub uid_validity: Option<u32>,
+    pub uid_next: Option<u32>,
+    pub exists: u32,
+}
+
+/// What one store fetch brought back.
+pub struct StoreFetch {
+    /// Messages the store does not hold yet, with their bodies.
+    pub messages: Vec<FetchedRaw>,
+    /// How many UIDs in the window the store already held.
+    pub skipped: usize,
+    /// The `\Seen` state of those already-held UIDs, the only server-to-local
+    /// read-status channel (#0004).
+    pub known_flags: Vec<(u32, bool)>,
+    /// What SELECT said about the mailbox.
+    pub state: MailboxState,
+    /// True when the server's UIDVALIDITY no longer matches the stored one, so
+    /// this fetch deliberately skipped nothing and redownloaded the window.
+    pub uidvalidity_reset: bool,
+}
+
+/// Two-pass fetch for the store ingest path.
 ///
-/// Pass 1 always covers the full `limit` window, even when nothing is new:
-/// the collected \Seen flags are the only server->local read-status channel,
-/// so shrinking the window silently drops flag changes made in other clients
-/// (ticket #0004). A former "adaptive probe" fast path that returned early
-/// after checking only the newest 10 UIDs did exactly that and was removed;
-/// pass 2 (body download) is still skipped entirely when nothing is new.
-pub async fn fetch_new_emails_on_session(
+/// Pass 1 fetches `UID FLAGS` over the whole window, pass 2 downloads
+/// `BODY.PEEK[]` only for UIDs the store does not hold yet. Identity is the
+/// UID, so pass 1 no longer needs the `Message-ID` header the `.md` era
+/// compared against a directory scan.
+///
+/// Pass 1 always covers the full `limit` window even when nothing is new: the
+/// `\Seen` flags it collects are the only server-to-local read-status channel
+/// (ticket #0004), so shrinking the window silently drops flag changes made in
+/// other clients. Pass 2 is skipped entirely when nothing is new.
+///
+/// The skip list is resolved against the server's UIDVALIDITY *after* SELECT
+/// (see [`KnownUids::resolve`]): a renumbering hands recycled UIDs to different
+/// messages, so carrying the stored list across one would make pass 2 skip
+/// bodies that were never downloaded.
+pub async fn fetch_new_raw_on_session(
     session: &mut ImapSession,
     mailbox: &str,
     limit: Option<usize>,
-    known_ids: &HashSet<String>,
-) -> Result<(Vec<FetchedEmail>, usize, HashMap<String, bool>, Option<super::sync::MailboxState>)> {
-    let mut span = TimingSpan::with_context("fetch_new_emails", mailbox.to_string());
+    known: KnownUids,
+) -> Result<StoreFetch> {
+    let mut span = TimingSpan::with_context("fetch_new_raw", mailbox.to_string());
 
     let imap_mailbox = session
         .select(mailbox)
         .await
         .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
     span.mark("select");
-    let mb_state = Some(super::sync::MailboxState {
+    let state = MailboxState {
         uid_validity: imap_mailbox.uid_validity,
         uid_next: imap_mailbox.uid_next,
         exists: imap_mailbox.exists,
-    });
+    };
+
+    let stored_uidvalidity = known.uidvalidity;
+    let (known_uids, uidvalidity_reset) = known.resolve(state.uid_validity);
+    if uidvalidity_reset {
+        warn!(
+            "UIDVALIDITY for '{}' changed from {:?} to {:?}: refetching the whole window, \
+             the rows are rebound through their Message-IDs",
+            mailbox, stored_uidvalidity, state.uid_validity
+        );
+    }
+    let empty = |state: MailboxState| StoreFetch {
+        messages: Vec::new(),
+        skipped: 0,
+        known_flags: Vec::new(),
+        state,
+        uidvalidity_reset,
+    };
 
     let uids = session
         .uid_search("ALL")
         .await
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
     span.mark("uid_search");
-
     if uids.is_empty() {
-        return Ok((Vec::new(), 0, HashMap::new(), mb_state));
+        return Ok(empty(state));
     }
 
     let mut uid_list: Vec<u32> = uids.into_iter().collect();
-    uid_list.sort();
-
-    let selected_uids: Vec<u32> = match limit {
+    uid_list.sort_unstable();
+    let mut window: Vec<u32> = match limit {
         Some(n) => uid_list.into_iter().rev().take(n).collect(),
         None => uid_list,
     };
-
-    if selected_uids.is_empty() {
-        return Ok((Vec::new(), 0, HashMap::new(), mb_state));
+    window.sort_unstable();
+    if window.is_empty() {
+        return Ok(empty(state));
     }
 
-    let checked_count = selected_uids.len();
-
-    // Pass 1: Fetch Message-ID headers + FLAGS (~100 bytes/msg)
-    let uid_set = compress_uid_set(&selected_uids);
-    let header_fetched: Vec<_> = session
-        .uid_fetch(&uid_set, "(UID BODY.PEEK[HEADER.FIELDS (Message-ID)] FLAGS)")
+    // Pass 1: UID + FLAGS over the whole window (~40 bytes per message).
+    let window_set = compress_uid_set(&window);
+    let flagged: Vec<_> = session
+        .uid_fetch(&window_set, "(UID FLAGS)")
         .await
-        .map_err(|e| anyhow!("Failed to fetch Message-ID headers: {}", e))?
+        .map_err(|e| anyhow!("Failed to fetch flags: {}", e))?
         .try_collect()
         .await
-        .map_err(|e| anyhow!("Failed to collect Message-ID headers: {}", e))?;
-    span.mark("pass1_headers");
+        .map_err(|e| anyhow!("Failed to collect flags: {}", e))?;
+    span.mark("pass1_flags");
 
-    // Identify UIDs whose Message-ID is not in known_ids,
-    // and collect \Seen flags for known emails.
     let mut new_uids: Vec<u32> = Vec::new();
-    let mut known_flags: HashMap<String, bool> = HashMap::new();
-    for msg in header_fetched.iter() {
-        let uid = match msg.uid {
-            Some(u) => u,
-            None => continue,
-        };
-        let mid = msg.header().and_then(parse_message_id_from_header_bytes);
-        match mid {
-            Some(ref id) if known_ids.contains(id) => {
-                // Already known locally -- capture \Seen flag for read status sync
-                let is_seen = msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen));
-                known_flags.insert(id.clone(), is_seen);
-            }
-            _ => {
-                new_uids.push(uid);
-            }
+    let mut known_flags: Vec<(u32, bool)> = Vec::new();
+    for msg in flagged.iter() {
+        let Some(uid) = msg.uid else { continue };
+        let is_seen = msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen));
+        if known_uids.contains(&(uid as i64)) {
+            known_flags.push((uid, is_seen));
+        } else {
+            new_uids.push(uid);
         }
     }
-
-    let skipped = checked_count - new_uids.len();
+    let skipped = known_flags.len();
 
     if new_uids.is_empty() {
-        return Ok((Vec::new(), skipped, known_flags, mb_state));
+        return Ok(StoreFetch {
+            messages: Vec::new(),
+            skipped,
+            known_flags,
+            state,
+            uidvalidity_reset,
+        });
     }
-    span.mark("diff_new_uids");
-
     info!(
-        "Two-pass fetch for '{}': {} new, {} skipped (out of {} checked)",
+        "Store fetch for '{}': {} new, {} already ingested",
         mailbox,
         new_uids.len(),
-        skipped,
-        checked_count
+        skipped
     );
 
-    // Pass 2: Fetch full message body only for genuinely new messages
-    let new_uid_set = compress_uid_set(&new_uids);
+    // Pass 2: full bodies for the new UIDs only.
+    let new_set = compress_uid_set(&new_uids);
     let fetched: Vec<_> = session
-        .uid_fetch(&new_uid_set, "(BODY.PEEK[] FLAGS)")
+        .uid_fetch(&new_set, "(UID BODY.PEEK[] FLAGS)")
         .await
         .map_err(|e| anyhow!("Failed to fetch emails: {}", e))?
         .try_collect()
@@ -270,74 +238,22 @@ pub async fn fetch_new_emails_on_session(
         .map_err(|e| anyhow!("Failed to collect emails: {}", e))?;
     span.mark("pass2_bodies");
 
-    let mut emails = Vec::new();
+    let mut out = Vec::new();
     for msg in fetched.iter() {
-        let body_raw = msg.body().unwrap_or_default();
-        if let Some(mut email) = parse_rfc822_to_fetched_email(body_raw) {
-            email.is_read = msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen));
-            emails.push(email);
-        }
-    }
-    span.mark("parse_rfc822");
-
-    Ok((emails, skipped, known_flags, mb_state))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_message_id_from_header_bytes_standard() {
-        let header = b"Message-ID: <abc123@mail.example.com>";
-        assert_eq!(
-            parse_message_id_from_header_bytes(header),
-            Some("<abc123@mail.example.com>".to_string())
-        );
+        let Some(uid) = msg.uid else { continue };
+        let Some(body) = msg.body() else { continue };
+        out.push(FetchedRaw {
+            uid,
+            raw: body.to_vec(),
+            is_read: msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen)),
+        });
     }
 
-    #[test]
-    fn test_parse_message_id_from_header_bytes_case_insensitive() {
-        let header = b"Message-Id: <def456@mail.example.com>\nOther: header";
-        assert_eq!(
-            parse_message_id_from_header_bytes(header),
-            Some("<def456@mail.example.com>".to_string())
-        );
-
-        let header = b"message-id: <xyz@mail.example.com>";
-        assert_eq!(
-            parse_message_id_from_header_bytes(header),
-            Some("<xyz@mail.example.com>".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_message_id_from_header_bytes_with_whitespace() {
-        let header = b"Message-ID:   <whitespace@mail.example.com>  ";
-        assert_eq!(
-            parse_message_id_from_header_bytes(header),
-            Some("<whitespace@mail.example.com>".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_message_id_from_header_bytes_not_found() {
-        let header = b"From: alice@example.com\nSubject: Test\nDate: Mon, 1 Jan 2024";
-        assert_eq!(parse_message_id_from_header_bytes(header), None);
-    }
-
-    #[test]
-    fn test_parse_message_id_from_header_bytes_empty_value() {
-        let header = b"Message-ID: ";
-        assert_eq!(parse_message_id_from_header_bytes(header), None);
-
-        let header = b"Message-ID:";
-        assert_eq!(parse_message_id_from_header_bytes(header), None);
-    }
-
-    #[test]
-    fn test_parse_message_id_from_header_bytes_utf8() {
-        let header = b"Message-ID: <utf8-test-\xc2\xb5@mail.example.com>";
-        assert!(parse_message_id_from_header_bytes(header).is_some());
-    }
+    Ok(StoreFetch {
+        messages: out,
+        skipped,
+        known_flags,
+        state,
+        uidvalidity_reset,
+    })
 }

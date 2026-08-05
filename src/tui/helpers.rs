@@ -1,6 +1,8 @@
 use std::io::{self, stdout};
 use std::panic;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
@@ -10,16 +12,14 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use super::app::{App, EmailEntry, SearchHit, SearchTarget};
+use super::app::{App, EmailEntry, MessageRef, SearchHit, SearchTarget};
 
-use crate::config::{all_configured_mailboxes, mailbox_dir, AccountConfig, ImapConfig};
+use crate::config::{all_configured_mailboxes, AccountConfig, ImapConfig};
 use crate::draft::parse_email_draft;
 use crate::imap_client::{
-    fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes,
-    MailboxState, MessageIdIndex, SyncTarget,
+    fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes, SyncTarget,
 };
 use crate::parse::FetchedEmail;
-use crate::sync::mailbox_status;
 
 // ---------------------------------------------------------------------------
 // Watcher
@@ -225,9 +225,6 @@ pub(super) async fn lib_do_sync(
     account_config: &AccountConfig,
     imap_config: &ImapConfig,
     limit: usize,
-    reconcile: bool,
-    known_index: Option<&mut MessageIdIndex>,
-    prev_states: Option<&std::collections::HashMap<String, MailboxState>>,
 ) -> anyhow::Result<(String, SyncResultMeta)> {
     let span_label = if limit < usize::MAX { "lib_do_sync:quick" } else { "lib_do_sync:full" };
     let _span = crate::timing::TimingSpan::with_context(span_label, account_config.name.clone());
@@ -237,72 +234,54 @@ pub(super) async fn lib_do_sync(
         .map(|(role, mapping)| SyncTarget {
             role: role.clone(),
             server_name: mapping.server.clone(),
-            local_dir: mailbox_dir(&account_config.name, role),
-            status: mailbox_status(role).to_string(),
         })
         .collect();
 
-    let result = sync_mailboxes(imap_config, &targets, limit, reconcile, false, known_index, prev_states).await?;
+    // The sync tick is also the outbox's retry tick: a Sent copy that could
+    // not be appended when the message was sent lands here (#0037 item 5).
+    crate::send::resume_outbox(account_config).await;
 
+    let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false).await?;
+    Ok((finish_sync(account_config, &result), SyncResultMeta {
+        new_inbox_mail: result.new_inbox_mail.clone(),
+    }))
+}
+
+/// Post-sync hooks shared by both backends, and the one-line status message.
+///
+/// The `.md` era also returned the directories a sync had touched so the TUI
+/// could invalidate its caches; ingest writes no files, so there is nothing to
+/// invalidate until the read path moves onto the store (#0038).
+fn finish_sync(
+    account_config: &AccountConfig,
+    result: &crate::imap_client::SyncResult,
+) -> String {
     // Incremental contacts-index update (best-effort, no-op if no cache).
     crate::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
 
-    // Organizer-side REPLY reconciliation (#0030): only walks the mailstore
-    // when this sync actually saved a METHOD:REPLY invite. Fold the invites it
-    // rewrote into touched_dirs so the affected mailbox cache is invalidated
-    // and the event card reloads with the updated attendee statuses.
-    let mut touched_dirs = result.touched_dirs;
-    let account_root = crate::config::account_dir(&account_config.name);
-    for invite_path in
-        crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite)
-    {
-        if let Some(dir) = invite_path.parent() {
-            let dir = dir.to_path_buf();
-            if !touched_dirs.contains(&dir) {
-                touched_dirs.push(dir);
-            }
-        }
-    }
+    // Organizer-side REPLY reconciliation (#0030) has no post-sync hook any
+    // more: the fold runs where the statuses are displayed, over the rows this
+    // sync just ingested (#0038 scope item 6), so there is nothing to bump.
 
     let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
     if result.read_updated > 0 {
         msg.push_str(&format!(", {} read status updated", result.read_updated));
     }
-    if result.deduped > 0 {
-        msg.push_str(&format!(", {} duplicates removed", result.deduped));
+    if result.uid_rebound > 0 {
+        msg.push_str(&format!(", {} renumbered", result.uid_rebound));
     }
-    if reconcile {
-        if result.moved > 0 || result.removed > 0 {
-            msg.push_str(&format!(
-                " | Reconciled: {} moved, {} removed",
-                result.moved, result.removed
-            ));
-        } else {
-            msg.push_str(" | Already in sync");
-        }
-    }
-    let meta = SyncResultMeta {
-        mailbox_states: result.mailbox_states,
-        touched_dirs,
-        new_inbox_mail: result.new_inbox_mail,
-    };
-    Ok((msg, meta))
+    msg
 }
 
-/// Metadata returned alongside the status message from lib_do_sync.
-/// Carries state that needs to be persisted back to AccountState.
+/// Metadata returned alongside the status message from a sync.
 pub(super) struct SyncResultMeta {
-    pub mailbox_states: std::collections::HashMap<String, MailboxState>,
-    /// Local mailbox directories the sync actually modified on disk.
-    /// Empty when the sync was a no-op (lets the UI skip cache
-    /// invalidation and mailbox reload entirely).
-    pub touched_dirs: Vec<std::path::PathBuf>,
     /// Sender + subject of every genuinely new inbox email this sync
-    /// saved, for the desktop notification (#0009).
+    /// ingested, for the desktop notification (#0009).
     pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
 }
 
 pub(super) async fn lib_do_multi_search(
+    account: &str,
     imap_config: &ImapConfig,
     query: &str,
     targets: &[SearchTarget],
@@ -340,7 +319,7 @@ pub(super) async fn lib_do_multi_search(
                 );
                 total += emails.len();
                 for fetched in emails {
-                    let entry = fetched_to_email_entry(&fetched);
+                    let entry = fetched_to_email_entry(account, &fetched);
                     hits.push(SearchHit {
                         entry,
                         fetched,
@@ -367,71 +346,31 @@ pub(super) async fn lib_do_sync_graph(
     account_config: &AccountConfig,
     graph_config: &crate::config::GraphConfig,
     limit: usize,
-    reconcile: bool,
-) -> anyhow::Result<(String, GraphSyncMeta)> {
+) -> anyhow::Result<(String, SyncResultMeta)> {
     let targets: Vec<SyncTarget> = all_configured_mailboxes(account_config)
         .iter()
         .map(|(role, mapping)| SyncTarget {
             role: role.clone(),
             server_name: mapping.server.clone(),
-            local_dir: mailbox_dir(&account_config.name, role),
-            status: mailbox_status(role).to_string(),
         })
         .collect();
 
-    let result =
-        crate::graph::sync_mailboxes_graph(graph_config, &targets, limit, reconcile, false)
-            .await?;
+    let result = crate::graph::sync_mailboxes_graph(
+        graph_config,
+        &account_config.name,
+        &targets,
+        limit,
+        false,
+    )
+    .await?;
 
-    crate::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
-
-    // Organizer-side REPLY reconciliation (#0030); see the IMAP path above.
-    let mut touched_dirs = result.touched_dirs;
-    let account_root = crate::config::account_dir(&account_config.name);
-    for invite_path in
-        crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite)
-    {
-        if let Some(dir) = invite_path.parent() {
-            let dir = dir.to_path_buf();
-            if !touched_dirs.contains(&dir) {
-                touched_dirs.push(dir);
-            }
-        }
-    }
-
-    let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
-    if result.read_updated > 0 {
-        msg.push_str(&format!(", {} read status updated", result.read_updated));
-    }
-    if result.deduped > 0 {
-        msg.push_str(&format!(", {} duplicates removed", result.deduped));
-    }
-    if reconcile {
-        if result.moved > 0 || result.removed > 0 {
-            msg.push_str(&format!(
-                " | Reconciled: {} moved, {} removed",
-                result.moved, result.removed
-            ));
-        } else {
-            msg.push_str(" | Already in sync");
-        }
-    }
-    let meta = GraphSyncMeta {
-        touched_dirs,
-        new_inbox_mail: result.new_inbox_mail,
-    };
-    Ok((msg, meta))
-}
-
-/// Metadata returned alongside the status message from `lib_do_sync_graph`.
-pub(super) struct GraphSyncMeta {
-    pub touched_dirs: Vec<std::path::PathBuf>,
-    /// Sender + subject of every genuinely new inbox email this sync
-    /// saved, for the desktop notification (#0009).
-    pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
+    Ok((finish_sync(account_config, &result), SyncResultMeta {
+        new_inbox_mail: result.new_inbox_mail.clone(),
+    }))
 }
 
 pub(super) async fn lib_do_multi_search_graph(
+    account: &str,
     graph_config: &crate::config::GraphConfig,
     query: &str,
     targets: &[SearchTarget],
@@ -457,7 +396,7 @@ pub(super) async fn lib_do_multi_search_graph(
             Ok(emails) => {
                 total += emails.len();
                 for fetched in emails {
-                    let entry = fetched_to_email_entry(&fetched);
+                    let entry = fetched_to_email_entry(account, &fetched);
                     hits.push(SearchHit {
                         entry,
                         fetched,
@@ -477,7 +416,30 @@ pub(super) async fn lib_do_multi_search_graph(
     Ok(hits)
 }
 
-fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
+/// Turn a server-search hit into a list entry.
+///
+/// The hit came straight off the server and was never ingested, so it may or
+/// may not correspond to a row this account already holds. The entry is
+/// resolved against the store by Message-ID (`store::read::find_by_message_id`,
+/// the same indexed lookup that replaced the startup Message-ID walk in
+/// #0038): a hit that resolves carries `Some(MessageRef)` and behaves like any
+/// other row, a hit that does not carries `None` and every row-dependent
+/// operation on it declines with a status message. There is deliberately no
+/// sentinel `MessageRef`: an entry that pretends to be row 0 could reach the
+/// selection set and a batch action would then act on the wrong message.
+///
+/// This is the honest continuation of the gap #0049 recorded as 4a
+/// ("server-search open hit only resolves messages already local"): before the
+/// nuke the resolution was a Message-ID scan of the mailbox directory, now it
+/// is the same question asked of the store. A server-only hit is still listed
+/// and previewable from the fetched content and still not openable as a local
+/// message; closing that needs the hit to be ingested on demand, which is not
+/// this unit.
+///
+/// A message that lives in several mailboxes resolves to the first row in
+/// `(mailbox, uid)` order, which is what the directory scan did too (it looked
+/// only in the mailbox the hit came from and took the single match there).
+fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
     let (date_display, date_sort) =
         if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&fetched.date) {
             (
@@ -491,8 +453,11 @@ fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
             )
         };
 
+    let msg = resolve_fetched_hit(account, fetched);
+
     EmailEntry {
-        path: PathBuf::new(),
+        msg,
+        draft_id: None,
         from: fetched.from.clone(),
         to: fetched.to.clone(),
         cc: fetched.cc.clone(),
@@ -500,10 +465,27 @@ fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
         status: String::new(),
         date_display,
         date_sort,
-        body: fetched.body_text.clone(),
         has_attachments: fetched.has_attachments,
         read: fetched.is_read,
-        event: fetched.event.clone(),
+        is_invite: fetched.event.is_some(),
+    }
+}
+
+/// Look one server-search hit up in the account's store by Message-ID.
+///
+/// `None` covers all three misses that mean the same thing to the caller: the
+/// account has no store yet, the hit carries no Message-ID, or no row holds
+/// it. The store is opened per hit, which is a few microseconds against a
+/// search that just did a network round trip.
+fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageRef> {
+    let message_id = fetched.message_id.as_deref()?;
+    let store = crate::tui::app::open_store(account)?;
+    match crate::store::read::find_by_message_id(&store, account, message_id) {
+        Ok(rows) => rows.first().map(|row| MessageRef::new(row.id)),
+        Err(e) => {
+            log::warn!("[store] resolving search hit {message_id}: {e:#}");
+            None
+        }
     }
 }
 
@@ -511,6 +493,12 @@ fn fetched_to_email_entry(fetched: &FetchedEmail) -> EmailEntry {
 // Account resolution for Send
 // ---------------------------------------------------------------------------
 
+/// Which account sends this draft: the one whose address its `from:` names,
+/// falling back to the active one.
+///
+/// The draft file rather than the open mailbox is the source of truth, because
+/// a draft written for another configured account (a reply to mail that
+/// arrived there) has to leave through that account's credentials.
 pub(super) fn resolve_send_account(
     app: &App,
     draft_path: &Path,
@@ -521,7 +509,6 @@ pub(super) fn resolve_send_account(
     Option<crate::config::GraphConfig>,
     AccountConfig,
     Option<String>,
-    Option<PathBuf>,
 ) {
     if let Ok(draft) = parse_email_draft(draft_path) {
         let from = draft.frontmatter.from.unwrap_or_default().to_lowercase();
@@ -534,7 +521,6 @@ pub(super) fn resolve_send_account(
                     acct.graph_config.clone(),
                     acct.account_config.clone(),
                     acct.signature_content.clone(),
-                    acct.sent_dir.clone(),
                 );
             }
         }
@@ -547,77 +533,7 @@ pub(super) fn resolve_send_account(
         acct.graph_config.clone(),
         acct.account_config.clone(),
         acct.signature_content.clone(),
-        acct.sent_dir.clone(),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Search result helpers
-// ---------------------------------------------------------------------------
-
-pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
-    let idx = app.server_search_index;
-    let result = app.server_search_results.get(idx)?;
-
-    if let Some(ref path) = result.saved_path {
-        return Some(path.clone());
-    }
-
-    let save_dir = result.source_local_dir.clone();
-    let status = result.source_status.clone();
-
-    log::info!(
-        "Search result save: source_label={}, status={}, dir={}, subject={}",
-        result.source_label,
-        status,
-        save_dir.display(),
-        result.entry.subject,
-    );
-
-    let fetched_clone = result.fetched.clone();
-    let message_id = result.fetched.message_id.clone();
-
-    let mut known_ids = crate::parse::scan_existing_message_ids(&save_dir).unwrap_or_default();
-    match crate::parse::save_fetched_emails_with_known_ids(
-        &[fetched_clone],
-        &save_dir,
-        &status,
-        &mut known_ids,
-    ) {
-        Ok((saved, _skipped, saved_paths)) => {
-            if saved > 0 {
-                if let Some((_mid, path)) = saved_paths.into_iter().next() {
-                    let result = app.server_search_results.get_mut(idx)?;
-                    result.saved_path = Some(path.clone());
-                    if let Some(cache_idx) = app.mailbox_index_for_dir(&save_dir) {
-                        app.invalidate_cache_idx(cache_idx);
-                    }
-                    return Some(path);
-                }
-                if let Some(cache_idx) = app.mailbox_index_for_dir(&save_dir) {
-                    app.invalidate_cache_idx(cache_idx);
-                }
-                None
-            } else {
-                // Skipped as duplicate: the email already exists on disk, so no
-                // path was returned. Look it up by message_id in frontmatter
-                // (never by whole-file substring, which could false-match an
-                // ID quoted in another email's body).
-                if let Some(ref mid) = message_id {
-                    if let Ok(ids) = crate::parse::scan_mailbox_message_ids(&save_dir) {
-                        if let Some(path) = ids.get(mid) {
-                            let path = path.clone();
-                            let result = app.server_search_results.get_mut(idx)?;
-                            result.saved_path = Some(path.clone());
-                            return Some(path);
-                        }
-                    }
-                }
-                None
-            }
-        }
-        Err(_) => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +582,7 @@ mod tests {
             sidebar_index: 0,
             active_mailbox: 0,
             list_index: 0,
-            cursor_path: None,
+            cursor_ref: None,
             headers_scroll: 0,
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
@@ -674,10 +590,8 @@ mod tests {
             search_includes_body: false,
             bg_mutations: 0,
             watcher_active: false,
+            outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
-            message_id_index: Default::default(),
-            indexing: false,
-            mailbox_states: Default::default(),
         }
     }
 
@@ -744,12 +658,11 @@ mod tests {
             Some("Sylvain Hellin <SYLVAIN@Perso.Example>"),
         );
 
-        let (idx, _smtp, _imap, _graph, cfg, signature, sent_dir) =
+        let (idx, _smtp, _imap, _graph, cfg, signature) =
             resolve_send_account(&app, &path);
         assert_eq!(idx, 1);
         assert_eq!(cfg.name, "perso");
         assert_eq!(signature.as_deref(), Some("-- \nperso"));
-        assert_eq!(sent_dir, Some(PathBuf::from("/tmp/perso/sent")));
     }
 
     /// parity. With no `from:` in the draft, or with a `from:` that matches no
@@ -790,7 +703,7 @@ mod tests {
             1,
         );
         let path = draft(tmp.path(), "d.md", Some("shared@example.com"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 0);
         assert_eq!(cfg.name, "first");
     }
@@ -813,7 +726,7 @@ mod tests {
             0,
         );
         let path = draft(tmp.path(), "d.md", Some("not-sylvain@work.example"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 1, "a different mailbox matched by substring");
         assert_eq!(cfg.name, "work");
     }
@@ -831,7 +744,7 @@ mod tests {
             1,
         );
         let path = draft(tmp.path(), "d.md", Some("sylvain@work.example"));
-        let (idx, _, _, _, cfg, _, _) = resolve_send_account(&app, &path);
+        let (idx, _, _, _, cfg, _) = resolve_send_account(&app, &path);
         assert_eq!(idx, 0);
         assert_eq!(cfg.name, "half-configured");
     }
@@ -840,22 +753,21 @@ mod tests {
     // fetched_to_email_entry
     // -----------------------------------------------------------------------
 
-    /// parity. A server-search hit becomes a list row with an empty path and
-    /// an empty status (it is not on disk yet; `ensure_search_result_saved`
-    /// fills those in on demand), and the remaining fields are copied through.
+    /// parity. A server-search hit becomes a list row with no store row (the
+    /// account below has no store at all) and an empty status, and the
+    /// remaining fields are copied through.
     #[test]
-    fn fetched_to_email_entry_copies_fields_and_leaves_path_and_status_empty() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+    fn fetched_to_email_entry_copies_fields_and_leaves_msg_and_status_empty() {
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
 
-        assert_eq!(entry.path, PathBuf::new());
+        assert_eq!(entry.msg, None);
         assert_eq!(entry.status, "");
         assert_eq!(entry.subject, "Grüße");
         assert_eq!(entry.to, "me@example.com");
         assert_eq!(entry.cc.as_deref(), Some("cc@example.com"));
-        assert_eq!(entry.body, "body text");
         assert!(entry.has_attachments);
         assert!(entry.read);
-        assert!(entry.event.is_none());
+        assert!(!entry.is_invite);
         assert_eq!(entry.date_display, "2024-01-01");
     }
 
@@ -868,13 +780,13 @@ mod tests {
     /// Target: `date_sort` in UTC, i.e. `2024-01-01T08:00:00` below.
     #[test]
     fn fetched_to_email_entry_sort_key_keeps_the_sender_local_wallclock() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 10:00:00 +0200"));
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 10:00:00 +0200"));
         assert_eq!(entry.date_display, "2024-01-01");
         assert_eq!(entry.date_sort, "2024-01-01T10:00:00");
 
         // 10:00+0200 is 08:00 UTC, so this later message (09:00 UTC) must sort
         // after it. On the recorded wallclock keys it sorts before.
-        let later = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 09:00:00 +0000"));
+        let later = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 09:00:00 +0000"));
         assert_eq!(later.date_sort, "2024-01-01T09:00:00");
         assert!(
             later.date_sort < entry.date_sort,
@@ -888,16 +800,77 @@ mod tests {
     /// string cannot panic, with the raw string as the sort key.
     #[test]
     fn fetched_to_email_entry_falls_back_to_the_first_ten_chars() {
-        let entry = fetched_to_email_entry(&fetched("2024-01-01 12:00 (approx)"));
+        let entry = fetched_to_email_entry("nobody", &fetched("2024-01-01 12:00 (approx)"));
         assert_eq!(entry.date_display, "2024-01-01");
         assert_eq!(entry.date_sort, "2024-01-01 12:00 (approx)");
 
-        let placeholder = fetched_to_email_entry(&fetched("(unknown date)"));
+        let placeholder = fetched_to_email_entry("nobody", &fetched("(unknown date)"));
         assert_eq!(placeholder.date_display, "(unknown d");
         assert_eq!(placeholder.date_sort, "(unknown date)");
 
-        let unicode = fetched_to_email_entry(&fetched("日本語の日付です、これは長い"));
+        let unicode = fetched_to_email_entry("nobody", &fetched("日本語の日付です、これは長い"));
         assert_eq!(unicode.date_display, "日本語の日付です、こ");
+    }
+
+    /// The decided behaviour for a server-search hit (#0038): the entry is
+    /// resolved against the account's store by Message-ID, so a hit a previous
+    /// sync already ingested carries that row's `MessageRef` and a hit that
+    /// exists only on the server carries `None`. No sentinel ref is minted for
+    /// the second case, because a fake ref could reach the selection set and a
+    /// batch action would then act on a different message.
+    #[test]
+    fn a_search_hit_carries_a_ref_only_when_the_store_holds_it() {
+        let _guard = crate::config::data_dir_lock();
+        let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+
+        let mut local = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        local.message_id = Some("<local@example.de>".to_string());
+        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
+        let blobs = crate::store::BlobStore::for_account("alice");
+        let row_id = crate::ingest::ingest_message(
+            &store,
+            &blobs,
+            &crate::ingest::IngestInput {
+                account: "alice",
+                mailbox: "inbox",
+                uid: 1,
+                email: &local,
+                raw: None,
+            },
+        )
+        .unwrap()
+        .row_id;
+        drop(store);
+
+        let resolved = fetched_to_email_entry("alice", &local);
+        assert_eq!(
+            resolved.msg,
+            Some(crate::tui::app::MessageRef::new(row_id)),
+            "a hit the store already holds resolves to its row"
+        );
+
+        let mut server_only = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        server_only.message_id = Some("<never-synced@example.de>".to_string());
+        assert_eq!(
+            fetched_to_email_entry("alice", &server_only).msg,
+            None,
+            "a server-only hit carries no ref"
+        );
+
+        let mut anonymous = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
+        anonymous.message_id = None;
+        assert_eq!(
+            fetched_to_email_entry("alice", &anonymous).msg,
+            None,
+            "a hit without a Message-ID cannot be resolved"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+        }
     }
 
     /// known-bug. The row keeps the raw `From:` header, address included,
@@ -907,7 +880,7 @@ mod tests {
     /// Target: one projection for both paths.
     #[test]
     fn fetched_to_email_entry_keeps_the_raw_from_header() {
-        let entry = fetched_to_email_entry(&fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
+        let entry = fetched_to_email_entry("nobody", &fetched("Mon, 01 Jan 2024 12:00:00 +0000"));
         assert_eq!(entry.from, "Jürgen Müller <juergen@example.de>");
         assert_eq!(
             crate::tui::app::extract_display_name(&entry.from),

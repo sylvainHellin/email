@@ -176,7 +176,7 @@ fn derive_machine_key() -> Result<DerivedKey> {
 }
 
 /// Encrypt arbitrary bytes with the machine-bound key.
-/// Output: MAGIC || VERSION || nonce[12] || ct_with_tag.
+/// Output: `MAGIC || VERSION || nonce[12] || ct_with_tag`.
 pub fn encrypt_blob(plaintext: &[u8]) -> Result<Vec<u8>> {
     let key = derive_machine_key()?;
     encrypt_with_key(&key, plaintext)

@@ -411,7 +411,7 @@ pub(super) fn render_mailbox_picker(picker: &MailboxPicker, frame: &mut Frame, a
     let dialog_area = vertical[0];
     frame.render_widget(Clear, dialog_area);
 
-    let count = picker.paths.len();
+    let count = picker.msgs.len();
     let title = if count == 1 {
         " Move to ".to_string()
     } else {

@@ -47,7 +47,7 @@
       { "key": "A", "action": "Approve draft" },
       { "key": "D", "action": "Mark approved as draft (reverse A)" },
       { "key": "x / X", "action": "Send / Send all approved" },
-      { "key": "y", "action": "Copy file path" },
+      { "key": "y", "action": "Copy selector (mp://)" },
       { "key": "o", "action": "Open attachment" },
       { "key": "O", "action": "Save attachment to disk" },
       { "key": "b", "action": "Open HTML in browser" },

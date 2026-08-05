@@ -11,19 +11,24 @@ import { Code } from 'astro:components';
 import tuiKeys from '../data/tui-keys.json';
 
 const draftCommands = [
-  { command: 'mp <file>', description: 'Preview a draft (dry-run)' },
-  { command: 'mp new <name>', description: 'Create a new draft from template' },
-  { command: 'mp list [dir]', description: 'List drafts grouped by status' },
-  { command: 'mp validate <file|dir>', description: 'Validate frontmatter' },
-  { command: 'mp mark-approved <file>', description: 'Mark draft as approved' },
-  { command: 'mp mark-draft <file>', description: 'Demote approved draft back to draft' },
-  { command: 'mp send <file> [-y]', description: 'Send a single approved email' },
+  { command: 'mp <selector>', description: 'Preview a draft (dry-run)' },
+  { command: 'mp new <name>', description: 'Create a new draft from template and print its selector' },
+  { command: 'mp list [--status draft|approved|sent]', description: "List the account's drafts" },
+  { command: 'mp validate [<selector>]', description: 'Validate one draft, or every draft of the account' },
+  { command: 'mp path <selector>', description: 'Print the filesystem path of a draft' },
+  { command: 'mp edit <selector>', description: 'Open a draft in $EDITOR' },
+  { command: 'mp mark-approved <selector>', description: 'Mark draft as approved' },
+  { command: 'mp mark-draft <selector>', description: 'Demote approved draft back to draft' },
+  { command: 'mp send <selector> [-y]', description: 'Send a single approved email' },
   { command: 'mp send --invite ...', description: 'Send a calendar invitation (iMIP REQUEST)' },
-  { command: 'mp invite accept|tentative|decline <file>', description: 'RSVP to a received invitation (iMIP REPLY)' },
-  { command: 'mp calendar rebuild [--account NAME]', description: 'Reconcile attendee RSVPs into your sent invites' },
-  { command: 'mp send-approved [dir] [-y]', description: 'Send all approved emails' },
-  { command: 'mp reply [file] [--all]', description: 'Create a reply draft' },
-  { command: 'mp forward [file]', description: 'Create a forward draft' },
+  { command: 'mp invite accept|tentative|decline <selector>', description: 'RSVP to a received invitation (iMIP REPLY)' },
+  { command: 'mp calendar rebuild [--account NAME]', description: 'Report the attendee RSVPs resolved against your sent invites' },
+  { command: 'mp send-approved [--all-accounts] [-y]', description: 'Send every approved draft of the account' },
+  { command: 'mp outbox list', description: 'Show queued, retrying and failed submissions' },
+  { command: 'mp outbox retry <id>', description: 'Send a failed submission again' },
+  { command: 'mp outbox discard <id>', description: 'Drop a submission and release its bytes' },
+  { command: 'mp reply <selector> [--all]', description: 'Create a reply draft and print its selector' },
+  { command: 'mp forward <selector>', description: 'Create a forward draft and print its selector' },
 ];
 
 const imapCommands = [
@@ -31,11 +36,11 @@ const imapCommands = [
   { command: 'mp sync [options]', description: 'Sync local folders with server' },
   { command: 'mp watch [options]', description: 'Watch mailbox for changes (IMAP IDLE)' },
   { command: 'mp list-mailboxes', description: 'List available server mailboxes' },
-  { command: 'mp archive <file>', description: 'Archive an email (server + local)' },
-  { command: 'mp delete <file>', description: 'Delete an email (server + local)' },
+  { command: 'mp archive <selector>', description: 'Archive a received email (server + local)' },
+  { command: 'mp delete <selector>', description: 'Delete a received email (server + local)' },
   { command: 'mp search <query>', description: 'Search emails on server' },
-  { command: 'mp open <file>', description: 'Open attachment in default app' },
-  { command: 'mp save <file> [--output]', description: 'Save attachment(s) to directory' },
+  { command: 'mp open <selector>', description: 'Open attachment in default app' },
+  { command: 'mp save <selector> [--output]', description: 'Save attachment(s) to directory' },
 ];
 
 const configCommands = [
@@ -124,6 +129,27 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
     </section>
 
     <section>
+      <h2 id="selectors">Selectors</h2>
+      <p>
+        Every command that names a message takes a selector, never a file path:
+        <code>mp://&lt;account&gt;/&lt;mailbox&gt;/&lt;key&gt;</code>. For received mail the key is the
+        Message-ID without its angle brackets; for a draft the mailbox is the reserved name
+        <code>drafts</code> and the key is the <code>id:</code> field in the draft's frontmatter,
+        so renaming the file does not change its selector.
+      </p>
+      <p>
+        The leading segments can be left off: the account falls back to <code>-A/--account</code>
+        or the first account in your config, and the mailbox to <code>--mailbox</code> or the
+        command's own scope. <code>mp send 9f2c1ab30d5e4471</code> and
+        <code>mp send mp://work/drafts/9f2c1ab30d5e4471</code> are the same command. A key that
+        matches messages in two mailboxes is reported with both full selectors rather than
+        resolved by guesswork; <code>--mailbox</code> picks one. Every command that creates or
+        lists something prints the fully qualified form, which pastes straight into the next
+        command, and <code>mp path &lt;selector&gt;</code> is the one way back to a filesystem path.
+      </p>
+    </section>
+
+    <section>
       <h2 id="draft-commands">Draft Commands</h2>
       <CommandTable commands={draftCommands} />
     </section>
@@ -180,7 +206,7 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
     <section>
       <h2 id="rsvp">RSVP to Invitations (<code>mp invite</code>)</h2>
       <p>
-        <code>mp invite accept|tentative|decline &lt;email-path&gt;</code> replies
+        <code>mp invite accept|tentative|decline &lt;selector&gt;</code> replies
         to a received calendar invitation. It reads the invite email's sidecar
         <code>invite.ics</code> (the source of truth for <code>UID</code>/<code>SEQUENCE</code>),
         builds a <code>METHOD:REPLY</code> with your account as the single
@@ -206,21 +232,21 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         When someone accepts or declines an invitation you sent with
         <code>mp send --invite</code>, their reply arrives as a
         <code>METHOD:REPLY</code> email during normal sync. mailypoppins matches
-        it by event <code>UID</code> to your locally-stored sent invite and
-        updates that invite's per-attendee <code>status</code> so you can see who
-        responded. This runs automatically after each sync (only when a reply
-        actually arrived), and the preview card reflects the live statuses.
+        it by event <code>UID</code> to your sent invitation and shows that
+        attendee's <code>status</code> on the invite, so you can see who
+        responded. The statuses are computed from the stored invitation and
+        reply messages every time they are shown, so the agenda and the preview
+        card are always current with what has arrived.
       </p>
       <p>
-        <code>mp calendar rebuild [--account NAME]</code> recomputes every
-        invite's attendee statuses from scratch by re-scanning the whole
-        mailstore (defaults to all accounts). It is idempotent and safe to
-        re-run: the attendee statuses are derived state reconstructible from the
-        messages on the server alone, so two machines syncing the same account
-        converge on identical state with no direct machine-to-machine sync.
-        Replies for a <code>SEQUENCE</code> older than the stored invite's are
+        <code>mp calendar rebuild [--account NAME]</code> reports what those
+        replies resolve across every stored invitation (defaults to all
+        accounts). It writes nothing: there is no cached copy of the statuses to
+        rebuild, so it is idempotent by construction, and two machines syncing
+        the same account see identical state with no direct machine-to-machine
+        sync. Replies for a <code>SEQUENCE</code> older than the invitation's are
         ignored, and the most recent reply per attendee wins.
-        <strong>This updates only your local mirror — without Graph, your
+        <strong>Nothing is written back to the server — without Graph, your
         server-side Exchange calendar is never touched.</strong>
       </p>
     </section>

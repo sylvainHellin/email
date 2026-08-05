@@ -1,19 +1,28 @@
 use email::draft::{
-    create_forward_draft, create_reply_draft, find_drafts, mark_as_approved, mark_as_draft,
-    parse_email_draft, update_status_to_sent, validate_draft,
+    create_forward_draft_from, create_reply_draft_from, find_drafts, mark_as_approved,
+    mark_as_draft, mark_draft_sent, parse_email_draft, validate_draft, SourceMessage,
 };
 use email::types::EmailStatus;
 use std::fs;
 use tempfile::tempdir;
 
-/// Write a minimal inbox email file and return its path.
-fn write_inbox_email(dir: &std::path::Path, filename: &str, from: &str, subject: &str, body: &str) -> std::path::PathBuf {
-    let path = dir.join(filename);
-    let content = format!(
-        "---\nfrom: \"{from}\"\nto: \"me@example.com\"\nsubject: \"{subject}\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<{filename}@example.com>\"\nstatus: inbox\nhas_attachments: false\n---\n\n{body}"
-    );
-    fs::write(&path, content).unwrap();
-    path
+/// The source a reply or a forward is built from.
+///
+/// Received mail is a store row, not a file (#0038), so the builders take a
+/// [`SourceMessage`] and this is what `draft::source_from_row` hands them:
+/// these tests pin the formatting of the draft, not where the source came
+/// from.
+fn source(from: &str, to: &str, subject: &str, body: &str) -> SourceMessage {
+    SourceMessage {
+        from: from.to_string(),
+        to: to.to_string(),
+        cc: None,
+        subject: subject.to_string(),
+        date: Some("Mon, 01 Jan 2024 12:00:00 +0000".to_string()),
+        body: body.to_string(),
+        attachments: Vec::new(),
+        html: None,
+    }
 }
 
 fn write_draft(dir: &std::path::Path, filename: &str, to: &str, subject: &str, body: &str, status: &str) -> std::path::PathBuf {
@@ -32,14 +41,11 @@ fn write_draft(dir: &std::path::Path, filename: &str, to: &str, subject: &str, b
 #[test]
 fn test_create_reply_draft() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "Hello", "Original body");
-
-    let draft_path = create_reply_draft(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+    let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
 
     assert!(draft_path.exists());
     let content = fs::read_to_string(&draft_path).unwrap();
@@ -59,13 +65,11 @@ fn test_create_reply_draft() {
 #[test]
 fn test_create_reply_draft_already_re_prefix() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "Re: Hello", "Body");
-    let draft_path = create_reply_draft(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+    let source = source("alice@example.com", "me@example.com", "Re: Hello", "Body");
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     // Should not double the Re: prefix
@@ -76,17 +80,19 @@ fn test_create_reply_draft_already_re_prefix() {
 #[test]
 fn test_create_reply_all_draft() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    // Source email with CC
-    let path = inbox.join("email.md");
-    let content = "---\nfrom: \"alice@example.com\"\nto: \"me@example.com, bob@example.com\"\ncc: \"carol@example.com\"\nsubject: \"Meeting\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<meeting@example.com>\"\nstatus: inbox\nhas_attachments: false\n---\n\nMeeting notes";
-    fs::write(&path, content).unwrap();
+    // Source with a CC line.
+    let mut source = source(
+        "alice@example.com",
+        "me@example.com, bob@example.com",
+        "Meeting",
+        "Meeting notes",
+    );
+    source.cc = Some("carol@example.com".to_string());
 
-    let draft_path = create_reply_draft(&path, true, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // Reply-all should have CC with bob and carol but not self
@@ -104,14 +110,11 @@ fn test_create_reply_all_draft() {
 #[test]
 fn test_create_forward_draft() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "Hello", "Forward me");
-
-    let draft_path = create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+    let source = source("alice@example.com", "me@example.com", "Hello", "Forward me");
+    let draft_path =
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
 
@@ -126,57 +129,62 @@ fn test_create_forward_draft() {
 #[test]
 fn test_forward_with_attachments() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    // Create source email with attachments
-    let source = inbox.join("email.md");
-    let att_dir = inbox.join("email_attachments");
-    fs::create_dir_all(&att_dir).unwrap();
-    fs::write(att_dir.join("report.pdf"), b"fake pdf").unwrap();
+    // The caller materialised the row's attachment blobs into files and hands
+    // over their paths, which is what `source_from_row` does for a forward.
+    let materialised = tmp.path().join("attachments");
+    fs::create_dir_all(&materialised).unwrap();
+    let report = materialised.join("report.pdf");
+    fs::write(&report, b"fake pdf").unwrap();
 
-    let content = "---\nfrom: \"alice@example.com\"\nto: \"me@example.com\"\nsubject: \"With attachment\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<att@example.com>\"\nstatus: inbox\nhas_attachments: true\nattachments:\n  - \"report.pdf\"\n---\n\nSee attached";
-    fs::write(&source, content).unwrap();
+    let mut source = source(
+        "alice@example.com",
+        "me@example.com",
+        "With attachment",
+        "See attached",
+    );
+    source.attachments = vec![report.clone()];
 
-    let draft_path = create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
-    // Forward should reference the attachment
+    // Forward should reference the attachment by the path it was given.
     assert!(draft_content.contains("attachments:"));
-    assert!(draft_content.contains("report.pdf"));
+    assert!(draft_content.contains(report.to_string_lossy().as_ref()));
 }
 
-/// Ticket #0006: forwarding an email and then archiving the source must not
-/// invalidate the attachment paths in the draft. The forward draft should
-/// reference the per-account stable attachments mirror, which survives
-/// `move_local_email` of the source.
+/// Ticket #0006: forwarding a message and then losing the source mailbox must
+/// not invalidate the attachment paths in the draft. The forward references
+/// the per-account stable attachments mirror, which is where the store-backed
+/// source (`draft::source_from_row`) materialises a row's blobs, so it
+/// survives the source row being archived, evicted or deleted.
 #[test]
 fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     let tmp = tempdir().unwrap();
     let account = tmp.path().join("account");
-    let inbox = account.join("inbox");
-    let archive = account.join("archive");
     let drafts = account.join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&archive).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = inbox.join("email.md");
-    let att_dir = inbox.join("email_attachments");
-    fs::create_dir_all(&att_dir).unwrap();
-    fs::write(att_dir.join("report.pdf"), b"fake pdf").unwrap();
+    let stable = email::parse::stable_attachments_dir(&account, "<att-archive@example.com>");
+    fs::create_dir_all(&stable).unwrap();
+    fs::write(stable.join("report.pdf"), b"fake pdf").unwrap();
 
-    let content = "---\nfrom: \"alice@example.com\"\nto: \"me@example.com\"\nsubject: \"With attachment\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<att-archive@example.com>\"\nstatus: inbox\nhas_attachments: true\nattachments:\n  - \"report.pdf\"\n---\n\nSee attached";
-    fs::write(&source, content).unwrap();
+    let mut source = source(
+        "alice@example.com",
+        "me@example.com",
+        "With attachment",
+        "See attached",
+    );
+    source.attachments = vec![stable.join("report.pdf")];
 
     let draft_path =
-        create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
 
-    // Move the source into archive (this also moves the per-mailbox _attachments/).
-    email::sync::move_local_email(&source, &archive, "inbox", "archived").unwrap();
-    assert!(!source.exists());
+    // The source's own mailbox goes away; the mirror does not.
+    let inbox = account.join("inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::remove_dir_all(&inbox).unwrap();
 
     // Re-parse the draft and resolve every attachment path on disk.
     let draft = parse_email_draft(&draft_path).unwrap();
@@ -185,7 +193,7 @@ fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     for path in &attachments {
         assert!(
             std::path::Path::new(path).exists(),
-            "attachment must still be readable after archive: {}",
+            "attachment must still be readable after the source is gone: {}",
             path
         );
         let bytes = fs::read(path).unwrap();
@@ -200,18 +208,20 @@ fn test_forward_then_archive_source_keeps_attachment_resolvable() {
 #[test]
 fn test_reply_with_companion_html() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "HTML email", "Plain text body");
+    // The html blob of the row (`store::read::load_html`) is what the source
+    // carries; the reply wraps it as the draft's companion.
+    let mut source = source(
+        "alice@example.com",
+        "me@example.com",
+        "HTML email",
+        "Plain text body",
+    );
+    source.html = Some("<p>Rich HTML body</p>".to_string());
 
-    // Write companion HTML
-    let html_path = inbox.join("email.html");
-    fs::write(&html_path, "<p>Rich HTML body</p>").unwrap();
-
-    let draft_path = create_reply_draft(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
 
     // Draft should have a companion HTML with quoted content
     let draft_html = draft_path.with_extension("html");
@@ -330,25 +340,22 @@ fn test_mark_as_draft_inbox_fails() {
 }
 
 #[test]
-fn test_update_status_to_sent() {
+fn test_mark_draft_sent() {
     let tmp = tempdir().unwrap();
     let drafts = tmp.path().join("drafts");
-    let sent = tmp.path().join("sent");
     fs::create_dir_all(&drafts).unwrap();
 
     let path = write_draft(&drafts, "draft.md", "alice@example.com", "Test", "Body", "approved");
     let draft = parse_email_draft(&path).unwrap();
 
-    update_status_to_sent(&draft, Some(sent.as_path()), Some("<msg123@example.com>")).unwrap();
+    mark_draft_sent(&draft, Some("<msg123@example.com>")).unwrap();
 
-    // Original should be removed
-    assert!(!path.exists());
+    // The draft is marked in place: there is no local sent `.md` any more,
+    // the Sent copy is the durable outbox's (#0037).
+    assert!(path.exists());
+    assert!(!tmp.path().join("sent").exists());
 
-    // Sent file should exist
-    let sent_file = sent.join("draft.md");
-    assert!(sent_file.exists());
-
-    let sent_draft = parse_email_draft(&sent_file).unwrap();
+    let sent_draft = parse_email_draft(&path).unwrap();
     assert_eq!(sent_draft.frontmatter.status, EmailStatus::Sent);
     assert!(sent_draft.frontmatter.sent_at.is_some());
     assert_eq!(sent_draft.frontmatter.message_id, Some("<msg123@example.com>".to_string()));
@@ -395,32 +402,16 @@ fn test_find_drafts_ignores_non_md_files() {
 }
 
 // -----------------------------------------------------------------------
-// update_status_to_sent edge cases
+// mark_draft_sent edge cases
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_update_status_to_sent_in_place() {
+fn test_mark_draft_sent_without_message_id() {
     let tmp = tempdir().unwrap();
     let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", "approved");
     let draft = parse_email_draft(&path).unwrap();
 
-    // No sent_dir: update in place
-    update_status_to_sent(&draft, None, Some("<msg@example.com>")).unwrap();
-
-    assert!(path.exists());
-    let updated = parse_email_draft(&path).unwrap();
-    assert_eq!(updated.frontmatter.status, EmailStatus::Sent);
-    assert!(updated.frontmatter.sent_at.is_some());
-    assert_eq!(updated.frontmatter.message_id, Some("<msg@example.com>".to_string()));
-}
-
-#[test]
-fn test_update_status_to_sent_without_message_id() {
-    let tmp = tempdir().unwrap();
-    let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", "approved");
-    let draft = parse_email_draft(&path).unwrap();
-
-    update_status_to_sent(&draft, None, None).unwrap();
+    mark_draft_sent(&draft, None).unwrap();
 
     let updated = parse_email_draft(&path).unwrap();
     assert_eq!(updated.frontmatter.status, EmailStatus::Sent);
@@ -428,10 +419,9 @@ fn test_update_status_to_sent_without_message_id() {
 }
 
 #[test]
-fn test_update_status_to_sent_cleans_companion_html() {
+fn test_mark_draft_sent_cleans_companion_html() {
     let tmp = tempdir().unwrap();
     let drafts = tmp.path().join("drafts");
-    let sent = tmp.path().join("sent");
     fs::create_dir_all(&drafts).unwrap();
 
     let path = write_draft(&drafts, "draft.md", "alice@example.com", "Test", "Body", "approved");
@@ -439,7 +429,7 @@ fn test_update_status_to_sent_cleans_companion_html() {
     fs::write(&html_path, "<p>companion</p>").unwrap();
 
     let draft = parse_email_draft(&path).unwrap();
-    update_status_to_sent(&draft, Some(sent.as_path()), None).unwrap();
+    mark_draft_sent(&draft, None).unwrap();
 
     // Companion HTML should be cleaned up
     assert!(!html_path.exists());
@@ -473,13 +463,11 @@ fn test_parse_email_draft_no_frontmatter() {
 #[test]
 fn test_forward_draft_already_fwd_prefix() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "Fwd: Original", "Body");
-    let draft_path = create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+    let source = source("alice@example.com", "me@example.com", "Fwd: Original", "Body");
+    let draft_path =
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     // Should not double the Fwd: prefix
@@ -490,16 +478,13 @@ fn test_forward_draft_already_fwd_prefix() {
 #[test]
 fn test_forward_draft_with_companion_html() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
-    let source = write_inbox_email(&inbox, "email.md", "alice@example.com", "Hello", "Body");
-    let html_path = inbox.join("email.html");
-    fs::write(&html_path, "<p>Rich content</p>").unwrap();
+    let mut source = source("alice@example.com", "me@example.com", "Hello", "Body");
+    source.html = Some("<p>Rich content</p>".to_string());
 
-    let draft_path = create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
 
     let draft_html = draft_path.with_extension("html");
     assert!(draft_html.exists());
@@ -515,17 +500,13 @@ fn test_forward_draft_with_companion_html() {
 #[test]
 fn test_reply_all_excludes_self_from_cc() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
     // All recipients are self -- CC should be absent
-    let path = inbox.join("email.md");
-    let content = "---\nfrom: \"alice@example.com\"\nto: \"me@example.com\"\nsubject: \"Solo\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<solo@example.com>\"\nstatus: inbox\nhas_attachments: false\n---\n\nBody";
-    fs::write(&path, content).unwrap();
+    let source = source("alice@example.com", "me@example.com", "Solo", "Body");
 
-    let draft_path = create_reply_draft(&path, true, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // No cc line should appear since the only other recipient is self
@@ -535,17 +516,19 @@ fn test_reply_all_excludes_self_from_cc() {
 #[test]
 fn test_reply_deduplicates_cc_addresses() {
     let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("inbox");
     let drafts = tmp.path().join("drafts");
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&drafts).unwrap();
 
     // bob appears in both To and CC
-    let path = inbox.join("email.md");
-    let content = "---\nfrom: \"alice@example.com\"\nto: \"me@example.com, bob@example.com\"\ncc: \"bob@example.com, carol@example.com\"\nsubject: \"Dupes\"\ndate: \"Mon, 01 Jan 2024 12:00:00 +0000\"\nmessage_id: \"<dupes@example.com>\"\nstatus: inbox\nhas_attachments: false\n---\n\nBody";
-    fs::write(&path, content).unwrap();
+    let mut source = source(
+        "alice@example.com",
+        "me@example.com, bob@example.com",
+        "Dupes",
+        "Body",
+    );
+    source.cc = Some("bob@example.com, carol@example.com".to_string());
 
-    let draft_path = create_reply_draft(&path, true, "me@example.com", Some(drafts.as_path())).unwrap();
+    let draft_path =
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // bob should appear only once in cc
@@ -562,6 +545,8 @@ fn test_validate_draft_missing_attachment_warning() {
     let draft = email::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
         frontmatter: email::types::EmailFrontmatter {
+            id: None,
+            date: None,
             to: Some("alice@example.com".to_string()),
             cc: None,
             bcc: None,
@@ -592,6 +577,8 @@ fn test_validate_draft_existing_attachment_no_warning() {
     let draft = email::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
         frontmatter: email::types::EmailFrontmatter {
+            id: None,
+            date: None,
             to: Some("alice@example.com".to_string()),
             cc: None,
             bcc: None,

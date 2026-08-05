@@ -6,8 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::{
     Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
-    EmailEntry, Focus, MailboxKind, MailboxPicker, Message, Overlay, RsvpChoice, RsvpOverlay,
-    SearchOverlayFocus,
+    EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
+    RsvpOverlay, SearchBodies, SearchOverlayFocus,
 };
 
 impl App {
@@ -365,8 +365,8 @@ impl App {
             A::CalendarOpenSource => {
                 self.pending_prefix = None;
                 if let Some(event) = self.selected_event() {
-                    let path = event.path.clone();
-                    self.push_action(Action::OpenEventSource { path });
+                    let msg = event.msg;
+                    self.push_action(Action::OpenEventSource { msg });
                 }
             }
             A::CalendarRsvp => {
@@ -437,10 +437,13 @@ impl App {
             }
             A::Forward => {
                 self.pending_prefix = None;
-                if let Some(path) = self.selected_email_path() {
-                    self.push_action(Action::OpenComposeWizard(ComposeMode::Forward {
-                        source_path: path,
-                    }));
+                if let Some(msg) = self.selected_email_ref() {
+                    self.push_action(Action::OpenComposeWizard(ComposeMode::Forward { msg }));
+                } else if self.selected_email().is_some() {
+                    // A Drafts row has no message behind it to forward.
+                    self.set_status(
+                        "Forward needs a received message; a draft has none to quote".to_string(),
+                    );
                 }
             }
             A::EditRecipients => {
@@ -448,9 +451,12 @@ impl App {
                 // hint (the guard is advisory, resolved everywhere).
                 self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
-                    if let Some(path) = self.selected_email_path() {
+                    // The draft is named by its `id:`, not by the path it
+                    // happens to sit at: the wizard resolves it through the
+                    // drafts index when it opens and again when it submits.
+                    if let Some(id) = self.selected_email().and_then(|e| e.draft_id.clone()) {
                         self.push_action(Action::OpenComposeWizard(ComposeMode::EditDraft {
-                            source_path: path,
+                            id,
                         }));
                     }
                 } else {
@@ -461,7 +467,7 @@ impl App {
             }
             A::SelectAllVisible => {
                 self.pending_prefix = None;
-                self.selection = self.visible_emails().map(|e| e.path.clone()).collect();
+                self.selection = self.visible_emails().filter_map(|e| e.key()).collect();
             }
             A::Archive => {
                 self.pending_prefix = None;
@@ -500,12 +506,11 @@ impl App {
             A::Approve => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let count = self.selection.len();
-                    self.overlay = Overlay::Confirm(ConfirmDialog {
-                        title: format!("Approve {} drafts?", count),
-                        detail: format!("{} selected drafts", count),
-                        action: ConfirmAction::Approve,
-                    });
+                    self.confirm_draft_batch(
+                        "Approve",
+                        |count| format!("Approve {count} drafts?"),
+                        ConfirmAction::Approve,
+                    );
                 } else {
                     self.push_action(Action::Approve);
                 }
@@ -513,12 +518,11 @@ impl App {
             A::MarkDraft => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let count = self.selection.len();
-                    self.overlay = Overlay::Confirm(ConfirmDialog {
-                        title: format!("Mark {} drafts as draft?", count),
-                        detail: format!("{} selected drafts", count),
-                        action: ConfirmAction::MarkDraft,
-                    });
+                    self.confirm_draft_batch(
+                        "Mark as draft",
+                        |count| format!("Mark {count} drafts as draft?"),
+                        ConfirmAction::MarkDraft,
+                    );
                 } else {
                     self.push_action(Action::MarkDraft);
                 }
@@ -541,15 +545,16 @@ impl App {
                     action: ConfirmAction::SendApproved,
                 });
             }
-            A::CopyPath => {
+            A::CopyMessageRef => {
                 self.pending_prefix = None;
-                self.push_action(Action::CopyPath);
+                self.push_action(Action::CopyMessageRef);
             }
             A::ToggleRead => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let paths: Vec<PathBuf> = self.selection.iter().cloned().collect();
-                    self.push_action(Action::BatchToggleRead(paths));
+                    let msgs: Vec<MessageRef> =
+                        self.selection.iter().filter_map(|k| k.msg()).collect();
+                    self.push_action(Action::BatchToggleRead(msgs));
                 } else {
                     self.push_action(Action::ToggleRead);
                 }
@@ -596,22 +601,27 @@ impl App {
             }
             A::OpenInBrowser => {
                 self.pending_prefix = None;
-                if let Some(email) = self.selected_email() {
-                    let html_path = email.path.with_extension("html");
-                    if html_path.exists() {
-                        self.push_action(Action::OpenHtmlInBrowser(html_path));
-                    } else {
-                        self.set_status("No HTML version available".to_string());
+                // The markup is a blob (or the html part of the raw message),
+                // not a `.html` beside a `.md`, so it is written to a temp
+                // file on demand and that is what the browser opens (#0052
+                // scope item 9).
+                if let Some(msg) = self.selected_email_ref() {
+                    if let Some(path) =
+                        crate::tui::actions::html_rendition_for_row(self, msg.row_id())
+                    {
+                        self.push_action(Action::OpenHtmlInBrowser(path));
                     }
                 }
             }
             A::ToggleSelect => {
                 self.pending_prefix = None;
-                if let Some(path) = self.selected_email_path() {
-                    if self.selection.contains(&path) {
-                        self.selection.remove(&path);
+                // Drafts are selectable too (#0052): the set is keyed on
+                // `EntryKey`, so the Drafts mailbox has a batch again.
+                if let Some(key) = self.selected_email().and_then(|e| e.key()) {
+                    if self.selection.contains(&key) {
+                        self.selection.remove(&key);
                     } else {
-                        self.selection.insert(path);
+                        self.selection.insert(key);
                     }
                     if self.list_index < self.visible.len() - 1 {
                         self.list_index += 1;
@@ -651,6 +661,39 @@ impl App {
         None
     }
 
+    /// Open the confirmation for a batch that writes to draft files, or say
+    /// why there is nothing to confirm.
+    ///
+    /// The batch takes the drafts half of the selection (see
+    /// [`Self::handle_confirm_key`]), so a selection holding no draft key --
+    /// `A` over a received-mail selection, which the keymap allows -- has
+    /// nothing to approve. Without this guard the dialog opened on the full
+    /// count and the batch then reported "Approved 0 drafts", asking a
+    /// question whose only honest answer was already known.
+    fn confirm_draft_batch(
+        &mut self,
+        what: &str,
+        title: impl Fn(usize) -> String,
+        action: ConfirmAction,
+    ) {
+        let count = self
+            .selection
+            .iter()
+            .filter(|key| key.draft().is_some())
+            .count();
+        if count == 0 {
+            self.set_status(format!(
+                "{what} needs drafts; the selection has no draft in it"
+            ));
+            return;
+        }
+        self.overlay = Overlay::Confirm(ConfirmDialog {
+            title: title(count),
+            detail: format!("{count} selected drafts"),
+            action,
+        });
+    }
+
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Message> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
@@ -658,21 +701,37 @@ impl App {
                     std::mem::replace(&mut self.overlay, Overlay::None)
                 {
                     match dialog.action {
+                        // Approve and mark-draft write to draft files, so they
+                        // take the drafts half of the selection; archive and
+                        // delete are store mutations and take the messages
+                        // half (#0052). A selection never holds both -- one
+                        // mailbox lists one kind of row and switching clears
+                        // the set -- but each side filters rather than assumes.
                         ConfirmAction::Approve if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchApprove(paths));
+                            let ids: Vec<String> = self
+                                .selection
+                                .drain()
+                                .filter_map(|k| k.draft().map(str::to_string))
+                                .collect();
+                            self.push_action(Action::BatchApprove(ids));
                         }
                         ConfirmAction::MarkDraft if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchMarkDraft(paths));
+                            let ids: Vec<String> = self
+                                .selection
+                                .drain()
+                                .filter_map(|k| k.draft().map(str::to_string))
+                                .collect();
+                            self.push_action(Action::BatchMarkDraft(ids));
                         }
                         ConfirmAction::Archive if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchArchive(paths));
+                            let msgs: Vec<MessageRef> =
+                                self.selection.drain().filter_map(|k| k.msg()).collect();
+                            self.push_action(Action::BatchArchive(msgs));
                         }
                         ConfirmAction::Delete if !self.selection.is_empty() => {
-                            let paths: Vec<PathBuf> = self.selection.drain().collect();
-                            self.push_action(Action::BatchDelete(paths));
+                            let msgs: Vec<MessageRef> =
+                                self.selection.drain().filter_map(|k| k.msg()).collect();
+                            self.push_action(Action::BatchDelete(msgs));
                         }
                         _ => {
                             self.push_action(match dialog.action {
@@ -1105,7 +1164,7 @@ impl App {
         let Some(email) = self.selected_email() else {
             return;
         };
-        if !email.is_invite() {
+        if !email.is_invite {
             self.set_status("Not a calendar invite".to_string());
             return;
         }
@@ -1115,19 +1174,30 @@ impl App {
             );
             return;
         }
-        if !email.is_request_invite() {
+        let subject = email.subject.clone();
+        let Some(msg) = email.msg else {
+            self.set_status("This search hit has no local copy to RSVP from".to_string());
+            return;
+        };
+        // The method and the summary live in the ics blob, which is parsed for
+        // the selected message only (#0038 item 6). The cursor is on it, so
+        // this is the memo the render pass already filled in the common case.
+        let event = self.load_message_invite(msg);
+        let is_request = event
+            .as_ref()
+            .and_then(|e| e.method.as_deref())
+            .is_some_and(|m| m.eq_ignore_ascii_case("REQUEST"));
+        if !is_request {
             self.set_status(
                 "Only received invitations (REQUEST) can be RSVP'd".to_string(),
             );
             return;
         }
-        let summary = email
-            .event
-            .as_ref()
-            .and_then(|e| e.summary.clone())
-            .unwrap_or_else(|| email.subject.clone());
+        let summary = event
+            .and_then(|e| e.summary)
+            .unwrap_or(subject);
         self.overlay = Overlay::Rsvp(RsvpOverlay {
-            path: email.path.clone(),
+            msg,
             summary,
             selected: 0,
         });
@@ -1171,9 +1241,9 @@ impl App {
             .summary
             .clone()
             .unwrap_or_else(|| event.subject.clone());
-        let path = event.path.clone();
+        let msg = event.msg;
         self.overlay = Overlay::Rsvp(RsvpOverlay {
-            path,
+            msg,
             summary,
             selected: 0,
         });
@@ -1205,7 +1275,7 @@ impl App {
                     return None;
                 };
                 self.push_action(Action::Rsvp {
-                    path: overlay.path,
+                    msg: overlay.msg,
                     choice,
                 });
                 // Consume-and-close: promote any error queued behind it.
@@ -1459,10 +1529,10 @@ impl App {
             return;
         }
 
-        let paths: Vec<PathBuf> = if !self.selection.is_empty() {
-            self.selection.iter().cloned().collect()
-        } else if let Some(p) = self.selected_email_path() {
-            vec![p]
+        let msgs: Vec<MessageRef> = if !self.selection.is_empty() {
+            self.selection.iter().filter_map(|k| k.msg()).collect()
+        } else if let Some(m) = self.selected_email_ref() {
+            vec![m]
         } else {
             return;
         };
@@ -1485,7 +1555,7 @@ impl App {
             candidates,
             filtered,
             selected: 0,
-            paths,
+            msgs,
         });
     }
 
@@ -1513,7 +1583,7 @@ impl App {
                     };
                     self.selection.clear();
                     self.push_action(Action::MoveToMailbox {
-                        paths: picker.paths,
+                        msgs: picker.msgs,
                         dest_idx,
                     });
                     // Consume-and-close: promote any error queued behind it.
@@ -1537,68 +1607,68 @@ impl App {
     }
 
     /// Helper to open the attachment picker in the given mode.
+    ///
+    /// The files come out of `message_blobs` (#0052 scope item 8): the row
+    /// under the cursor is materialised into a temp directory the way
+    /// `mp open` and `mp save` do it, and the picker and the save pipeline
+    /// below it address those files, as they always did.
     fn open_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        if let Some(email) = self.selected_email() {
-            match crate::parse::list_attachments(&email.path) {
-                Ok(files) if files.is_empty() => {
-                    self.set_status("No attachments".to_string());
-                }
-                Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Open => {
-                    self.push_action(Action::OpenAttachment(files.into_iter().next().unwrap()));
-                }
-                Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Save => {
-                    // Single file in save mode -- skip picker, go straight to dir picker
-                    let sources = files;
-                    self.open_dir_picker(sources);
-                }
-                Ok(files) => {
-                    self.overlay = Overlay::Attachment(AttachmentPicker {
-                        files,
-                        selected: 0,
-                        mode,
-                        selected_set: HashSet::new(),
-                    });
-                }
-                Err(e) => {
-                    self.set_status(format!("Attachments error: {e}"));
-                }
-            }
-        }
+        let Some(files) = crate::tui::actions::cursor_attachment_files(self) else {
+            return;
+        };
+        self.present_attachments(files, mode);
     }
 
     /// Helper to open the attachment picker for a search result.
-    /// Saves the search result locally first, then feeds into the same
-    /// attachment picker / dir picker pipeline as the regular list.
+    ///
+    /// A hit that resolved to a local row is [`Self::open_attachment_picker`]
+    /// exactly; one that did not has the attachment bytes of the fetch the
+    /// overlay is rendering, which are written out to the same temp area, so
+    /// neither half declines (#0052 scope item 11).
     fn open_search_result_attachment_picker(&mut self, mode: AttachmentPickerMode) {
-        let path = match super::super::helpers::ensure_search_result_saved(self) {
-            Some(p) => p,
-            None => {
-                self.set_status("Failed to save email locally".to_string());
-                return;
-            }
+        let Some(hit) = self.server_search_results.get(self.server_search_index) else {
+            return;
         };
-
-        match crate::parse::list_attachments(&path) {
-            Ok(files) if files.is_empty() => {
-                self.set_status("No attachments".to_string());
+        let msg = hit.entry.msg;
+        let index = self.server_search_index;
+        // Cloned only for the unresolved hit, which is the one case that needs
+        // the fetched payload while `self` is borrowed mutably below.
+        let fetched = msg.is_none().then(|| hit.fetched.clone());
+        let files = match (msg, fetched) {
+            (Some(msg), _) => crate::tui::actions::row_attachment_files(self, msg.row_id()),
+            (None, Some(fetched)) => {
+                crate::tui::actions::fetched_attachment_files(self, &fetched, index)
             }
-            Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Open => {
+            (None, None) => None,
+        };
+        let Some(files) = files else {
+            return;
+        };
+        self.present_attachments(files, mode);
+    }
+
+    /// Put a materialised attachment list in front of the user: nothing to
+    /// show says so, one file skips the picker (`o` opens it, `O` goes
+    /// straight to the directory picker), several open the picker.
+    ///
+    /// The pre-store build's own branching, kept: only the origin of the files
+    /// changed. `mp open`'s CLI shortcut of opening every attachment at once
+    /// stays CLI-only, because a TUI that opened six windows on one keypress
+    /// would be the surprising half of the two.
+    fn present_attachments(&mut self, files: Vec<PathBuf>, mode: AttachmentPickerMode) {
+        match files.len() {
+            0 => self.set_status("No attachments".to_string()),
+            1 if mode == AttachmentPickerMode::Open => {
                 self.push_action(Action::OpenAttachment(files.into_iter().next().unwrap()));
             }
-            Ok(files) if files.len() == 1 && mode == AttachmentPickerMode::Save => {
-                let sources = files;
-                self.open_dir_picker(sources);
-            }
-            Ok(files) => {
+            1 => self.open_dir_picker(files),
+            _ => {
                 self.overlay = Overlay::Attachment(AttachmentPicker {
                     files,
                     selected: 0,
                     mode,
                     selected_set: HashSet::new(),
                 });
-            }
-            Err(e) => {
-                self.set_status(format!("Attachments error: {e}"));
             }
         }
     }
@@ -1808,15 +1878,15 @@ impl App {
         if self.search_query.is_empty() {
             self.visible = (0..self.emails.len()).collect();
         } else {
+            self.sync_search_bodies();
             let kind = self.active_kind();
-            let includes_body = self.search_includes_body;
+            let bodies = self.search_includes_body.then_some(&self.search_bodies);
             if narrow {
                 let needle = self.search_query.to_lowercase();
-                narrow_visible(&self.emails, &mut self.visible, &needle, kind, includes_body);
+                narrow_visible(&self.emails, &mut self.visible, &needle, kind, bodies);
             } else {
                 // `filter_visible` lowercases the needle once internally.
-                self.visible =
-                    filter_visible(&self.emails, &self.search_query, kind, includes_body);
+                self.visible = filter_visible(&self.emails, &self.search_query, kind, bodies);
             }
         }
 
@@ -1842,11 +1912,17 @@ impl App {
 // ---------------------------------------------------------------------------
 
 /// Does `email` match the (already lowercased) search needle?
+///
+/// `bodies` is `Some` only in body-search mode (`\`), and holds the mailbox's
+/// bodies already lowercased, so the body test is the same substring test the
+/// entry used to answer from its own `body` field before it became lazy
+/// (#0038 scope item 5). An entry the index has no body for (no store row, or
+/// a blob the retention sweep evicted) simply does not match on body.
 fn email_matches(
     email: &EmailEntry,
     needle_lower: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) -> bool {
     email.subject.to_lowercase().contains(needle_lower)
         || email
@@ -1856,7 +1932,10 @@ fn email_matches(
         || email.date_display.to_lowercase().contains(needle_lower)
         || email.from.to_lowercase().contains(needle_lower)
         || email.to.to_lowercase().contains(needle_lower)
-        || (includes_body && email.body.to_lowercase().contains(needle_lower))
+        || bodies
+            .zip(email.msg)
+            .and_then(|(bodies, msg)| bodies.get(msg))
+            .is_some_and(|body| body.contains(needle_lower))
 }
 
 /// Build the visible-index view of `emails` for `query` from scratch.
@@ -1865,7 +1944,7 @@ pub(super) fn filter_visible(
     emails: &[EmailEntry],
     query: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) -> Vec<usize> {
     if query.is_empty() {
         return (0..emails.len()).collect();
@@ -1874,7 +1953,7 @@ pub(super) fn filter_visible(
     emails
         .iter()
         .enumerate()
-        .filter(|(_, e)| email_matches(e, &needle, kind, includes_body))
+        .filter(|(_, e)| email_matches(e, &needle, kind, bodies))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1887,12 +1966,12 @@ fn narrow_visible(
     visible: &mut Vec<usize>,
     needle_lower: &str,
     kind: MailboxKind,
-    includes_body: bool,
+    bodies: Option<&SearchBodies>,
 ) {
     visible.retain(|&i| {
         emails
             .get(i)
-            .is_some_and(|e| email_matches(e, needle_lower, kind, includes_body))
+            .is_some_and(|e| email_matches(e, needle_lower, kind, bodies))
     });
 }
 
@@ -2041,12 +2120,25 @@ fn refresh_browser_entries(picker: &mut DirPicker) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{AttachmentPicker, EntryKey};
     use super::super::PersistentError;
     use std::path::PathBuf;
 
-    fn entry(subject: &str, from: &str, body: &str) -> EmailEntry {
+    /// A `MessageRef` derived from the subject, so the same fixture email
+    /// built twice (a reload delivering a re-sorted `sample()`) carries the
+    /// same identity, exactly as two loads of one store row would. The
+    /// subject is the fixtures' de-facto primary key.
+    fn ref_for(subject: &str) -> MessageRef {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        subject.hash(&mut h);
+        MessageRef::new((h.finish() >> 1) as i64)
+    }
+
+    fn entry(subject: &str, from: &str) -> EmailEntry {
         EmailEntry {
-            path: PathBuf::from(format!("/mail/inbox/{subject}.md")),
+            msg: Some(ref_for(subject)),
+            draft_id: None,
             from: from.to_string(),
             to: "me@example.com".to_string(),
             cc: None,
@@ -2054,20 +2146,39 @@ mod tests {
             status: "inbox".to_string(),
             date_display: "2026-07-01".to_string(),
             date_sort: "2026-07-01T00:00:00".to_string(),
-            body: body.to_string(),
             has_attachments: false,
             read: false,
-            event: None,
+            is_invite: false,
         }
     }
 
     fn sample() -> Vec<EmailEntry> {
         vec![
-            entry("Invoice March", "Alice", "please pay"),
-            entry("Invoice April", "Bob", "reminder"),
-            entry("Weekly report", "Alice", "invoice attached"),
-            entry("Holiday plans", "Carol", "beach"),
+            entry("Invoice March", "Alice"),
+            entry("Invoice April", "Bob"),
+            entry("Weekly report", "Alice"),
+            entry("Holiday plans", "Carol"),
         ]
+    }
+
+    /// The bodies of `sample()`, in the shape body search now takes them:
+    /// an index the store filled, keyed by the same `MessageRef` the entry
+    /// carries (#0038 scope item 5). These are the exact strings the entries
+    /// used to hold in an `EmailEntry.body` field.
+    fn sample_bodies() -> Vec<(MessageRef, String)> {
+        [
+            ("Invoice March", "please pay"),
+            ("Invoice April", "reminder"),
+            ("Weekly report", "invoice attached"),
+            ("Holiday plans", "beach"),
+        ]
+        .into_iter()
+        .map(|(subject, body)| (ref_for(subject), body.to_string()))
+        .collect()
+    }
+
+    fn sample_index() -> SearchBodies {
+        SearchBodies::for_tests(sample_bodies())
     }
 
     // -----------------------------------------------------------------------
@@ -2078,7 +2189,7 @@ mod tests {
     fn empty_query_yields_all_indices_in_order() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "", MailboxKind::Inbox, false),
+            filter_visible(&emails, "", MailboxKind::Inbox, None),
             vec![0, 1, 2, 3]
         );
     }
@@ -2087,7 +2198,7 @@ mod tests {
     fn filter_matches_subject_case_insensitively() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "INVOICE", MailboxKind::Inbox, false),
+            filter_visible(&emails, "INVOICE", MailboxKind::Inbox, None),
             vec![0, 1]
         );
     }
@@ -2097,7 +2208,7 @@ mod tests {
         let emails = sample();
         // Inbox displays `from`; Alice appears in entries 0 and 2.
         assert_eq!(
-            filter_visible(&emails, "alice", MailboxKind::Inbox, false),
+            filter_visible(&emails, "alice", MailboxKind::Inbox, None),
             vec![0, 2]
         );
     }
@@ -2106,11 +2217,11 @@ mod tests {
     fn body_matches_only_when_included() {
         let emails = sample();
         assert_eq!(
-            filter_visible(&emails, "beach", MailboxKind::Inbox, false),
+            filter_visible(&emails, "beach", MailboxKind::Inbox, None),
             Vec::<usize>::new()
         );
         assert_eq!(
-            filter_visible(&emails, "beach", MailboxKind::Inbox, true),
+            filter_visible(&emails, "beach", MailboxKind::Inbox, Some(&sample_index())),
             vec![3]
         );
     }
@@ -2118,7 +2229,7 @@ mod tests {
     #[test]
     fn filter_indices_map_back_to_underlying_entries() {
         let emails = sample();
-        let visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, true);
+        let visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, Some(&sample_index()));
         // "invoice" hits subjects 0/1 and the body of 2 (content search).
         assert_eq!(visible, vec![0, 1, 2]);
         // Selecting position 2 of the view must resolve to "Weekly report":
@@ -2134,22 +2245,23 @@ mod tests {
     fn narrowing_equals_full_recompute_on_append() {
         let emails = sample();
         // Simulate typing "inv" then "invo": narrow from the "inv" view.
-        let mut visible = filter_visible(&emails, "inv", MailboxKind::Inbox, true);
-        narrow_visible(&emails, &mut visible, "invo", MailboxKind::Inbox, true);
+        let bodies = sample_index();
+        let mut visible = filter_visible(&emails, "inv", MailboxKind::Inbox, Some(&bodies));
+        narrow_visible(&emails, &mut visible, "invo", MailboxKind::Inbox, Some(&bodies));
         assert_eq!(
             visible,
-            filter_visible(&emails, "invo", MailboxKind::Inbox, true)
+            filter_visible(&emails, "invo", MailboxKind::Inbox, Some(&bodies))
         );
     }
 
     #[test]
     fn narrowing_removes_entries_that_stop_matching() {
         let emails = sample();
-        let mut visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, false);
+        let mut visible = filter_visible(&emails, "invoice", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0, 1]);
-        narrow_visible(&emails, &mut visible, "invoice m", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice m", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0]);
-        narrow_visible(&emails, &mut visible, "invoice mx", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice mx", MailboxKind::Inbox, None);
         assert!(visible.is_empty());
     }
 
@@ -2158,7 +2270,7 @@ mod tests {
         let emails = sample();
         // A stale index beyond the list must be dropped, not panic.
         let mut visible = vec![0, 99];
-        narrow_visible(&emails, &mut visible, "invoice", MailboxKind::Inbox, false);
+        narrow_visible(&emails, &mut visible, "invoice", MailboxKind::Inbox, None);
         assert_eq!(visible, vec![0]);
     }
 
@@ -2171,7 +2283,7 @@ mod tests {
         // would drop the entry forever; the fifth keystroke must fall
         // back to a full recompute and bring it back.
         let mut emails = sample();
-        emails.push(entry("θεοσφανια", "Dora", ""));
+        emails.push(entry("θεοσφανια", "Dora"));
         let theos_idx = emails.len() - 1;
         let mut app = app_with_emails(emails);
         app.focus = Focus::Search;
@@ -2195,7 +2307,151 @@ mod tests {
         app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
         app.mailbox_counts = vec![app.emails.len()];
         app.rebuild_visible();
+        // The fixture has no store behind it, so the index body search would
+        // have read from the blob store is primed instead.
+        app.prime_search_bodies(sample_bodies());
         app
+    }
+
+    /// A Drafts row: no `messages` row behind it, its indexed `id:` instead
+    /// (what `entry_from_draft` builds).
+    fn draft_entry(id: &str, subject: &str) -> EmailEntry {
+        EmailEntry {
+            msg: None,
+            draft_id: Some(id.to_string()),
+            subject: subject.to_string(),
+            status: "draft".to_string(),
+            read: true,
+            ..entry(subject, "me")
+        }
+    }
+
+    /// A draft can enter the selection (#0052).
+    ///
+    /// It could not while the set was keyed on `MessageRef`: a draft has no
+    /// store row, so `Ctrl+a` in Drafts selected nothing and `A` fell through
+    /// to the single-draft path. The batch it guarded was reachable by
+    /// keystroke and dead in fact.
+    #[test]
+    fn select_all_in_drafts_takes_the_draft_keys() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selection.len(), 2);
+        let mut ids: Vec<&str> = app.selection.iter().filter_map(|k| k.draft()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["aaa", "bbb"]);
+    }
+
+    /// `v` toggles a Drafts row in and out of the selection like any other.
+    #[test]
+    fn toggling_selects_the_draft_under_the_cursor() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert_eq!(
+            app.selection.iter().next().and_then(|k| k.draft()),
+            Some("aaa")
+        );
+        // The cursor moved on; toggling the second row leaves both selected.
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert_eq!(app.selection.len(), 2);
+    }
+
+    /// `A` over a Drafts selection confirms, then queues the batch by draft
+    /// id: approving is a write to a file, and a draft has no `MessageRef`
+    /// to name it by.
+    #[test]
+    fn confirming_a_drafts_selection_queues_the_batch_by_id() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(matches!(app.overlay, Overlay::Confirm(_)));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchApprove(mut ids)) => {
+                ids.sort();
+                assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
+            }
+            other => panic!("expected BatchApprove, got {other:?}"),
+        }
+        assert!(app.selection.is_empty(), "the confirm drained the selection");
+    }
+
+    /// `A` and `D` over a received-mail selection ask nothing: the batch takes
+    /// the drafts half of the set, so a selection with no draft in it would
+    /// have confirmed "Approve 4 drafts?" and then reported "Approved 0
+    /// drafts".
+    #[test]
+    fn a_selection_without_drafts_never_opens_the_draft_confirmation() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.selection.len(), 4, "the received rows are selected");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Approve needs drafts; the selection has no draft in it")
+        );
+        assert!(app.pending_actions.is_empty(), "and nothing is queued");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Mark as draft needs drafts; the selection has no draft in it")
+        );
+        assert!(app.pending_actions.is_empty(), "and nothing is queued");
+        assert_eq!(app.selection.len(), 4, "the selection is left alone");
+    }
+
+    /// A selection cannot mix the two namespaces in practice -- a mailbox
+    /// lists one kind of row and switching mailboxes clears the set -- but
+    /// each batch filters rather than assumes, so neither can act on the
+    /// other's rows.
+    #[test]
+    fn each_batch_takes_only_its_own_half_of_a_mixed_selection() {
+        let mut app = app_with_emails(sample());
+        let msg = app.emails[0].msg.unwrap();
+        app.selection = std::collections::HashSet::from([
+            EntryKey::Msg(msg),
+            EntryKey::Draft("aaa".to_string()),
+        ]);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchApprove(ids)) => assert_eq!(ids, vec!["aaa".to_string()]),
+            other => panic!("expected BatchApprove, got {other:?}"),
+        }
+
+        app.selection = std::collections::HashSet::from([
+            EntryKey::Msg(msg),
+            EntryKey::Draft("aaa".to_string()),
+        ]);
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchDelete(msgs)) => assert_eq!(msgs, vec![msg]),
+            other => panic!("expected BatchDelete, got {other:?}"),
+        }
+    }
+
+    /// `y` queues the selector copy, not the dead path copy (#0050 scope item
+    /// 7). Dispatch-level only, like the contacts copy test: the `arboard`
+    /// call lives in `actions.rs` and would touch the real system clipboard.
+    #[test]
+    fn copy_key_queues_the_selector_copy() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(
+            matches!(app.pending_actions.pop_front(), Some(Action::CopyMessageRef)),
+            "y must queue CopyMessageRef"
+        );
     }
 
     #[test]
@@ -2218,7 +2474,7 @@ mod tests {
         app.list_index = 2; // "Weekly report" via body match
 
         let removed = app.remove_selected_from_list().unwrap();
-        assert!(removed.ends_with("Weekly report.md"));
+        assert_eq!(removed, ref_for("Weekly report"));
         // The underlying list lost exactly that entry...
         assert_eq!(app.emails.len(), 3);
         assert!(app.emails.iter().all(|e| e.subject != "Weekly report"));
@@ -2233,8 +2489,8 @@ mod tests {
     #[test]
     fn set_email_read_updates_shared_cache_without_deep_clone() {
         let mut app = app_with_emails(sample());
-        let path = app.emails[1].path.clone();
-        app.set_email_read(&path, true);
+        let msg = app.emails[1].msg.unwrap();
+        app.set_email_read(msg, true);
         assert!(app.emails[1].read);
         let cached = app.email_cache[0].as_ref().unwrap();
         assert!(std::sync::Arc::ptr_eq(cached, &app.emails));
@@ -2245,8 +2501,8 @@ mod tests {
     fn with_emails_mut_leaves_invalidated_cache_slot_none() {
         let mut app = app_with_emails(sample());
         app.email_cache[0] = None; // e.g. load in flight
-        let path = app.emails[0].path.clone();
-        app.set_email_read(&path, true);
+        let msg = app.emails[0].msg.unwrap();
+        app.set_email_read(msg, true);
         assert!(app.emails[0].read);
         assert!(app.email_cache[0].is_none());
     }
@@ -2258,7 +2514,7 @@ mod tests {
     // re-sorts or grows the entry list used to move the cursor to a
     // different email (approving a draft re-sorted the list; new inbox mail
     // shifted every row down under queued keystrokes). The cursor is
-    // anchored on the entry's path and restored after the rebuild.
+    // anchored on the entry's `MessageRef` and restored after the rebuild.
     // -----------------------------------------------------------------------
 
     /// Deliver a fresh entry list through the real async funnel
@@ -2279,7 +2535,7 @@ mod tests {
     fn cursor_follows_its_email_when_the_reload_resorts_the_list() {
         let mut app = app_with_emails(sample());
         app.list_index = 1;
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // The approved draft's status/date changed, so the reload sorts it
         // last instead of second.
@@ -2289,22 +2545,22 @@ mod tests {
         deliver_mailbox_load(&mut app, resorted);
 
         assert_eq!(app.list_index, 3);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
     fn cursor_stays_put_when_new_mail_is_prepended() {
         let mut app = app_with_emails(sample());
         app.list_index = 2;
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // New inbox mail sorts above everything and shifts every row down.
-        let mut grown = vec![entry("Fresh arrival", "Dave", "just landed")];
+        let mut grown = vec![entry("Fresh arrival", "Dave")];
         grown.extend(sample());
         deliver_mailbox_load(&mut app, grown);
 
         assert_eq!(app.list_index, 3);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
@@ -2336,29 +2592,29 @@ mod tests {
         // clamp (`min(list_index, len - 1)`) would have left the cursor at
         // row 3, two emails below the one the user was looking at.
         let mut emails = sample();
-        emails.push(entry("Team sync", "Dave", "agenda"));
-        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        emails.push(entry("Team sync", "Dave"));
+        emails.push(entry("Renewal notice", "Eve"));
         let mut app = app_with_emails(emails);
         app.list_index = 3; // "Holiday plans"
-        let anchored = app.selected_email().unwrap().path.clone();
+        let anchored = app.selected_email().unwrap().msg;
 
         // Archive the two rows above the cursor: the cursor's own email
         // survives, so it must stay under the cursor (at its new position).
         let mut batch = std::collections::HashSet::new();
-        batch.insert(app.emails[0].path.clone());
-        batch.insert(app.emails[1].path.clone());
+        batch.insert(app.emails[0].msg.unwrap());
+        batch.insert(app.emails[1].msg.unwrap());
         let removed = app.remove_selected_from_list_batch(&batch);
 
         assert_eq!(removed.len(), 2);
         assert_eq!(app.list_index, 1);
-        assert_eq!(app.selected_email().unwrap().path, anchored);
+        assert_eq!(app.selected_email().unwrap().msg, anchored);
     }
 
     #[test]
     fn batch_removal_including_the_cursor_lands_on_the_next_survivor() {
         let mut emails = sample();
-        emails.push(entry("Team sync", "Dave", "agenda"));
-        emails.push(entry("Renewal notice", "Eve", "expires soon"));
+        emails.push(entry("Team sync", "Dave"));
+        emails.push(entry("Renewal notice", "Eve"));
         let mut app = app_with_emails(emails);
         app.list_index = 3; // "Holiday plans"
 
@@ -2366,13 +2622,60 @@ mod tests {
         // above it: the cursor falls back to the count of survivors above
         // it, i.e. the row that took its place.
         let mut batch = std::collections::HashSet::new();
-        batch.insert(app.emails[0].path.clone());
-        batch.insert(app.emails[1].path.clone());
-        batch.insert(app.emails[3].path.clone());
+        batch.insert(app.emails[0].msg.unwrap());
+        batch.insert(app.emails[1].msg.unwrap());
+        batch.insert(app.emails[3].msg.unwrap());
         app.remove_selected_from_list_batch(&batch);
 
         assert_eq!(app.list_index, 1);
         assert_eq!(app.selected_email().unwrap().subject, "Team sync");
+    }
+
+    /// A deleted row's `MessageRef` must not survive in the selection.
+    ///
+    /// The id of a deleted row is not reserved: the next ingest is handed the
+    /// same number (pinned by `store::write`'s
+    /// `a_deleted_row_id_can_be_handed_to_the_next_message`), so a reference
+    /// held across the boundary can name a *different* message. The list drops
+    /// it, and so must the selection set (#0038 scope item 7).
+    #[test]
+    fn removing_a_row_drops_its_reference_from_the_selection() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 2;
+        let doomed = app.selected_email().unwrap().msg.unwrap();
+        let survivor = app.emails[0].msg.unwrap();
+        app.selection.insert(EntryKey::Msg(doomed));
+        app.selection.insert(EntryKey::Msg(survivor));
+
+        app.remove_selected_from_list();
+
+        assert!(
+            !app.selection.contains(&EntryKey::Msg(doomed)),
+            "the selection kept a reference to a row that no longer exists"
+        );
+        assert!(app.selection.contains(&EntryKey::Msg(survivor)));
+        assert!(app.cursor_anchor().is_none_or(|m| m != doomed));
+    }
+
+    /// Same guarantee for a batch: every removed reference leaves the
+    /// selection, so a follow-up mutation cannot act on a freed row id.
+    #[test]
+    fn batch_removal_drops_every_removed_reference_from_the_selection() {
+        let mut app = app_with_emails(sample());
+        let batch: std::collections::HashSet<MessageRef> = app.emails[..2]
+            .iter()
+            .filter_map(|e| e.msg)
+            .collect();
+        app.selection = app.emails.iter().filter_map(|e| e.key()).collect();
+
+        app.remove_selected_from_list_batch(&batch);
+
+        assert_eq!(app.selection.len(), 2);
+        assert!(app
+            .selection
+            .iter()
+            .all(|k| !k.msg().is_some_and(|m| batch.contains(&m))));
+        assert!(app.emails.iter().all(|e| !e.msg.is_some_and(|m| batch.contains(&m))));
     }
 
     // -----------------------------------------------------------------------
@@ -2404,7 +2707,7 @@ mod tests {
                 .collect(),
             filtered: (0..labels.len()).collect(),
             selected: 0,
-            paths: vec![PathBuf::from("/mail/inbox/a.md")],
+            msgs: vec![MessageRef::new(1)],
         }
     }
 
@@ -2477,19 +2780,19 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["Sent", "Archive"]);
         // Cursor email is carried as the move target.
-        assert_eq!(picker.paths.len(), 1);
+        assert_eq!(picker.msgs.len(), 1);
     }
 
     #[test]
     fn open_picker_uses_selection_when_present() {
         let mut app = app_with_mailboxes();
-        app.selection.insert(app.emails[0].path.clone());
-        app.selection.insert(app.emails[2].path.clone());
+        app.selection.insert(EntryKey::Msg(app.emails[0].msg.unwrap()));
+        app.selection.insert(EntryKey::Msg(app.emails[2].msg.unwrap()));
         app.handle_key(KeyEvent::from(KeyCode::Char('M')));
         let Overlay::Mailbox(picker) = &app.overlay else {
             panic!("picker should open");
         };
-        assert_eq!(picker.paths.len(), 2);
+        assert_eq!(picker.msgs.len(), 2);
     }
 
     #[test]
@@ -2511,9 +2814,9 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(!matches!(app.overlay, Overlay::Mailbox(_)));
         match app.pending_actions.pop_front() {
-            Some(Action::MoveToMailbox { paths, dest_idx }) => {
+            Some(Action::MoveToMailbox { msgs, dest_idx }) => {
                 assert_eq!(dest_idx, 3); // Archive
-                assert_eq!(paths.len(), 1);
+                assert_eq!(msgs.len(), 1);
             }
             other => panic!("expected MoveToMailbox, got {:?}", other),
         }
@@ -2634,11 +2937,11 @@ mod tests {
 
         app.set_persistent_error("Move failed: boom\nEmail restored.".to_string());
 
-        // Picker (and its carried paths) survive; the error is queued.
+        // Picker (and its carried messages) survive; the error is queued.
         let Overlay::Mailbox(picker) = &app.overlay else {
             panic!("picker must not be clobbered by a background error");
         };
-        assert_eq!(picker.paths.len(), 1);
+        assert_eq!(picker.msgs.len(), 1);
         assert!(app.pending_error.is_some());
         assert_eq!(app.status_message.as_deref(), Some("Move failed: boom"));
 
@@ -3041,7 +3344,7 @@ mod tests {
         method: &str,
     ) -> super::super::CalendarEvent {
         super::super::CalendarEvent {
-            path: PathBuf::from(format!("/mail/inbox/{summary}.md")),
+            msg: ref_for(summary),
             event: crate::types::EventFrontmatter {
                 uid: Some(format!("uid-{summary}")),
                 method: Some(method.to_string()),
@@ -3108,16 +3411,19 @@ mod tests {
         assert_eq!(app.pending_prefix, None);
     }
 
-    /// `V` on a received invite opens the RSVP overlay for that event's path.
+    /// `V` on a received agenda invite opens the RSVP overlay against that
+    /// row's own message, not the mail cursor's: the agenda carries a
+    /// `MessageRef` since the calendar moved onto the store (#0038 item 6).
     #[test]
-    fn calendar_rsvp_opens_overlay_for_received_invite() {
+    fn calendar_rsvp_opens_against_the_agenda_rows_message() {
         let mut app = app_in_calendar();
         app.handle_key(KeyEvent::from(KeyCode::Char('V')));
         let Overlay::Rsvp(overlay) = &app.overlay else {
-            panic!("V must open the RSVP overlay on a received invite");
+            panic!("V on a received agenda invite must open the RSVP overlay");
         };
+        assert_eq!(overlay.msg, ref_for("Standup"), "the agenda row's own message");
         assert_eq!(overlay.summary, "Standup");
-        assert_eq!(overlay.path, PathBuf::from("/mail/inbox/Standup.md"));
+        assert_eq!(overlay.selected, 0);
     }
 
     /// `V` on an invite we sent refuses with a hint (we are the organizer).
@@ -3166,8 +3472,13 @@ mod tests {
     #[test]
     fn calendar_rsvp_overlay_t_selects_tentative_not_scope_toggle() {
         let mut app = app_in_calendar();
-        app.handle_key(KeyEvent::from(KeyCode::Char('V')));
-        assert!(matches!(app.overlay, Overlay::Rsvp(_)));
+        // Opened directly rather than with `V`: what this test is about is
+        // key precedence with the overlay already up, not how it got there.
+        app.overlay = Overlay::Rsvp(RsvpOverlay {
+            msg: MessageRef::new(1),
+            summary: "Standup".to_string(),
+            selected: 0,
+        });
         let scope_before = app.calendar_view.show_past;
         app.handle_key(KeyEvent::from(KeyCode::Char('t')));
         let Overlay::Rsvp(overlay) = &app.overlay else {
@@ -3210,14 +3521,15 @@ mod tests {
         assert_eq!(visible, vec!["Invitation: Running"]);
     }
 
-    /// `Enter` queues opening the source invite email, carrying its path.
+    /// `Enter` queues opening the source invite email, carrying the agenda
+    /// row's own message reference (the invite may live in any mailbox).
     #[test]
     fn calendar_enter_opens_the_source_invite() {
         let mut app = app_in_calendar();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         match app.pending_actions.pop_front() {
-            Some(Action::OpenEventSource { path }) => {
-                assert_eq!(path, PathBuf::from("/mail/inbox/Standup.md"));
+            Some(Action::OpenEventSource { msg }) => {
+                assert_eq!(msg, ref_for("Standup"));
             }
             other => panic!("expected OpenEventSource, got {other:?}"),
         }

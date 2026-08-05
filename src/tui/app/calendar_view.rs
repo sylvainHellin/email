@@ -1,143 +1,111 @@
 //! Local calendar loader (#0034): build the Calendar view's agenda rows from
-//! the `.md` files the iMIP traffic already produced.
+//! the iMIP messages the store already holds.
 //!
 //! This is deliberately local-first and **blind to Outlook-created events**:
-//! only invitations that arrived (or were sent) by email exist on disk, so an
+//! only invitations that arrived (or were sent) by email exist locally, so an
 //! event created directly in Outlook is invisible here until the Graph sync
 //! backend lands (#0036). The UI states that caveat in the pane.
 //!
-//! The walk mirrors `crate::reconcile::build_index`: every `.md` under the
-//! account root, frontmatter-parsed, with the sidecar `invite.ics` treated as
-//! authoritative for UID/SEQUENCE (the `event:` block is a lossy cache). It is
-//! a free function taking only a path so it stays unit-testable and could be
-//! moved off the UI thread unchanged.
+//! Since #0038 scope item 6 the source is the store, not the `.md` tree: the
+//! rows that carry an `invite.ics` attachment blob, with that blob parsed as
+//! the single authority for UID, SEQUENCE, DTSTAMP and every displayed field.
+//! There is no frontmatter cache left to drift from it, and no directory walk
+//! to be fooled by a sender-controlled `.md` attachment (TKT-0047's exposure
+//! is gone by construction; #0040 closes the ticket formally).
+//!
+//! Attendee statuses and our own RSVP are folded in from the REPLY rows by
+//! [`crate::reconcile`], which computes them rather than storing them. The
+//! whole agenda is therefore rebuilt from rows and blobs on demand, and is
+//! kept in `CalendarView` until the user refreshes it (`r`) or switches
+//! account, exactly as the walk-based build was.
+//!
+//! Cost: one indexed join over `messages` plus one blob read per invite row.
+//! Invites are a rare row, the blobs are a few kilobytes, and none of it runs
+//! at cold start: the agenda is built the first time the Calendar view is
+//! opened, never during `App::new`.
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
-use serde::Deserialize;
+use super::types::{CalendarEvent, MessageRef};
+use crate::reconcile::{self, InviteMessage};
+use crate::store::{BlobStore, Store};
 
-use super::types::CalendarEvent;
+/// The mailbox role our own sent mail lives in. A REQUEST found there is one
+/// we sent, which is what makes us the organizer (the pre-store build asked
+/// the same question of the `sent/` directory).
+const SENT_MAILBOX: &str = "sent";
 
-/// The frontmatter subset the calendar walk needs.
-#[derive(Debug, Deserialize, Default)]
-struct CalendarFrontmatter {
-    subject: Option<String>,
-    #[serde(default)]
-    event: Option<crate::types::EventFrontmatter>,
-}
-
-/// A REQUEST candidate before dedup, with its identity/tiebreak keys.
+/// A REQUEST candidate before dedup, with its identity and tiebreak keys.
 struct Candidate {
     row: CalendarEvent,
-    /// Authoritative sequence (sidecar-first).
+    /// `SEQUENCE` from the ics.
     sequence: u32,
-    /// Authoritative `DTSTAMP`, empty when unknown.
+    /// `DTSTAMP` from the ics, empty when unknown.
     dtstamp: String,
+    /// The row's `(mailbox, uid)`, the final deterministic tiebreak.
+    ident: (String, i64),
 }
 
 impl Candidate {
     /// Latest-wins ordering key: higher sequence, then later DTSTAMP, then our
-    /// own sent copy, then the path (so ties are resolved deterministically
-    /// rather than by walk order).
+    /// own sent copy, then `(mailbox, uid)` so ties resolve deterministically
+    /// rather than by query order.
     ///
     /// The sent-copy component is load-bearing, not cosmetic: a self-invited
     /// event has one `DTSTAMP` shared by every copy, so without it the winner
     /// is whichever mailbox name sorts last and `is_organizer` flips for any
-    /// custom mailbox sorting after `sent` (`team/` beat `sent/`).
-    fn rank(&self) -> (u32, &str, bool, &Path) {
+    /// custom mailbox sorting after `sent` (`team` beat `sent`).
+    fn rank(&self) -> (u32, &str, bool, &str, i64) {
         (
             self.sequence,
             self.dtstamp.as_str(),
             self.row.is_organizer,
-            self.row.path.as_path(),
+            self.ident.0.as_str(),
+            self.ident.1,
         )
     }
 }
 
-/// True for paths inside an attachment directory, in either layout `parse.rs`
-/// writes: the per-email `<stem>_attachments/` sidecar dir and the account-wide
-/// `attachments/<message-id>/` mirror.
+/// Build the agenda rows for one account from its store, sorted by start
+/// instant with undated events last.
 ///
-/// Those files are *inbound, sender-controlled content*. A `.md` attached to an
-/// email carries frontmatter an attacker chooses, so ingesting it would let a
-/// crafted attachment spoof an agenda row, displace a real invite (same UID,
-/// higher sequence) or strike it through with a forged `METHOD:CANCEL`. The
-/// invite's own `invite.ics` sidecar still lives there and is still read, but
-/// only through [`authoritative_ids`], keyed off a real email's path.
-fn is_attachment_path(path: &Path) -> bool {
-    path.components().any(|c| match c {
-        std::path::Component::Normal(name) => {
-            let name = name.to_string_lossy();
-            name == "attachments" || name.ends_with("_attachments")
-        }
-        _ => false,
-    })
-}
-
-/// Walk `account_root` and return the agenda rows for the Calendar view,
-/// sorted by start instant with undated events last.
+/// `self_address` is the account's own address, used to resolve our own RSVP
+/// out of the REPLY we sent (see [`crate::reconcile::own_rsvp`]).
 ///
-/// Semantics:
+/// Semantics, unchanged from the walk-based build:
 /// - only `METHOD:REQUEST` messages are agenda rows (a `REPLY` is an attendee
-///   response to one of our invites, already folded into the REQUEST's
-///   `attendees[]` by `mp calendar rebuild`);
+///   response, folded into the REQUEST's `attendees[]` instead);
 /// - one row per iCal UID, keeping the highest `(sequence, dtstamp)` copy, so
 ///   the Sent/Inbox/Archive copies of one event collapse into one row;
-/// - events with no usable UID fall back to path identity (they are still real
+/// - events with no usable UID fall back to row identity (they are still real
 ///   events, they just cannot be deduped);
 /// - a `METHOD:CANCEL` message tags its UID as cancelled when its sequence is
 ///   at least the surviving REQUEST's; the row stays visible (display only --
 ///   the cancellation *semantics* are #0031).
 ///
-/// Never panics: unreadable files, malformed YAML and missing directories are
-/// skipped, and every field degrades to a missing value.
-pub fn load_events_for_account(account_root: &Path) -> Vec<CalendarEvent> {
-    if !account_root.is_dir() {
-        return Vec::new();
-    }
-    // Our own sent invites live under `<account_root>/sent` (the fixed role dir
-    // from `config::mailbox_dir`); that is what makes us the organizer.
-    let sent_root = account_root.join("sent");
+/// Never panics: an unreadable blob, an unparseable payload and an account
+/// with no invites all degrade to fewer rows, and every field degrades to a
+/// missing value.
+pub fn load_events_for_account(
+    store: &Store,
+    blobs: &BlobStore,
+    account: &str,
+    self_address: &str,
+) -> Vec<CalendarEvent> {
+    let invites = reconcile::load_invites(store, blobs, account);
+    let replies = reconcile::fold_replies(&invites);
 
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     // uid -> highest CANCEL sequence seen.
     let mut cancels: HashMap<String, u32> = HashMap::new();
-    let matter = Matter::<YAML>::new();
 
-    for entry in walkdir::WalkDir::new(account_root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        if is_attachment_path(path) {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let parsed = matter.parse(&content);
-        let fm: CalendarFrontmatter = parsed
-            .data
-            .and_then(|d| d.deserialize().ok())
-            .unwrap_or_default();
-        let Some(event) = fm.event else {
-            continue;
-        };
-        let method = event.method.as_deref().unwrap_or("").to_uppercase();
-        let (uid, sequence, dtstamp) = authoritative_ids(path, &event);
-        let uid = uid.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
-
-        match method.as_str() {
+    for invite in &invites {
+        let uid = invite.uid().map(str::to_string);
+        match invite.method().as_str() {
             "CANCEL" => {
                 if let Some(uid) = uid {
-                    let slot = cancels.entry(uid).or_insert(sequence);
-                    *slot = (*slot).max(sequence);
+                    let slot = cancels.entry(uid).or_insert(invite.parsed.sequence);
+                    *slot = (*slot).max(invite.parsed.sequence);
                 }
                 continue;
             }
@@ -147,27 +115,8 @@ pub fn load_events_for_account(account_root: &Path) -> Vec<CalendarEvent> {
             _ => continue,
         }
 
-        let start = normalize_stamp(event.start.as_deref());
-        let end = normalize_stamp(event.end.as_deref());
-        // An all-day event with no explicit end stays "upcoming" through the
-        // end of its own local day rather than expiring at local midnight.
-        let end_sort = match (end.sort.is_empty(), start.all_day) {
-            (true, true) => plus_one_day(&start.sort),
-            _ => end.sort,
-        };
-        let (start_sort, start_display) = (start.sort, start.display);
-        let row = CalendarEvent {
-            path: path.to_path_buf(),
-            subject: fm.subject.unwrap_or_else(|| "(no subject)".to_string()),
-            start_sort,
-            end_sort,
-            start_display,
-            is_organizer: path.starts_with(&sent_root),
-            cancelled: false,
-            event,
-        };
-        let key = uid.unwrap_or_else(|| path.to_string_lossy().to_string());
-        let candidate = Candidate { row, sequence, dtstamp };
+        let candidate = candidate_from(invite, self_address, &replies);
+        let key = uid.unwrap_or_else(|| format!("row:{}", invite.row_id));
         match candidates.get(&key) {
             Some(existing) if existing.rank() >= candidate.rank() => {}
             _ => {
@@ -186,33 +135,54 @@ pub fn load_events_for_account(account_root: &Path) -> Vec<CalendarEvent> {
         })
         .collect();
 
-    // Chronological, undated last; path as the final tiebreak so the order is
-    // stable across runs.
+    // Chronological, undated last; the row reference as the final tiebreak so
+    // the order is stable across runs.
     events.sort_by(|a, b| {
-        let a_key = (a.start_sort.is_empty(), a.start_sort.as_str(), a.path.as_path());
-        let b_key = (b.start_sort.is_empty(), b.start_sort.as_str(), b.path.as_path());
+        let a_key = (a.start_sort.is_empty(), &a.start_sort, a.msg);
+        let b_key = (b.start_sort.is_empty(), &b.start_sort, b.msg);
         a_key.cmp(&b_key)
     });
     events
 }
 
-/// Read the authoritative UID / SEQUENCE / DTSTAMP for an invite email: the
-/// sidecar `invite.ics` when it parses, the `event:` frontmatter cache
-/// otherwise. Mirrors `reconcile::authoritative_ids` (the frontmatter block is
-/// a lossy cache and can drift from the sidecar).
-fn authoritative_ids(
-    md_path: &Path,
-    fm_event: &crate::types::EventFrontmatter,
-) -> (Option<String>, u32, String) {
-    let sidecar =
-        crate::parse::attachments_dir_for(md_path).join(crate::parse::CALENDAR_SIDECAR_NAME);
-    if let Ok(bytes) = std::fs::read(&sidecar) {
-        if let Some(parsed) = crate::calendar::parse_ics(&bytes) {
-            let uid = parsed.uid.or_else(|| fm_event.uid.clone());
-            return (uid, parsed.sequence, parsed.dtstamp.unwrap_or_default());
-        }
+/// Turn one REQUEST into an agenda candidate, with the replies folded in.
+fn candidate_from(
+    invite: &InviteMessage,
+    self_address: &str,
+    replies: &reconcile::ReplyIndex,
+) -> Candidate {
+    let mut event = crate::calendar::event_frontmatter(&invite.parsed);
+    let by_addr = invite.uid().and_then(|uid| replies.get(uid));
+    reconcile::apply_replies(&mut event, invite.parsed.sequence, by_addr);
+    event.rsvp = reconcile::own_rsvp(&event, self_address, by_addr);
+
+    let start = normalize_stamp(event.start.as_deref());
+    let end = normalize_stamp(event.end.as_deref());
+    // An all-day event with no explicit end stays "upcoming" through the end
+    // of its own local day rather than expiring at local midnight.
+    let end_sort = match (end.sort.is_empty(), start.all_day) {
+        (true, true) => plus_one_day(&start.sort),
+        _ => end.sort,
+    };
+    Candidate {
+        row: CalendarEvent {
+            msg: MessageRef::new(invite.row_id),
+            subject: invite
+                .subject
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(no subject)".to_string()),
+            start_sort: start.sort,
+            end_sort,
+            start_display: start.display,
+            is_organizer: invite.mailbox == SENT_MAILBOX,
+            cancelled: false,
+            event,
+        },
+        sequence: invite.parsed.sequence,
+        dtstamp: invite.dtstamp().to_string(),
+        ident: (invite.mailbox.clone(), invite.uid),
     }
-    (fm_event.uid.clone(), fm_event.sequence, String::new())
 }
 
 /// A normalised `event:` timestamp: a UTC sort key, a human display string,
@@ -318,169 +288,206 @@ pub fn now_sort_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::reconcile::tests::{fixture, reply_ics, Fixture};
 
-    /// Write an invite `.md` with an `event:` block into `dir`.
-    #[allow(clippy::too_many_arguments)]
-    fn write_invite(
-        dir: &Path,
-        filename: &str,
-        subject: &str,
-        uid: &str,
+    /// A VEVENT payload for one ingested message.
+    ///
+    /// `dtstart` is the text that follows `DTSTART` in the property line, so a
+    /// test can pick the exact iCalendar time form whose handling it is about:
+    /// `":20260801T093000Z"` (UTC), `";TZID=Europe/Berlin:20260801T100000"`
+    /// (zoned), `":20260801T090000"` (floating), `";VALUE=DATE:20260801"`
+    /// (all-day), or `None` for an event with no start at all.
+    ///
+    /// `DTSTAMP` is fixed, so two copies of one event tie on `(sequence,
+    /// dtstamp)` exactly as a self-invited event's copies do in the wild.
+    fn event_ics(
         method: &str,
+        uid: Option<&str>,
         sequence: u32,
-        start: Option<&str>,
-    ) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let start_line = match start {
-            Some(s) => format!("  start: \"{s}\"\n"),
-            None => String::new(),
-        };
-        let body = format!(
-            "---\nfrom: Org <org@example.com>\nto: me@example.com\n\
-             subject: \"{subject}\"\nevent:\n  uid: {uid}\n  method: {method}\n  \
-             sequence: {sequence}\n  summary: \"{subject}\"\n{start_line}---\n\nbody\n"
-        );
-        let path = dir.join(filename);
-        std::fs::write(&path, body).unwrap();
-        path
+        summary: &str,
+        dtstart: Option<&str>,
+    ) -> String {
+        let uid_line = uid.map(|u| format!("UID:{u}\r\n")).unwrap_or_default();
+        let start_line = dtstart
+            .map(|d| format!("DTSTART{d}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\n{uid_line}\
+             SEQUENCE:{sequence}\r\nDTSTAMP:20260701T090000Z\r\nSUMMARY:{summary}\r\n{start_line}\
+             ORGANIZER:mailto:org@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// The agenda of the fixture account, with no own address to resolve.
+    fn agenda(fx: &Fixture) -> Vec<CalendarEvent> {
+        load_events_for_account(&fx.store, &fx.blobs, "alice", "")
+    }
+
+    /// Ingest one REQUEST and return the agenda it produces.
+    fn agenda_of(mailbox: &str, uid: i64, ics: &str) -> Vec<CalendarEvent> {
+        let fx = fixture();
+        fx.ingest_invite(mailbox, uid, "Subject", ics);
+        agenda(&fx)
+    }
+
+    fn subjects(events: &[CalendarEvent]) -> Vec<&str> {
+        events.iter().map(|e| e.subject.as_str()).collect()
     }
 
     #[test]
-    fn loads_request_invites_from_account_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "a.md",
+    fn loads_request_invites_from_every_mailbox() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Standup",
-            "uid-a",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics("REQUEST", Some("uid-a"), 0, "Standup", Some(":20260801T090000Z")),
         );
-        write_invite(
-            &tmp.path().join("archive"),
-            "b.md",
+        fx.ingest_invite(
+            "archive",
+            1,
             "Retro",
-            "uid-b",
-            "REQUEST",
-            0,
-            Some("2026-08-02T09:00:00+00:00"),
+            &event_ics("REQUEST", Some("uid-b"), 0, "Retro", Some(":20260802T090000Z")),
         );
-        let events = load_events_for_account(tmp.path());
+        let events = agenda(&fx);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event.summary.as_deref(), Some("Standup"));
         assert_eq!(events[1].event.summary.as_deref(), Some("Retro"));
     }
 
+    /// A message with no iMIP payload is not an invite row at all, so it never
+    /// reaches the agenda (the listing query filters it out before any blob
+    /// read).
     #[test]
-    fn ignores_non_invite_emails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(
-            inbox.join("plain.md"),
-            "---\nfrom: a@b.com\nto: me@x.com\nsubject: \"Re: Plan\"\n---\n\nhi\n",
-        )
-        .unwrap();
-        assert!(load_events_for_account(tmp.path()).is_empty());
+    fn ignores_messages_without_an_ics() {
+        let fx = fixture();
+        fx.ingest_plain("inbox", 1, "Re: Plan");
+        assert!(agenda(&fx).is_empty());
     }
 
     #[test]
     fn ignores_reply_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "reply.md",
-            "Standup",
-            "uid-a",
-            "REPLY",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
+        let events = agenda_of(
+            "inbox",
+            1,
+            &event_ics("REPLY", Some("uid-a"), 0, "Standup", Some(":20260801T090000Z")),
         );
-        assert!(load_events_for_account(tmp.path()).is_empty());
+        assert!(events.is_empty());
     }
 
     #[test]
     fn dedups_same_uid_keeping_highest_sequence() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("sent"),
-            "v0.md",
-            "Planning",
-            "uid-dup",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "v1.md",
-            "Planning (moved)",
-            "uid-dup",
-            "REQUEST",
+        let fx = fixture();
+        fx.ingest_invite(
+            "sent",
             1,
-            Some("2026-08-01T15:00:00+00:00"),
+            "Planning",
+            &event_ics(
+                "REQUEST",
+                Some("uid-dup"),
+                0,
+                "Planning",
+                Some(":20260801T090000Z"),
+            ),
         );
-        let events = load_events_for_account(tmp.path());
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Planning (moved)",
+            &event_ics(
+                "REQUEST",
+                Some("uid-dup"),
+                1,
+                "Planning (moved)",
+                Some(":20260801T150000Z"),
+            ),
+        );
+        let events = agenda(&fx);
         assert_eq!(events.len(), 1, "one row per UID");
         assert_eq!(events[0].event.sequence, 1);
         assert_eq!(events[0].event.summary.as_deref(), Some("Planning (moved)"));
     }
 
-    /// Our own sent invites make us the organizer (no own-RSVP, no RSVP key).
+    /// A REQUEST sitting in `sent` is one we sent, which is what makes us the
+    /// organizer (the pre-store build asked the same of the `sent/` directory).
     #[test]
     fn sent_copies_are_flagged_as_organizer() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("sent"),
-            "mine.md",
+        let fx = fixture();
+        fx.ingest_invite(
+            "sent",
+            1,
             "My meeting",
-            "uid-mine",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics(
+                "REQUEST",
+                Some("uid-mine"),
+                0,
+                "My meeting",
+                Some(":20260801T090000Z"),
+            ),
         );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "theirs.md",
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Their meeting",
-            "uid-theirs",
-            "REQUEST",
-            0,
-            Some("2026-08-02T09:00:00+00:00"),
+            &event_ics(
+                "REQUEST",
+                Some("uid-theirs"),
+                0,
+                "Their meeting",
+                Some(":20260802T090000Z"),
+            ),
         );
-        let events = load_events_for_account(tmp.path());
+        let events = agenda(&fx);
         let mine = events.iter().find(|e| e.subject == "My meeting").unwrap();
         let theirs = events.iter().find(|e| e.subject == "Their meeting").unwrap();
         assert!(mine.is_organizer);
         assert!(!theirs.is_organizer);
     }
 
+    /// On an equal-`(sequence, dtstamp)` tie the sent copy wins, so
+    /// `is_organizer` cannot flip on a mailbox name that sorts after `sent`.
+    /// A self-invited event shares one DTSTAMP across every copy, so this tie
+    /// is the normal case, not an exotic one.
+    #[test]
+    fn sent_copy_wins_an_equal_rank_tie() {
+        let fx = fixture();
+        let ics = event_ics(
+            "REQUEST",
+            Some("uid-tie"),
+            0,
+            "All hands",
+            Some(":20260801T090000Z"),
+        );
+        fx.ingest_invite("sent", 1, "All hands", &ics);
+        // `team` sorts after `sent`, so plain mailbox order would pick this copy.
+        fx.ingest_invite("team", 1, "All hands", &ics);
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].is_organizer,
+            "our sent copy must win the tie, got {}",
+            events[0].msg
+        );
+    }
+
     /// A CANCEL at or above the REQUEST's sequence tags the row; the event is
     /// still listed (display only -- #0031 owns the semantics).
     #[test]
     fn cancel_message_tags_the_uid_as_cancelled() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "req.md",
-            "Doomed",
-            "uid-c",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "cancel.md",
-            "Cancelled: Doomed",
-            "uid-c",
-            "CANCEL",
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
             1,
-            Some("2026-08-01T09:00:00+00:00"),
+            "Doomed",
+            &event_ics("REQUEST", Some("uid-c"), 0, "Doomed", Some(":20260801T090000Z")),
         );
-        let events = load_events_for_account(tmp.path());
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Cancelled: Doomed",
+            &event_ics("CANCEL", Some("uid-c"), 1, "Doomed", Some(":20260801T090000Z")),
+        );
+        let events = agenda(&fx);
         assert_eq!(events.len(), 1, "the CANCEL is not its own agenda row");
         assert!(events[0].cancelled);
     }
@@ -489,26 +496,20 @@ mod tests {
     /// REQUEST's sequence still tags it (`>=`, not `>`).
     #[test]
     fn cancel_at_the_same_sequence_tags_the_request() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "req.md",
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Weekly",
-            "uid-eq",
-            "REQUEST",
-            2,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics("REQUEST", Some("uid-eq"), 2, "Weekly", Some(":20260801T090000Z")),
         );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "cancel.md",
+        fx.ingest_invite(
+            "inbox",
+            2,
             "Cancelled: Weekly",
-            "uid-eq",
-            "CANCEL",
-            2,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics("CANCEL", Some("uid-eq"), 2, "Weekly", Some(":20260801T090000Z")),
         );
-        let events = load_events_for_account(tmp.path());
+        let events = agenda(&fx);
         assert_eq!(events.len(), 1);
         assert!(
             events[0].cancelled,
@@ -520,26 +521,20 @@ mod tests {
     /// the rescheduled event.
     #[test]
     fn stale_cancel_does_not_tag_a_newer_request() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "cancel.md",
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Cancelled: Weekly",
-            "uid-s",
-            "CANCEL",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics("CANCEL", Some("uid-s"), 0, "Weekly", Some(":20260801T090000Z")),
         );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "req.md",
-            "Weekly",
-            "uid-s",
-            "REQUEST",
+        fx.ingest_invite(
+            "inbox",
             2,
-            Some("2026-08-08T09:00:00+00:00"),
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-s"), 2, "Weekly", Some(":20260808T090000Z")),
         );
-        let events = load_events_for_account(tmp.path());
+        let events = agenda(&fx);
         assert_eq!(events.len(), 1);
         assert!(!events[0].cancelled);
     }
@@ -548,90 +543,104 @@ mod tests {
     /// actual instant, not by wallclock (mirrors `resolve_date`, #0024).
     #[test]
     fn sorts_by_start_instant_not_wallclock() {
-        let tmp = tempfile::tempdir().unwrap();
-        // 10:00+02:00 == 08:00 UTC (earlier instant)
-        write_invite(
-            &tmp.path().join("inbox"),
-            "early.md",
+        let fx = fixture();
+        // 10:00 Europe/Berlin == 08:00 UTC in August (the earlier instant).
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Early",
-            "uid-e",
-            "REQUEST",
-            0,
-            Some("2026-08-01T10:00:00+02:00"),
+            &event_ics(
+                "REQUEST",
+                Some("uid-e"),
+                0,
+                "Early",
+                Some(";TZID=Europe/Berlin:20260801T100000"),
+            ),
         );
-        // 09:30+00:00 == 09:30 UTC (later instant)
-        write_invite(
-            &tmp.path().join("inbox"),
-            "late.md",
+        // 09:30 UTC (the later instant).
+        fx.ingest_invite(
+            "inbox",
+            2,
             "Late",
-            "uid-l",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:30:00+00:00"),
+            &event_ics("REQUEST", Some("uid-l"), 0, "Late", Some(":20260801T093000Z")),
         );
-        let events = load_events_for_account(tmp.path());
-        let names: Vec<&str> = events.iter().map(|e| e.subject.as_str()).collect();
-        assert_eq!(names, vec!["Early", "Late"]);
+        let events = agenda(&fx);
+        assert_eq!(subjects(&events), vec!["Early", "Late"]);
         // The display keeps the event's own offset.
         assert_eq!(events[0].start_display, "2026-08-01 10:00");
     }
 
     #[test]
     fn handles_missing_start_without_panicking() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "dated.md",
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Dated",
-            "uid-d",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
+            &event_ics("REQUEST", Some("uid-d"), 0, "Dated", Some(":20260801T090000Z")),
         );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "undated.md",
+        fx.ingest_invite(
+            "inbox",
+            2,
             "Undated",
-            "uid-u",
-            "REQUEST",
-            0,
-            None,
+            &event_ics("REQUEST", Some("uid-u"), 0, "Undated", None),
         );
-        let events = load_events_for_account(tmp.path());
+        let events = agenda(&fx);
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].subject, "Undated", "undated events sort last");
         assert!(events[1].start_sort.is_empty());
         assert!(events[1].start_display.is_empty());
     }
 
+    /// An unparseable payload costs its own row and nothing else, and an
+    /// account that has never synced yields an empty agenda rather than an
+    /// error.
     #[test]
-    fn handles_malformed_frontmatter_and_missing_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(inbox.join("broken.md"), "---\nnot: [valid\n---\nbody").unwrap();
-        std::fs::write(inbox.join("nofm.md"), "just a body, no frontmatter").unwrap();
-        assert!(load_events_for_account(tmp.path()).is_empty());
-        // A missing account root yields no events rather than panicking.
-        assert!(load_events_for_account(&tmp.path().join("nope")).is_empty());
+    fn unparseable_payloads_and_empty_accounts_yield_no_rows() {
+        let fx = fixture();
+        assert!(agenda(&fx).is_empty(), "no invites yet");
+        fx.ingest_invite("inbox", 1, "Broken", "not an ics at all");
+        assert!(agenda(&fx).is_empty());
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Real",
+            &event_ics("REQUEST", Some("uid-ok"), 0, "Real", Some(":20260801T090000Z")),
+        );
+        assert_eq!(subjects(&agenda(&fx)), vec!["Real"]);
     }
 
-    /// All-day (`VALUE=DATE`) invites serialise as midnight wallclock; they get
-    /// a date-only display, a UTC-normalised sort key, and an implicit end at
-    /// the start of the next local day.
+    /// Invites with no UID at all are kept (keyed by row) rather than dropped
+    /// or collapsed into each other.
+    #[test]
+    fn keeps_uidless_invites_keyed_by_row() {
+        let fx = fixture();
+        for uid in [1, 2] {
+            fx.ingest_invite(
+                "inbox",
+                uid,
+                "No UID",
+                &event_ics("REQUEST", None, 0, "No UID", Some(":20260801T090000Z")),
+            );
+        }
+        assert_eq!(agenda(&fx).len(), 2);
+    }
+
+    /// All-day (`VALUE=DATE`) invites get a date-only display, a UTC-normalised
+    /// sort key, and an implicit end at the start of the next local day.
     #[test]
     fn all_day_events_display_as_a_bare_date() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "allday.md",
-            "Offsite",
-            "uid-a",
-            "REQUEST",
-            0,
-            Some("2026-08-01T00:00:00"),
+        let events = agenda_of(
+            "inbox",
+            1,
+            &event_ics(
+                "REQUEST",
+                Some("uid-a"),
+                0,
+                "Offsite",
+                Some(";VALUE=DATE:20260801"),
+            ),
         );
-        let events = load_events_for_account(tmp.path());
         assert_eq!(events[0].start_display, "2026-08-01");
         // Local midnight, expressed as a UTC instant.
         assert_eq!(
@@ -645,30 +654,15 @@ mod tests {
         assert_eq!(events[0].end_sort, plus_one_day(&events[0].start_sort));
     }
 
-    /// A hand-edited all-day date at the far end of chrono's range must not
-    /// panic in `plus_one_day` (the implicit-end `+1 day` used to overflow);
-    /// it degrades to an unchanged end key and the event still loads.
+    /// A date at the far end of chrono's range must not panic in
+    /// `plus_one_day` (the implicit-end `+1 day` used to overflow); it degrades
+    /// to an unchanged end key.
     #[test]
-    fn far_future_all_day_event_does_not_overflow() {
-        // TZ-independent core: one day past this key does not exist.
+    fn far_future_all_day_key_does_not_overflow() {
         let max_key = chrono::NaiveDateTime::MAX
             .format("%Y-%m-%dT%H:%M:%S")
             .to_string();
         assert_eq!(plus_one_day(&max_key), max_key);
-
-        // End-to-end: the reviewer's reproducer (panicked under TZ=UTC).
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "doom.md",
-            "Heat death planning",
-            "uid-far",
-            "REQUEST",
-            0,
-            Some("+262142-12-31T00:00:00"),
-        );
-        let events = load_events_for_account(tmp.path());
-        assert_eq!(events.len(), 1);
     }
 
     /// An offset-less wallclock is a *local* time, so it must normalise to the
@@ -698,278 +692,165 @@ mod tests {
     }
 
     /// An all-day event for *today* stays in the default upcoming scope all
-    /// day. It serialises as offset-less local midnight, so before the fix its
-    /// key sorted before a UTC `now` and the row vanished from 00:00 onward.
+    /// day. It normalises as offset-less local midnight, so without the
+    /// implicit end its key sorts before a UTC `now` and the row vanishes from
+    /// 00:00 onward.
     #[test]
     fn todays_all_day_event_stays_upcoming() {
-        let tmp = tempfile::tempdir().unwrap();
+        let fx = fixture();
         let today = chrono::Local::now().date_naive();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "today.md",
+        fx.ingest_invite(
+            "inbox",
+            1,
             "Offsite",
-            "uid-today",
-            "REQUEST",
-            0,
-            Some(&today.format("%Y-%m-%dT00:00:00").to_string()),
-        );
-        // Yesterday's all-day event is over and must not linger.
-        write_invite(
-            &tmp.path().join("inbox"),
-            "yesterday.md",
-            "Past offsite",
-            "uid-yesterday",
-            "REQUEST",
-            0,
-            Some(
-                &(today - chrono::Duration::days(1))
-                    .format("%Y-%m-%dT00:00:00")
-                    .to_string(),
+            &event_ics(
+                "REQUEST",
+                Some("uid-today"),
+                0,
+                "Offsite",
+                Some(&format!(";VALUE=DATE:{}", today.format("%Y%m%d"))),
             ),
         );
-        let mut app = crate::tui::app::App::default_for_tests();
-        app.calendar_view.events = load_events_for_account(tmp.path());
-        app.calendar_view.loaded = true;
-        app.recompute_calendar_visible();
-        let visible: Vec<&str> = app
-            .calendar_view
-            .visible
-            .iter()
-            .map(|&i| app.calendar_view.events[i].subject.as_str())
-            .collect();
-        assert_eq!(visible, vec!["Offsite"]);
+        // Yesterday's all-day event is over and must not linger.
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Past offsite",
+            &event_ics(
+                "REQUEST",
+                Some("uid-yesterday"),
+                0,
+                "Past offsite",
+                Some(&format!(
+                    ";VALUE=DATE:{}",
+                    (today - chrono::Duration::days(1)).format("%Y%m%d")
+                )),
+            ),
+        );
+        assert_eq!(upcoming(&fx), vec!["Offsite"]);
     }
 
     /// A floating (offset-less) event that already finished must leave the
-    /// upcoming scope on time. Before the fix its wallclock key was compared
-    /// against a UTC `now`, so in a positive-offset zone it lingered for the
-    /// length of the offset. Vacuous on a UTC machine, sharp everywhere else.
+    /// upcoming scope on time. Compared against a UTC `now` without the local
+    /// normalisation it lingers for the length of the local offset: vacuous on
+    /// a UTC machine, sharp everywhere else.
     #[test]
     fn a_finished_floating_event_leaves_the_upcoming_scope() {
-        let tmp = tempfile::tempdir().unwrap();
+        let fx = fixture();
         let now = chrono::Local::now().naive_local();
-        write_invite(
-            &tmp.path().join("inbox"),
-            "past.md",
-            "Just finished",
-            "uid-past",
-            "REQUEST",
-            0,
-            Some(
-                &(now - chrono::Duration::minutes(45))
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ),
-        );
-        write_invite(
-            &tmp.path().join("inbox"),
-            "soon.md",
-            "Starting soon",
-            "uid-soon",
-            "REQUEST",
-            0,
-            Some(
-                &(now + chrono::Duration::minutes(45))
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ),
-        );
+        for (uid, subject, minutes) in [
+            ("uid-past", "Just finished", -45),
+            ("uid-soon", "Starting soon", 45),
+        ] {
+            let start = (now + chrono::Duration::minutes(minutes))
+                .format("%Y%m%dT%H%M%S")
+                .to_string();
+            fx.ingest_invite(
+                "inbox",
+                if minutes < 0 { 1 } else { 2 },
+                subject,
+                &event_ics("REQUEST", Some(uid), 0, subject, Some(&format!(":{start}"))),
+            );
+        }
+        assert_eq!(upcoming(&fx), vec!["Starting soon"]);
+    }
+
+    /// The subjects the Calendar view's default (upcoming-only) scope shows.
+    fn upcoming(fx: &Fixture) -> Vec<String> {
         let mut app = crate::tui::app::App::default_for_tests();
-        app.calendar_view.events = load_events_for_account(tmp.path());
+        app.calendar_view.events = agenda(fx);
         app.calendar_view.loaded = true;
         app.recompute_calendar_visible();
-        let visible: Vec<&str> = app
-            .calendar_view
+        app.calendar_view
             .visible
             .iter()
-            .map(|&i| app.calendar_view.events[i].subject.as_str())
-            .collect();
-        assert_eq!(visible, vec!["Starting soon"]);
+            .map(|&i| app.calendar_view.events[i].subject.clone())
+            .collect()
     }
 
-    /// The sidecar `.ics` is authoritative for identity: an invite whose
-    /// frontmatter UID drifted from the sidecar dedups on the sidecar's UID.
+    /// The organizer's view: an attendee's REPLY lands on the agenda row's
+    /// attendee list without anything being written.
     #[test]
-    fn prefers_sidecar_uid_over_frontmatter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        let a = write_invite(
-            &inbox,
-            "a.md",
-            "Sync",
-            "stale-uid",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        let b = write_invite(
-            &tmp.path().join("archive"),
-            "b.md",
-            "Sync",
-            "real-uid",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        // Give the drifted copy a sidecar carrying the real UID.
-        let att = crate::parse::attachments_dir_for(&a);
-        std::fs::create_dir_all(&att).unwrap();
-        std::fs::write(
-            att.join(crate::parse::CALENDAR_SIDECAR_NAME),
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
-             UID:real-uid\r\nSEQUENCE:3\r\nSUMMARY:Sync\r\n\
-             DTSTART:20260801T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-        )
-        .unwrap();
-        let events = load_events_for_account(tmp.path());
-        assert_eq!(events.len(), 1, "sidecar UID collapses the two copies");
-        // Sequence 3 from the sidecar beats the frontmatter copy's 0.
-        assert_eq!(events[0].path, a);
-        assert_ne!(events[0].path, b);
-    }
-
-    /// `.md` files that arrived as *email attachments* are sender-controlled
-    /// content, not our mail: they must never become agenda rows, displace a
-    /// real invite (same UID, huge sequence) or strike one through.
-    #[test]
-    fn attachment_markdown_cannot_hijack_a_real_invite() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        let real = write_invite(
-            &inbox,
-            "invite.md",
-            "Board meeting",
-            "real-uid",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        // Layout 1: the per-email `<stem>_attachments/` sidecar dir.
-        write_invite(
-            &inbox.join("spam_attachments"),
-            "notes.md",
-            "Board meeting (MOVED to attacker room)",
-            "real-uid",
-            "REQUEST",
-            u32::MAX,
-            Some("2026-08-01T20:00:00+00:00"),
-        );
-        // Layout 2: the account-wide `attachments/<message-id>/` mirror.
-        write_invite(
-            &tmp.path().join("attachments").join("mid-1"),
-            "cancel.md",
-            "Cancelled: Board meeting",
-            "real-uid",
-            "CANCEL",
-            u32::MAX,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        // And a fabricated event with a fresh UID: no phantom row either.
-        write_invite(
-            &inbox.join("spam_attachments"),
-            "phantom.md",
-            "Free money",
-            "phantom-uid",
-            "REQUEST",
-            0,
-            Some("2026-08-02T09:00:00+00:00"),
-        );
-        let events = load_events_for_account(tmp.path());
-        assert_eq!(events.len(), 1, "only the real invite is an agenda row");
-        assert_eq!(events[0].path, real);
-        assert_eq!(events[0].event.summary.as_deref(), Some("Board meeting"));
-        assert!(!events[0].cancelled, "an attached CANCEL must not strike it");
-    }
-
-    /// On an equal-`(sequence, dtstamp)` tie the sent copy wins, so
-    /// `is_organizer` cannot flip on a mailbox name that sorts after `sent`.
-    /// A self-invited event shares one DTSTAMP across every copy, so this tie
-    /// is the normal case, not an exotic one.
-    #[test]
-    fn sent_copy_wins_an_equal_rank_tie() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_invite(
-            &tmp.path().join("sent"),
-            "x.md",
-            "All hands",
-            "uid-tie",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        // `team` sorts after `sent`, so plain path order would pick this copy.
-        write_invite(
-            &tmp.path().join("team"),
-            "x.md",
-            "All hands",
-            "uid-tie",
-            "REQUEST",
-            0,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        let events = load_events_for_account(tmp.path());
-        assert_eq!(events.len(), 1);
-        assert!(
-            events[0].is_organizer,
-            "our sent copy must win the tie, got {}",
-            events[0].path.display()
-        );
-    }
-
-    /// A sidecar that does not parse falls back to the frontmatter identity
-    /// rather than dropping the event or losing its UID.
-    #[test]
-    fn malformed_sidecar_falls_back_to_frontmatter_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        let a = write_invite(
-            &inbox,
-            "a.md",
-            "Sync",
-            "fm-uid",
-            "REQUEST",
-            2,
-            Some("2026-08-01T09:00:00+00:00"),
-        );
-        let att = crate::parse::attachments_dir_for(&a);
-        std::fs::create_dir_all(&att).unwrap();
-        std::fs::write(
-            att.join(crate::parse::CALENDAR_SIDECAR_NAME),
-            b"not an ics at all",
-        )
-        .unwrap();
-        // A second copy of the same frontmatter UID at a lower sequence: it
-        // dedups away only if the fallback UID survived.
-        write_invite(
-            &tmp.path().join("archive"),
-            "b.md",
-            "Sync",
-            "fm-uid",
-            "REQUEST",
+    fn a_reply_folds_onto_the_agenda_row() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "sent",
             1,
-            Some("2026-08-01T09:00:00+00:00"),
+            "Plan",
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+             UID:uid-fold\r\nSEQUENCE:0\r\nDTSTAMP:20260701T090000Z\r\nSUMMARY:Plan\r\n\
+             DTSTART:20260801T090000Z\r\n\
+             ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:a@example.com\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
         );
-        let events = load_events_for_account(tmp.path());
-        assert_eq!(events.len(), 1, "frontmatter UID still dedups the copies");
-        assert_eq!(events[0].path, a);
-        assert_eq!(events[0].event.sequence, 2);
+        assert_eq!(agenda(&fx)[0].event.attendees[0].status, "needs-action");
+
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Accepted: Plan",
+            &reply_ics(
+                "uid-fold",
+                0,
+                "a@example.com",
+                "ACCEPTED",
+                "20260710T120000Z",
+            ),
+        );
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 1, "the REPLY is not its own agenda row");
+        assert_eq!(events[0].event.attendees[0].status, "accepted");
     }
 
-    /// Invites with no UID at all are kept (keyed by path) rather than dropped.
+    /// The attendee's view, end to end over the store: the REQUEST arrives,
+    /// our RSVP is sent, and the sent-copy REPLY the outbox ingests is where
+    /// our own `PARTSTAT` comes from. Nothing is written to the invite: the
+    /// agenda derives `rsvp` from that REPLY on every rebuild.
     #[test]
-    fn keeps_uidless_invites_keyed_by_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = tmp.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
-        for name in ["one.md", "two.md"] {
-            std::fs::write(
-                inbox.join(name),
-                "---\nfrom: a@b.com\nto: me@x.com\nsubject: \"No UID\"\n\
-                 event:\n  method: REQUEST\n  summary: \"No UID\"\n  \
-                 start: \"2026-08-01T09:00:00+00:00\"\n---\n\nbody\n",
-            )
-            .unwrap();
-        }
-        assert_eq!(load_events_for_account(tmp.path()).len(), 2);
+    fn our_own_rsvp_reaches_the_agenda_through_the_sent_reply() {
+        let fx = fixture();
+        let request = fx.ingest_invite(
+            "inbox",
+            1,
+            "Plan",
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+             UID:uid-rsvp\r\nSEQUENCE:0\r\nDTSTAMP:20260701T090000Z\r\nSUMMARY:Plan\r\n\
+             DTSTART:20260801T090000Z\r\nORGANIZER:mailto:org@example.com\r\n\
+             ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        let me = "me@example.com";
+        let before = load_events_for_account(&fx.store, &fx.blobs, "alice", me);
+        assert_eq!(before[0].event.rsvp, "needs-action");
+        assert_eq!(before[0].msg, MessageRef::new(request));
+
+        // What `outbox::ingest_sent_copy` does during the send itself.
+        let reply = fx.ingest_invite(
+            "sent",
+            2,
+            "Declined: Plan",
+            &reply_ics("uid-rsvp", 0, me, "DECLINED", "20260710T120000Z"),
+        );
+
+        // The REPLY is a real invite row, and its blob carries the PARTSTAT.
+        let row = crate::store::read::find_by_id(&fx.store, reply)
+            .unwrap()
+            .expect("the sent reply is a row");
+        assert!(row.is_invite, "the sent copy carries an invite.ics blob");
+        assert_eq!(row.mailbox, "sent");
+        let ics = crate::store::read::load_invite_ics(&fx.store, &fx.blobs, reply)
+            .expect("the reply's ics blob");
+        let ics = String::from_utf8(ics).unwrap();
+        assert!(ics.contains("METHOD:REPLY"), "{ics}");
+        assert!(ics.contains("PARTSTAT=DECLINED"), "{ics}");
+
+        // And the agenda derives our answer from it, with the invite row
+        // untouched: still one agenda row, still the REQUEST's.
+        let after = load_events_for_account(&fx.store, &fx.blobs, "alice", me);
+        assert_eq!(after.len(), 1, "the REPLY is not a second agenda row");
+        assert_eq!(after[0].msg, MessageRef::new(request));
+        assert_eq!(after[0].event.rsvp, "declined");
+        assert_eq!(after[0].event.attendees[0].status, "declined");
     }
 }
+

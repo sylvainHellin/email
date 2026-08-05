@@ -8,6 +8,8 @@ created: 2026-07-29
 ---
 
 Parked 2026-07-31 as an accepted risk, resolved by [#0040](0040-drop-file-layer-cutover.md).
+The exposure itself is gone since [#0038](0038-read-path-to-db.md) scope item 6 (2026-08-06): reconcile and the calendar loader read invites from `messages` rows joined to their own `invite.ics` blob, and the fold writes nothing, so neither the walk that classified a sender-controlled attachment nor the frontmatter writer that persisted the forged `PARTSTAT` still exists.
+The ticket stays open until #0040 lands because that is what removes the attachment `.md` files themselves and the acceptance criteria below are written against the walk.
 The exposure the owner accepted: a sender-controlled `.md` attachment can carry a forged `method: REPLY` that `reconcile::build_index` classifies and writes into a real invite's `PARTSTAT`, and the live mailstore holds 72 attachment `.md` files today, none of them carrying an `event:` block.
 No code is spent on it, because the data-access-layer rebuild deletes the walk it lives in: `src/reconcile.rs` moves onto store-backed sources in [#0038](0038-read-path-to-db.md) and there is no attachment `.md` on disk after the cutover.
 See [data-access-layer](../plans/data-access-layer.md), decision F.

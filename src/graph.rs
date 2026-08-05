@@ -6,7 +6,7 @@
 // storage layer (`.md` + `.html` + `_attachments/`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use serde::Deserialize;
@@ -525,13 +525,15 @@ impl GraphClient {
     }
 
     /// Two-pass fetch: first get IDs, then full messages for new ones only.
-    /// Returns (new_emails, skipped_count).
+    /// Returns (new_emails, skipped_count, server_read_flags), where the flag
+    /// map covers *every* message in the folder so the ingest path can apply
+    /// read-status changes to rows it already holds.
     pub async fn fetch_new_messages(
         &self,
         folder: &str,
         limit: usize,
         known_ids: &HashSet<String>,
-    ) -> Result<(Vec<FetchedEmail>, usize)> {
+    ) -> Result<(Vec<FetchedEmail>, usize, HashMap<String, bool>)> {
         let server_ids = self.fetch_message_ids(folder).await?;
         let new_ids: Vec<&String> = server_ids
             .keys()
@@ -542,7 +544,7 @@ impl GraphClient {
         let to_fetch = new_ids.len().min(limit);
 
         if to_fetch == 0 {
-            return Ok((Vec::new(), skipped));
+            return Ok((Vec::new(), skipped, server_ids));
         }
 
         // Fetch the full messages. We use the folder endpoint with a limit,
@@ -562,7 +564,7 @@ impl GraphClient {
             .take(to_fetch)
             .collect();
 
-        Ok((filtered, skipped))
+        Ok((filtered, skipped, server_ids))
     }
 }
 
@@ -570,309 +572,119 @@ impl GraphClient {
 // Phase 4: sync_mailboxes_graph
 // ---------------------------------------------------------------------------
 
-/// Sync orchestrator for Graph accounts. Mirrors the IMAP `sync_mailboxes`.
+/// Sync orchestrator for Graph accounts, store-only. Mirrors the IMAP
+/// `sync_mailboxes`, with two documented differences forced by the API:
+///
+/// - Graph never returns the original RFC822, so rows get `raw_blob` NULL and
+///   the body/attachment blobs are the only copies of the content;
+/// - Graph has no UID, so the row's `uid` is [`crate::ingest::graph_uid`] of
+///   the message's `Message-ID`, which is stable per message and keeps the
+///   `UNIQUE (account, mailbox, uid)` identity meaningful.
+///
+/// TODO(#0037-4b-or-0038): this still enumerates `internetMessageId` for the
+/// whole folder on every pass. The `sync_cursors.deltalink` column is written
+/// as NULL until the `/messages/delta` fetch replaces that enumeration.
 pub async fn sync_mailboxes_graph(
     config: &GraphConfig,
+    account_name: &str,
     targets: &[SyncTarget],
     limit: usize,
-    reconcile: bool,
     dry_run: bool,
 ) -> Result<SyncResult> {
     info!(
-        "sync_mailboxes_graph: {} targets, limit={}, reconcile={}, dry_run={}",
+        "sync_mailboxes_graph: account={account_name}, {} targets, limit={limit}, dry_run={dry_run}",
         targets.len(),
-        limit,
-        reconcile,
-        dry_run
     );
 
     let client = GraphClient::new_async(config).await?;
+    let store = crate::store::Store::open_account(account_name)?;
+    let blobs = crate::store::BlobStore::for_account(account_name);
+    let mut result = SyncResult::default();
 
-    let mut total_saved = 0usize;
-    let mut total_skipped = 0usize;
-    let mut total_read_updated = 0usize;
-    let mut fresh_observations: Vec<FreshObservation> = Vec::new();
-    // Sender/subject of new inbox saves, for desktop notifications (#0009).
-    let mut new_inbox_mail: Vec<crate::notify::NewMailMeta> = Vec::new();
-    // Whether any saved email is a METHOD:REPLY invite (#0030 reconciliation).
-    let mut saw_reply_invite = false;
-    // Local dirs actually modified on disk by this sync (saves, read-flag
-    // updates, reconciliation moves/removals). Lets the TUI invalidate only
-    // the affected mailbox caches. Left empty on dry_run.
-    let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
-
-    // Build global known IDs from all local directories
-    let mut global_known_ids = HashSet::new();
     for target in targets {
-        if target.local_dir.is_dir() {
-            if let Ok(ids) = crate::parse::scan_existing_message_ids(&target.local_dir) {
-                global_known_ids.extend(ids);
-            }
-        }
-    }
+        let known = crate::ingest::known_message_ids(&store, account_name, &target.role)?;
 
-    // Additive pass: fetch new messages for each mailbox
-    for target in targets {
-        info!(
-            "Graph sync: {} (server={}, local={})",
-            target.role, target.server_name, target.local_dir.display()
-        );
-
-        if !dry_run {
-            std::fs::create_dir_all(&target.local_dir).ok();
-        }
-
-        match client
-            .fetch_new_messages(&target.server_name, limit, &global_known_ids)
+        let (new_emails, skipped, server_flags) = match client
+            .fetch_new_messages(&target.server_name, limit, &known)
             .await
         {
-            Ok((new_emails, skipped)) => {
-                total_skipped += skipped;
-                if !new_emails.is_empty() {
-                    if dry_run {
-                        total_saved += new_emails.len();
-                    } else {
-                        match crate::parse::save_fetched_emails_with_known_ids(
-                            &new_emails,
-                            &target.local_dir,
-                            &target.status,
-                            &mut global_known_ids,
-                        ) {
-                            Ok((saved, dup, saved_paths)) => {
-                                total_saved += saved;
-                                total_skipped += dup;
-                                if saved > 0 {
-                                    touched_dirs.insert(target.local_dir.clone());
-                                    if new_emails.iter().any(|e| {
-                                        e.event
-                                            .as_ref()
-                                            .and_then(|ev| ev.method.as_deref())
-                                            .is_some_and(|m| m.eq_ignore_ascii_case("REPLY"))
-                                    }) {
-                                        saw_reply_invite = true;
-                                    }
-                                }
-                                // Record sender/subject of new *inbox* saves
-                                // for the desktop notification (#0009);
-                                // matched against the actually-written message
-                                // IDs so skipped duplicates don't notify.
-                                if saved > 0 && target.role.eq_ignore_ascii_case("inbox") {
-                                    new_inbox_mail.extend(
-                                        crate::notify::collect_new_mail_meta(
-                                            &new_emails,
-                                            &saved_paths,
-                                        ),
-                                    );
-                                }
-                                // Collect fresh observations
-                                for email in &new_emails {
-                                    fresh_observations.push(FreshObservation {
-                                        role: target.role.clone(),
-                                        from: email.from.clone(),
-                                        to: email.to.clone(),
-                                        cc: email.cc.clone(),
-                                        date: email.date.clone(),
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to save emails for {}: {}", target.role, e);
-                                // Save may have partially written files
-                                // before failing -- invalidate conservatively.
-                                touched_dirs.insert(target.local_dir.clone());
-                            }
-                        }
-                    }
-                }
-
-                // Sync read status for existing local files
-                if !dry_run {
-                    // Snapshot-staleness cutoff: local files modified at or
-                    // after this instant may carry a user change made while
-                    // this sync was reading the server; the (older) server
-                    // snapshot must not overwrite them. Captured before the
-                    // server read below (ticket #0004).
-                    let flags_cutoff = std::time::SystemTime::now();
-                    match sync_read_status_graph(
-                        &client,
-                        &target.server_name,
-                        &target.local_dir,
-                        flags_cutoff,
-                    )
-                    .await
-                    {
-                        Ok(updated) => {
-                            total_read_updated += updated;
-                            if updated > 0 {
-                                touched_dirs.insert(target.local_dir.clone());
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to sync read status for {}: {}", target.role, e);
-                            // May have partially updated files before failing.
-                            touched_dirs.insert(target.local_dir.clone());
-                        }
-                    }
-                }
-            }
-            Err(e) => warn!("Graph sync failed for {}: {}", target.role, e),
-        }
-    }
-
-    // Reconciliation pass
-    let mut total_moved = 0usize;
-    let mut total_removed = 0usize;
-
-    if reconcile {
-        // Only reconcile inbox and archive (not sent -- locally-authored is source of truth)
-        let reconcile_targets: Vec<&SyncTarget> = targets
-            .iter()
-            .filter(|t| {
-                let lower = t.role.to_lowercase();
-                lower == "inbox" || lower == "archive"
-            })
-            .collect();
-
-        // Gather all server message IDs across reconcilable mailboxes
-        let mut all_server_ids: HashSet<String> = HashSet::new();
-        // Map: message_id -> folder it was found in
-        let mut server_id_to_folder: HashMap<String, String> = HashMap::new();
-
-        for target in &reconcile_targets {
-            match client.fetch_message_ids(&target.server_name).await {
-                Ok(ids) => {
-                    for (id, _) in &ids {
-                        all_server_ids.insert(id.clone());
-                        server_id_to_folder.insert(id.clone(), target.role.clone());
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Reconciliation: failed to fetch IDs for {}: {}",
-                        target.role, e
-                    );
-                }
-            }
-        }
-
-        // Check local files: if a message is local but not on server, remove it.
-        // If it's in the wrong folder, move it.
-        for target in &reconcile_targets {
-            if !target.local_dir.is_dir() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Graph sync failed for {}: {}", target.role, e);
                 continue;
             }
-            let local_ids = match crate::parse::scan_mailbox_message_ids(&target.local_dir) {
-                Ok(ids) => ids,
-                Err(_) => continue,
-            };
+        };
+        result.skipped += skipped;
 
-            for (mid, local_path) in &local_ids {
-                if !all_server_ids.contains(mid) {
-                    // Not on server at all -- remove locally
-                    if dry_run {
-                        total_removed += 1;
-                    } else {
-                        info!("Reconcile: removing {} (not on server)", local_path.display());
-                        remove_local_email(local_path);
-                        total_removed += 1;
-                        touched_dirs.insert(target.local_dir.clone());
-                    }
-                } else if let Some(server_folder) = server_id_to_folder.get(mid) {
-                    // Check if it's in the right local folder
-                    let expected_target = reconcile_targets
-                        .iter()
-                        .find(|t| t.role == *server_folder);
-                    if let Some(expected) = expected_target {
-                        if expected.local_dir != target.local_dir {
-                            if dry_run {
-                                total_moved += 1;
-                            } else {
-                                info!(
-                                    "Reconcile: moving {} from {} to {}",
-                                    local_path.display(),
-                                    target.local_dir.display(),
-                                    expected.local_dir.display()
-                                );
-                                move_local_email(local_path, &expected.local_dir);
-                                total_moved += 1;
-                                // A move touches both source and destination
-                                touched_dirs.insert(target.local_dir.clone());
-                                touched_dirs.insert(expected.local_dir.clone());
-                            }
+        if dry_run {
+            result.saved += new_emails.len();
+            continue;
+        }
+
+        for email in &new_emails {
+            let message_id = crate::ingest::resolve_message_id(email, None);
+            let uid = crate::ingest::graph_uid(&message_id);
+            match crate::ingest::ingest_message(
+                &store,
+                &blobs,
+                &crate::ingest::IngestInput {
+                    account: account_name,
+                    mailbox: &target.role,
+                    uid,
+                    email,
+                    raw: None,
+                },
+            ) {
+                Ok(outcome) => {
+                    if outcome.inserted {
+                        result.saved += 1;
+                        if target.role.eq_ignore_ascii_case("inbox") {
+                            result
+                                .new_inbox_mail
+                                .push(crate::notify::NewMailMeta::new(&email.from, &email.subject));
                         }
                     }
+                    if outcome.uid_rebound {
+                        result.uid_rebound += 1;
+                    }
+                    result.fresh_observations.push(FreshObservation {
+                        role: target.role.clone(),
+                        from: email.from.clone(),
+                        to: email.to.clone(),
+                        cc: email.cc.clone(),
+                        date: email.date.clone(),
+                    });
                 }
+                Err(e) => warn!("Failed to ingest {} from {}: {:#}", message_id, target.role, e),
             }
         }
+
+        // Read status for messages the store already holds.
+        for (mid, is_read) in &server_flags {
+            let uid = crate::ingest::graph_uid(mid);
+            match crate::ingest::apply_seen_flag(&store, account_name, &target.role, uid, *is_read)
+            {
+                Ok(true) => result.read_updated += 1,
+                Ok(false) => {}
+                Err(e) => warn!("Failed to apply the read flag for {mid}: {e:#}"),
+            }
+        }
+
+        crate::ingest::record_mailbox_cursor(
+            &store,
+            account_name,
+            &target.role,
+            &crate::ingest::MailboxCursor {
+                uidvalidity: None,
+                last_uid: None,
+                uidnext: None,
+                exists: Some(server_flags.len() as i64),
+                deltalink: None,
+            },
+        )?;
     }
 
-    Ok(SyncResult {
-        saved: total_saved,
-        skipped: total_skipped,
-        moved: total_moved,
-        removed: total_removed,
-        read_updated: total_read_updated,
-        deduped: 0,
-        fresh_observations,
-        mailbox_states: std::collections::HashMap::new(),
-        touched_dirs: touched_dirs.into_iter().collect(),
-        new_inbox_mail,
-        saw_reply_invite,
-    })
-}
-
-/// Sync read status: compare server read flags against local frontmatter.
-///
-/// Delegates to the shared `sync_local_read_flags` helper (same as the IMAP
-/// path) so the local read state is parsed from *frontmatter*, not via a
-/// body-matching substring search, and so files modified after
-/// `snapshot_cutoff` are left alone (see ticket #0004).
-async fn sync_read_status_graph(
-    client: &GraphClient,
-    folder: &str,
-    local_dir: &std::path::Path,
-    snapshot_cutoff: std::time::SystemTime,
-) -> Result<usize> {
-    let server_flags = client.fetch_message_ids(folder).await?;
-    Ok(crate::imap_client::sync_local_read_flags(
-        local_dir,
-        &server_flags,
-        Some(snapshot_cutoff),
-    ))
-}
-
-fn remove_local_email(path: &std::path::Path) {
-    // Remove .md, .html companion, and _attachments directory
-    std::fs::remove_file(path).ok();
-    let html_path = path.with_extension("html");
-    if html_path.exists() {
-        std::fs::remove_file(&html_path).ok();
-    }
-    let att_dir = crate::parse::attachments_dir_for(path);
-    if att_dir.is_dir() {
-        std::fs::remove_dir_all(&att_dir).ok();
-    }
-}
-
-fn move_local_email(path: &std::path::Path, dest_dir: &std::path::Path) {
-    std::fs::create_dir_all(dest_dir).ok();
-    let filename = path.file_name().unwrap_or_default();
-    let dest = dest_dir.join(filename);
-    std::fs::rename(path, &dest).ok();
-
-    // Move .html companion
-    let html_src = path.with_extension("html");
-    if html_src.exists() {
-        let html_dest = dest.with_extension("html");
-        std::fs::rename(&html_src, &html_dest).ok();
-    }
-
-    // Move _attachments directory
-    let att_src = crate::parse::attachments_dir_for(path);
-    if att_src.is_dir() {
-        let att_dest = crate::parse::attachments_dir_for(&dest);
-        std::fs::rename(&att_src, &att_dest).ok();
-    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -967,14 +779,27 @@ impl GraphClient {
             "saveToSentItems": "true"
         });
 
-        let resp = self
+        // A connect or builder failure never reached the API, so nothing was
+        // sent; anything else (a timeout, a dropped response) leaves it
+        // unknown, and the outbox must not re-send on its own. See
+        // [`crate::outbox::AmbiguousSubmission`].
+        let resp = match self
             .client
             .post(&url)
             .bearer_auth(self.bearer())
             .json(&payload)
             .send()
             .await
-            .context("Failed to send mail via Graph API")?;
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_connect() || e.is_builder() => {
+                return Err(anyhow!(e).context("Failed to send mail via Graph API"))
+            }
+            Err(e) => {
+                return Err(anyhow!(crate::outbox::AmbiguousSubmission(e.to_string()))
+                    .context("Failed to send mail via Graph API"))
+            }
+        };
 
         if resp.status().is_success() || resp.status().as_u16() == 202 {
             info!("Graph sendMail succeeded");
@@ -1125,101 +950,52 @@ impl GraphClient {
     }
 }
 
-/// Archive an email via Graph API: find by message-id, move on server, move locally.
-pub async fn archive_email_graph(
+/// Move a message to another folder via Graph (#0018), naming it by its
+/// `Message-ID` and touching nothing locally: the store row was already moved
+/// optimistically by the caller (`crate::store::write`). Archiving is this with
+/// the archive folder as destination.
+///
+/// A message the server does not have is not an error. Graph's copy may already
+/// be gone (moved from another client), and the local row is what the user is
+/// looking at.
+pub async fn move_message_graph(
     config: &GraphConfig,
-    archive_dir: &std::path::Path,
-    file_path: &std::path::Path,
-    archive_folder: &str,
-) -> Result<()> {
-    move_email_graph(config, archive_dir, file_path, archive_folder, "inbox", "archived").await
-}
-
-/// Move an email to another folder via Graph API: find by message-id,
-/// move on server, move locally with a `status:` frontmatter update
-/// (#0018). Generalizes the archive flow -- archiving is
-/// `move_email_graph(.., archive_folder, "inbox", "archived")`.
-pub async fn move_email_graph(
-    config: &GraphConfig,
-    dest_dir: &std::path::Path,
-    file_path: &std::path::Path,
+    internet_message_id: &str,
     dest_folder: &str,
-    old_status: &str,
-    new_status: &str,
 ) -> Result<()> {
-    let message_id = crate::imap_client::get_message_id_from_file(file_path)
-        .ok_or_else(|| anyhow!("No message_id found in {}", file_path.display()))?;
-
     let client = GraphClient::new_async(config).await?;
 
-    // Find the message on the server
-    if let Some(graph_id) = client.find_message_by_internet_id(&message_id).await? {
-        client.move_message(&graph_id, dest_folder).await?;
-        info!("Graph: moved message {} to {}", message_id, dest_folder);
-    } else {
-        warn!(
-            "Graph: message {} not found on server, moving locally only",
-            message_id
-        );
+    match client.find_message_by_internet_id(internet_message_id).await? {
+        Some(graph_id) => {
+            client.move_message(&graph_id, dest_folder).await?;
+            info!("Graph: moved message {} to {}", internet_message_id, dest_folder);
+        }
+        None => warn!(
+            "Graph: message {} not found on server, nothing to move",
+            internet_message_id
+        ),
     }
-
-    // Move local files
-    std::fs::create_dir_all(dest_dir)?;
-    let filename = file_path
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid file path"))?;
-    let dest = dest_dir.join(filename);
-
-    // Update frontmatter status to match the destination mailbox
-    if let Ok(content) = std::fs::read_to_string(file_path) {
-        let updated = content.replace(
-            &format!("status: {}", old_status),
-            &format!("status: {}", new_status),
-        );
-        std::fs::write(file_path, updated)?;
-    }
-
-    std::fs::rename(file_path, &dest)?;
-
-    // Move .html companion
-    let html_src = file_path.with_extension("html");
-    if html_src.exists() {
-        let html_dest = dest.with_extension("html");
-        std::fs::rename(&html_src, &html_dest)?;
-    }
-
-    // Move _attachments directory
-    let att_src = crate::parse::attachments_dir_for(file_path);
-    if att_src.is_dir() {
-        let att_dest = crate::parse::attachments_dir_for(&dest);
-        std::fs::rename(&att_src, &att_dest)?;
-    }
-
     Ok(())
 }
 
-/// Delete an email via Graph API: find by message-id, delete on server, remove locally.
-pub async fn delete_email_graph(
+/// Delete a message via Graph, naming it by its `Message-ID`. Same contract as
+/// [`move_message_graph`]: server only, and a missing message is not an error.
+pub async fn delete_message_graph(
     config: &GraphConfig,
-    file_path: &std::path::Path,
+    internet_message_id: &str,
 ) -> Result<()> {
-    let message_id = crate::imap_client::get_message_id_from_file(file_path)
-        .ok_or_else(|| anyhow!("No message_id found in {}", file_path.display()))?;
-
     let client = GraphClient::new_async(config).await?;
 
-    if let Some(graph_id) = client.find_message_by_internet_id(&message_id).await? {
-        client.delete_message(&graph_id).await?;
-        info!("Graph: deleted message {} from server", message_id);
-    } else {
-        warn!(
-            "Graph: message {} not found on server, deleting locally only",
-            message_id
-        );
+    match client.find_message_by_internet_id(internet_message_id).await? {
+        Some(graph_id) => {
+            client.delete_message(&graph_id).await?;
+            info!("Graph: deleted message {} from server", internet_message_id);
+        }
+        None => warn!(
+            "Graph: message {} not found on server, nothing to delete",
+            internet_message_id
+        ),
     }
-
-    // Remove local files
-    remove_local_email(file_path);
     Ok(())
 }
 

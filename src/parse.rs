@@ -2,160 +2,13 @@ use anyhow::Result;
 use chrono::Utc;
 use colored::*;
 use mailparse::{parse_mail, MailHeaderMap};
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-
-/// Find the first occurrence of `needle` in `haystack`, ignoring ASCII case.
-/// Returns a byte offset valid for `haystack` itself. Never lowercase the whole
-/// string for offset math: `to_lowercase()` can change byte length (e.g. 'İ'
-/// U+0130, 2 bytes, lowercases to "i\u{307}", 3 bytes), so offsets computed on
-/// the lowercased copy misalign in the original -- wrong insertion point at
-/// best, panic on a non-char-boundary slice at worst.
-fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.is_empty() || h.len() < n.len() {
-        return None;
-    }
-    // The returned offset is a char boundary as long as the needle starts with
-    // an ASCII byte (eq_ignore_ascii_case only matches ASCII against ASCII).
-    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
-}
-
-/// Insert `tag` at the very start of `html`, after a leading doctype if one is
-/// present. Rationale for skipping the doctype: content before `<!DOCTYPE>`
-/// makes the browser ignore the doctype and render in quirks mode (a cosmetic
-/// degradation -- meta CSP is enforced either way). The doctype ends at its
-/// first `>` in every state of the HTML tokenizer (even inside quoted
-/// public/system identifiers, via the "abrupt-doctype-*" parse errors), so
-/// finding the first `>` matches browser behaviour and cannot be abused to
-/// swallow the tag.
-fn insert_at_document_start(html: &str, tag: &str) -> String {
-    let ws_len = html.len() - html.trim_start_matches(|c: char| c.is_ascii_whitespace()).len();
-    let rest = &html[ws_len..];
-    if rest.len() >= 9 && rest.as_bytes()[..9].eq_ignore_ascii_case(b"<!doctype") {
-        if let Some(gt) = rest.find('>') {
-            let insert = ws_len + gt + 1;
-            return format!("{}{}{}", &html[..insert], tag, &html[insert..]);
-        }
-        // Doctype never closed: the tokenizer consumes the rest of the input
-        // as (bogus) doctype, so nothing renders; prepending is still safe.
-    }
-    format!("{}{}", tag, html)
-}
-
-/// Ensure an HTML string declares UTF-8 charset.
-/// `mailparse` already decodes bodies to UTF-8, but the original HTML may still
-/// carry a different charset declaration (e.g. `charset=iso-8859-1`). If the
-/// browser honours that stale declaration it will misrender non-ASCII characters.
-/// This function *replaces* any existing charset with UTF-8, or inserts one if
-/// none is present.
-pub(crate) fn ensure_utf8_charset(html: &str) -> String {
-    use regex::Regex;
-
-    let meta = r#"<meta charset="UTF-8">"#;
-
-    // Replace <meta charset="..."> (HTML5 form)
-    let re_meta = Regex::new(r#"(?i)<meta\s+charset\s*=\s*"[^"]*"\s*/?>"#).unwrap();
-    if re_meta.is_match(html) {
-        return re_meta.replace(html, meta).into_owned();
-    }
-
-    // Replace <meta http-equiv="Content-Type" content="text/html; charset=...">
-    let re_http =
-        Regex::new(r#"(?i)<meta\s+http-equiv\s*=\s*"Content-Type"\s+content\s*=\s*"[^"]*"\s*/?>"#)
-            .unwrap();
-    if re_http.is_match(html) {
-        return re_http.replace(html, meta).into_owned();
-    }
-
-    // No charset declaration found -- inject one. Offsets come from
-    // `find_ascii_ci` (valid in `html` itself), never from a lowercased copy.
-    // Note this head-finding is still spoofable via a `<head>` inside a
-    // comment or attribute value; for the charset the worst case is mojibake,
-    // not a security hole, so simplicity wins here (unlike `inject_csp_meta`).
-    if let Some(pos) = find_ascii_ci(html, "<head>") {
-        let insert = pos + "<head>".len();
-        format!("{}{}{}", &html[..insert], meta, &html[insert..])
-    } else if let Some(tag_end) = find_ascii_ci(html, "<html")
-        .and_then(|pos| html[pos..].find('>').map(|i| pos + i + 1))
-    {
-        format!("{}<head>{}</head>{}", &html[..tag_end], meta, &html[tag_end..])
-    } else {
-        // No <head>, and either no <html> or an unclosed one (in which case
-        // the browser consumes the rest as attributes and renders nothing).
-        format!("{}{}", meta, html)
-    }
-}
-
-/// Inject a restrictive Content-Security-Policy `<meta>` tag into saved HTML so
-/// that opening the companion `.html` file in a browser (via `file://`) cannot
-/// execute scripts, phone home, or load remote tracking pixels.
-///
-/// Policy rationale:
-/// - `script-src 'none'` / `connect-src 'none'`: no script execution, no network
-///   requests from script -- neutralizes active content in hostile emails.
-/// - `img-src data: cid: file:`: remote (http/https) images -- i.e. tracking
-///   pixels -- are blocked by default. `file:` is required because inline
-///   `cid:` image references are rewritten to local `file://` paths at save
-///   time (see `rewrite_cid_references`); with scripts and connections blocked
-///   there is no exfiltration channel, so allowing local files is safe.
-///
-/// Any pre-existing CSP meta tag (e.g. supplied by the sender) is removed and
-/// replaced with ours, so our policy always wins. (Even if a sender CSP
-/// survived stripping, meta CSPs only intersect -- it could not weaken ours.)
-/// Idempotent: re-saving already-tagged HTML does not duplicate the tag.
-pub(crate) fn inject_csp_meta(html: &str) -> String {
-    use regex::Regex;
-
-    const CSP_META: &str = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'none'; connect-src 'none'; img-src data: cid: file:">"#;
-
-    // Strip any existing CSP meta tags (ours from a previous save, or
-    // sender-supplied ones), handling case variations and single/double quotes.
-    let re_csp = Regex::new(
-        r#"(?i)<meta\s+http-equiv\s*=\s*["']Content-Security-Policy["']\s+content\s*=\s*(?:"[^"]*"|'[^']*')\s*/?>"#,
-    )
-    .unwrap();
-    let html = re_csp.replace_all(html, "").into_owned();
-
-    // Insertion strategy: PREPEND at the very start of the document (after a
-    // leading doctype), never search for `<head>`/`<html>`. Searching is
-    // spoofable: a crafted email can hide an earlier `<head>` inside a comment
-    // (`<!--<head>-->`) or an attribute value, making a searched-in tag land
-    // where the browser never sees it -- fully neutralizing the CSP.
-    // Prepending is immune: during tree construction the HTML parser hoists a
-    // `<meta>` seen before any `<head>`/`<body>` into the implicitly created
-    // `<head>` (initial -> before-html -> before-head -> in-head reprocessing),
-    // and any later explicit `<head>` start tag is ignored, so our tag is
-    // always the first child of the real head and is always honored -- before
-    // any attacker-controlled content is parsed. This also avoids computing
-    // byte offsets on a lowercased copy (see `find_ascii_ci`).
-    insert_at_document_start(&html, CSP_META)
-}
-
-/// Rewrite `cid:` references in HTML to point to local attachment files.
-/// `attachments` is the list of extracted attachments (with Content-ID populated for
-/// inline images). `att_dir` is the directory where the files were saved.
-pub(crate) fn rewrite_cid_references(
-    html: &str,
-    attachments: &[AttachmentData],
-    att_dir: &Path,
-) -> String {
-    let mut result = html.to_string();
-    for att in attachments {
-        if let Some(ref cid) = att.content_id {
-            let local_path = att_dir.join(&att.filename);
-            let local_url = format!("file://{}", local_path.display());
-            // Replace both quoted and unquoted cid: references
-            result = result.replace(&format!("cid:{}", cid), &local_url);
-        }
-    }
-    result
-}
 
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char boundary.
+///
+/// Never lowercase or slice blindly for offset math: `to_lowercase()` can
+/// change byte length, and a mid-character slice panics.
 pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     if max_bytes >= s.len() {
         return s.len();
@@ -521,26 +374,6 @@ pub fn stable_attachments_dir(account_dir: &Path, message_id: &str) -> PathBuf {
         .join(sanitize_message_id_for_path(message_id))
 }
 
-/// Best-effort hardlink from `src` to `dst`, falling back to `fs::copy` on
-/// errors that indicate the filesystem doesn't support hardlinks for this
-/// pair (cross-device, permission, unsupported FS, etc.). If `dst` already
-/// exists, this is a no-op (caller assumes the existing entry is correct).
-pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
-    if dst.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst)?;
-            Ok(())
-        }
-    }
-}
-
 /// Given a path to an email `.md` file at `<account>/<mailbox>/<file>.md`,
 /// return `<account>` (i.e. `parent().parent()`).
 /// Returns `None` if the path doesn't have at least two ancestors.
@@ -562,6 +395,76 @@ pub fn list_attachments(email_path: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     Ok(files)
+}
+
+/// The temp directory a message's files are materialised into, created
+/// private to the current user.
+///
+/// One function for both halves of the product: `mp open` and the list's `o`
+/// put the same message's files in the same place, and the bytes are
+/// rewritten before every open, so a directory two accounts share (row ids
+/// are per-account) never hands the opener a stale file -- only the paths
+/// just written are returned. `stem` keys it: the row id for a stored
+/// message, `search-<n>` for a hit that resolved to no row.
+///
+/// The name is predictable, so the directory is not trusted: on a shared host
+/// `$TMPDIR` is world-writable, and a directory (or a symlink to one) an
+/// attacker created first would otherwise receive the message bytes. It is
+/// created 0o700, a pre-existing one must be a real directory owned by this
+/// user, and a loose mode left by an older build is tightened rather than
+/// used.
+pub fn materialisation_dir(stem: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("mailypoppins-{stem}"));
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!("creating {}: {e}", dir.display()));
+        }
+    }
+    // `symlink_metadata`, not `metadata`: a symlink pointing at a directory
+    // someone else owns must be rejected, not followed.
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "{} exists and is not a directory; refusing to materialise message files there",
+            dir.display()
+        );
+    }
+    // Safe: getuid() is always defined on POSIX, never fails.
+    let uid = unsafe { libc_getuid() };
+    if meta.uid() != uid {
+        anyhow::bail!(
+            "{} is owned by another user; refusing to materialise message files there",
+            dir.display()
+        );
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("restricting {} to 0700: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    // WSL is unix; native Windows is not a target, so there is no mode to set.
+    fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))
 }
 
 /// Open a file with the system default application (macOS `open`).
@@ -653,7 +556,7 @@ pub fn parse_rfc822_to_fetched_email(rfc822_body: &[u8]) -> Option<FetchedEmail>
 }
 
 /// Compress a sorted list of UIDs into IMAP sequence set format using ranges.
-/// e.g., [1,2,3,5,7,8,9] -> "1:3,5,7:9"
+/// e.g., `[1,2,3,5,7,8,9]` -> `"1:3,5,7:9"`
 pub fn compress_uid_set(uids: &[u32]) -> String {
     if uids.is_empty() {
         return String::new();
@@ -751,295 +654,6 @@ pub fn parse_email_date_prefix(date_str: &str) -> String {
     Utc::now().format("%Y-%m-%d-%H%M").to_string()
 }
 
-/// Low-level scanner: walks a mailbox directory and extracts message_id from frontmatter.
-/// Returns {message_id -> file_path}. Used as the canonical base for all scanning.
-pub(crate) fn scan_mailbox_message_ids(dir: &Path) -> Result<HashMap<String, PathBuf>> {
-    let mut ids = HashMap::new();
-    if !dir.exists() {
-        return Ok(ids);
-    }
-    for entry in WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            if let Ok(content) = fs::read_to_string(path) {
-                let mut in_frontmatter = false;
-                for line in content.lines() {
-                    if line == "---" {
-                        if !in_frontmatter {
-                            in_frontmatter = true;
-                            continue;
-                        } else {
-                            break;
-                        }
-                    }
-                    if in_frontmatter && line.starts_with("message_id:") {
-                        let id = line.trim_start_matches("message_id:").trim().trim_matches('"').trim_matches('\'');
-                        if !id.is_empty() {
-                            ids.insert(id.to_string(), path.to_path_buf());
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(ids)
-}
-
-/// Scan a directory for .md files and collect their message_ids into a HashSet.
-/// Delegates to scan_mailbox_message_ids to deduplicate the low-level scanning logic.
-pub fn scan_existing_message_ids(dir: &Path) -> Result<HashSet<String>> {
-    Ok(scan_mailbox_message_ids(dir)?.into_keys().collect())
-}
-
-pub fn save_fetched_emails(emails: &[FetchedEmail], inbox_dir: &Path, status: &str) -> Result<(usize, usize)> {
-    let mut existing_ids = scan_existing_message_ids(inbox_dir)?;
-    let (saved, skipped, _paths) =
-        save_fetched_emails_with_known_ids(emails, inbox_dir, status, &mut existing_ids)?;
-    Ok((saved, skipped))
-}
-
-/// `(message_id, path)` for each email written by `save_fetched_emails_with_known_ids`.
-pub type SavedEmailPaths = Vec<(Option<String>, PathBuf)>;
-
-/// Save fetched emails, skipping any whose message_id is already in `existing_ids`.
-/// Returns `(saved, skipped, saved_paths)` where `saved_paths` contains the
-/// destination path of every email actually written (so callers can update
-/// their indexes without re-scanning the directory).
-pub fn save_fetched_emails_with_known_ids(
-    emails: &[FetchedEmail],
-    inbox_dir: &Path,
-    status: &str,
-    existing_ids: &mut HashSet<String>,
-) -> Result<(usize, usize, SavedEmailPaths)> {
-    fs::create_dir_all(inbox_dir)?;
-
-    let mut saved = 0;
-    let mut skipped = 0;
-    let mut saved_paths: SavedEmailPaths = Vec::new();
-
-    for email in emails {
-        // Skip duplicates by message_id
-        if let Some(ref mid) = email.message_id {
-            if existing_ids.contains(mid) {
-                skipped += 1;
-                continue;
-            }
-        }
-
-        let date_prefix = parse_email_date_prefix(&email.date);
-        let sender_slug = slugify_sender(&email.from);
-        let subject_slug = slugify_subject(&email.subject);
-        let filename = if subject_slug.is_empty() {
-            format!("{}_{}_email.md", date_prefix, sender_slug)
-        } else {
-            format!("{}_{}_{}.md", date_prefix, sender_slug, subject_slug)
-        };
-
-        let mut dest = inbox_dir.join(&filename);
-        // Avoid overwriting if filename collides
-        if dest.exists() {
-            let mut counter = 1;
-            loop {
-                let name = if subject_slug.is_empty() {
-                    format!("{}_{}_email-{}.md", date_prefix, sender_slug, counter)
-                } else {
-                    format!("{}_{}_{}-{}.md", date_prefix, sender_slug, subject_slug, counter)
-                };
-                dest = inbox_dir.join(&name);
-                if !dest.exists() {
-                    break;
-                }
-                counter += 1;
-            }
-        }
-
-        // Build frontmatter via serde for correct quoting
-        let fetched_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let fm = crate::types::SaveFrontmatter {
-            from: email.from.clone(),
-            to: email.to.clone(),
-            cc: email.cc.clone(),
-            subject: email.subject.clone(),
-            date: email.date.clone(),
-            message_id: email.message_id.clone(),
-            status: status.to_string(),
-            has_attachments: email.has_attachments,
-            attachments: None, // filled below after saving attachment files
-            read: email.is_read,
-            fetched_at: fetched_at.clone(),
-            event: email.event.clone(),
-        };
-
-        // Save the iMIP calendar sidecar `.ics` (source of truth for
-        // UID/SEQUENCE), colocated with attachments so archive/move keeps it
-        // next to the email (ticket #0006). Best-effort: a write error must not
-        // fail the email save.
-        if let Some(ref ics) = email.calendar_ics {
-            let att_dir = attachments_dir_for(&dest);
-            if let Err(e) = fs::create_dir_all(&att_dir)
-                .and_then(|_| fs::write(att_dir.join(CALENDAR_SIDECAR_NAME), ics))
-            {
-                log::warn!(
-                    "failed to save calendar sidecar for {}: {}",
-                    dest.display(),
-                    e
-                );
-            }
-        }
-
-        // Save attachment files and record filenames
-        let mut saved_filenames: Vec<String> = Vec::new();
-        if !email.attachments.is_empty() {
-            let att_dir = attachments_dir_for(&dest);
-            fs::create_dir_all(&att_dir)?;
-
-            // Stable per-account mirror, keyed by Message-ID (ticket #0006).
-            // `inbox_dir` is `<account>/<mailbox>` -> account is `parent()`.
-            let stable_dir = email.message_id.as_deref().and_then(|mid| {
-                inbox_dir
-                    .parent()
-                    .map(|acct| stable_attachments_dir(acct, mid))
-            });
-
-            let mut used_names: HashSet<String> = HashSet::new();
-            for att in &email.attachments {
-                let mut name = att.filename.clone();
-                if used_names.contains(&name) {
-                    let stem = Path::new(&name)
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let ext = Path::new(&name)
-                        .extension()
-                        .map(|e| format!(".{}", e.to_string_lossy()))
-                        .unwrap_or_default();
-                    let mut n = 1;
-                    loop {
-                        name = format!("{}-{}{}", stem, n, ext);
-                        if !used_names.contains(&name) {
-                            break;
-                        }
-                        n += 1;
-                    }
-                }
-                used_names.insert(name.clone());
-                let written_path = att_dir.join(&name);
-                fs::write(&written_path, &att.content)?;
-                if let Some(stable) = stable_dir.as_ref() {
-                    // Best-effort: log but don't fail the fetch on link/copy errors.
-                    if let Err(e) = link_or_copy(&written_path, &stable.join(&name)) {
-                        log::warn!(
-                            "failed to mirror attachment {} into stable store: {}",
-                            written_path.display(),
-                            e
-                        );
-                    }
-                }
-                saved_filenames.push(name);
-            }
-        }
-
-        // Build frontmatter with attachment info
-        let fm = crate::types::SaveFrontmatter {
-            attachments: if saved_filenames.is_empty() { None } else { Some(saved_filenames) },
-            ..fm
-        };
-        let mut frontmatter = serde_yaml::to_string(&fm)?;
-        // serde_yaml 0.9 does not add document markers.
-        // Wrap in "---\n...\n---\n\n" for valid frontmatter.
-        frontmatter = format!("---\n{}---\n\n", frontmatter);
-
-        let content = format!("{}{}", frontmatter, email.body_text);
-        fs::write(&dest, content)?;
-
-        // Save companion HTML file if available
-        if let Some(ref html) = email.html_body {
-            let html_path = dest.with_extension("html");
-            let att_dir = attachments_dir_for(&dest);
-            let html = rewrite_cid_references(html, &email.attachments, &att_dir);
-            let html = ensure_utf8_charset(&html);
-            // Neutralize scripts and remote tracking pixels when the file is
-            // later opened in a browser (see `inject_csp_meta`).
-            let html = inject_csp_meta(&html);
-            fs::write(&html_path, html)?;
-        }
-
-        // Track the new message_id to prevent duplicates within the same batch
-        if let Some(ref mid) = email.message_id {
-            existing_ids.insert(mid.clone());
-        }
-
-        saved_paths.push((email.message_id.clone(), dest));
-        saved += 1;
-    }
-
-    Ok((saved, skipped, saved_paths))
-}
-
-/// Remove duplicate emails in a directory by message_id.
-/// Keeps the first file found (alphabetically) and deletes subsequent duplicates
-/// along with their companion .html and _attachments/ files.
-/// Returns the number of duplicates removed.
-pub fn deduplicate_mailbox(dir: &Path) -> Result<usize> {
-    let mut seen: HashMap<String, PathBuf> = HashMap::new();
-    let mut removed = 0usize;
-
-    // Collect all (message_id, path) pairs, sorted by filename for determinism
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    if !dir.exists() {
-        return Ok(0);
-    }
-    for entry in WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() || path.extension().map_or(true, |ext| ext != "md") {
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(path) {
-            let mut in_frontmatter = false;
-            for line in content.lines() {
-                if line == "---" {
-                    if !in_frontmatter { in_frontmatter = true; continue; }
-                    else { break; }
-                }
-                if in_frontmatter && line.starts_with("message_id:") {
-                    let id = line.trim_start_matches("message_id:").trim().trim_matches('"').trim_matches('\'');
-                    if !id.is_empty() {
-                        entries.push((id.to_string(), path.to_path_buf()));
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    entries.sort_by(|a, b| a.1.cmp(&b.1));
-
-    for (mid, path) in entries {
-        if let Some(_keeper) = seen.get(&mid) {
-            // This is a duplicate -- remove .md, .html, and _attachments/
-            let _ = fs::remove_file(&path);
-            let html = path.with_extension("html");
-            if html.exists() {
-                let _ = fs::remove_file(&html);
-            }
-            let att_dir = attachments_dir_for(&path);
-            if att_dir.is_dir() {
-                let _ = fs::remove_dir_all(&att_dir);
-            }
-            removed += 1;
-        } else {
-            seen.insert(mid, path);
-        }
-    }
-
-    Ok(removed)
-}
-
 pub fn display_fetched_emails(emails: &[FetchedEmail], full_body: bool) {
     if emails.is_empty() {
         println!("No emails found matching the criteria.");
@@ -1092,143 +706,6 @@ pub fn display_fetched_emails(emails: &[FetchedEmail], full_body: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // ensure_utf8_charset
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ensure_utf8_charset_already_has_charset() {
-        let html = r#"<html><head><meta charset="UTF-8"></head><body>hi</body></html>"#;
-        assert_eq!(ensure_utf8_charset(html), html);
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_injects_after_head() {
-        let html = "<html><head><title>Test</title></head><body>hi</body></html>";
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains("<meta charset=\"UTF-8\">"));
-        // Must appear right after <head>
-        assert!(result.contains("<head><meta charset=\"UTF-8\"><title>"));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_html_without_head() {
-        let html = "<html><body>hi</body></html>";
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains(r#"<meta charset="UTF-8">"#));
-        assert!(result.contains("<head>"));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_bare_html() {
-        let html = "<div>hello</div>";
-        let result = ensure_utf8_charset(html);
-        assert!(result.starts_with(r#"<meta charset="UTF-8">"#));
-    }
-
-    // -----------------------------------------------------------------------
-    // inject_csp_meta
-    // -----------------------------------------------------------------------
-
-    const CSP_META: &str = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'none'; connect-src 'none'; img-src data: cid: file:">"#;
-
-    #[test]
-    fn test_inject_csp_meta_normal_html() {
-        let html = "<html><head><title>Test</title></head><body>hi</body></html>";
-        let result = inject_csp_meta(html);
-        // Prepended before everything: the parser hoists it into <head> and
-        // no earlier attacker-controlled bytes can hide it.
-        assert!(result.starts_with(CSP_META));
-        assert!(result.ends_with(html));
-    }
-
-    #[test]
-    fn test_inject_csp_meta_without_head() {
-        let html = "<html><body>hi</body></html>";
-        let result = inject_csp_meta(html);
-        assert!(result.starts_with(CSP_META));
-        assert!(result.ends_with(html));
-    }
-
-    #[test]
-    fn test_inject_csp_meta_after_doctype() {
-        let html = "<!DOCTYPE html><html><head></head><body>hi</body></html>";
-        let result = inject_csp_meta(html);
-        // After the doctype (so standards mode is preserved), before all else.
-        assert!(result.starts_with(&format!("<!DOCTYPE html>{}<html>", CSP_META)));
-    }
-
-    #[test]
-    fn test_inject_csp_meta_comment_fake_head() {
-        // A <head> hidden in a comment must not lure the tag into the comment
-        // (where the browser would never see it).
-        let html = "<html><!--<head>--><head><script>alert(1)</script></head><body>hi</body></html>";
-        let result = inject_csp_meta(html);
-        assert!(result.starts_with(CSP_META));
-        // The tag must appear before the comment, not inside it.
-        assert!(result.find(CSP_META).unwrap() < result.find("<!--").unwrap());
-    }
-
-    #[test]
-    fn test_inject_csp_meta_attribute_fake_head() {
-        // A <head> hidden in an attribute value must not attract the tag into
-        // the attribute (where it would be inert text).
-        let html = r#"<html data-x="<head>"><head><script>alert(1)</script></head></html>"#;
-        let result = inject_csp_meta(html);
-        assert!(result.starts_with(CSP_META));
-        assert!(result.find(CSP_META).unwrap() < result.find("data-x").unwrap());
-    }
-
-    #[test]
-    fn test_inject_csp_meta_unicode_lowercase_expansion() {
-        // 'İ' (U+0130, 2 bytes) lowercases to "i\u{307}" (3 bytes), so byte
-        // offsets computed on a lowercased copy misalign in the original --
-        // the old implementation could panic on a non-char-boundary slice.
-        // Must not panic, and the tag must come first so the browser honors it.
-        let html = "<html title=\"İİİİİİİİ\"><head></head><body>hi</body></html>";
-        let result = inject_csp_meta(html);
-        assert!(result.starts_with(CSP_META));
-        assert!(result.ends_with(html));
-    }
-
-    #[test]
-    fn test_inject_csp_meta_bare_fragment() {
-        let html = "<div>hello</div>";
-        let result = inject_csp_meta(html);
-        assert!(result.starts_with(CSP_META));
-        assert!(result.ends_with("<div>hello</div>"));
-    }
-
-    #[test]
-    fn test_inject_csp_meta_idempotent() {
-        let html = "<html><head><title>t</title></head><body>hi</body></html>";
-        let once = inject_csp_meta(html);
-        let twice = inject_csp_meta(&once);
-        assert_eq!(once, twice);
-        assert_eq!(twice.matches("Content-Security-Policy").count(), 1);
-    }
-
-    #[test]
-    fn test_inject_csp_meta_replaces_existing_csp() {
-        // A sender-supplied (permissive) CSP must be replaced by ours, even
-        // with case variations and single quotes.
-        let html = r#"<html><head><META HTTP-EQUIV='content-security-policy' CONTENT='default-src *'></head><body>hi</body></html>"#;
-        let result = inject_csp_meta(html);
-        assert!(!result.contains("default-src *"));
-        assert!(result.contains(CSP_META));
-        assert_eq!(
-            result.to_lowercase().matches("content-security-policy").count(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_inject_csp_meta_uppercase_head() {
-        let html = "<HTML><HEAD></HEAD><BODY>hi</BODY></HTML>";
-        let result = inject_csp_meta(html);
-        assert!(result.contains(CSP_META));
-    }
 
     // -----------------------------------------------------------------------
     // compress_uid_set
@@ -1464,32 +941,6 @@ mod tests {
             stable_attachments_dir(acct, "<m@x.com>"),
             PathBuf::from("/data/accounts/tum/attachments/m@x.com")
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // link_or_copy
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_link_or_copy_creates_link_or_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.bin");
-        let dst = dir.path().join("sub/dst.bin");
-        std::fs::write(&src, b"hello").unwrap();
-        link_or_copy(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn test_link_or_copy_idempotent_when_dst_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.bin");
-        let dst = dir.path().join("dst.bin");
-        std::fs::write(&src, b"new").unwrap();
-        std::fs::write(&dst, b"old").unwrap();
-        link_or_copy(&src, &dst).unwrap();
-        // Existing destination is left untouched.
-        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
     }
 
     // -----------------------------------------------------------------------
@@ -1762,49 +1213,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // scan_existing_message_ids (filesystem)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_scan_existing_message_ids_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let ids = scan_existing_message_ids(dir.path()).unwrap();
-        assert!(ids.is_empty());
-    }
-
-    #[test]
-    fn test_scan_existing_message_ids_nonexistent_dir() {
-        let ids = scan_existing_message_ids(Path::new("/nonexistent/path/12345")).unwrap();
-        assert!(ids.is_empty());
-    }
-
-    #[test]
-    fn test_scan_existing_message_ids_finds_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = "---\nmessage_id: \"<abc@example.com>\"\nstatus: inbox\n---\n\nBody";
-        std::fs::write(dir.path().join("email1.md"), content).unwrap();
-        let content2 = "---\nmessage_id: \"<def@example.com>\"\nstatus: inbox\n---\n\nBody";
-        std::fs::write(dir.path().join("email2.md"), content2).unwrap();
-        // Non-md file should be ignored
-        std::fs::write(dir.path().join("notes.txt"), "---\nmessage_id: \"<skip>\"\n---\n").unwrap();
-
-        let ids = scan_existing_message_ids(dir.path()).unwrap();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("<abc@example.com>"));
-        assert!(ids.contains("<def@example.com>"));
-    }
-
-    #[test]
-    fn test_scan_existing_message_ids_no_message_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = "---\nstatus: inbox\n---\n\nBody without message_id";
-        std::fs::write(dir.path().join("email.md"), content).unwrap();
-
-        let ids = scan_existing_message_ids(dir.path()).unwrap();
-        assert!(ids.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
     // list_attachments (filesystem)
     // -----------------------------------------------------------------------
 
@@ -1880,6 +1288,49 @@ mod tests {
         assert_eq!(std::fs::read(&result).unwrap(), b"data");
     }
 
+    /// The materialisation directory is created private to this user, and a
+    /// path an attacker could have put there first is refused rather than
+    /// written into: `$TMPDIR` is world-writable and the name is predictable.
+    ///
+    /// `create_private_dir` is exercised directly rather than through
+    /// `materialisation_dir`, which would need `$TMPDIR` moved under the whole
+    /// test process.
+    #[cfg(unix)]
+    #[test]
+    fn a_materialisation_dir_is_private_and_never_an_attackers_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // Created fresh: 0700, whatever the umask says.
+        let fresh = root.path().join("mailypoppins-1");
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700, "{:o}", mode_of(&fresh));
+
+        // Ours already, but left group- and world-readable by an older build:
+        // tightened, not used as found.
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700, "{:o}", mode_of(&fresh));
+
+        // A file where the directory should be: refused.
+        let as_file = root.path().join("mailypoppins-2");
+        fs::write(&as_file, b"not a directory").unwrap();
+        let err = create_private_dir(&as_file).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink pointing at a directory elsewhere: refused, not followed,
+        // so the message bytes cannot be redirected out of the temp area.
+        let elsewhere = root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let link = root.path().join("mailypoppins-3");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
     #[test]
     fn test_save_attachment_no_extension() {
         let src_dir = tempfile::tempdir().unwrap();
@@ -1892,229 +1343,5 @@ mod tests {
         let result = save_attachment(&source, dest_dir.path()).unwrap();
         assert_eq!(result, dest_dir.path().join("Makefile_1"));
         assert_eq!(std::fs::read(&result).unwrap(), b"data");
-    }
-
-    // -----------------------------------------------------------------------
-    // save_fetched_emails (filesystem)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_save_fetched_emails_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let emails = vec![FetchedEmail {
-            from: "alice@example.com".to_string(),
-            to: "bob@example.com".to_string(),
-            cc: None,
-            subject: "Test Subject".to_string(),
-            date: "Mon, 01 Jan 2024 12:00:00 +0000".to_string(),
-            body_text: "Hello world".to_string(),
-            html_body: None,
-            has_attachments: false,
-            message_id: Some("<test1@example.com>".to_string()),
-            attachments: vec![],
-            is_read: false,
-            calendar_ics: None,
-            event: None,
-        }];
-
-        let (saved, skipped) = save_fetched_emails(&emails, dir.path(), "inbox").unwrap();
-        assert_eq!(saved, 1);
-        assert_eq!(skipped, 0);
-
-        // Verify file was created
-        let files: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-            .collect();
-        assert_eq!(files.len(), 1);
-
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        assert!(content.contains("message_id:"));
-        assert!(content.contains("Hello world"));
-    }
-
-    #[test]
-    fn test_save_fetched_emails_dedup_by_message_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let email = FetchedEmail {
-            from: "alice@example.com".to_string(),
-            to: "bob@example.com".to_string(),
-            cc: None,
-            subject: "Dup Test".to_string(),
-            date: "Mon, 01 Jan 2024 12:00:00 +0000".to_string(),
-            body_text: "Body".to_string(),
-            html_body: None,
-            has_attachments: false,
-            message_id: Some("<dup@example.com>".to_string()),
-            attachments: vec![],
-            is_read: false,
-            calendar_ics: None,
-            event: None,
-        };
-
-        // Save once
-        let (saved1, _) = save_fetched_emails(&[email.clone()], dir.path(), "inbox").unwrap();
-        assert_eq!(saved1, 1);
-
-        // Save again -- should be skipped
-        let (saved2, skipped2) = save_fetched_emails(&[email], dir.path(), "inbox").unwrap();
-        assert_eq!(saved2, 0);
-        assert_eq!(skipped2, 1);
-    }
-
-    #[test]
-    fn test_save_fetched_emails_with_html_companion() {
-        let dir = tempfile::tempdir().unwrap();
-        let emails = vec![FetchedEmail {
-            from: "alice@example.com".to_string(),
-            to: "bob@example.com".to_string(),
-            cc: None,
-            subject: "HTML Email".to_string(),
-            date: "Mon, 01 Jan 2024 12:00:00 +0000".to_string(),
-            body_text: "Plain text".to_string(),
-            html_body: Some("<p>Rich text</p>".to_string()),
-            has_attachments: false,
-            message_id: Some("<html@example.com>".to_string()),
-            attachments: vec![],
-            is_read: false,
-            calendar_ics: None,
-            event: None,
-        }];
-
-        save_fetched_emails(&emails, dir.path(), "inbox").unwrap();
-
-        let html_files: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "html"))
-            .collect();
-        assert_eq!(html_files.len(), 1);
-        let html_content = std::fs::read_to_string(html_files[0].path()).unwrap();
-        assert!(html_content.contains("Rich text"));
-        // Saved HTML must carry the restrictive CSP (S1 security fix)
-        assert!(html_content.contains("Content-Security-Policy"));
-        assert!(html_content.contains("script-src 'none'"));
-    }
-
-    #[test]
-    fn test_save_fetched_emails_with_attachments() {
-        let dir = tempfile::tempdir().unwrap();
-        // Use an account/inbox layout so the stable mirror lands inside the
-        // tempdir instead of in the parent of the bare tempdir.
-        let account_dir = dir.path().join("account");
-        let inbox_dir = account_dir.join("inbox");
-        std::fs::create_dir_all(&inbox_dir).unwrap();
-        let emails = vec![FetchedEmail {
-            from: "alice@example.com".to_string(),
-            to: "bob@example.com".to_string(),
-            cc: None,
-            subject: "Attachment Email".to_string(),
-            date: "Mon, 01 Jan 2024 12:00:00 +0000".to_string(),
-            body_text: "See attached".to_string(),
-            html_body: None,
-            has_attachments: true,
-            message_id: Some("<att@example.com>".to_string()),
-            attachments: vec![
-                AttachmentData {
-                    filename: "report.pdf".to_string(),
-                    content: b"pdf content".to_vec(),
-                    content_id: None,
-                },
-                AttachmentData {
-                    filename: "image.png".to_string(),
-                    content: b"png content".to_vec(),
-                    content_id: None,
-                },
-            ],
-            is_read: false,
-            calendar_ics: None,
-            event: None,
-        }];
-
-        save_fetched_emails(&emails, &inbox_dir, "inbox").unwrap();
-
-        // Find the md file and check its attachments dir
-        let md_files: Vec<_> = std::fs::read_dir(&inbox_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-            .collect();
-        assert_eq!(md_files.len(), 1);
-
-        let att_dir = attachments_dir_for(&md_files[0].path());
-        assert!(att_dir.is_dir());
-        assert!(att_dir.join("report.pdf").exists());
-        assert!(att_dir.join("image.png").exists());
-        assert_eq!(
-            std::fs::read(att_dir.join("report.pdf")).unwrap(),
-            b"pdf content"
-        );
-
-        // The stable per-account mirror exists for the same Message-ID and
-        // shares an inode with the per-mailbox copy (hardlink).
-        let stable = stable_attachments_dir(&account_dir, "<att@example.com>");
-        assert!(stable.is_dir(), "stable dir missing: {}", stable.display());
-        assert!(stable.join("report.pdf").exists());
-        assert!(stable.join("image.png").exists());
-        assert_eq!(
-            std::fs::read(stable.join("report.pdf")).unwrap(),
-            b"pdf content"
-        );
-        // Same inode: deleting the per-mailbox copy must leave the stable
-        // copy readable. (This is the property the bug-fix relies on.)
-        std::fs::remove_dir_all(&att_dir).unwrap();
-        assert_eq!(
-            std::fs::read(stable.join("report.pdf")).unwrap(),
-            b"pdf content"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // ensure_utf8_charset -- additional edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ensure_utf8_charset_replaces_existing() {
-        // An existing charset (even UTF-8) gets normalized to our canonical form.
-        let html = r#"<html><head><meta CHARSET="utf-8"></head><body>hi</body></html>"#;
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains(r#"<meta charset="UTF-8">"#));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_replaces_wrong_charset() {
-        let html =
-            r#"<html><head><meta charset="iso-8859-1"></head><body>Gr&uuml;&szlig;e</body></html>"#;
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains(r#"<meta charset="UTF-8">"#));
-        assert!(!result.contains("iso-8859-1"));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_replaces_http_equiv() {
-        let html = r#"<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252"></head><body>hi</body></html>"#;
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains(r#"<meta charset="UTF-8">"#));
-        assert!(!result.contains("windows-1252"));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_html_with_attributes() {
-        let html = r#"<html lang="en"><body>hi</body></html>"#;
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains("<head>"));
-        assert!(result.contains(r#"<meta charset="UTF-8">"#));
-    }
-
-    #[test]
-    fn test_ensure_utf8_charset_unicode_lowercase_expansion() {
-        // Same 'İ' offset-misalignment hazard as in inject_csp_meta: the old
-        // implementation lowercased the whole string for offset math and could
-        // panic or insert at the wrong byte. Must not panic; the tag must land
-        // right after the real <head>.
-        let html = "<html title=\"İİİİİİİİ\"><head></head><body>hi</body></html>";
-        let result = ensure_utf8_charset(html);
-        assert!(result.contains("<head><meta charset=\"UTF-8\"></head>"));
     }
 }
