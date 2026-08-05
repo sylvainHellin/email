@@ -344,3 +344,18 @@ Once a string carries its scheme it has declared what it is, and the parser has 
 
 The `drafts` table is keyed by `(account, id)` and the reindex upserted, so two files carrying the same `id:` frontmatter collapsed to one row: the losing file stayed on disk and stopped being addressable by any selector, with nothing said anywhere.
 The fix is visibility rather than resolution, because nothing but the user can say which file was meant: the reindex picks a deterministic winner (newest file, ties broken by path, so a re-index never flips the answer) and reports the pair, in the log and on `mp`'s stderr, naming both paths ([src/store/drafts.rs](../src/store/drafts.rs), #0050 review).
+
+## A typed key that only one half of the list can produce silently kills the other half's batch
+
+The TUI's multi-select set was keyed on `MessageRef`, the id of a `messages` row, which drafts do not have: `entry_from_draft` leaves `msg` empty and carries the indexed `id:` instead.
+`Ctrl+a` therefore selected nothing in the Drafts mailbox, `v` toggled nothing there, and `A` / `D` always fell through to their single-draft path, so `Action::BatchApprove` and `Action::BatchMarkDraft` were reachable by keystroke, present in the keymap and in the help overlay, and unreachable in fact.
+Nothing failed: the confirmation dialog never opened, and a flow that does not run reports nothing.
+The fix is to make the two namespaces a type the set can hold, `EntryKey::Msg(MessageRef) | EntryKey::Draft(String)`, and to have each batch filter the set to its own half rather than assume homogeneity ([src/tui/app/types.rs](../src/tui/app/types.rs), #0052).
+When a list holds two kinds of row, any set keyed on one of them is a dead end for the other, and the compiler cannot see it because `filter_map` on the absent field is perfectly well typed.
+
+## The rule a command enforces is not always in the function named after checking
+
+`mp send` calls `validate_draft`, which checks recipients, subject and address syntax, and says nothing about approval.
+The approved-status requirement lives in `send::build_draft_message`, which refuses anything whose `status:` is not `approved` before the outbox row is written.
+Porting the TUI's send by mirroring the validator alone would therefore have shipped a `s` key that sends unapproved drafts, which is the one thing the draft/approved split exists to prevent.
+Mirroring a CLI path means calling the same functions in the same order, not reproducing the checks that look like checks ([src/send.rs](../src/send.rs), #0052).

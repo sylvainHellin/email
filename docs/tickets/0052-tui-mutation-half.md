@@ -27,11 +27,17 @@ No flow re-reads a received `.md` file, because there is not one.
 2. Forward, the same shape through `create_forward_draft_from`, with attachments materialised from the row's blobs into the stable per-account mirror.
    Landed, unit A: `w` opens the compose wizard in `ComposeMode::Forward` again, as the pre-nuke build did, and the wizard's recipients and subject are written over the builder's before the draft is indexed.
 3. Send, whose draft comes from the drafts index and whose account resolver is `helpers::resolve_send_account`, which loses its `#[allow(dead_code)]` here.
+   Landed, unit B: `s` confirms, then submits the cursor draft through `send::send_durably` (or `send_durably_via` for Graph), which is the path `mp send <selector>` takes.
+   The approved-status requirement is not restated in the TUI because it is not the CLI's either: `send::build_draft_message` enforces it, before the outbox row exists, and its refusal is the status line the user reads.
 4. Approve and the batch approve.
+   Landed, unit B.
 5. Mark-draft and the batch mark-draft.
+   Landed, unit B: both flips call the same `draft::mark_as_approved` / `draft::mark_as_draft` the CLI calls, so the legal transitions and the error text of an illegal one are one implementation, not two.
 6. Edit recipients (the compose wizard's `EditDraft` mode) resolved through the drafts index rather than a cached path.
    Landed, unit A: the mode carries the draft's `id:` and resolves it on open and again on submit.
 7. Open in `$EDITOR`, which is `mp edit <selector>`'s job done in-process.
+   Landed, unit B, for a Drafts row, through the same suspend/edit/refresh seam the new drafts use.
+   On a received row it declines permanently rather than with the #0052 line: the pre-nuke build handed `$EDITOR` the message's `.md`, that file no longer exists, and `mp edit` takes draft selectors only, so there is no CLI behaviour to port.
 8. Attachment open and save, from the list and from the search-result overlay, sourced from `message_blobs`.
 9. Open in browser, from the list and from the search-result overlay: the rendered HTML comes from the html blob or the raw blob, not from a `.html` file beside a `.md`.
 10. Open event source, from the calendar view, through the invite's own row and ics blob.
@@ -45,6 +51,10 @@ Housekeeping this ticket owns, so nothing survives by accident:
   Done, unit A.
   `parse::link_or_copy` went with them, its only caller having been `source_from_file`, and `main.rs`'s `source_from_row` plus `materialise_attachments` moved into the library (`draft::source_from_row`, `store::read::materialise_attachments`) so the TUI and the CLI build a draft's source through one function.
 - Every remaining `needs_tui_mutation_half` decline disappears with the flow it guards; the helper itself goes when the last caller does.
+  After unit B its callers are the attachment, browser and event-source flows (scope items 8, 9, 10) plus the search-result Open of item 11.
+- The multi-select set is keyed on `EntryKey` (a `MessageRef` or an indexed draft id) rather than on a `MessageRef` alone, landed in unit B.
+  It had to be: `entry_from_draft` leaves `msg` empty, so a draft could not enter a `MessageRef`-keyed selection at all, and the batch approve and batch mark-draft of items 4 and 5 were reachable by keystroke and dead in fact.
+  The received-mail batches (archive, delete, move, toggle-read) filter the set to its `MessageRef` half and the draft batches to its draft-id half; a mixed selection cannot arise, because one mailbox lists one kind of row and switching clears the set.
 
 ## Acceptance criteria
 

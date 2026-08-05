@@ -493,7 +493,12 @@ fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageR
 // Account resolution for Send
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // no caller until TUI Send is ported onto the store (#0052)
+/// Which account sends this draft: the one whose address its `from:` names,
+/// falling back to the active one.
+///
+/// The draft file rather than the open mailbox is the source of truth, because
+/// a draft written for another configured account (a reply to mail that
+/// arrived there) has to leave through that account's credentials.
 pub(super) fn resolve_send_account(
     app: &App,
     draft_path: &Path,

@@ -156,7 +156,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, email)| {
                 let is_cursor = i == app.list_index;
-                let is_in_selection = has_selection && email.msg.is_some_and(|m| app.selection.contains(&m));
+                let is_in_selection = has_selection && app.is_selected(email);
                 let contact = truncate(email.display_contact(app.active_kind()), contact_width);
                 // Invite badge (calendar glyph) is distinct from the
                 // attachment paperclip; an invite may also have attachments.
@@ -236,7 +236,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, email)| {
                 let is_cursor = i == app.list_index;
-                let is_in_selection = has_selection && email.msg.is_some_and(|m| app.selection.contains(&m));
+                let is_in_selection = has_selection && app.is_selected(email);
                 let subject_prefix = invite_and_attachment_prefix(email);
                 let subject = truncate(
                     &format!("{}{}", subject_prefix, email.subject),

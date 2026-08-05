@@ -30,13 +30,15 @@ use crate::types::EmailStatus;
 /// The status line an action shows while its TUI flow has not been ported.
 ///
 /// The mutations moved onto the store with #0038 scope item 7 and the naming
-/// half landed with #0050, which is what these used to wait on. What is left
-/// is the TUI flows that still address a message as a file: a draft to edit,
-/// a file to hand `$EDITOR`, an attachment to write somewhere, a quote to
-/// build. Their CLI counterparts already run on the store and the selector,
-/// and [#0052] is the ticket that ports the TUI onto the same substrate.
+/// half landed with #0050, which is what these used to wait on. Units A and B
+/// of #0052 took the drafting, sending and status flows off the file layer;
+/// what is left are the flows that still want a file on disk that no longer
+/// exists: an attachment to write somewhere, a rendered `.html` to open in a
+/// browser, an `.ics` to hand the calendar. Their CLI counterparts already run
+/// on the store and the selector, and [#0052] is the ticket that ports the
+/// rest of the TUI onto the same substrate.
 ///
-/// `what` names the operation ("Reply", "Attachments"). The message tells the
+/// `what` names the operation ("Open in browser", "Attachments"). The message tells the
 /// user both halves of the truth: this build will do it soon, and there is a
 /// working way to do it right now.
 pub(super) fn needs_tui_mutation_half(what: &str) -> String {
@@ -219,26 +221,43 @@ fn forward_subject(app: &App, msg: MessageRef) -> String {
     crate::draft::fwd_subject(&subject)
 }
 
-/// The file behind an indexed draft id, or `None` with the status line saying
-/// the index no longer holds it.
+/// The file behind an indexed draft id, without a status line: the batch
+/// flows count their misses instead of narrating each one.
 ///
 /// [`crate::store::Store::open`] rather than `open_store`, for the reason the
 /// Drafts mailbox load gives: drafts are local-only files, so an account that
 /// has never synced has no store file and still has drafts.
+fn lookup_draft_path(account: &str, id: &str) -> Result<Option<PathBuf>> {
+    let store = crate::store::Store::open(crate::config::store_path(account))?;
+    Ok(crate::store::drafts::find(&store, account, id)?.map(|row| row.path))
+}
+
+/// The draft under the cursor, as its indexed id and the file that id names,
+/// or `None` with the status line saying why there is not one.
+///
+/// `why` is what to say when the cursor is on a received message instead,
+/// which every draft-only operation has to answer for itself: after #0037 a
+/// received message is a store row, so "the same thing but for mail" does not
+/// exist for editing, sending or approving.
+fn cursor_draft(app: &mut App, why: &str) -> Option<(String, PathBuf)> {
+    let id = match app.selected_email() {
+        Some(email) => email.draft_id.clone(),
+        None => return None,
+    };
+    let Some(id) = id else {
+        app.set_status_level(why.to_string(), StatusLevel::Warning);
+        return None;
+    };
+    let path = indexed_draft_path(app, &id)?;
+    Some((id, path))
+}
+
+/// The file behind an indexed draft id, or `None` with the status line saying
+/// the index no longer holds it.
 fn indexed_draft_path(app: &mut App, id: &str) -> Option<PathBuf> {
     let account = app.account_config.name.clone();
-    let store = match crate::store::Store::open(crate::config::store_path(&account)) {
-        Ok(store) => store,
-        Err(e) => {
-            app.set_status_level(
-                format!("No drafts index for {account}: {e:#}"),
-                StatusLevel::Error,
-            );
-            return None;
-        }
-    };
-    match crate::store::drafts::find(&store, &account, id) {
-        Ok(Some(row)) => Some(row.path),
+    match lookup_draft_path(&account, id) {
+        Ok(Some(path)) => Some(path),
         Ok(None) => {
             app.set_status_level(
                 format!("That draft is no longer in the index ({id})"),
@@ -248,11 +267,311 @@ fn indexed_draft_path(app: &mut App, id: &str) -> Option<PathBuf> {
         }
         Err(e) => {
             app.set_status_level(
-                format!("Reading the drafts index failed: {e:#}"),
+                format!("Reading the drafts index of {account} failed: {e:#}"),
                 StatusLevel::Error,
             );
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approve and mark-draft (#0052 scope items 4 and 5)
+// ---------------------------------------------------------------------------
+
+/// Which way a draft's `status:` is flipped.
+///
+/// The legal transitions are not this module's to decide: they are
+/// [`crate::draft::mark_as_approved`] and [`crate::draft::mark_as_draft`],
+/// the same two functions `mp mark-approved` and `mp mark-draft` call, so an
+/// illegal flip fails in the TUI with the error text the CLI prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftStatusFlip {
+    Approve,
+    Demote,
+}
+
+impl DraftStatusFlip {
+    /// How the operation names itself in a failure line.
+    fn what(self) -> &'static str {
+        match self {
+            DraftStatusFlip::Approve => "Approve",
+            DraftStatusFlip::Demote => "Mark-draft",
+        }
+    }
+
+    fn apply(self, path: &Path) -> Result<String> {
+        match self {
+            DraftStatusFlip::Approve => crate::draft::mark_as_approved(path),
+            DraftStatusFlip::Demote => crate::draft::mark_as_draft(path),
+        }
+    }
+
+    /// The line one flip shows, in the CLI's two shapes: the draft moved, or
+    /// it was already where it was being moved to. Named by its selector,
+    /// which is the handle the user can hand to `mp` (#0050), not by a path.
+    fn line(self, already: bool, selector: &Selector) -> String {
+        match (self, already) {
+            (DraftStatusFlip::Approve, false) => format!("Approved {selector}"),
+            (DraftStatusFlip::Approve, true) => format!("Already approved: {selector}"),
+            (DraftStatusFlip::Demote, false) => format!("Demoted {selector}"),
+            (DraftStatusFlip::Demote, true) => format!("Already a draft: {selector}"),
+        }
+    }
+}
+
+/// Re-index the drafts directory after a status flip and put the list, the
+/// sidebar counts and the cached Drafts mailbox back in step with the files.
+///
+/// Same sequence as `mp mark-approved`'s `reindex_drafts`, plus the refresh of
+/// the two things the CLI does not have: an open list and a sidebar count.
+fn refresh_drafts_after_flip(app: &mut App) {
+    if let Err(e) = crate::store::drafts::refresh_account(&app.account_config.name) {
+        log::warn!("[drafts] refreshing after a status flip failed: {e:#}");
+    }
+    if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
+        app.invalidate_cache_idx(idx);
+    }
+    app.recount_all_mailboxes();
+    app.reload_current_mailbox();
+}
+
+/// Flip the `status:` of the draft under the cursor.
+fn status_flip(app: &mut App, flip: DraftStatusFlip) {
+    let why = format!(
+        "{} needs a draft; received mail has no draft status to flip",
+        flip.what()
+    );
+    let Some((id, path)) = cursor_draft(app, &why) else {
+        return;
+    };
+    match flip.apply(&path) {
+        Ok(msg) => {
+            let selector = Selector::for_draft(&app.account_config.name, &id);
+            app.set_status(flip.line(msg.starts_with("Already"), &selector));
+            refresh_drafts_after_flip(app);
+        }
+        Err(e) => app.set_status_level(
+            format!("{} failed: {e:#}", flip.what()),
+            StatusLevel::Error,
+        ),
+    }
+}
+
+/// Flip the `status:` of every selected draft, counting what took it.
+///
+/// The counting and its two status-line shapes are the pre-nuke build's: a
+/// batch is not all-or-nothing, and a draft the flip refuses (an already-sent
+/// one, say) is one failure among N rather than an abort. The reason lands in
+/// the log, because the status line has room for a count and not for N errors.
+fn status_flip_batch(app: &mut App, ids: &[String], flip: DraftStatusFlip) {
+    let total = ids.len();
+    let account = app.account_config.name.clone();
+    // One store open for the whole batch, not one per draft.
+    let store = match crate::store::Store::open(crate::config::store_path(&account)) {
+        Ok(store) => store,
+        Err(e) => {
+            app.set_status_level(
+                format!("Reading the drafts index of {account} failed: {e:#}"),
+                StatusLevel::Error,
+            );
+            return;
+        }
+    };
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for id in ids {
+        let outcome = match crate::store::drafts::find(&store, &account, id) {
+            Ok(Some(row)) => flip.apply(&row.path).map(|_| ()),
+            Ok(None) => Err(anyhow::anyhow!("no longer in the index")),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => succeeded += 1,
+            Err(e) => {
+                log::warn!("[drafts] {} failed for {id}: {e:#}", flip.what());
+                failed += 1;
+            }
+        }
+    }
+    let line = match flip {
+        DraftStatusFlip::Approve if failed == 0 => format!("Approved {succeeded} drafts"),
+        DraftStatusFlip::Approve => {
+            format!("Approved {succeeded}/{total} drafts ({failed} failed)")
+        }
+        DraftStatusFlip::Demote if failed == 0 => format!("Marked {succeeded} as draft"),
+        DraftStatusFlip::Demote => {
+            format!("Marked {succeeded}/{total} as draft ({failed} failed)")
+        }
+    };
+    if failed == 0 {
+        app.set_status(line);
+    } else {
+        app.set_status_level(line, StatusLevel::Warning);
+    }
+    // The refresh re-opens the store to write the index; this read handle has
+    // no business being alive across it (WAL single-writer discipline).
+    drop(store);
+    refresh_drafts_after_flip(app);
+}
+
+// ---------------------------------------------------------------------------
+// Send (#0052 scope item 3)
+// ---------------------------------------------------------------------------
+
+/// Everything one durable send needs that does not come out of the draft.
+///
+/// `graph` being `Some` is what picks the Graph submission over SMTP, the same
+/// test `mp send` makes on `AuthMethod::Graph`; `smtp` is what the SMTP path
+/// submits through and where its `from` fallback comes from.
+struct SendCtx {
+    graph: Option<crate::config::GraphConfig>,
+    smtp: Option<crate::config::SmtpConfig>,
+    account: crate::config::AccountConfig,
+    email_settings: crate::config::EmailSettings,
+    signature: Option<String>,
+}
+
+/// The attachments a draft names, read off the paths in its frontmatter.
+///
+/// Only the Graph path needs them separately: the SMTP path's bytes are built
+/// by [`crate::send::build_draft_message`], which reads the same list itself.
+fn draft_attachments(draft: &crate::types::EmailDraft) -> Result<Vec<(String, Vec<u8>, String)>> {
+    let mut data = Vec::new();
+    let Some(attachments) = draft.frontmatter.attachments.as_ref() else {
+        return Ok(data);
+    };
+    for att_path in attachments {
+        let expanded = shellexpand::tilde(att_path);
+        let path = Path::new(expanded.as_ref());
+        let content = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("reading the attachment {att_path}: {e}"))?;
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string());
+        let content_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        data.push((filename, content, content_type));
+    }
+    Ok(data)
+}
+
+/// Send one draft the way `mp send <selector>` does, and leave the same trail.
+///
+/// The order is the CLI's, and the durability is the outbox's (#0037 item 5):
+/// the bytes are built first (which is where the approved-status requirement
+/// is enforced, by [`crate::send::build_draft_message`]), committed to the
+/// outbox, submitted, and only a submission that reached at least one
+/// recipient rewrites the draft's `status:` to `sent`. The sent copy is the
+/// outbox's business, not this function's.
+///
+/// The drafts index is refreshed afterwards so the `sent` status is the answer
+/// the next selector resolution gives, without waiting for the one-second
+/// poll (#0050's post-write refresh discipline).
+fn send_one_draft(
+    rt: &tokio::runtime::Runtime,
+    draft: &crate::types::EmailDraft,
+    ctx: &SendCtx,
+) -> Result<crate::send::SendReport> {
+    // The Graph path has no SMTP config to take a `from` fallback from, so it
+    // takes the account's; identical bytes either way (see
+    // `build_draft_message`).
+    let default_from = match (ctx.graph.as_ref(), ctx.smtp.as_ref()) {
+        (Some(_), _) => ctx.account.default_from.clone(),
+        (None, Some(smtp)) => smtp.default_from.clone(),
+        (None, None) => anyhow::bail!("SMTP not configured"),
+    };
+    let built = crate::send::build_draft_message(
+        draft,
+        &default_from,
+        &ctx.email_settings,
+        ctx.signature.as_deref(),
+        None,
+    )?;
+
+    let report = match ctx.graph.as_ref() {
+        Some(graph_config) => {
+            let to = parse_graph_recipients(draft.frontmatter.to.as_deref());
+            let cc = parse_graph_recipients(draft.frontmatter.cc.as_deref());
+            let bcc = parse_graph_recipients(draft.frontmatter.bcc.as_deref());
+            let to_refs: Vec<(&str, &str)> =
+                to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+            let cc_refs: Vec<(&str, &str)> =
+                cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+            let bcc_refs: Vec<(&str, &str)> =
+                bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+
+            // The quoted reply lives in the companion HTML the draft builder
+            // wrote; the Graph API takes a rendered body rather than bytes.
+            let quoted_html = draft.path.with_extension("html");
+            let quoted = if quoted_html.exists() {
+                std::fs::read_to_string(&quoted_html).ok()
+            } else {
+                None
+            };
+            let html_body = crate::send::markdown_to_html(
+                &draft.body_markdown,
+                &ctx.email_settings,
+                ctx.signature.as_deref(),
+                quoted.as_deref(),
+            );
+            let att_data = draft_attachments(draft)?;
+            let client = rt.block_on(crate::graph::GraphClient::new_async(graph_config))?;
+            rt.block_on(crate::send::send_durably_via(
+                &built,
+                &ctx.account,
+                client.send_mail(
+                    &to_refs,
+                    &cc_refs,
+                    &bcc_refs,
+                    &draft.frontmatter.subject,
+                    &html_body,
+                    &att_data,
+                ),
+            ))?
+        }
+        None => {
+            let smtp = ctx
+                .smtp
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SMTP not configured"))?;
+            rt.block_on(crate::send::send_durably(&built, &ctx.account, smtp))?
+        }
+    };
+
+    if report.send_result.any_succeeded() {
+        mark_draft_sent(draft, Some(&built.message_id))?;
+        crate::contacts::hooks::bump_after_send(&ctx.account, draft);
+        if let Err(e) = crate::store::drafts::refresh_account(&ctx.account.name) {
+            log::warn!("[drafts] refreshing after the send failed: {e:#}");
+        }
+    }
+    Ok(report)
+}
+
+/// The status line one finished send shows, which is the CLI's own report:
+/// how many recipients took it, and where the message actually is (#0037).
+fn send_status_line(report: &crate::send::SendReport) -> Result<String> {
+    let result = &report.send_result;
+    if result.all_succeeded() {
+        Ok(format!(
+            "Sent to {} recipient(s) [{}]",
+            result.results.len(),
+            report.status_line()
+        ))
+    } else if result.any_succeeded() {
+        let failed: Vec<String> = result.failed().iter().map(|r| r.address.clone()).collect();
+        Ok(format!(
+            "Partial: {}/{} succeeded -- failed: {} [{}]",
+            result.succeeded().len(),
+            result.results.len(),
+            failed.join(", "),
+            report.status_line()
+        ))
+    } else {
+        anyhow::bail!("Failed to send to all {} recipient(s)", result.results.len())
     }
 }
 
@@ -399,9 +718,24 @@ pub(super) fn handle_action(
 ) -> Result<()> {
     match action {
         Action::EditCurrent => {
-            // Opening a message in `$EDITOR` means handing it a file, which
-            // `mp edit <selector>` already does; the TUI flow lands with #0052.
-            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
+            // `mp edit <selector>` done in-process (#0052 scope item 7): the
+            // draft is resolved through the index and handed to `$EDITOR`,
+            // with the index refreshed on the way back so the list shows what
+            // the user just typed.
+            //
+            // A received row has no file to open. The pre-nuke build handed
+            // `$EDITOR` the message's `.md`; after #0037 there is no such
+            // file, and `mp edit` takes draft selectors only, so there is no
+            // CLI behaviour to mirror and nothing honest to open. It declines
+            // permanently rather than with the #0052 line, because nothing is
+            // coming that would make it work.
+            let Some((_id, path)) = cursor_draft(
+                app,
+                "Open in $EDITOR needs a draft; received mail is a store row, not a file",
+            ) else {
+                return Ok(());
+            };
+            edit_new_draft(app, terminal, &path, "Returned from editor".to_string())?;
         }
         Action::Reply(reply_all) => {
             let what = if reply_all { "Reply-all" } else { "Reply" };
@@ -431,7 +765,65 @@ pub(super) fn handle_action(
             write_draft_and_edit(app, terminal, &source, DraftFromSource::Forward, "Forward")?;
         }
         Action::Send => {
-            app.set_status_level(needs_tui_mutation_half("Send"), StatusLevel::Warning);
+            // `mp send <selector>` in-process (#0052 scope item 3). The draft
+            // is resolved through the index, validated the way the CLI
+            // validates it, and submitted through the durable outbox; the
+            // approved-status requirement is not checked here because it is
+            // not the CLI's either -- `build_draft_message` enforces it, and
+            // its refusal is the error the user sees.
+            let Some((_id, path)) = cursor_draft(
+                app,
+                "Send needs a draft; received mail has nothing to send",
+            ) else {
+                return Ok(());
+            };
+
+            let draft = match crate::draft::parse_email_draft(&path) {
+                Ok(draft) => draft,
+                Err(e) => {
+                    app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
+                    return Ok(());
+                }
+            };
+            if let Err(e) = crate::draft::validate_draft(&draft) {
+                app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
+                return Ok(());
+            }
+
+            // Which account sends it is the draft's own `from:`, not the open
+            // mailbox: a draft written for another configured account is sent
+            // from that account's SMTP or Graph credentials.
+            //
+            // The IMAP config that resolver also hands back is not used here:
+            // the sent copy is an APPEND the outbox owns and drives (#0037),
+            // not something this path does after the fact.
+            let (acct_idx, smtp, _imap, graph, account_config, signature) =
+                super::helpers::resolve_send_account(app, &path);
+            let graph =
+                graph.filter(|_| account_config.auth_method == crate::config::AuthMethod::Graph);
+            if graph.is_none() && smtp.is_none() {
+                app.set_status_level("SMTP not configured".to_string(), StatusLevel::Error);
+                return Ok(());
+            }
+            let ctx = SendCtx {
+                graph,
+                smtp,
+                account: account_config,
+                email_settings: app.global_config.email.clone(),
+                signature,
+            };
+
+            app.bg_count += 1;
+            app.set_status_level("Sending...".to_string(), StatusLevel::Progress);
+            let tx = bg_tx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                let result = send_one_draft(&rt, &draft, &ctx).and_then(|r| send_status_line(&r));
+                let _ = tx.send(BgResult::Send {
+                    account_index: acct_idx,
+                    result: result.map_err(|e| format!("{e:#}")),
+                });
+            });
         }
         Action::Rsvp { msg, choice } => {
             // The invitation's own iMIP payload is the source of truth for the
@@ -754,16 +1146,16 @@ pub(super) fn handle_action(
         }
 
         Action::Approve => {
-            app.set_status_level(needs_tui_mutation_half("Approve"), StatusLevel::Warning);
+            status_flip(app, DraftStatusFlip::Approve);
         }
-        Action::BatchApprove(_msgs) => {
-            app.set_status_level(needs_tui_mutation_half("Approve"), StatusLevel::Warning);
+        Action::BatchApprove(ids) => {
+            status_flip_batch(app, &ids, DraftStatusFlip::Approve);
         }
         Action::MarkDraft => {
-            app.set_status_level(needs_tui_mutation_half("Mark-draft"), StatusLevel::Warning);
+            status_flip(app, DraftStatusFlip::Demote);
         }
-        Action::BatchMarkDraft(_msgs) => {
-            app.set_status_level(needs_tui_mutation_half("Mark-draft"), StatusLevel::Warning);
+        Action::BatchMarkDraft(ids) => {
+            status_flip_batch(app, &ids, DraftStatusFlip::Demote);
         }
         Action::Archive => {
             if let Some(msg) = app.selected_email_ref() {
@@ -2144,8 +2536,8 @@ mod tests {
     /// at all.
     #[test]
     fn the_decline_message_points_at_the_working_fallback() {
-        let msg = needs_tui_mutation_half("Send");
-        assert!(msg.starts_with("Send "), "{msg}");
+        let msg = needs_tui_mutation_half("Attachments");
+        assert!(msg.starts_with("Attachments "), "{msg}");
         assert!(msg.contains("#0052"), "{msg}");
         assert!(!msg.contains("#0050"), "{msg}");
         assert!(msg.contains("mp-legacy"), "{msg}");
@@ -2266,14 +2658,14 @@ mod store_backed_drafts {
 
     /// Point the data directory at a tempdir so every `config::` path resolves
     /// inside the fixture, serialised against the other data-dir tests.
-    struct Fixture {
+    pub(super) struct Fixture {
         _dir: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let guard = crate::config::data_dir_lock();
             let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
             let dir = tempfile::tempdir().unwrap();
@@ -2285,12 +2677,12 @@ mod store_backed_drafts {
             }
         }
 
-        fn store(&self) -> Store {
+        pub(super) fn store(&self) -> Store {
             Store::open(crate::config::store_path("alice")).unwrap()
         }
 
         /// Ingest one message and hand back the row the list would show.
-        fn ingest(&self, email: &FetchedEmail) -> MessageRow {
+        pub(super) fn ingest(&self, email: &FetchedEmail) -> MessageRow {
             let store = self.store();
             let blobs = BlobStore::for_account("alice");
             let outcome = crate::ingest::ingest_message(
@@ -2312,7 +2704,7 @@ mod store_backed_drafts {
 
         /// The source of a reply or a forward off that row, which is what both
         /// the list flow and `mp reply` build.
-        fn source(&self, row: &MessageRow, with_attachments: bool) -> SourceMessage {
+        pub(super) fn source(&self, row: &MessageRow, with_attachments: bool) -> SourceMessage {
             let store = self.store();
             let blobs = BlobStore::for_account("alice");
             crate::draft::source_from_row(&store, &blobs, row, with_attachments).unwrap()
@@ -2320,7 +2712,7 @@ mod store_backed_drafts {
 
         /// Resolve a selector through the drafts index, exactly as
         /// `mp send <selector>` would after reading it off the status line.
-        fn resolve(&self, selector: &Selector) -> crate::store::drafts::DraftRow {
+        pub(super) fn resolve(&self, selector: &Selector) -> crate::store::drafts::DraftRow {
             let store = self.store();
             let query =
                 crate::selector::parse_in(&selector.to_string(), Namespace::Drafts, "alice", None)
@@ -2338,7 +2730,7 @@ mod store_backed_drafts {
         }
     }
 
-    fn fixture_email(subject: &str) -> FetchedEmail {
+    pub(super) fn fixture_email(subject: &str) -> FetchedEmail {
         FetchedEmail {
             from: "Alice <alice@example.com>".into(),
             to: "me@example.com, bob@example.com".into(),
@@ -2612,5 +3004,271 @@ mod store_backed_drafts {
             "{content}"
         );
         assert_eq!(fx.resolve(&selector).path, path);
+    }
+}
+
+/// The store-backed mutation flows (#0052 unit B), over the same fixture:
+/// send, approve, mark-draft and the batch forms of the last two.
+///
+/// The send tests are offline by construction. The two halves of `mp send`'s
+/// contract that do not need a server are exactly the two worth pinning: a
+/// draft that is not approved is refused before anything is enqueued, and a
+/// submission that reaches nobody still leaves the durable record the outbox
+/// exists for, with the draft file untouched.
+#[cfg(test)]
+mod store_backed_mutations {
+    use super::store_backed_drafts::{fixture_email, Fixture};
+    use super::*;
+    use crate::tui::app::EmailEntry;
+
+    /// An account that submits to a closed port: the SMTP conversation fails
+    /// on connect, deterministically and without a network.
+    fn dead_smtp_ctx() -> SendCtx {
+        SendCtx {
+            graph: None,
+            smtp: Some(crate::config::SmtpConfig {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                username: String::new(),
+                password: String::new(),
+                default_from: "me@example.com".to_string(),
+                accept_invalid_certs: false,
+                auth_method: crate::config::AuthMethod::Password,
+            }),
+            account: crate::config::AccountConfig {
+                name: "alice".to_string(),
+                default_from: "me@example.com".to_string(),
+                ..Default::default()
+            },
+            email_settings: crate::config::EmailSettings::default(),
+            signature: None,
+        }
+    }
+
+    /// A received list row: a `messages` row and no draft id, which is what
+    /// `entry_from_row` builds.
+    fn received_entry() -> EmailEntry {
+        EmailEntry {
+            msg: Some(MessageRef::new(1)),
+            draft_id: None,
+            ..draft_entry("unused")
+        }
+    }
+
+    /// A Drafts list row: the indexed id and no `messages` row, which is what
+    /// `entry_from_draft` builds.
+    fn draft_entry(id: &str) -> EmailEntry {
+        EmailEntry {
+            msg: None,
+            draft_id: Some(id.to_string()),
+            from: String::new(),
+            to: "alice@example.com".to_string(),
+            cc: None,
+            subject: "Re: Hello".to_string(),
+            status: "draft".to_string(),
+            date_display: "2026-07-01".to_string(),
+            date_sort: "2026-07-01T00:00:00".to_string(),
+            has_attachments: false,
+            read: true,
+            is_invite: false,
+        }
+    }
+
+    /// An app whose cursor sits on `id`'s Drafts row.
+    fn app_on_draft(id: &str) -> App {
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.emails = std::sync::Arc::new(vec![draft_entry(id)]);
+        app.rebuild_visible();
+        app
+    }
+
+    /// Write one reply draft off a fresh row and hand back its file and id.
+    fn a_draft(fx: &Fixture) -> (PathBuf, Selector, String) {
+        let row = fx.ingest(&fixture_email("Hello"));
+        let source = fx.source(&row, false);
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Reply { all: false },
+            None,
+        )
+        .unwrap();
+        let id = fx.resolve(&selector).id;
+        (path, selector, id)
+    }
+
+    fn outbox_counts(fx: &Fixture) -> crate::outbox::OutboxCounts {
+        crate::outbox::counts(&fx.store(), "alice").unwrap()
+    }
+
+    /// The approved-status requirement is `mp send`'s, and it lives in
+    /// [`crate::send::build_draft_message`], which runs before the outbox row
+    /// is written: a draft that is not approved is refused with the CLI's own
+    /// message and leaves nothing behind.
+    #[test]
+    fn send_refuses_an_unapproved_draft_before_it_reaches_the_outbox() {
+        let fx = Fixture::new();
+        let (path, _selector, _id) = a_draft(&fx);
+        let draft = crate::draft::parse_email_draft(&path).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match send_one_draft(&rt, &draft, &dead_smtp_ctx()) {
+            Ok(_) => panic!("an unapproved draft must not be sent"),
+            Err(e) => e,
+        };
+
+        let text = format!("{err:#}");
+        assert!(text.contains("Email not approved for sending"), "{text}");
+        assert!(text.contains("Current status: draft"), "{text}");
+        assert_eq!(outbox_counts(&fx).total(), 0, "nothing was enqueued");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("status: draft"));
+    }
+
+    /// An approved draft is committed to the outbox before the submission is
+    /// attempted, so a send that reaches nobody leaves a durable `failed` row
+    /// and a draft that is still approved rather than a message lost between
+    /// the two.
+    #[test]
+    fn a_send_that_reaches_nobody_leaves_a_failed_outbox_row_and_an_unsent_draft() {
+        let fx = Fixture::new();
+        let (path, selector, _id) = a_draft(&fx);
+        crate::draft::mark_as_approved(&path).unwrap();
+        crate::store::drafts::refresh_account("alice").unwrap();
+        let draft = crate::draft::parse_email_draft(&path).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = send_one_draft(&rt, &draft, &dead_smtp_ctx()).unwrap();
+
+        assert!(!report.send_result.any_succeeded());
+        assert!(report.row_id.is_some(), "the message reached the outbox");
+        assert!(matches!(
+            report.state,
+            Some(crate::outbox::OutboxState::Failed)
+        ));
+        assert_eq!(outbox_counts(&fx).failed, 1);
+
+        // The status line is the CLI's refusal, and the draft is untouched:
+        // nothing was marked sent.
+        let err = send_status_line(&report).unwrap_err();
+        assert!(
+            err.to_string().starts_with("Failed to send to all"),
+            "{err}"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("status: approved"));
+        assert_eq!(fx.resolve(&selector).status, "approved");
+    }
+
+    /// Approve and mark-draft flip the file `mp mark-approved` /
+    /// `mp mark-draft` flip, name the draft by its selector, and leave the
+    /// index holding the new status.
+    #[test]
+    fn approve_and_mark_draft_flip_the_indexed_status() {
+        let fx = Fixture::new();
+        let (_path, selector, id) = a_draft(&fx);
+        let mut app = app_on_draft(&id);
+
+        status_flip(&mut app, DraftStatusFlip::Approve);
+        assert_eq!(app.status_message.as_deref(), Some(&*format!("Approved {selector}")));
+        assert_eq!(fx.resolve(&selector).status, "approved");
+
+        // The reload the flip triggers emptied the list (the fixture app has
+        // no mailboxes to load from), so the cursor is put back by hand.
+        app.emails = std::sync::Arc::new(vec![draft_entry(&id)]);
+        app.rebuild_visible();
+        status_flip(&mut app, DraftStatusFlip::Approve);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(&*format!("Already approved: {selector}"))
+        );
+
+        app.emails = std::sync::Arc::new(vec![draft_entry(&id)]);
+        app.rebuild_visible();
+        status_flip(&mut app, DraftStatusFlip::Demote);
+        assert_eq!(app.status_message.as_deref(), Some(&*format!("Demoted {selector}")));
+        assert_eq!(fx.resolve(&selector).status, "draft");
+    }
+
+    /// An illegal transition fails with the library's own error text, which is
+    /// the one `mp mark-draft` prints: a sent email has left the draft
+    /// pipeline and is not rewritten back into it.
+    #[test]
+    fn marking_a_sent_draft_back_to_draft_fails_like_the_cli() {
+        let fx = Fixture::new();
+        let (path, _selector, id) = a_draft(&fx);
+        let draft = crate::draft::parse_email_draft(&path).unwrap();
+        mark_draft_sent(&draft, None).unwrap();
+        crate::store::drafts::refresh_account("alice").unwrap();
+
+        let mut app = app_on_draft(&id);
+        status_flip(&mut app, DraftStatusFlip::Demote);
+
+        let status = app.status_message.clone().unwrap();
+        assert!(
+            status.starts_with("Mark-draft failed: Cannot revert a sent email back to draft"),
+            "{status}"
+        );
+    }
+
+    /// The batch flips every selected draft and counts what it could not do,
+    /// which is the pre-nuke build's contract: one refusal is one failure, not
+    /// an abort.
+    #[test]
+    fn the_batch_flips_every_selected_draft_and_counts_the_refusals() {
+        let fx = Fixture::new();
+        let (_p1, sel_one, one) = a_draft(&fx);
+        let (_p2, sel_two, two) = a_draft(&fx);
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+
+        status_flip_batch(&mut app, &[one.clone(), two.clone()], DraftStatusFlip::Approve);
+        assert_eq!(app.status_message.as_deref(), Some("Approved 2 drafts"));
+        assert_eq!(fx.resolve(&sel_one).status, "approved");
+        assert_eq!(fx.resolve(&sel_two).status, "approved");
+
+        status_flip_batch(
+            &mut app,
+            &[one.clone(), "not-in-the-index".to_string()],
+            DraftStatusFlip::Demote,
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Marked 1/2 as draft (1 failed)")
+        );
+        assert_eq!(fx.resolve(&sel_one).status, "draft");
+        assert_eq!(fx.resolve(&sel_two).status, "approved");
+    }
+
+    /// `$EDITOR` opens the file the index holds for the row under the cursor,
+    /// and a received row has none to open.
+    #[test]
+    fn edit_current_resolves_the_cursor_draft_through_the_index() {
+        let fx = Fixture::new();
+        let (path, _selector, id) = a_draft(&fx);
+        let mut app = app_on_draft(&id);
+
+        assert_eq!(
+            cursor_draft(&mut app, "never shown"),
+            Some((id, path)),
+            "the cursor's draft resolves to the file the index holds"
+        );
+
+        // On a received row there is no file to open, and no CLI behaviour to
+        // mirror: `mp edit` takes draft selectors only. The decline is
+        // permanent, so it does not carry the #0052 line.
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.emails = std::sync::Arc::new(vec![received_entry()]);
+        app.rebuild_visible();
+        assert_eq!(
+            cursor_draft(&mut app, "Open in $EDITOR needs a draft"),
+            None
+        );
+        let status = app.status_message.clone().unwrap();
+        assert_eq!(status, "Open in $EDITOR needs a draft");
+        assert!(!status.contains("#0052"), "{status}");
     }
 }

@@ -466,7 +466,7 @@ impl App {
             }
             A::SelectAllVisible => {
                 self.pending_prefix = None;
-                self.selection = self.visible_emails().filter_map(|e| e.msg).collect();
+                self.selection = self.visible_emails().filter_map(|e| e.key()).collect();
             }
             A::Archive => {
                 self.pending_prefix = None;
@@ -553,7 +553,8 @@ impl App {
             A::ToggleRead => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let msgs: Vec<MessageRef> = self.selection.iter().copied().collect();
+                    let msgs: Vec<MessageRef> =
+                        self.selection.iter().filter_map(|k| k.msg()).collect();
                     self.push_action(Action::BatchToggleRead(msgs));
                 } else {
                     self.push_action(Action::ToggleRead);
@@ -611,11 +612,13 @@ impl App {
             }
             A::ToggleSelect => {
                 self.pending_prefix = None;
-                if let Some(msg) = self.selected_email_ref() {
-                    if self.selection.contains(&msg) {
-                        self.selection.remove(&msg);
+                // Drafts are selectable too (#0052): the set is keyed on
+                // `EntryKey`, so the Drafts mailbox has a batch again.
+                if let Some(key) = self.selected_email().and_then(|e| e.key()) {
+                    if self.selection.contains(&key) {
+                        self.selection.remove(&key);
                     } else {
-                        self.selection.insert(msg);
+                        self.selection.insert(key);
                     }
                     if self.list_index < self.visible.len() - 1 {
                         self.list_index += 1;
@@ -662,20 +665,36 @@ impl App {
                     std::mem::replace(&mut self.overlay, Overlay::None)
                 {
                     match dialog.action {
+                        // Approve and mark-draft write to draft files, so they
+                        // take the drafts half of the selection; archive and
+                        // delete are store mutations and take the messages
+                        // half (#0052). A selection never holds both -- one
+                        // mailbox lists one kind of row and switching clears
+                        // the set -- but each side filters rather than assumes.
                         ConfirmAction::Approve if !self.selection.is_empty() => {
-                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
-                            self.push_action(Action::BatchApprove(msgs));
+                            let ids: Vec<String> = self
+                                .selection
+                                .drain()
+                                .filter_map(|k| k.draft().map(str::to_string))
+                                .collect();
+                            self.push_action(Action::BatchApprove(ids));
                         }
                         ConfirmAction::MarkDraft if !self.selection.is_empty() => {
-                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
-                            self.push_action(Action::BatchMarkDraft(msgs));
+                            let ids: Vec<String> = self
+                                .selection
+                                .drain()
+                                .filter_map(|k| k.draft().map(str::to_string))
+                                .collect();
+                            self.push_action(Action::BatchMarkDraft(ids));
                         }
                         ConfirmAction::Archive if !self.selection.is_empty() => {
-                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            let msgs: Vec<MessageRef> =
+                                self.selection.drain().filter_map(|k| k.msg()).collect();
                             self.push_action(Action::BatchArchive(msgs));
                         }
                         ConfirmAction::Delete if !self.selection.is_empty() => {
-                            let msgs: Vec<MessageRef> = self.selection.drain().collect();
+                            let msgs: Vec<MessageRef> =
+                                self.selection.drain().filter_map(|k| k.msg()).collect();
                             self.push_action(Action::BatchDelete(msgs));
                         }
                         _ => {
@@ -1475,7 +1494,7 @@ impl App {
         }
 
         let msgs: Vec<MessageRef> = if !self.selection.is_empty() {
-            self.selection.iter().copied().collect()
+            self.selection.iter().filter_map(|k| k.msg()).collect()
         } else if let Some(m) = self.selected_email_ref() {
             vec![m]
         } else {
@@ -2018,7 +2037,7 @@ fn refresh_browser_entries(picker: &mut DirPicker) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::AttachmentPicker;
+    use crate::tui::app::{AttachmentPicker, EntryKey};
     use super::super::PersistentError;
     use std::path::PathBuf;
 
@@ -2209,6 +2228,106 @@ mod tests {
         // have read from the blob store is primed instead.
         app.prime_search_bodies(sample_bodies());
         app
+    }
+
+    /// A Drafts row: no `messages` row behind it, its indexed `id:` instead
+    /// (what `entry_from_draft` builds).
+    fn draft_entry(id: &str, subject: &str) -> EmailEntry {
+        EmailEntry {
+            msg: None,
+            draft_id: Some(id.to_string()),
+            subject: subject.to_string(),
+            status: "draft".to_string(),
+            read: true,
+            ..entry(subject, "me")
+        }
+    }
+
+    /// A draft can enter the selection (#0052).
+    ///
+    /// It could not while the set was keyed on `MessageRef`: a draft has no
+    /// store row, so `Ctrl+a` in Drafts selected nothing and `A` fell through
+    /// to the single-draft path. The batch it guarded was reachable by
+    /// keystroke and dead in fact.
+    #[test]
+    fn select_all_in_drafts_takes_the_draft_keys() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selection.len(), 2);
+        let mut ids: Vec<&str> = app.selection.iter().filter_map(|k| k.draft()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["aaa", "bbb"]);
+    }
+
+    /// `v` toggles a Drafts row in and out of the selection like any other.
+    #[test]
+    fn toggling_selects_the_draft_under_the_cursor() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert_eq!(
+            app.selection.iter().next().and_then(|k| k.draft()),
+            Some("aaa")
+        );
+        // The cursor moved on; toggling the second row leaves both selected.
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert_eq!(app.selection.len(), 2);
+    }
+
+    /// `A` over a Drafts selection confirms, then queues the batch by draft
+    /// id: approving is a write to a file, and a draft has no `MessageRef`
+    /// to name it by.
+    #[test]
+    fn confirming_a_drafts_selection_queues_the_batch_by_id() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(matches!(app.overlay, Overlay::Confirm(_)));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchApprove(mut ids)) => {
+                ids.sort();
+                assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
+            }
+            other => panic!("expected BatchApprove, got {other:?}"),
+        }
+        assert!(app.selection.is_empty(), "the confirm drained the selection");
+    }
+
+    /// A selection cannot mix the two namespaces in practice -- a mailbox
+    /// lists one kind of row and switching mailboxes clears the set -- but
+    /// each batch filters rather than assumes, so neither can act on the
+    /// other's rows.
+    #[test]
+    fn each_batch_takes_only_its_own_half_of_a_mixed_selection() {
+        let mut app = app_with_emails(sample());
+        let msg = app.emails[0].msg.unwrap();
+        app.selection = std::collections::HashSet::from([
+            EntryKey::Msg(msg),
+            EntryKey::Draft("aaa".to_string()),
+        ]);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchApprove(ids)) => assert_eq!(ids, vec!["aaa".to_string()]),
+            other => panic!("expected BatchApprove, got {other:?}"),
+        }
+
+        app.selection = std::collections::HashSet::from([
+            EntryKey::Msg(msg),
+            EntryKey::Draft("aaa".to_string()),
+        ]);
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchDelete(msgs)) => assert_eq!(msgs, vec![msg]),
+            other => panic!("expected BatchDelete, got {other:?}"),
+        }
     }
 
     /// `y` queues the selector copy, not the dead path copy (#0050 scope item
@@ -2414,16 +2533,16 @@ mod tests {
         app.list_index = 2;
         let doomed = app.selected_email().unwrap().msg.unwrap();
         let survivor = app.emails[0].msg.unwrap();
-        app.selection.insert(doomed);
-        app.selection.insert(survivor);
+        app.selection.insert(EntryKey::Msg(doomed));
+        app.selection.insert(EntryKey::Msg(survivor));
 
         app.remove_selected_from_list();
 
         assert!(
-            !app.selection.contains(&doomed),
+            !app.selection.contains(&EntryKey::Msg(doomed)),
             "the selection kept a reference to a row that no longer exists"
         );
-        assert!(app.selection.contains(&survivor));
+        assert!(app.selection.contains(&EntryKey::Msg(survivor)));
         assert!(app.cursor_anchor().is_none_or(|m| m != doomed));
     }
 
@@ -2436,12 +2555,15 @@ mod tests {
             .iter()
             .filter_map(|e| e.msg)
             .collect();
-        app.selection = app.emails.iter().filter_map(|e| e.msg).collect();
+        app.selection = app.emails.iter().filter_map(|e| e.key()).collect();
 
         app.remove_selected_from_list_batch(&batch);
 
         assert_eq!(app.selection.len(), 2);
-        assert!(app.selection.is_disjoint(&batch));
+        assert!(app
+            .selection
+            .iter()
+            .all(|k| !k.msg().is_some_and(|m| batch.contains(&m))));
         assert!(app.emails.iter().all(|e| !e.msg.is_some_and(|m| batch.contains(&m))));
     }
 
@@ -2553,8 +2675,8 @@ mod tests {
     #[test]
     fn open_picker_uses_selection_when_present() {
         let mut app = app_with_mailboxes();
-        app.selection.insert(app.emails[0].msg.unwrap());
-        app.selection.insert(app.emails[2].msg.unwrap());
+        app.selection.insert(EntryKey::Msg(app.emails[0].msg.unwrap()));
+        app.selection.insert(EntryKey::Msg(app.emails[2].msg.unwrap()));
         app.handle_key(KeyEvent::from(KeyCode::Char('M')));
         let Overlay::Mailbox(picker) = &app.overlay else {
             panic!("picker should open");

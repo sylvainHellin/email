@@ -64,7 +64,7 @@ pub struct App {
     pub pending_prefix: Option<char>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
-    pub selection: HashSet<MessageRef>,
+    pub selection: HashSet<EntryKey>,
     pub email_cache: Vec<Option<Arc<Vec<EmailEntry>>>>,
     /// The body behind the preview pane, loaded from the blob store on
     /// selection and memoised (#0038 scope item 5). Refreshed by
@@ -1151,6 +1151,35 @@ impl App {
         self.selected_email().and_then(|e| e.msg)
     }
 
+    /// Whether this list entry is in the multi-select set (#0052).
+    ///
+    /// Asked once per rendered row, so the received case is a hash lookup and
+    /// only a draft pays a scan of the (small) selection, rather than every
+    /// row paying an allocation to build the key it would look up.
+    pub fn is_selected(&self, email: &EmailEntry) -> bool {
+        match (email.msg, email.draft_id.as_deref()) {
+            (Some(msg), _) => self.selection.contains(&EntryKey::Msg(msg)),
+            (None, Some(id)) => self.selection.iter().any(|k| k.draft() == Some(id)),
+            (None, None) => false,
+        }
+    }
+
+    /// Drop every selection key the freshly loaded list no longer holds.
+    ///
+    /// The mutation paths scrub the ids they free themselves
+    /// ([`Self::remove_selected_from_list`] and its batch twin); this covers
+    /// the writes this application did not make, which is how a draft leaves:
+    /// a file deleted behind the TUI's back disappears from the index at the
+    /// next poll, and its id must not linger in the set as a member the batch
+    /// would then count as a failure.
+    pub(crate) fn scrub_selection(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let live: HashSet<EntryKey> = self.emails.iter().filter_map(|e| e.key()).collect();
+        self.selection.retain(|key| live.contains(key));
+    }
+
     pub fn remove_selected_from_list(&mut self) -> Option<MessageRef> {
         let msg = self.selected_email()?.msg?;
         let fallback = self.list_index;
@@ -1158,7 +1187,7 @@ impl App {
         // A removed row's id must not survive in the selection: a delete frees
         // it, and a re-ingest of the same message mints a new one, so a held
         // reference would either miss or, worse, name a different message.
-        self.selection.remove(&msg);
+        self.selection.remove(&EntryKey::Msg(msg));
         self.invalidate_pending_mailbox_loads();
 
         // Underlying indices shifted -- recompute the view, then park the
@@ -1205,7 +1234,8 @@ impl App {
         });
         // See `remove_selected_from_list`: the ids are dead, so nothing may
         // keep holding them.
-        self.selection.retain(|m| !msgs.contains(m));
+        self.selection
+            .retain(|key| !key.msg().is_some_and(|m| msgs.contains(&m)));
         self.invalidate_pending_mailbox_loads();
 
         self.rebuild_visible();

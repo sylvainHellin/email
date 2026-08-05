@@ -35,7 +35,7 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
 use crate::tui::app::{
-    App, CalendarEvent, EmailEntry, MailboxInfo, MailboxKind, MessageRef, Overlay, View,
+    App, CalendarEvent, EmailEntry, EntryKey, MailboxInfo, MailboxKind, MessageRef, Overlay, View,
 };
 use crate::tui::theme::{self, Theme};
 use crate::types::EventFrontmatter;
@@ -418,7 +418,10 @@ fn golden_mail_view() {
 #[test]
 fn golden_mail_view_with_selection() {
     let mut app = mail_fixture();
-    app.selection = HashSet::from([MessageRef::new(1), MessageRef::new(3)]);
+    app.selection = HashSet::from([
+        EntryKey::Msg(MessageRef::new(1)),
+        EntryKey::Msg(MessageRef::new(3)),
+    ]);
     // Cursor off the selection: the cursor fill and the selection foreground
     // are separate signals and must stay separable in the legend.
     app.list_index = 1;

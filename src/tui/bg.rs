@@ -343,6 +343,10 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 *slot = Some(std::sync::Arc::clone(&entries));
             }
             app.emails = entries;
+            // A key the fresh list no longer holds must leave the selection
+            // with it (#0052): an externally deleted draft is gone from the
+            // index, not just from the screen.
+            app.scrub_selection();
             // Reapply the active search filter (if any) to the fresh
             // entries, then put the cursor back on the anchored email.
             app.rebuild_visible();

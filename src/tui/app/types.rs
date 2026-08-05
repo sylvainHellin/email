@@ -55,6 +55,47 @@ impl std::fmt::Display for MessageRef {
     }
 }
 
+/// What the multi-select set holds: one list entry, named in whichever of the
+/// two namespaces it lives in (#0052).
+///
+/// The list has exactly two kinds of row and they are named differently: a
+/// received message is a `messages` row ([`MessageRef`]), a draft is a file the
+/// drafts index knows by its `id:`. Keying the selection on `MessageRef` alone
+/// meant a draft could never enter it, which left batch approve and batch
+/// mark-draft reachable by keystroke and dead in fact. The enum makes the two
+/// namespaces explicit, the same way the `mp://` selector does at the CLI
+/// boundary, so a handler that only accepts one of them says so in its types.
+///
+/// A selection never mixes the two in practice: a mailbox lists one kind of row
+/// and [`crate::tui::app::App::switch_mailbox`] clears the set on the way out.
+/// The batch handlers still filter rather than assume, because a filter is
+/// honest about a set it did not build.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EntryKey {
+    /// A received message, by its store row.
+    Msg(MessageRef),
+    /// A draft, by its indexed `id:` (#0050 scope item 4).
+    Draft(String),
+}
+
+impl EntryKey {
+    /// The store row this names, or `None` for a draft.
+    pub fn msg(&self) -> Option<MessageRef> {
+        match self {
+            EntryKey::Msg(msg) => Some(*msg),
+            EntryKey::Draft(_) => None,
+        }
+    }
+
+    /// The indexed draft id this names, or `None` for a received message.
+    pub fn draft(&self) -> Option<&str> {
+        match self {
+            EntryKey::Msg(_) => None,
+            EntryKey::Draft(id) => Some(id),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EmailEntry (ported from beautifulmail's email.rs)
 // ---------------------------------------------------------------------------
@@ -120,6 +161,16 @@ impl EmailEntry {
         match kind {
             MailboxKind::Inbox | MailboxKind::Archive | MailboxKind::Extra => &self.from,
             MailboxKind::Drafts | MailboxKind::Sent => &self.to,
+        }
+    }
+
+    /// How the selection set names this entry, or `None` for the one entry
+    /// that has no name: a server-search hit that resolved to no local row.
+    pub fn key(&self) -> Option<EntryKey> {
+        match (self.msg, self.draft_id.as_deref()) {
+            (Some(msg), _) => Some(EntryKey::Msg(msg)),
+            (None, Some(id)) => Some(EntryKey::Draft(id.to_string())),
+            (None, None) => None,
         }
     }
 }
@@ -620,7 +671,7 @@ pub struct AccountState {
     pub cursor_ref: Option<MessageRef>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
-    pub selection: std::collections::HashSet<MessageRef>,
+    pub selection: std::collections::HashSet<EntryKey>,
     pub search_query: String,
     pub search_includes_body: bool,
     pub bg_mutations: usize,
@@ -1124,12 +1175,16 @@ pub enum Action {
     SendApproved,
     NewDraft,
     Approve,
-    BatchApprove(Vec<MessageRef>),
+    /// Batch variant for `Action::Approve`: the indexed `id:` of every draft
+    /// in the selection (#0052). Draft ids rather than [`MessageRef`]s
+    /// because approving is a write to a draft file, and a draft has no
+    /// `messages` row to name it by.
+    BatchApprove(Vec<String>),
     /// Demote a single approved draft back to `draft` status (#0021).
     MarkDraft,
     /// Batch variant for `Action::MarkDraft` -- run mark_as_draft over
-    /// the current selection.
-    BatchMarkDraft(Vec<MessageRef>),
+    /// the current selection, by indexed draft id (see [`Action::BatchApprove`]).
+    BatchMarkDraft(Vec<String>),
     Archive,
     Delete,
     BatchArchive(Vec<MessageRef>),
