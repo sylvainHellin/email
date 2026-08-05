@@ -16,28 +16,28 @@ use super::helpers::{
 use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
-use crate::draft::{create_forward_draft, find_drafts, mark_draft_sent, new_draft_skeleton};
+use crate::draft::{find_drafts, mark_draft_sent, new_draft_skeleton};
 use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
 // ---------------------------------------------------------------------------
-// What is still addressed by file (#0050)
+// The TUI mutation half (#0052)
 // ---------------------------------------------------------------------------
 
-/// The status line an action shows while it still needs a `.md` file.
+/// The status line an action shows while its TUI flow has not been ported.
 ///
-/// The mutations moved onto the store with #0038 scope item 7, which is what
-/// deleted the always-`None` bridge these used to share. What is left is the
-/// operations that name a message *outside* the store: a draft to edit, a file
-/// to hand `$EDITOR`, an attachment to write somewhere. Those are the selector
-/// contract and the drafts index, i.e. [#0050], and they decline until it
-/// lands.
+/// The mutations moved onto the store with #0038 scope item 7 and the naming
+/// half landed with #0050, which is what these used to wait on. What is left
+/// is the TUI flows that still address a message as a file: a draft to edit,
+/// a file to hand `$EDITOR`, an attachment to write somewhere, a quote to
+/// build. Their CLI counterparts already run on the store and the selector,
+/// and [#0052] is the ticket that ports the TUI onto the same substrate.
 ///
 /// `what` names the operation ("Reply", "Attachments"). The message tells the
 /// user both halves of the truth: this build will do it soon, and there is a
 /// working way to do it right now.
-pub(super) fn needs_selector_contract(what: &str) -> String {
-    format!("{what} lands with the selector contract (#0050); mp-legacy is the working fallback meanwhile")
+pub(super) fn needs_tui_mutation_half(what: &str) -> String {
+    format!("{what} lands with the TUI mutation half (#0052); mp-legacy is the working fallback meanwhile")
 }
 
 // ---------------------------------------------------------------------------
@@ -183,20 +183,21 @@ pub(super) fn handle_action(
 ) -> Result<()> {
     match action {
         Action::EditCurrent => {
-            // Opening a message in `$EDITOR` means handing it a file, which is
-            // `mp edit <selector>`'s job and lands with #0050.
-            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
+            // Opening a message in `$EDITOR` means handing it a file, which
+            // `mp edit <selector>` already does; the TUI flow lands with #0052.
+            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
         }
         Action::Reply(_reply_all) => {
-            // Reply and forward write a draft from the source message; the
-            // drafts index that names both is #0050's.
-            app.set_status_level(needs_selector_contract("Reply"), StatusLevel::Warning);
+            // Reply and forward write a draft from the source message, which
+            // `mp reply` / `mp forward` do off the store; the TUI flow is
+            // #0052's.
+            app.set_status_level(needs_tui_mutation_half("Reply"), StatusLevel::Warning);
         }
         Action::Forward => {
-            app.set_status_level(needs_selector_contract("Forward"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Forward"), StatusLevel::Warning);
         }
         Action::Send => {
-            app.set_status_level(needs_selector_contract("Send"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Send"), StatusLevel::Warning);
         }
         Action::Rsvp { msg, choice } => {
             // The invitation's own iMIP payload is the source of truth for the
@@ -519,16 +520,16 @@ pub(super) fn handle_action(
         }
 
         Action::Approve => {
-            app.set_status_level(needs_selector_contract("Approve"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Approve"), StatusLevel::Warning);
         }
         Action::BatchApprove(_msgs) => {
-            app.set_status_level(needs_selector_contract("Approve"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Approve"), StatusLevel::Warning);
         }
         Action::MarkDraft => {
-            app.set_status_level(needs_selector_contract("Mark-draft"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Mark-draft"), StatusLevel::Warning);
         }
         Action::BatchMarkDraft(_msgs) => {
-            app.set_status_level(needs_selector_contract("Mark-draft"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Mark-draft"), StatusLevel::Warning);
         }
         Action::Archive => {
             if let Some(msg) = app.selected_email_ref() {
@@ -1099,7 +1100,7 @@ pub(super) fn handle_action(
         }
 
         Action::OpenEventSource { msg: _ } => {
-            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
         }
         Action::ComposeWizardCancel => {
             app.close_overlay();
@@ -1133,11 +1134,6 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
 
     let (to, cc, bcc, subject) = match &mode {
         ComposeMode::New => (String::new(), String::new(), String::new(), String::new()),
-        ComposeMode::Forward { source_path } => {
-            let subject = crate::draft::fwd_subject_from_source(source_path)
-                .unwrap_or_else(|_| String::from("Fwd: "));
-            (String::new(), String::new(), String::new(), subject)
-        }
         ComposeMode::EditDraft { source_path } => {
             match crate::draft::parse_email_draft(source_path) {
                 Ok(draft) => (
@@ -1390,9 +1386,6 @@ fn submit_compose_wizard(
 
     let draft_result = match &wizard.mode {
         ComposeMode::New => write_new_draft_from_wizard(app, &wizard),
-        ComposeMode::Forward { source_path } => {
-            write_forward_draft_from_wizard(app, source_path, &wizard)
-        }
         ComposeMode::EditDraft { .. } => unreachable!("handled above"),
     };
 
@@ -1487,114 +1480,6 @@ fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<Path
     Ok(path)
 }
 
-fn write_forward_draft_from_wizard(
-    app: &App,
-    source_path: &std::path::Path,
-    wizard: &ComposeWizard,
-) -> Result<PathBuf> {
-    let default_from_owned = app
-        .smtp_config
-        .as_ref()
-        .map(|s| s.default_from.clone())
-        .unwrap_or_else(|| app.account_config.default_from.clone());
-    let default_from = default_from_owned.as_str();
-    let drafts_dir = app
-        .find_mailbox_by_kind(MailboxKind::Drafts)
-        .map(|i| app.mailboxes[i].dir.clone())
-        .or_else(|| app.drafts_dir.clone());
-    let path = create_forward_draft(source_path, default_from, drafts_dir.as_deref())?;
-
-    // Patch the frontmatter fields in place.
-    patch_draft_frontmatter(&path, wizard)?;
-    Ok(path)
-}
-
-fn patch_draft_frontmatter(path: &std::path::Path, wizard: &ComposeWizard) -> Result<()> {
-    let content = std::fs::read_to_string(path)?;
-    let mut lines = content.lines();
-
-    // Expect the file to start with `---`.
-    let Some(first) = lines.next() else {
-        return Ok(());
-    };
-    if first.trim() != "---" {
-        return Ok(());
-    }
-
-    // Collect frontmatter lines until the closing `---`.
-    let mut fm_lines: Vec<String> = Vec::new();
-    let mut body_lines: Vec<String> = Vec::new();
-    let mut in_body = false;
-    for line in lines {
-        if !in_body {
-            if line.trim() == "---" {
-                in_body = true;
-                continue;
-            }
-            fm_lines.push(line.to_string());
-        } else {
-            body_lines.push(line.to_string());
-        }
-    }
-
-    // Rewrite to/cc/bcc/subject; leave everything else alone.
-    // Simple single-line field rewriter: replace `key:` lines if found,
-    // otherwise append them before the closing `---`.
-    let mut rewrote_to = false;
-    let mut rewrote_cc = false;
-    let mut rewrote_bcc = false;
-    let mut rewrote_subject = false;
-    for line in fm_lines.iter_mut() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("to:") {
-            *line = format!("to: {}", yaml_escape(&wizard.to));
-            rewrote_to = true;
-        } else if trimmed.starts_with("cc:") {
-            if wizard.cc.trim().is_empty() {
-                *line = "cc:".to_string();
-            } else {
-                *line = format!("cc: {}", yaml_escape(&wizard.cc));
-            }
-            rewrote_cc = true;
-        } else if trimmed.starts_with("bcc:") {
-            if wizard.bcc.trim().is_empty() {
-                *line = "bcc:".to_string();
-            } else {
-                *line = format!("bcc: {}", yaml_escape(&wizard.bcc));
-            }
-            rewrote_bcc = true;
-        } else if trimmed.starts_with("subject:") {
-            *line = format!("subject: {}", yaml_escape(&wizard.subject));
-            rewrote_subject = true;
-        }
-    }
-    if !rewrote_to {
-        fm_lines.push(format!("to: {}", yaml_escape(&wizard.to)));
-    }
-    if !rewrote_cc && !wizard.cc.trim().is_empty() {
-        fm_lines.push(format!("cc: {}", yaml_escape(&wizard.cc)));
-    }
-    if !rewrote_bcc && !wizard.bcc.trim().is_empty() {
-        fm_lines.push(format!("bcc: {}", yaml_escape(&wizard.bcc)));
-    }
-    if !rewrote_subject {
-        fm_lines.push(format!("subject: {}", yaml_escape(&wizard.subject)));
-    }
-
-    let mut rebuilt = String::from("---\n");
-    for line in fm_lines {
-        rebuilt.push_str(&line);
-        rebuilt.push('\n');
-    }
-    rebuilt.push_str("---\n");
-    for line in body_lines {
-        rebuilt.push_str(&line);
-        rebuilt.push('\n');
-    }
-    std::fs::write(path, rebuilt)?;
-    Ok(())
-}
-
 /// Normalize a recipient-list field on wizard submit:
 /// - trim leading/trailing whitespace,
 /// - strip trailing commas and whitespace left behind by the
@@ -1632,7 +1517,7 @@ fn slugify_subject_for_filename(subject: &str) -> String {
 /// has its own Open / Save / Reply / Forward / Archive.
 ///
 /// Four of the five address the hit as a file (an editor, a browser rendition,
-/// a draft), which is #0050's ground. The fifth is a mutation, and it runs on
+/// a draft), which is #0052's ground. The fifth is a mutation, and it runs on
 /// the store like every other one, for the hits that resolved to a row: a hit
 /// the account has never synced has nothing local to archive, and says so.
 fn handle_search_result_action(
@@ -1643,22 +1528,22 @@ fn handle_search_result_action(
 ) -> Result<()> {
     match action {
         Action::SearchResultOpen => {
-            app.set_status_level(needs_selector_contract("Open"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
         }
 
         Action::SearchResultOpenInBrowser => {
             app.set_status_level(
-                needs_selector_contract("Open in browser"),
+                needs_tui_mutation_half("Open in browser"),
                 StatusLevel::Warning,
             );
         }
 
         Action::SearchResultReply(_) => {
-            app.set_status_level(needs_selector_contract("Reply"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Reply"), StatusLevel::Warning);
         }
 
         Action::SearchResultForward => {
-            app.set_status_level(needs_selector_contract("Forward"), StatusLevel::Warning);
+            app.set_status_level(needs_tui_mutation_half("Forward"), StatusLevel::Warning);
         }
 
         Action::SearchResultArchive => {
@@ -1921,17 +1806,18 @@ mod tests {
         }
     }
 
-    /// The decline message names both the future (the selector contract) and
+    /// The decline message names both the future (the TUI mutation half) and
     /// the present (mp-legacy), so a user who hits it knows what to do now.
     ///
-    /// This is what is left of the #0038 bridge: the mutations are store-backed,
-    /// and only the operations that address a message as a *file* still
-    /// decline.
+    /// The ticket it names must be an open one: #0038 and #0050 have landed,
+    /// and a message pointing at a done ticket tells the user to wait for
+    /// something that already happened.
     #[test]
     fn the_decline_message_points_at_the_working_fallback() {
-        let msg = needs_selector_contract("Reply");
+        let msg = needs_tui_mutation_half("Reply");
         assert!(msg.starts_with("Reply "), "{msg}");
-        assert!(msg.contains("#0050"), "{msg}");
+        assert!(msg.contains("#0052"), "{msg}");
+        assert!(!msg.contains("#0050"), "{msg}");
         assert!(msg.contains("mp-legacy"), "{msg}");
     }
 

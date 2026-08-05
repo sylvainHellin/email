@@ -332,3 +332,15 @@ A file this build writes must parse in this build, so the skeleton writes `subje
 Ingest stores the `Message-ID` header verbatim, angle brackets included, because that is what the wire format says.
 The `mp://` selector key is defined as the identifier without them, so `resolve_received` looking the key up as stored matched nothing at all, and `Selector::for_message` would otherwise have printed every selector with a trailing `%3E`.
 Delimiters are not part of an identifier: `Selector::for_message` strips them, and the resolver asks for the bracketed form first and the bare one second, so a pasted mail header and a hand-typed key both land on the same row ([src/selector.rs](../src/selector.rs), #0050).
+
+## A guess about what a string is must not run on a string that already said
+
+`selector::parse` refused anything ending in `.md` as a filesystem path, so that `mp archive ./inbox/mail.md` names the real mistake instead of "no match".
+The heuristic ran on the whole input, scheme included, which made the canonical form of any key ending in `.md` unparseable: a Message-ID on a `.md` ccTLD, or a draft id ending that way, could be printed by the build and then refused by it.
+A heuristic is for ambiguous input only.
+Once a string carries its scheme it has declared what it is, and the parser has no business sniffing it ([src/selector.rs](../src/selector.rs), #0050 review).
+
+## A derived index keyed on a field the user controls needs a collision report, not just a winner
+
+The `drafts` table is keyed by `(account, id)` and the reindex upserted, so two files carrying the same `id:` frontmatter collapsed to one row: the losing file stayed on disk and stopped being addressable by any selector, with nothing said anywhere.
+The fix is visibility rather than resolution, because nothing but the user can say which file was meant: the reindex picks a deterministic winner (newest file, ties broken by path, so a re-index never flips the answer) and reports the pair, in the log and on `mp`'s stderr, naming both paths ([src/store/drafts.rs](../src/store/drafts.rs), #0050 review).

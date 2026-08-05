@@ -72,4 +72,7 @@ Residual risks, accepted:
 - `source_from_row` reads the account name back out of the store path (`account_name_of`) to place forwarded attachments in the stable per-account mirror. It is correct for every path `config` builds, and it is the one place that inverts a path.
 - `mp open` materialises every attachment into a temp directory and opens all of them; the pre-#0038 build had an interactive picker.
 - `EmailStatus::{Inbox, Archived}` no longer appear in `mp list`, which now lists the drafts index only.
-- The other `#0050` stop-gates in the TUI (reply, forward, send, approve, attachments, `$EDITOR`) still decline: they need the mutation half, not the naming half, and are not in this ticket's scope.
+- The other stop-gates in the TUI (reply, forward, send, approve, attachments, `$EDITOR`) still decline: they need the mutation half, not the naming half, and are not in this ticket's scope.
+  They are owned by [#0052](0052-tui-mutation-half.md), filed by this ticket's review, which is also the third and last gate ticket.
+
+The review of this ticket found and fixed, in a follow-up commit on the same branch: the filesystem-path heuristic ran on qualified selectors too, so a key ending in `.md` (a Message-ID on a `.md` ccTLD, a draft id) could not survive its own canonical form; two draft files sharing an `id:` collapsed to one row in silence; `mp reply` and `mp forward` dropped the quoted HTML companion; and the sidebar drafts count and the Drafts list opened the store differently, so a never-synced account listed drafts and counted zero.

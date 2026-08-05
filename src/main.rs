@@ -878,8 +878,14 @@ fn drafts_store(account: &str) -> Result<Store> {
     let store = Store::open(email::config::store_path(account))
         .with_context(|| format!("opening the store of {account}"))?;
     let dir = email::config::drafts_dir(account);
-    email::store::drafts::refresh(&store, account, &dir)
+    let (_, collisions) = email::store::drafts::refresh_reporting(&store, account, &dir)
         .with_context(|| format!("refreshing the drafts index of {account}"))?;
+    // Two files claiming one id means one of them is unaddressable. The index
+    // cannot decide which the user meant, so it says so rather than dropping
+    // the loser in silence.
+    for collision in &collisions {
+        eprintln!("{} {collision}", "⚠".yellow());
+    }
     Ok(store)
 }
 
@@ -972,7 +978,9 @@ fn source_from_row(
         date: row.date_display.clone(),
         body,
         attachments,
-        html: None,
+        // The quoted HTML companion the file build wrote beside the draft:
+        // without it a reply quotes plain text where the sender wrote markup.
+        html: email::store::read::load_html(store, blobs, row.id),
     })
 }
 

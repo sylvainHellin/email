@@ -32,7 +32,8 @@
 //! - `flags`: sorted, deduplicated state tokens from the closed set
 //!   `approved`, `draft`, `seen`. `seen` comes from `\Seen` in
 //!   `messages.flags`. `draft` and `approved` cannot occur on a `messages`
-//!   row: drafts are not indexed until #0050.
+//!   row: drafts are local files in the `drafts` index, permanently outside
+//!   this table and outside the dump contract (see the allow-list).
 //! - `attachments`: array of `{"name", "size"}`, sorted by name then size,
 //!   read from the attachment blobs of the row. `size` is the blob length and
 //!   is therefore always present. The iMIP sidecar is excluded, exactly as the
@@ -191,7 +192,8 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
         flags.insert("seen".to_string());
     }
     // `draft` and `approved` were frontmatter `status:` values. Nothing writes
-    // them to a `messages` row: drafts live outside this table until #0050.
+    // them to a `messages` row: drafts live in the `drafts` index, outside
+    // this table by design.
 
     let mut attachments: Vec<AttachmentRecord> = read::attachments_for(store, row.id)
         .unwrap_or_else(|e| {

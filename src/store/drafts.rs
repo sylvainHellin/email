@@ -18,6 +18,7 @@
 //! after any command that writes a draft. A `notify`-style watcher is a later
 //! refinement and deliberately not a new dependency here.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -51,6 +52,35 @@ pub struct DraftRow {
     pub snippet: Option<String>,
 }
 
+/// Two draft files claiming the same `id:`.
+///
+/// The `drafts` primary key is `(account, id)`, so only one of them can be the
+/// row that selector resolves to and the other becomes unaddressable. The
+/// index does not try to resolve that (nothing here can say which file the
+/// user meant): it picks a deterministic winner and reports the pair, so the
+/// shadowed file is visible instead of silently gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdCollision {
+    pub id: String,
+    /// The file the index kept, i.e. what the selector now resolves to.
+    pub kept: PathBuf,
+    /// The file the id no longer addresses.
+    pub shadowed: PathBuf,
+}
+
+impl fmt::Display for IdCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "two drafts share the id {}: {} is indexed, {} is not addressable until its \
+             id: field is changed",
+            self.id,
+            self.kept.display(),
+            self.shadowed.display()
+        )
+    }
+}
+
 /// Rebuild the whole index for one account from `dir`.
 ///
 /// Deliberately a full rebuild rather than a diff: the directory holds tens of
@@ -63,8 +93,23 @@ pub struct DraftRow {
 /// indexed, so the selector it is listed under is the one in the file. A file
 /// that cannot be parsed is skipped with a log line rather than failing the
 /// refresh: one malformed draft must not hide the other twenty.
+///
+/// Collisions are reported rather than swallowed; see [`refresh_reporting`].
 pub fn refresh(store: &Store, account: &str, dir: &Path) -> Result<Vec<DraftRow>> {
-    let rows = scan(dir);
+    Ok(refresh_reporting(store, account, dir)?.0)
+}
+
+/// [`refresh`], additionally handing back the id collisions it found, for the
+/// callers that can put them in front of the user instead of only in the log.
+pub fn refresh_reporting(
+    store: &Store,
+    account: &str,
+    dir: &Path,
+) -> Result<(Vec<DraftRow>, Vec<IdCollision>)> {
+    let (rows, collisions) = dedupe_by_id(scan(dir));
+    for collision in &collisions {
+        log::warn!("[drafts] {collision}");
+    }
     let conn = store.conn();
     let tx_guard = conn.unchecked_transaction()?;
     conn.execute("DELETE FROM drafts WHERE account = ?1", [account])?;
@@ -97,7 +142,55 @@ pub fn refresh(store: &Store, account: &str, dir: &Path) -> Result<Vec<DraftRow>
         }
     }
     tx_guard.commit()?;
-    Ok(rows)
+    Ok((rows, collisions))
+}
+
+/// Keep one row per id and report the rest.
+///
+/// The winner is the newest file, ties broken by path, so the same directory
+/// always indexes the same way regardless of readdir order. This is not a
+/// resolution rule: an id is supposed to be unique, and two files carrying one
+/// is a state only the user can fix.
+fn dedupe_by_id(rows: Vec<DraftRow>) -> (Vec<DraftRow>, Vec<IdCollision>) {
+    use std::collections::HashMap;
+
+    let mut winner: HashMap<&str, usize> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        match winner.get(row.id.as_str()) {
+            None => {
+                winner.insert(&row.id, i);
+            }
+            Some(&held) => {
+                let current = &rows[held];
+                let beats = (row.mtime, std::cmp::Reverse(&row.path))
+                    > (current.mtime, std::cmp::Reverse(&current.path));
+                if beats {
+                    winner.insert(&row.id, i);
+                }
+            }
+        }
+    }
+    let winning: HashMap<String, (usize, PathBuf)> = winner
+        .iter()
+        .map(|(id, &i)| ((*id).to_string(), (i, rows[i].path.clone())))
+        .collect();
+
+    let mut kept = Vec::with_capacity(winning.len());
+    let mut collisions = Vec::new();
+    for (i, row) in rows.into_iter().enumerate() {
+        let (winner_index, winner_path) = &winning[&row.id];
+        if *winner_index == i {
+            kept.push(row);
+        } else {
+            collisions.push(IdCollision {
+                id: row.id,
+                kept: winner_path.clone(),
+                shadowed: row.path,
+            });
+        }
+    }
+    collisions.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.shadowed.cmp(&b.shadowed)));
+    (kept, collisions)
 }
 
 /// Refresh the index of an account from its configured drafts directory,
@@ -350,6 +443,74 @@ mod tests {
         let row = find(&store, "work", &id).unwrap().expect("id survives the rename");
         assert_eq!(row.path, renamed);
         assert_eq!(row.slug, "after");
+    }
+
+    /// Two files carrying one `id:` collapse to one row, because the index
+    /// primary key says so. What must not happen is that collapse being
+    /// silent: the shadowed file is still on disk and no longer addressable,
+    /// so the refresh names both paths. The winner is deterministic (newest
+    /// file, ties by path) so a re-index does not flip which one answers.
+    #[test]
+    fn two_drafts_sharing_an_id_collapse_to_one_row_and_are_reported() {
+        let (tmp, store) = store();
+        let dir = tmp.path().join("drafts");
+        let one = write_draft(&dir, "one.md", "id: shared\n");
+        let two = write_draft(&dir, "two.md", "id: shared\n");
+
+        let (rows, collisions) = refresh_reporting(&store, "work", &dir).unwrap();
+        assert_eq!(rows.len(), 1, "one id is one row");
+        assert_eq!(list(&store, "work", None).unwrap().len(), 1);
+        let indexed = find(&store, "work", "shared").unwrap().unwrap().path;
+        assert_eq!(indexed, rows[0].path);
+
+        assert_eq!(collisions.len(), 1, "the shadowed file is reported, not dropped");
+        assert_eq!(collisions[0].id, "shared");
+        assert_eq!(collisions[0].kept, indexed);
+        assert_ne!(collisions[0].shadowed, indexed);
+        assert!([one.clone(), two.clone()].contains(&collisions[0].shadowed));
+        let message = collisions[0].to_string();
+        assert!(message.contains(&one.display().to_string()), "{message}");
+        assert!(message.contains(&two.display().to_string()), "{message}");
+
+        // Deterministic: the same directory indexes the same way every time.
+        let (again, _) = refresh_reporting(&store, "work", &dir).unwrap();
+        assert_eq!(again[0].path, indexed);
+    }
+
+    /// The winner rule itself, away from the filesystem's mtime resolution:
+    /// newest file wins, and equal mtimes are broken by path so readdir order
+    /// cannot decide which draft an id addresses.
+    #[test]
+    fn the_surviving_row_is_the_newest_file_then_the_first_path() {
+        let row = |path: &str, mtime: i64| DraftRow {
+            id: "shared".to_string(),
+            slug: path.trim_end_matches(".md").to_string(),
+            path: PathBuf::from(path),
+            mtime,
+            size: 1,
+            status: "draft".to_string(),
+            to: None,
+            cc: None,
+            subject: None,
+            date: None,
+            snippet: None,
+        };
+
+        let (kept, collisions) = dedupe_by_id(vec![row("b.md", 10), row("a.md", 20)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, PathBuf::from("a.md"));
+        assert_eq!(collisions[0].shadowed, PathBuf::from("b.md"));
+
+        let (kept, collisions) = dedupe_by_id(vec![row("b.md", 10), row("a.md", 10)]);
+        assert_eq!(kept[0].path, PathBuf::from("a.md"), "equal mtime breaks by path");
+        assert_eq!(collisions[0].shadowed, PathBuf::from("b.md"));
+
+        // A third file claiming the id names the final winner, not an
+        // intermediate one.
+        let (kept, collisions) = dedupe_by_id(vec![row("c.md", 5), row("b.md", 10), row("a.md", 20)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(collisions.len(), 2);
+        assert!(collisions.iter().all(|c| c.kept == PathBuf::from("a.md")));
     }
 
     #[test]

@@ -6,14 +6,14 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
+- [#0052 TUI mutation half on the store and the selector](docs/tickets/0052-tui-mutation-half.md) -- refactor _(Stage 2c, third and last ticket of the stop-gate)_
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
 - [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
 
 ## Next
 
-> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 pair, because the CLI is unusable between them. Both have shipped; the stop-gate review is the next step.
+> Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038 and #0050 have shipped; #0052 is under Now.
 
-- [#0038 Read path, calendar and reconcile on the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(Stage 2, first half of the stop-gate pair)_
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
@@ -23,6 +23,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
+- [#0038 Read path, calendar and reconcile on the store; cold start stops walking files](docs/tickets/0038-read-path-to-db.md) -- perf _(data layer, Stage 2; blocked on the live envelope dump-parity check against `dumps/pre-nuke-<account>.ndjson`, which needs a full sync of the three real accounts)_
 - [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_

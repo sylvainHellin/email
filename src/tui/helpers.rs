@@ -493,7 +493,7 @@ fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageR
 // Account resolution for Send
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // no caller until `Send` returns with the drafts index (#0050)
+#[allow(dead_code)] // no caller until TUI Send is ported onto the store (#0052)
 pub(super) fn resolve_send_account(
     app: &App,
     draft_path: &Path,

@@ -230,7 +230,7 @@ Two tree-walking modules the original split missed, both of which land in [#0038
 
 Both source invites from `messages` rows and ics blobs after the flip; neither is a Stage-4 afterthought.
 
-## Staged transition, with a stop-gate after Stage 2b
+## Staged transition, with a stop-gate after Stage 2c
 
 No big-bang and no dual-write.
 The lever is the no-migrations-before-v1.0 rule: the cutover in Stage 4 is not a migration, it is wipe-the-local-tree-and-resync-from-the-server, with a one-time import of drafts.
@@ -240,14 +240,16 @@ The lever is the no-migrations-before-v1.0 rule: the cutover in Stage 4 is not a
 | 0 Pre-nuke oracle capture | [#0049](../tickets/0049-pre-nuke-oracle-capture.md) | Golden frames, gap-list fixtures, `mp dump-mailbox --json` envelope dumps, then the `pre-dal-nuke` tag and the `mp-legacy` binary. | The absence of an oracle. Nothing greenfield opens until this closes. | M |
 | 1 Greenfield store, ingest and outbox | [#0037](../tickets/0037-sqlite-store-engine-skeleton.md) | `src/store/` (schema v1, WAL, blob store, retention config) plus store-only ingest and the durable outbox. No `.md` is written on the ingest path; drafts stay file-truth. | Schema, WAL single-writer discipline, blob store, and sent durability, which the nuke would otherwise regress. | L |
 | 2 Read path on the store | [#0038](../tickets/0038-read-path-to-db.md) | `load_emails`, list render, counts, search, the calendar agenda and reconcile all read the store; cold start stops walking files. | List-render perf, envelope correctness and look-and-feel parity against the golden frames. | L-XL |
-| 2b Selector contract and drafts index | [#0050](../tickets/0050-selector-contract-drafts-index.md) | `mp://<account>/<mailbox>/<key>` everywhere, the `drafts` table and the CLI rewrite, in one commit. | The CLI contract, committed once rather than migrated. Subsumes TKT-0045. STOP-GATE, after this ticket and not after Stage 2 alone. | M-L |
+| 2b Selector contract and drafts index | [#0050](../tickets/0050-selector-contract-drafts-index.md) | `mp://<account>/<mailbox>/<key>` everywhere, the `drafts` table and the CLI rewrite, in one commit. | The CLI contract, committed once rather than migrated. Subsumes TKT-0045. | M-L |
+| 2c TUI mutation half | [#0052](../tickets/0052-tui-mutation-half.md) | The TUI's reply, forward, send, approve, mark-draft, `$EDITOR`, attachment, browser and calendar-source flows on the store and the selector, so nothing declines. | The half of the product the owner actually uses. STOP-GATE, after this ticket and not after Stage 2 or 2b. | M-L |
 | 3 Remaining mutations to `pending_ops` | [#0039](../tickets/0039-pending-ops-queue.md) | Archive/delete/move/mark-read become durable queue rows; engine drains with retry/backoff. Send is already durable via the outbox. | The op-queue, the genuinely new core infra and its new bug class. | L |
 | 4 Legacy decommission | [#0040](../tickets/0040-drop-file-layer-cutover.md) | Retire the legacy `.md` tree and `mp-legacy`, one-time draft import assigning `id:` frontmatter, TKT-0047 closed. | The end of the transition period, not a code deletion (the greenfield build never had the file layer). | S-M |
 | 5 Persistent conn + protocol + FTS | [#0041](../tickets/0041-persistent-conn-condstore.md), [#0042](../tickets/0042-graph-delta-sync.md), [#0043](../tickets/0043-fts5-search.md) | Persistent authenticated connection, CONDSTORE/QRESYNC flag-delta, Graph `/messages/delta`, FTS5 search. | Sync smoothness and full-text search. | M-L |
 
-The stop-gate is still real, and it is what the greenfield ordering buys, but it sits after the Stage 2 and Stage 2b pair rather than after Stage 2 alone.
-Stage 2 moves the read path onto the store; Stage 2b is what puts the path-taking CLI commands and the drafts index back on a tree that no longer holds a `.md` mailstore, so the pause point is the pair and the CLI is not usable between them.
-After Stage 2b the owner has the perf win (cold start and quick-sync render both stop touching thousands of files) with mutations still optimistic and direct-to-server: Stage 2 updates the store row and fires the server op directly, which is exactly today's semantics and durability, and the durable queue behind those ops is Stage 3's scope.
+The stop-gate is still real, and it is what the greenfield ordering buys, but it sits after the Stage 2, 2b and 2c triple rather than after Stage 2 alone.
+Stage 2 moves the read path onto the store; Stage 2b puts the path-taking CLI commands and the drafts index back on a tree that no longer holds a `.md` mailstore; Stage 2c does the same for the TUI, whose mutations decline until it lands.
+The pause point is therefore the triple: the gate passes when #0038, #0050 and #0052 are all done, and the legacy-driver invariant (`~/.cargo/bin/mp` stays `mp-legacy`) holds until it does.
+After Stage 2c the owner has the perf win (cold start and quick-sync render both stop touching thousands of files) with mutations still optimistic and direct-to-server: Stage 2 updates the store row and fires the server op directly, which is exactly today's semantics and durability, and the durable queue behind those ops is Stage 3's scope.
 Pausing there is viable; the only thing already promoted out of Stage 3 is send, because the outbox ships in Stage 1.
 
 ### The complete nuke (decided 2026-07-31)

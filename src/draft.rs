@@ -114,8 +114,8 @@ pub fn select_inbox_email(inbox_dir: &Path, prompt: &str) -> Result<PathBuf> {
 ///
 /// #0050 is why this type exists: received mail is a store row now, not a
 /// `.md` file, so the draft builders cannot start by reading a path. They take
-/// this instead, and [`create_reply_draft`] / [`create_forward_draft`] are the
-/// thin file-shaped adapters the library tests (and nothing else) still use.
+/// this instead. [`create_reply_draft`] and [`create_forward_draft`] are
+/// test-only fixtures over the same builders, deleted by #0052.
 #[derive(Debug, Clone, Default)]
 pub struct SourceMessage {
     pub from: String,
@@ -133,6 +133,11 @@ pub struct SourceMessage {
     pub html: Option<String>,
 }
 
+/// Test-only fixture: build a reply from a pre-nuke `.md` file.
+///
+/// Deleted by #0052, which ports the tests that use it onto
+/// [`create_reply_draft_from`]. Do not add callers: nothing user-facing can
+/// reach a path-shaped call any more, and this is not a fallback.
 pub fn create_reply_draft(
     source_path: &Path,
     reply_all: bool,
@@ -376,24 +381,11 @@ fn source_from_file(source_path: &Path, with_attachments: bool) -> Result<Source
     })
 }
 
-/// Compute the `Fwd: ...` subject that would be used for a forward draft of
-/// the given source email, without writing the draft file.
-/// Used by the TUI compose wizard to pre-populate the Subject field.
-pub fn fwd_subject_from_source(source_path: &Path) -> Result<String> {
-    let content = fs::read_to_string(source_path)?;
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let inbox: InboxFrontmatter = parsed
-        .data
-        .ok_or_else(|| anyhow!("No frontmatter found"))?
-        .deserialize()?;
-    if inbox.subject.to_lowercase().starts_with("fwd: ") {
-        Ok(inbox.subject)
-    } else {
-        Ok(format!("Fwd: {}", inbox.subject))
-    }
-}
-
+/// Test-only fixture: build a forward from a pre-nuke `.md` file.
+///
+/// Deleted by #0052, which ports the tests that use it onto
+/// [`create_forward_draft_from`]. Do not add callers: nothing user-facing can
+/// reach a path-shaped call any more, and this is not a fallback.
 pub fn create_forward_draft(
     source_path: &Path,
     default_from: &str,

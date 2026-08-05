@@ -47,7 +47,6 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
 
     let title = match &wizard.mode {
         ComposeMode::New => " Compose ".to_string(),
-        ComposeMode::Forward { .. } => " Forward ".to_string(),
         ComposeMode::EditDraft { .. } => " Edit recipients ".to_string(),
     };
 

@@ -437,10 +437,10 @@ impl App {
             A::Forward => {
                 self.pending_prefix = None;
                 if self.selected_email_ref().is_some() {
-                    // The compose wizard reads the source email from a `.md`
-                    // file, which is the drafts index and the selector
-                    // contract's ground (#0050).
-                    self.set_status(crate::tui::actions::needs_selector_contract("Forward"));
+                    // The compose wizard would read the source email from a
+                    // `.md` file; `mp forward <selector>` builds it from the
+                    // store row instead, and the TUI flow lands with #0052.
+                    self.set_status(crate::tui::actions::needs_tui_mutation_half("Forward"));
                 }
             }
             A::EditRecipients => {
@@ -449,7 +449,7 @@ impl App {
                 self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
                     if self.selected_email_ref().is_some() {
-                        self.set_status(crate::tui::actions::needs_selector_contract(
+                        self.set_status(crate::tui::actions::needs_tui_mutation_half(
                             "Edit recipients",
                         ));
                     }
@@ -598,8 +598,8 @@ impl App {
                 self.pending_prefix = None;
                 if self.selected_email_ref().is_some() {
                     // The rendered HTML is written next to a `.md` file, so
-                    // opening it needs the same file addressing #0050 owns.
-                    self.set_status(crate::tui::actions::needs_selector_contract(
+                    // opening it needs the store-backed rendition #0052 ports.
+                    self.set_status(crate::tui::actions::needs_tui_mutation_half(
                         "Open in browser",
                     ));
                 }
@@ -1550,20 +1550,20 @@ impl App {
     ///
     /// Attachments live in the blob store, but the picker and the save/open
     /// pipeline below it address them as files under `_attachments/`, which is
-    /// the file edge #0050 settles.
+    /// the file edge #0052 ports onto `message_blobs`.
     fn open_attachment_picker(&mut self, mode: AttachmentPickerMode) {
         let _ = mode;
         if self.selected_email_ref().is_some() {
-            self.set_status(crate::tui::actions::needs_selector_contract("Attachments"));
+            self.set_status(crate::tui::actions::needs_tui_mutation_half("Attachments"));
         }
     }
 
     /// Helper to open the attachment picker for a search result: the same
-    /// file edge as [`Self::open_attachment_picker`], and the same #0050
+    /// file edge as [`Self::open_attachment_picker`], and the same #0052
     /// boundary.
     fn open_search_result_attachment_picker(&mut self, mode: AttachmentPickerMode) {
         let _ = mode;
-        self.set_status(crate::tui::actions::needs_selector_contract("Attachments"));
+        self.set_status(crate::tui::actions::needs_tui_mutation_half("Attachments"));
     }
 
     /// Open the directory picker overlay with the given source files.

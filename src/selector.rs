@@ -145,18 +145,21 @@ pub fn parse(input: &str) -> Result<SelectorParts> {
     if trimmed.is_empty() {
         bail!("empty selector: expected {SCHEME}<account>/<mailbox>/<key>");
     }
-    if looks_like_path(trimmed) {
+    let (qualified, rest) = match trimmed.strip_prefix(SCHEME) {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    // The path heuristic is a guess, so it only runs where the input is
+    // ambiguous. A string carrying the scheme has already said what it is, and
+    // sniffing it would make the canonical form of any key ending in `.md`
+    // (a Message-ID on a `.md` ccTLD, a draft id ending `.md`) unparseable.
+    if !qualified && looks_like_path(trimmed) {
         bail!(
             "{trimmed} looks like a filesystem path; commands take a selector \
              ({SCHEME}<account>/<mailbox>/<key>), and `mp path <selector>` is the only \
              way back to a path"
         );
     }
-
-    let (qualified, rest) = match trimmed.strip_prefix(SCHEME) {
-        Some(rest) => (true, rest),
-        None => (false, trimmed),
-    };
     let segments: Vec<&str> = rest.split('/').collect();
     if segments.iter().any(|s| s.is_empty()) {
         bail!("selector {trimmed} has an empty segment");
@@ -345,7 +348,8 @@ fn non_empty(s: &str) -> Option<String> {
 }
 
 /// True for strings that are obviously filesystem paths, so the decline names
-/// the real mistake instead of "no match for ./drafts/foo.md".
+/// the real mistake instead of "no match for ./drafts/foo.md". Only ever
+/// applied to unqualified input: see [`parse`].
 fn looks_like_path(s: &str) -> bool {
     s.starts_with('/')
         || s.starts_with("./")
@@ -428,6 +432,10 @@ mod tests {
             "sha256-0123456789abcdef@local.invalid".to_string(),
             "<already-bracketed@example.com>".to_string(),
             "trailing-dot.".to_string(),
+            // A key that ends in `.md` is not a path: Message-IDs live on
+            // `.md` ccTLD domains and draft ids can end that way too.
+            "2026-07-31-note.md".to_string(),
+            "newsletter@digital.md".to_string(),
             "%%%".to_string(),
             "a".repeat(300),
             "emoji \u{1F4E7} key".to_string(),
@@ -529,6 +537,19 @@ mod tests {
                 "{path}: {err}"
             );
         }
+    }
+
+    /// The heuristic is for unqualified input only. Once the scheme is there
+    /// the string has declared itself, and a key ending in `.md` (a `.md`
+    /// ccTLD Message-ID, a draft id) must survive its own canonical form.
+    #[test]
+    fn the_path_heuristic_does_not_run_on_qualified_selectors() {
+        let parts = parse("mp://work/inbox/newsletter@digital.md").expect("qualified .md key parses");
+        assert_eq!(parts.key, "newsletter@digital.md");
+
+        let parts = parse("mp://work/drafts/2026-07-31-note.md").expect("qualified .md draft id parses");
+        assert_eq!(parts.mailbox.as_deref(), Some(DRAFTS_MAILBOX));
+        assert_eq!(parts.key, "2026-07-31-note.md");
     }
 
     #[test]

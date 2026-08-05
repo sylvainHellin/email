@@ -33,7 +33,7 @@ use crate::store::{drafts, Store};
 ///
 /// The user-facing name of a message is the `mp://<account>/<mailbox>/<key>`
 /// selector, which is a different thing with a different job (it survives a
-/// restart, this does not) and lands with #0050.
+/// restart, this does not) and landed with #0050.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageRef(i64);
 
@@ -181,8 +181,18 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
 /// behaviour: sending rewrites the draft's status in place and leaves the file
 /// in `drafts/`.
 fn load_drafts(account: &str) -> Vec<EmailEntry> {
-    // `Store::open` rather than `open_store`: a local-only account that has
-    // never synced has no store file, and its drafts still have to list.
+    indexed_drafts(account).into_iter().map(entry_from_draft).collect()
+}
+
+/// The indexed drafts of one account: the single answer the Drafts list and
+/// the sidebar count both read.
+///
+/// [`Store::open`] rather than [`open_store`], and the refresh is paid here
+/// rather than assumed: drafts are local-only files, so an account that has
+/// never synced has no store *file* and still has drafts, and a count that
+/// opened differently or skipped the refresh would contradict the list it
+/// labels.
+fn indexed_drafts(account: &str) -> Vec<drafts::DraftRow> {
     let store = match Store::open(crate::config::store_path(account)) {
         Ok(store) => store,
         Err(e) => {
@@ -195,7 +205,7 @@ fn load_drafts(account: &str) -> Vec<EmailEntry> {
         log::warn!("[drafts] refreshing the index of {account} failed: {e:#}");
     }
     match drafts::list(&store, account, None) {
-        Ok(rows) => rows.into_iter().map(entry_from_draft).collect(),
+        Ok(rows) => rows,
         Err(e) => {
             log::warn!("[drafts] listing the index of {account} failed: {e:#}");
             Vec::new()
@@ -211,8 +221,8 @@ fn load_drafts(account: &str) -> Vec<EmailEntry> {
 ///
 /// Drafts are the exception, and have to be: they are not `messages` rows, so
 /// the grouped query cannot see them and the sidebar would show 0 next to a
-/// populated list. That count comes from the drafts index, which
-/// [`load_drafts`] has just refreshed if the mailbox was loaded at all.
+/// populated list. That count comes from [`indexed_drafts`], the same refresh
+/// plus read the Drafts mailbox load itself does.
 pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> {
     let store = open_store(account);
     let counts = store
@@ -225,13 +235,10 @@ pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> 
             }
         })
         .unwrap_or_default();
-    let draft_count = || {
-        store
-            .as_ref()
-            .and_then(|store| drafts::list(store, account, None).ok())
-            .map(|rows| rows.len())
-            .unwrap_or(0)
-    };
+    // The count is the length of the list, from the same [`indexed_drafts`]
+    // call the mailbox load makes, so the sidebar cannot disagree with the
+    // mailbox it labels.
+    let draft_count = || indexed_drafts(account).len();
 
     mailboxes
         .iter()
@@ -874,12 +881,15 @@ impl ComposeField {
     }
 }
 
-/// Wizard mode: blank new draft, forward from an existing email, or
-/// edit the recipient/subject fields of an existing draft in place.
+/// Wizard mode: blank new draft, or edit the recipient/subject fields of an
+/// existing draft in place.
+///
+/// The forward mode is not here: forwarding from the TUI is one of the flows
+/// #0052 ports onto the store, and it will build its draft from a store row
+/// the way `mp forward <selector>` already does, not from a source path.
 #[derive(Debug, Clone)]
 pub enum ComposeMode {
     New,
-    Forward { source_path: PathBuf },
     EditDraft { source_path: PathBuf },
 }
 
@@ -1755,6 +1765,30 @@ mod tests {
             MailboxKind::Drafts,
         )];
         assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
+    }
+
+    /// The sidebar count and the Drafts list read the same index through the
+    /// same open, so an account that has never synced (no store file yet, its
+    /// drafts written straight into the directory) cannot list drafts and
+    /// count 0 beside them. Nothing has loaded the mailbox here: the count is
+    /// the first read.
+    #[test]
+    fn the_drafts_count_agrees_with_the_list_on_a_never_synced_account() {
+        let _data = DataDir::new();
+        external_draft("2026-08-01-one.md", "a@example.com", "One", "draft");
+        external_draft("2026-08-02-two.md", "b@example.com", "Two", "draft");
+        assert!(
+            !crate::config::store_path("alice").exists(),
+            "the account must be un-synced for this to be the case under test"
+        );
+
+        let mailboxes = vec![mb(
+            "Drafts",
+            crate::config::drafts_dir("alice"),
+            MailboxKind::Drafts,
+        )];
+        assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
+        assert_eq!(load_emails("alice", "drafts").len(), 2);
     }
 
     /// The [TKT-0045] scenario from the TUI's side: a draft written by another

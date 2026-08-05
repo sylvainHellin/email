@@ -363,6 +363,54 @@ pub fn load_body(store: &Store, blobs: &BlobStore, id: i64) -> Option<String> {
     Some(blob_text(blobs, id, hash.as_deref()))
 }
 
+/// The HTML rendition of one message, or `None` when it has none.
+///
+/// This is what the quoted companion of a reply or a forward is built from:
+/// the pre-store build wrote a `.html` file beside every received `.md` and
+/// `mp reply` copied it, so without this the store build would send a
+/// plain-text-only quote where the file build sent the sender's own markup.
+///
+/// Two shapes carry it, because ingest stores whichever it was given: the
+/// Graph path has no RFC822 and writes an `html` blob of its own, the IMAP
+/// path writes the raw message and the HTML part lives inside it. The blob is
+/// preferred because it needs no parse; the raw is parsed only when there is
+/// no blob, and only for the one message being replied to.
+pub fn load_html(store: &Store, blobs: &BlobStore, message_row: i64) -> Option<String> {
+    let hash: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT hash FROM message_blobs
+             WHERE message_row = ?1 AND kind = 'html' ORDER BY ordinal LIMIT 1",
+            [message_row],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!("[store] reading the html hash of message {message_row}: {e:#}");
+            None
+        });
+    if let Some(hash) = hash {
+        if let Some(bytes) = read_blob(blobs, message_row, &hash) {
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    let raw_hash: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT hash FROM message_blobs
+             WHERE message_row = ?1 AND kind = 'raw' ORDER BY ordinal LIMIT 1",
+            [message_row],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!("[store] reading the raw hash of message {message_row}: {e:#}");
+            None
+        });
+    let raw = read_blob(blobs, message_row, raw_hash.as_deref()?)?;
+    crate::parse::parse_rfc822_to_fetched_email(&raw).and_then(|email| email.html_body)
+}
+
 /// Resolve the body blobs of a batch of messages, keyed by `messages.id`.
 ///
 /// One prepared statement, one blob read per id: the batch shape exists for
@@ -555,6 +603,47 @@ mod tests {
                 "the single read must agree with the batch"
             );
         }
+    }
+
+    /// The quoted companion of a reply or a forward comes from here, so both
+    /// shapes ingest writes have to answer: the Graph path's own `html` blob
+    /// and the IMAP path's raw message, whose HTML part is inside it.
+    #[test]
+    fn the_html_rendition_is_read_from_the_blob_or_from_the_raw_message() {
+        let fx = fixture();
+
+        // Graph shape: no RFC822, so ingest wrote an `html` blob.
+        let mut graph = email("graph", "Mon, 01 Jan 2024 09:00:00 +0000");
+        graph.html_body = Some("<p>markup the sender wrote</p>".to_string());
+        let graph_id = ingest(&fx, "inbox", 1, &graph);
+        assert_eq!(
+            load_html(&fx.store, &fx.blobs, graph_id).as_deref(),
+            Some("<p>markup the sender wrote</p>")
+        );
+
+        // IMAP shape: the raw message carries the HTML part.
+        let raw = b"From: ada@example.com\r\nTo: b@example.com\r\nSubject: raw\r\n\
+Message-ID: <raw@example.com>\r\nDate: Mon, 01 Jan 2024 10:00:00 +0000\r\n\
+Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
+        let raw_id = ingest_message(
+            &fx.store,
+            &fx.blobs,
+            &IngestInput {
+                account: "alice",
+                mailbox: "inbox",
+                uid: 2,
+                email: &crate::parse::parse_rfc822_to_fetched_email(raw).unwrap(),
+                raw: Some(raw),
+            },
+        )
+        .unwrap()
+        .row_id;
+        let html = load_html(&fx.store, &fx.blobs, raw_id).expect("the raw message has html");
+        assert!(html.contains("html inside the raw"), "{html}");
+
+        // A plain-text message has none, and says so rather than inventing one.
+        let plain_id = ingest(&fx, "inbox", 3, &email("plain", "Mon, 01 Jan 2024 11:00:00 +0000"));
+        assert_eq!(load_html(&fx.store, &fx.blobs, plain_id), None);
     }
 
     /// A reference to a row that no longer exists is `None`, not an empty

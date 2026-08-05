@@ -29,6 +29,18 @@ All notable changes to this project are documented in this file.
   a draft written by another process shows up within a second without a
   restart (closes TKT-0045), and `y` copies the selector instead of a file path.
 
+### Fixed
+- **Selector keys ending in `.md`, quoted HTML in replies, duplicate draft ids
+  and the drafts count (#0050 review).** The filesystem-path heuristic now runs
+  only on unqualified input, so a Message-ID on a `.md` ccTLD and a draft id
+  ending `.md` survive their own canonical form. `mp reply` and `mp forward`
+  quote the sender's HTML again, read from the message's html blob or its raw
+  message. Two draft files carrying one `id:` still collapse to one index row,
+  but the reindex now picks a deterministic winner and names both paths instead
+  of losing one silently. The TUI sidebar counts drafts through the same read
+  the Drafts list uses, so an account that has never synced no longer lists
+  drafts and counts zero.
+
 ### Added
 - **Durable outbox for sent mail (#0037).** Every outgoing message is committed
   to the per-account store (raw bytes plus an `outbox` row) *before* SMTP runs,
