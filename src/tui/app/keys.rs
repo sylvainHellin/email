@@ -436,11 +436,13 @@ impl App {
             }
             A::Forward => {
                 self.pending_prefix = None;
-                if self.selected_email_ref().is_some() {
-                    // The compose wizard would read the source email from a
-                    // `.md` file; `mp forward <selector>` builds it from the
-                    // store row instead, and the TUI flow lands with #0052.
-                    self.set_status(crate::tui::actions::needs_tui_mutation_half("Forward"));
+                if let Some(msg) = self.selected_email_ref() {
+                    self.push_action(Action::OpenComposeWizard(ComposeMode::Forward { msg }));
+                } else if self.selected_email().is_some() {
+                    // A Drafts row has no message behind it to forward.
+                    self.set_status(
+                        "Forward needs a received message; a draft has none to quote".to_string(),
+                    );
                 }
             }
             A::EditRecipients => {
@@ -448,10 +450,13 @@ impl App {
                 // hint (the guard is advisory, resolved everywhere).
                 self.pending_prefix = None;
                 if self.active_kind() == MailboxKind::Drafts {
-                    if self.selected_email_ref().is_some() {
-                        self.set_status(crate::tui::actions::needs_tui_mutation_half(
-                            "Edit recipients",
-                        ));
+                    // The draft is named by its `id:`, not by the path it
+                    // happens to sit at: the wizard resolves it through the
+                    // drafts index when it opens and again when it submits.
+                    if let Some(id) = self.selected_email().and_then(|e| e.draft_id.clone()) {
+                        self.push_action(Action::OpenComposeWizard(ComposeMode::EditDraft {
+                            id,
+                        }));
                     }
                 } else {
                     self.set_status(

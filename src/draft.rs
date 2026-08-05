@@ -9,8 +9,7 @@ use walkdir::WalkDir;
 
 use crate::config::{EmailSettings, SmtpConfig};
 use crate::parse::{
-    account_dir_for_email, attachments_dir_for, extract_email_address, link_or_copy,
-    slugify_sender, slugify_subject, stable_attachments_dir,
+    extract_email_address, slugify_sender, slugify_subject, stable_attachments_dir,
 };
 use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus, InboxFrontmatter};
 
@@ -114,8 +113,8 @@ pub fn select_inbox_email(inbox_dir: &Path, prompt: &str) -> Result<PathBuf> {
 ///
 /// #0050 is why this type exists: received mail is a store row now, not a
 /// `.md` file, so the draft builders cannot start by reading a path. They take
-/// this instead. [`create_reply_draft`] and [`create_forward_draft`] are
-/// test-only fixtures over the same builders, deleted by #0052.
+/// this instead: [`source_from_row`] is the one way to build it, off a store
+/// row and its blobs, for the CLI and the TUI alike (#0052).
 #[derive(Debug, Clone, Default)]
 pub struct SourceMessage {
     pub from: String,
@@ -133,19 +132,110 @@ pub struct SourceMessage {
     pub html: Option<String>,
 }
 
-/// Test-only fixture: build a reply from a pre-nuke `.md` file.
+/// Build the source of a reply or a forward out of a store row.
 ///
-/// Deleted by #0052, which ports the tests that use it onto
-/// [`create_reply_draft_from`]. Do not add callers: nothing user-facing can
-/// reach a path-shaped call any more, and this is not a fallback.
-pub fn create_reply_draft(
-    source_path: &Path,
-    reply_all: bool,
-    default_from: &str,
-    drafts_dir: Option<&Path>,
-) -> Result<PathBuf> {
-    let source = source_from_file(source_path, false)?;
-    create_reply_draft_from(&source, reply_all, default_from, drafts_dir)
+/// The one assembler both stacks use: `mp reply` / `mp forward` and the TUI's
+/// `r` / `R` / `w` all reach a message the same way, so a draft written from
+/// the list is the draft the CLI writes for the same selector (#0052).
+///
+/// `with_attachments` is the forward's extra cost: the attachments are blobs,
+/// and a draft's `attachments:` list needs paths, so they are materialised
+/// into the stable per-account mirror keyed by Message-ID (#0006) where the
+/// draft keeps resolving them after the source row is archived or evicted.
+pub fn source_from_row(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    row: &crate::store::read::MessageRow,
+    with_attachments: bool,
+) -> Result<SourceMessage> {
+    let body = crate::store::read::load_body(store, blobs, row.id).unwrap_or_default();
+    let attachments = if with_attachments && row.has_attachments {
+        let dest = stable_attachments_dir(
+            &crate::config::account_dir(&account_name_of(store)),
+            &row.message_id,
+        );
+        crate::store::read::materialise_attachments(store, blobs, row.id, &dest)?
+    } else {
+        Vec::new()
+    };
+    Ok(SourceMessage {
+        from: row.from.clone().unwrap_or_default(),
+        to: row.to.clone().unwrap_or_default(),
+        cc: row.cc.clone(),
+        subject: row.subject.clone().unwrap_or_default(),
+        date: row.date_display.clone(),
+        body,
+        attachments,
+        // The quoted HTML companion the file build wrote beside the draft:
+        // without it a reply quotes plain text where the sender wrote markup.
+        html: crate::store::read::load_html(store, blobs, row.id),
+    })
+}
+
+/// Build the source of a reply or a forward out of a message that was fetched
+/// from the server but never ingested: the server-search hit that resolved to
+/// no local row (#0052).
+///
+/// The same shape [`source_from_row`] produces, with the bytes coming from the
+/// fetch instead of a blob, so a reply to a hit quotes what the overlay just
+/// showed. A hit with no Message-ID has no stable key for its attachments, so
+/// it forwards its body without them rather than inventing one; the forwarded
+/// header block still names the message.
+pub fn source_from_fetched(
+    account_dir: &Path,
+    fetched: &crate::parse::FetchedEmail,
+    with_attachments: bool,
+) -> Result<SourceMessage> {
+    let attachments = match (with_attachments, fetched.message_id.as_deref()) {
+        (true, Some(message_id)) if !fetched.attachments.is_empty() => {
+            let dest = stable_attachments_dir(account_dir, message_id);
+            fs::create_dir_all(&dest)
+                .with_context(|| format!("creating {}", dest.display()))?;
+            let mut written = Vec::new();
+            for att in &fetched.attachments {
+                let out = dest.join(crate::parse::sanitize_attachment_filename(&att.filename));
+                fs::write(&out, &att.content)
+                    .with_context(|| format!("writing {}", out.display()))?;
+                written.push(out);
+            }
+            written
+        }
+        _ => Vec::new(),
+    };
+    Ok(SourceMessage {
+        from: fetched.from.clone(),
+        to: fetched.to.clone(),
+        cc: fetched.cc.clone(),
+        subject: fetched.subject.clone(),
+        date: Some(fetched.date.clone()),
+        body: fetched.body_text.trim().to_string(),
+        attachments,
+        html: fetched.html_body.clone(),
+    })
+}
+
+/// The account a store belongs to, read back from its own path
+/// (`<data>/<account>/store.sqlite3`).
+fn account_name_of(store: &crate::store::Store) -> String {
+    store
+        .path()
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The `Fwd:`-prefixed subject of a forward, idempotent on a subject that
+/// already carries the prefix.
+///
+/// Shared with the compose wizard, which shows the subject before the draft
+/// exists and must show the one the draft will carry.
+pub fn fwd_subject(subject: &str) -> String {
+    if subject.to_lowercase().starts_with("fwd: ") {
+        subject.to_string()
+    } else {
+        format!("Fwd: {subject}")
+    }
 }
 
 /// Reply to a message that is not a file: the #0050 path, used by
@@ -292,109 +382,6 @@ pub fn create_reply_draft_from(
     Ok(dest)
 }
 
-/// Read a `.md` message into a [`SourceMessage`].
-///
-/// `with_attachments` resolves the forward's attachment paths, preferring the
-/// per-account stable store keyed by Message-ID so the draft survives the
-/// source email being archived (#0006), and lazy-hydrating it from the
-/// per-mailbox `_attachments/` directory for emails fetched before that scheme
-/// existed.
-fn source_from_file(source_path: &Path, with_attachments: bool) -> Result<SourceMessage> {
-    let content = fs::read_to_string(source_path)?;
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let inbox: InboxFrontmatter = parsed
-        .data
-        .ok_or_else(|| anyhow!("No frontmatter found"))?
-        .deserialize()?;
-
-    let attachments = match (with_attachments, inbox.attachments.as_ref()) {
-        (true, Some(filenames)) => {
-            let per_mailbox_dir = attachments_dir_for(source_path);
-            let stable_dir = match (
-                account_dir_for_email(source_path),
-                inbox.message_id.as_deref(),
-            ) {
-                (Some(acct), Some(mid)) => Some(stable_attachments_dir(&acct, mid)),
-                _ => None,
-            };
-
-            if let Some(stable) = stable_dir.as_ref() {
-                // Ensure the stable mirror exists for every named attachment.
-                // Idempotent: link_or_copy is a no-op when dst already exists.
-                if let Err(e) = fs::create_dir_all(stable) {
-                    log::warn!(
-                        "failed to create stable attachments dir {}: {}",
-                        stable.display(),
-                        e
-                    );
-                } else {
-                    for name in filenames {
-                        let from = per_mailbox_dir.join(name);
-                        let to = stable.join(name);
-                        if from.exists() && !to.exists() {
-                            if let Err(e) = link_or_copy(&from, &to) {
-                                log::warn!(
-                                    "failed to hydrate stable attachment {}: {}",
-                                    to.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            filenames
-                .iter()
-                .filter_map(|name| {
-                    let candidate = stable_dir
-                        .as_ref()
-                        .map(|d| d.join(name))
-                        .filter(|p| p.exists())
-                        .or_else(|| {
-                            let p = per_mailbox_dir.join(name);
-                            p.exists().then_some(p)
-                        })?;
-                    candidate.canonicalize().ok()
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
-    let source_html = source_path.with_extension("html");
-    let html = source_html
-        .exists()
-        .then(|| fs::read_to_string(&source_html).ok())
-        .flatten();
-
-    Ok(SourceMessage {
-        from: inbox.from,
-        to: inbox.to,
-        cc: inbox.cc,
-        subject: inbox.subject,
-        date: inbox.date,
-        body: parsed.content.trim().to_string(),
-        attachments,
-        html,
-    })
-}
-
-/// Test-only fixture: build a forward from a pre-nuke `.md` file.
-///
-/// Deleted by #0052, which ports the tests that use it onto
-/// [`create_forward_draft_from`]. Do not add callers: nothing user-facing can
-/// reach a path-shaped call any more, and this is not a fallback.
-pub fn create_forward_draft(
-    source_path: &Path,
-    default_from: &str,
-    drafts_dir: Option<&Path>,
-) -> Result<PathBuf> {
-    let source = source_from_file(source_path, true)?;
-    create_forward_draft_from(&source, default_from, drafts_dir)
-}
-
 /// Forward a message that is not a file: the #0050 path, used by
 /// `mp forward <selector>` over a store row.
 pub fn create_forward_draft_from(
@@ -406,11 +393,7 @@ pub fn create_forward_draft_from(
     let original_body = inbox.body.trim();
 
     // Build forward subject
-    let fwd_subject = if inbox.subject.to_lowercase().starts_with("fwd: ") {
-        inbox.subject.clone()
-    } else {
-        format!("Fwd: {}", inbox.subject)
-    };
+    let fwd_subject = fwd_subject(&inbox.subject);
 
     let attachment_paths: Vec<String> = inbox
         .attachments
@@ -2339,130 +2322,6 @@ mod tests {
     fn test_resolve_drafts_dir_default_fallback() {
         let result = resolve_drafts_dir(Path::new("."), &None);
         assert_eq!(result, PathBuf::from("."));
-    }
-
-    // -----------------------------------------------------------------------
-    // create_forward_draft attachment-path resolution (ticket #0006)
-    // -----------------------------------------------------------------------
-
-    /// Helper: write a synthetic inbox email + per-mailbox `_attachments/`.
-    /// Returns the path to the .md file. Uses an `<account>/inbox/` layout so
-    /// `account_dir_for_email` resolves the per-account stable directory.
-    fn write_inbox_with_attachments(
-        account_dir: &Path,
-        message_id: &str,
-        files: &[(&str, &[u8])],
-    ) -> PathBuf {
-        let inbox = account_dir.join("inbox");
-        fs::create_dir_all(&inbox).unwrap();
-        let md = inbox.join("2024-01-01-1200_alice_subj.md");
-        let mut fm = String::from("---\n");
-        fm.push_str("from: \"alice@example.com\"\n");
-        fm.push_str("to: \"me@example.com\"\n");
-        fm.push_str("subject: \"Subj\"\n");
-        fm.push_str("date: \"Mon, 01 Jan 2024 12:00:00 +0000\"\n");
-        fm.push_str(&format!("message_id: \"{}\"\n", message_id));
-        fm.push_str("status: inbox\n");
-        fm.push_str("has_attachments: true\n");
-        fm.push_str("attachments:\n");
-        for (name, _) in files {
-            fm.push_str(&format!("  - \"{}\"\n", name));
-        }
-        fm.push_str("fetched_at: \"2024-01-01T12:00:00Z\"\n");
-        fm.push_str("---\n\nHi.");
-        fs::write(&md, fm).unwrap();
-        let att_dir = crate::parse::attachments_dir_for(&md);
-        fs::create_dir_all(&att_dir).unwrap();
-        for (name, content) in files {
-            fs::write(att_dir.join(name), content).unwrap();
-        }
-        md
-    }
-
-    #[test]
-    fn test_forward_draft_uses_stable_attachment_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let acct = tmp.path().join("account");
-        let mid = "<fwd1@example.com>";
-        let src = write_inbox_with_attachments(&acct, mid, &[("report.pdf", b"PDF")]);
-        let drafts = acct.join("drafts");
-
-        let draft_path =
-            create_forward_draft(&src, "me@example.com", Some(&drafts)).unwrap();
-        let body = fs::read_to_string(&draft_path).unwrap();
-
-        let stable = crate::parse::stable_attachments_dir(&acct, mid);
-        let stable_file = stable.join("report.pdf");
-        assert!(
-            stable_file.exists(),
-            "stable file should be hydrated: {}",
-            stable_file.display()
-        );
-        let canon = stable_file.canonicalize().unwrap();
-        assert!(
-            body.contains(canon.to_string_lossy().as_ref()),
-            "forward draft frontmatter should reference stable path; body={}",
-            body
-        );
-    }
-
-    #[test]
-    fn test_forward_draft_survives_archive_of_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let acct = tmp.path().join("account");
-        let mid = "<fwd2@example.com>";
-        let src = write_inbox_with_attachments(&acct, mid, &[("report.pdf", b"PDF")]);
-        let drafts = acct.join("drafts");
-        let archive = acct.join("archive");
-        fs::create_dir_all(&archive).unwrap();
-
-        let draft_path =
-            create_forward_draft(&src, "me@example.com", Some(&drafts)).unwrap();
-
-        // Move the source from inbox to archive, attachments directory
-        // included (the `.md` mover that used to do this went with the
-        // legacy sync in #0037; the draft contract under test is the same).
-        let dest = archive.join(src.file_name().unwrap());
-        fs::rename(&src, &dest).unwrap();
-        let att_src = crate::parse::attachments_dir_for(&src);
-        if att_src.is_dir() {
-            fs::rename(&att_src, crate::parse::attachments_dir_for(&dest)).unwrap();
-        }
-
-        // Re-parse the draft and verify every attachment path still exists.
-        let draft = parse_email_draft(&draft_path).unwrap();
-        let attachments = draft.frontmatter.attachments.expect("attachments");
-        assert!(!attachments.is_empty());
-        for path in &attachments {
-            assert!(
-                Path::new(path).exists(),
-                "attachment path should survive archive move: {}",
-                path
-            );
-        }
-    }
-
-    #[test]
-    fn test_forward_draft_falls_back_when_no_message_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let acct = tmp.path().join("account");
-        let inbox = acct.join("inbox");
-        fs::create_dir_all(&inbox).unwrap();
-        let md = inbox.join("no-mid.md");
-        let body = "---\nfrom: \"a@x.com\"\nto: \"b@x.com\"\nsubject: \"S\"\nstatus: inbox\nhas_attachments: true\nattachments:\n  - \"f.txt\"\n---\n\nHi";
-        fs::write(&md, body).unwrap();
-        let att_dir = crate::parse::attachments_dir_for(&md);
-        fs::create_dir_all(&att_dir).unwrap();
-        fs::write(att_dir.join("f.txt"), b"x").unwrap();
-        let drafts = acct.join("drafts");
-
-        // No message_id -> falls back to per-mailbox path. Should still succeed.
-        let draft_path =
-            create_forward_draft(&md, "me@example.com", Some(&drafts)).unwrap();
-        let draft = parse_email_draft(&draft_path).unwrap();
-        let attachments = draft.frontmatter.attachments.expect("attachments");
-        assert_eq!(attachments.len(), 1);
-        assert!(Path::new(&attachments[0]).exists());
     }
 
     // ------------------------------------------------------------------

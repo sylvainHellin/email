@@ -23,20 +23,27 @@ Port every TUI flow below onto the store plus the selector: quote and forward bo
 No flow re-reads a received `.md` file, because there is not one.
 
 1. Reply and Reply-all (list and preview), building the draft with `draft::create_reply_draft_from` over a `SourceMessage` assembled from the store row, HTML companion included.
+   Landed, unit A.
 2. Forward, the same shape through `create_forward_draft_from`, with attachments materialised from the row's blobs into the stable per-account mirror.
+   Landed, unit A: `w` opens the compose wizard in `ComposeMode::Forward` again, as the pre-nuke build did, and the wizard's recipients and subject are written over the builder's before the draft is indexed.
 3. Send, whose draft comes from the drafts index and whose account resolver is `helpers::resolve_send_account`, which loses its `#[allow(dead_code)]` here.
 4. Approve and the batch approve.
 5. Mark-draft and the batch mark-draft.
 6. Edit recipients (the compose wizard's `EditDraft` mode) resolved through the drafts index rather than a cached path.
+   Landed, unit A: the mode carries the draft's `id:` and resolves it on open and again on submit.
 7. Open in `$EDITOR`, which is `mp edit <selector>`'s job done in-process.
 8. Attachment open and save, from the list and from the search-result overlay, sourced from `message_blobs`.
 9. Open in browser, from the list and from the search-result overlay: the rendered HTML comes from the html blob or the raw blob, not from a `.html` file beside a `.md`.
 10. Open event source, from the calendar view, through the invite's own row and ics blob.
 11. Search-result Open, Reply and Forward, which are the same three flows over a hit that resolved to a row.
+    Reply and Forward landed, unit A, for both halves of a hit: one that resolved builds its source from the row, one that did not builds it from the content the overlay is already rendering (`draft::source_from_fetched`) rather than declining.
+    Open is still open.
 
 Housekeeping this ticket owns, so nothing survives by accident:
 
 - Delete `draft::create_reply_draft`, `draft::create_forward_draft` and `draft::source_from_file`, the path-shaped test-only fixtures left over from the file build, and port the formatting tests in `tests/draft_integration.rs` onto `create_reply_draft_from` / `create_forward_draft_from` with a `SourceMessage`. The three file-attachment-hydration unit tests in `src/draft.rs` (#0006 lineage) die with them: the behaviour they cover does not exist post-nuke.
+  Done, unit A.
+  `parse::link_or_copy` went with them, its only caller having been `source_from_file`, and `main.rs`'s `source_from_row` plus `materialise_attachments` moved into the library (`draft::source_from_row`, `store::read::materialise_attachments`) so the TUI and the CLI build a draft's source through one function.
 - Every remaining `needs_tui_mutation_half` decline disappears with the flow it guards; the helper itself goes when the last caller does.
 
 ## Acceptance criteria

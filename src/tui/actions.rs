@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use anyhow::Result;
@@ -16,7 +16,10 @@ use super::helpers::{
 use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
-use crate::draft::{find_drafts, mark_draft_sent, new_draft_skeleton};
+use crate::draft::{
+    find_drafts, mark_draft_sent, new_draft_skeleton, DraftRecipientEdit, SourceMessage,
+};
+use crate::selector::Selector;
 use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
@@ -38,6 +41,219 @@ use crate::types::EmailStatus;
 /// working way to do it right now.
 pub(super) fn needs_tui_mutation_half(what: &str) -> String {
     format!("{what} lands with the TUI mutation half (#0052); mp-legacy is the working fallback meanwhile")
+}
+
+// ---------------------------------------------------------------------------
+// Drafts written from a source message (#0052 scope items 1, 2 and 11)
+// ---------------------------------------------------------------------------
+
+/// Which draft a [`SourceMessage`] is turned into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DraftFromSource {
+    Reply { all: bool },
+    Forward,
+}
+
+/// The message under the cursor, or `None` with the status line saying why
+/// there is not one.
+///
+/// A Drafts row is the case worth naming: it has no `messages` row behind it,
+/// so there is nothing to quote, and an empty list is not an error at all.
+fn cursor_message(app: &mut App, what: &str) -> Option<MessageRef> {
+    if let Some(msg) = app.selected_email_ref() {
+        return Some(msg);
+    }
+    if app.selected_email().is_some() {
+        app.set_status_level(
+            format!("{what} needs a received message; a draft has none to quote"),
+            StatusLevel::Warning,
+        );
+    }
+    None
+}
+
+/// The source of a reply or a forward, read off the store row under the
+/// cursor, or `None` with the status line saying why not.
+///
+/// This is `mp reply` / `mp forward`'s own path: the row is resolved by id,
+/// the quote and the HTML companion come out of `message_blobs`, and the
+/// forward's attachments are materialised by the same
+/// [`crate::draft::source_from_row`] the CLI calls. Nothing here reads a
+/// `.md` file, because there is not one.
+fn source_for_msg(
+    app: &mut App,
+    msg: MessageRef,
+    what: &str,
+    with_attachments: bool,
+) -> Option<SourceMessage> {
+    let (store, blobs) = store_for_mutation(app, what)?;
+    let row = match crate::store::read::find_by_id(&store, msg.row_id()) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            app.set_status_level(
+                format!("{what} failed: that message is no longer in the store"),
+                StatusLevel::Error,
+            );
+            return None;
+        }
+        Err(e) => {
+            app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
+            return None;
+        }
+    };
+    match crate::draft::source_from_row(&store, &blobs, &row, with_attachments) {
+        Ok(source) => Some(source),
+        Err(e) => {
+            app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
+            None
+        }
+    }
+}
+
+/// Write the draft `source` produces, mint its `id:`, and refresh the drafts
+/// index so the selector this hands back resolves before the status line shows
+/// it (#0050's post-write refresh discipline).
+///
+/// `headers` is the compose wizard's recipient/subject block, applied to the
+/// file before the id is minted so the index holds the final content. `None`
+/// is the direct reply/forward, which takes the builder's own headers.
+///
+/// Shared by the list, the preview and the search overlay, and byte for byte
+/// the CLI's sequence: build, `set_draft_id`, reindex, name the draft.
+fn draft_from_source(
+    account: &str,
+    default_from: &str,
+    source: &SourceMessage,
+    kind: DraftFromSource,
+    headers: Option<&DraftRecipientEdit>,
+) -> Result<(PathBuf, Selector)> {
+    let dir = crate::config::drafts_dir(account);
+    let path = match kind {
+        DraftFromSource::Reply { all } => {
+            crate::draft::create_reply_draft_from(source, all, default_from, Some(&dir))?
+        }
+        DraftFromSource::Forward => {
+            crate::draft::create_forward_draft_from(source, default_from, Some(&dir))?
+        }
+    };
+    if let Some(edit) = headers {
+        crate::draft::rewrite_draft_recipients(&path, edit)?;
+    }
+    let id = crate::store::drafts::new_id();
+    crate::draft::set_draft_id(&path, &id)?;
+    crate::store::drafts::refresh_account(account)?;
+    Ok((path, Selector::for_draft(account, &id)))
+}
+
+/// The address a draft this account writes is sent from: the SMTP config's,
+/// falling back to the account's own default.
+fn default_from(app: &App) -> String {
+    app.smtp_config
+        .as_ref()
+        .map(|s| s.default_from.clone())
+        .unwrap_or_else(|| app.account_config.default_from.clone())
+}
+
+/// Build the draft and hand it straight to `$EDITOR`, which is what reply and
+/// forward did before the read path moved (the draft is a starting point, not
+/// a finished message).
+fn write_draft_and_edit(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    source: &SourceMessage,
+    kind: DraftFromSource,
+    what: &str,
+) -> Result<()> {
+    let account = app.account_config.name.clone();
+    let from = default_from(app);
+    let (path, selector) = match draft_from_source(&account, &from, source, kind, None) {
+        Ok(pair) => pair,
+        Err(e) => {
+            app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
+            return Ok(());
+        }
+    };
+    edit_new_draft(app, terminal, &path, format!("{what} draft ready: {selector}"))
+}
+
+/// Hand a freshly written draft to `$EDITOR` and put `ready` on the status
+/// line, with the list, the index and the sidebar caught up afterwards.
+///
+/// The index is refreshed a second time on the way out because the editor
+/// session is a write this application did not make: the subject and the
+/// recipients the user just typed are what the Drafts list has to show.
+fn edit_new_draft(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    path: &Path,
+    ready: String,
+) -> Result<()> {
+    if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
+        app.invalidate_cache_idx(idx);
+    }
+    suspend_terminal(terminal)?;
+    let result = edit_file(path);
+    resume_terminal(terminal)?;
+    match result {
+        Ok(()) => app.set_status(ready),
+        Err(e) => app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error),
+    }
+    if let Err(e) = crate::store::drafts::refresh_account(&app.account_config.name) {
+        log::warn!("[drafts] refreshing after the editor session failed: {e:#}");
+    }
+    app.recount_all_mailboxes();
+    app.reload_current_mailbox();
+    Ok(())
+}
+
+/// The subject the forward wizard opens with: the row's own subject under a
+/// `Fwd:` prefix, or a bare prefix when the row cannot be read.
+///
+/// The list entry is not the source here: it substitutes "(no subject)" for an
+/// empty subject, and that placeholder must not end up in a sent header.
+fn forward_subject(app: &App, msg: MessageRef) -> String {
+    let subject = crate::tui::app::open_store(&app.account_config.name)
+        .and_then(|store| crate::store::read::find_by_id(&store, msg.row_id()).ok().flatten())
+        .and_then(|row| row.subject)
+        .unwrap_or_default();
+    crate::draft::fwd_subject(&subject)
+}
+
+/// The file behind an indexed draft id, or `None` with the status line saying
+/// the index no longer holds it.
+///
+/// [`crate::store::Store::open`] rather than `open_store`, for the reason the
+/// Drafts mailbox load gives: drafts are local-only files, so an account that
+/// has never synced has no store file and still has drafts.
+fn indexed_draft_path(app: &mut App, id: &str) -> Option<PathBuf> {
+    let account = app.account_config.name.clone();
+    let store = match crate::store::Store::open(crate::config::store_path(&account)) {
+        Ok(store) => store,
+        Err(e) => {
+            app.set_status_level(
+                format!("No drafts index for {account}: {e:#}"),
+                StatusLevel::Error,
+            );
+            return None;
+        }
+    };
+    match crate::store::drafts::find(&store, &account, id) {
+        Ok(Some(row)) => Some(row.path),
+        Ok(None) => {
+            app.set_status_level(
+                format!("That draft is no longer in the index ({id})"),
+                StatusLevel::Error,
+            );
+            None
+        }
+        Err(e) => {
+            app.set_status_level(
+                format!("Reading the drafts index failed: {e:#}"),
+                StatusLevel::Error,
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,14 +403,32 @@ pub(super) fn handle_action(
             // `mp edit <selector>` already does; the TUI flow lands with #0052.
             app.set_status_level(needs_tui_mutation_half("Open"), StatusLevel::Warning);
         }
-        Action::Reply(_reply_all) => {
-            // Reply and forward write a draft from the source message, which
-            // `mp reply` / `mp forward` do off the store; the TUI flow is
-            // #0052's.
-            app.set_status_level(needs_tui_mutation_half("Reply"), StatusLevel::Warning);
+        Action::Reply(reply_all) => {
+            let what = if reply_all { "Reply-all" } else { "Reply" };
+            let Some(msg) = cursor_message(app, what) else {
+                return Ok(());
+            };
+            let Some(source) = source_for_msg(app, msg, what, false) else {
+                return Ok(());
+            };
+            write_draft_and_edit(
+                app,
+                terminal,
+                &source,
+                DraftFromSource::Reply { all: reply_all },
+                what,
+            )?;
         }
         Action::Forward => {
-            app.set_status_level(needs_tui_mutation_half("Forward"), StatusLevel::Warning);
+            // `w` opens the wizard (see `ComposeMode::Forward`); this arm is
+            // the direct path, kept for a caller that already has the row.
+            let Some(msg) = cursor_message(app, "Forward") else {
+                return Ok(());
+            };
+            let Some(source) = source_for_msg(app, msg, "Forward", true) else {
+                return Ok(());
+            };
+            write_draft_and_edit(app, terminal, &source, DraftFromSource::Forward, "Forward")?;
         }
         Action::Send => {
             app.set_status_level(needs_tui_mutation_half("Send"), StatusLevel::Warning);
@@ -1134,8 +1368,18 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
 
     let (to, cc, bcc, subject) = match &mode {
         ComposeMode::New => (String::new(), String::new(), String::new(), String::new()),
-        ComposeMode::EditDraft { source_path } => {
-            match crate::draft::parse_email_draft(source_path) {
+        // The forward's subject is shown before its draft exists, so it is
+        // built by the same rule the draft will use.
+        ComposeMode::Forward { msg } => {
+            let subject = forward_subject(app, *msg);
+            (String::new(), String::new(), String::new(), subject)
+        }
+        ComposeMode::EditDraft { id } => {
+            let Some(path) = indexed_draft_path(app, id) else {
+                app.focus = Focus::List;
+                return;
+            };
+            match crate::draft::parse_email_draft(&path) {
                 Ok(draft) => (
                     draft.frontmatter.to.unwrap_or_default(),
                     draft.frontmatter.cc.unwrap_or_default(),
@@ -1359,23 +1603,37 @@ fn submit_compose_wizard(
         return Ok(());
     }
 
+    let edit = DraftRecipientEdit {
+        to: wizard.to.clone(),
+        cc: wizard.cc.clone(),
+        bcc: wizard.bcc.clone(),
+        subject: wizard.subject.clone(),
+    };
+
     // Editing an existing draft's recipients/subject rewrites the file in
     // place and does NOT open $EDITOR -- the whole point is a quick,
     // fuzzy-finder edit of the header fields.
-    if let ComposeMode::EditDraft { source_path } = &wizard.mode {
-        let edit = crate::draft::DraftRecipientEdit {
-            to: wizard.to.clone(),
-            cc: wizard.cc.clone(),
-            bcc: wizard.bcc.clone(),
-            subject: wizard.subject.clone(),
+    if let ComposeMode::EditDraft { id } = &wizard.mode {
+        let id = id.clone();
+        let Some(path) = indexed_draft_path(app, &id) else {
+            return Ok(());
         };
-        match crate::draft::rewrite_draft_recipients(source_path, &edit) {
+        match crate::draft::rewrite_draft_recipients(&path, &edit) {
             Ok(()) => {
+                let account = app.account_config.name.clone();
+                // The file changed, so the row the index holds for it is
+                // stale; the selector is the draft's own id either way.
+                if let Err(e) = crate::store::drafts::refresh_account(&account) {
+                    log::warn!("[drafts] refreshing after a recipient edit failed: {e:#}");
+                }
                 if let Some(idx) = app.find_mailbox_by_kind(MailboxKind::Drafts) {
                     app.invalidate_cache_idx(idx);
                 }
                 app.reload_current_mailbox();
-                app.set_status("Recipients updated".to_string());
+                app.set_status(format!(
+                    "Recipients updated: {}",
+                    Selector::for_draft(&account, &id)
+                ));
             }
             Err(e) => {
                 app.set_status_level(format!("Recipient update failed: {e}"), StatusLevel::Error);
@@ -1384,9 +1642,35 @@ fn submit_compose_wizard(
         return Ok(());
     }
 
+    // A forward keeps the wizard's recipients and subject over the ones the
+    // builder derived, which is the whole reason it asks for them first.
+    if let ComposeMode::Forward { msg } = wizard.mode {
+        let Some(source) = source_for_msg(app, msg, "Forward", true) else {
+            return Ok(());
+        };
+        let account = app.account_config.name.clone();
+        let from = default_from(app);
+        let (path, selector) = match draft_from_source(
+            &account,
+            &from,
+            &source,
+            DraftFromSource::Forward,
+            Some(&edit),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                app.set_status_level(format!("Forward failed: {e:#}"), StatusLevel::Error);
+                return Ok(());
+            }
+        };
+        return edit_new_draft(app, terminal, &path, format!("Forward draft ready: {selector}"));
+    }
+
     let draft_result = match &wizard.mode {
         ComposeMode::New => write_new_draft_from_wizard(app, &wizard),
-        ComposeMode::EditDraft { .. } => unreachable!("handled above"),
+        ComposeMode::Forward { .. } | ComposeMode::EditDraft { .. } => {
+            unreachable!("handled above")
+        }
     };
 
     let path = match draft_result {
@@ -1538,12 +1822,13 @@ fn handle_search_result_action(
             );
         }
 
-        Action::SearchResultReply(_) => {
-            app.set_status_level(needs_tui_mutation_half("Reply"), StatusLevel::Warning);
+        Action::SearchResultReply(all) => {
+            let what = if all { "Reply-all" } else { "Reply" };
+            search_result_draft(app, terminal, DraftFromSource::Reply { all }, what)?;
         }
 
         Action::SearchResultForward => {
-            app.set_status_level(needs_tui_mutation_half("Forward"), StatusLevel::Warning);
+            search_result_draft(app, terminal, DraftFromSource::Forward, "Forward")?;
         }
 
         Action::SearchResultArchive => {
@@ -1575,6 +1860,49 @@ fn handle_search_result_action(
     Ok(())
 }
 
+
+/// Reply to or forward the selected server-search hit.
+///
+/// A hit that resolved to a row is the list flow exactly: same store read,
+/// same builder, same draft. A hit that did not resolve has no row, and its
+/// content is the fetch the overlay is already rendering, so the draft is
+/// built from that rather than declined: the message is in front of the user,
+/// and refusing to quote it would be a limitation of the plumbing, not of what
+/// is known.
+fn search_result_draft(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    kind: DraftFromSource,
+    what: &str,
+) -> Result<()> {
+    let with_attachments = matches!(kind, DraftFromSource::Forward);
+    let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+        return Ok(());
+    };
+    let msg = hit.entry.msg;
+    // Cloned only for the unresolved hit, which is the one case that needs the
+    // fetched payload while `app` is borrowed mutably for the status line.
+    let fetched = msg.is_none().then(|| hit.fetched.clone());
+
+    let source = match (msg, fetched) {
+        (Some(msg), _) => source_for_msg(app, msg, what, with_attachments),
+        (None, Some(fetched)) => {
+            let account_dir = crate::config::account_dir(&app.account_config.name);
+            match crate::draft::source_from_fetched(&account_dir, &fetched, with_attachments) {
+                Ok(source) => Some(source),
+                Err(e) => {
+                    app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+    };
+    let Some(source) = source else {
+        return Ok(());
+    };
+    write_draft_and_edit(app, terminal, &source, kind, what)
+}
 
 /// Archive one or many messages: the store rows move into the archive mailbox,
 /// then the server op follows (#0038 scope item 7).
@@ -1811,11 +2139,13 @@ mod tests {
     ///
     /// The ticket it names must be an open one: #0038 and #0050 have landed,
     /// and a message pointing at a done ticket tells the user to wait for
-    /// something that already happened.
+    /// something that already happened. The operation is one that still
+    /// declines, because the ones #0052 has landed no longer show this line
+    /// at all.
     #[test]
     fn the_decline_message_points_at_the_working_fallback() {
-        let msg = needs_tui_mutation_half("Reply");
-        assert!(msg.starts_with("Reply "), "{msg}");
+        let msg = needs_tui_mutation_half("Send");
+        assert!(msg.starts_with("Send "), "{msg}");
         assert!(msg.contains("#0052"), "{msg}");
         assert!(!msg.contains("#0050"), "{msg}");
         assert!(msg.contains("mp-legacy"), "{msg}");
@@ -1916,5 +2246,371 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// The store-backed drafting flows (#0052 unit A), over a real ingested store.
+///
+/// Each test writes its message through the ingest API, builds the source the
+/// way the list flow does ([`crate::draft::source_from_row`]) and then asserts
+/// the three things a user sees: the draft file `mp reply` / `mp forward`
+/// would have written for the same source, the drafts index holding it right
+/// away, and a status-line selector that resolves back to it.
+#[cfg(test)]
+mod store_backed_drafts {
+    use super::*;
+    use crate::parse::{AttachmentData, FetchedEmail};
+    use crate::selector::Namespace;
+    use crate::store::read::MessageRow;
+    use crate::store::Store;
+
+    /// Point the data directory at a tempdir so every `config::` path resolves
+    /// inside the fixture, serialised against the other data-dir tests.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let guard = crate::config::data_dir_lock();
+            let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+            Self {
+                _dir: dir,
+                _guard: guard,
+                previous,
+            }
+        }
+
+        fn store(&self) -> Store {
+            Store::open(crate::config::store_path("alice")).unwrap()
+        }
+
+        /// Ingest one message and hand back the row the list would show.
+        fn ingest(&self, email: &FetchedEmail) -> MessageRow {
+            let store = self.store();
+            let blobs = BlobStore::for_account("alice");
+            let outcome = crate::ingest::ingest_message(
+                &store,
+                &blobs,
+                &crate::ingest::IngestInput {
+                    account: "alice",
+                    mailbox: "inbox",
+                    uid: 1,
+                    email,
+                    raw: None,
+                },
+            )
+            .unwrap();
+            crate::store::read::find_by_id(&store, outcome.row_id)
+                .unwrap()
+                .unwrap()
+        }
+
+        /// The source of a reply or a forward off that row, which is what both
+        /// the list flow and `mp reply` build.
+        fn source(&self, row: &MessageRow, with_attachments: bool) -> SourceMessage {
+            let store = self.store();
+            let blobs = BlobStore::for_account("alice");
+            crate::draft::source_from_row(&store, &blobs, row, with_attachments).unwrap()
+        }
+
+        /// Resolve a selector through the drafts index, exactly as
+        /// `mp send <selector>` would after reading it off the status line.
+        fn resolve(&self, selector: &Selector) -> crate::store::drafts::DraftRow {
+            let store = self.store();
+            let query =
+                crate::selector::parse_in(&selector.to_string(), Namespace::Drafts, "alice", None)
+                    .unwrap();
+            crate::selector::resolve_draft(&store, &query).unwrap().0
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+            }
+        }
+    }
+
+    fn fixture_email(subject: &str) -> FetchedEmail {
+        FetchedEmail {
+            from: "Alice <alice@example.com>".into(),
+            to: "me@example.com, bob@example.com".into(),
+            cc: Some("carol@example.com".into()),
+            subject: subject.into(),
+            date: "Mon, 01 Jan 2024 12:00:00 +0000".into(),
+            body_text: "Original body".into(),
+            html_body: Some("<p>Rich body</p>".into()),
+            has_attachments: false,
+            message_id: Some(format!("<{subject}@example.com>")),
+            attachments: Vec::new(),
+            is_read: true,
+            calendar_ics: None,
+            event: None,
+        }
+    }
+
+    /// Reply: the quote comes out of the body blob, the companion HTML out of
+    /// the html blob, and the draft is the one `mp reply` writes for the same
+    /// row. It is in the index before the status line names it.
+    #[test]
+    fn reply_writes_the_cli_draft_and_indexes_it_immediately() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Hello"));
+        let source = fx.source(&row, false);
+
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Reply { all: false },
+            None,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("from: \"me@example.com\""), "{content}");
+        assert!(content.contains("to: \"alice@example.com\""), "{content}");
+        assert!(content.contains("subject: \"Re: Hello\""), "{content}");
+        assert!(content.contains("status: draft"), "{content}");
+        // A plain reply addresses the sender only.
+        assert!(!content.contains("cc: \""), "{content}");
+        assert!(content.contains("{{SIGNATURE}}"), "{content}");
+        assert!(
+            content.contains("On Mon, 01 Jan 2024 12:00:00 +0000, Alice <alice@example.com> wrote:"),
+            "{content}"
+        );
+        assert!(content.contains("> Original body"), "{content}");
+
+        // The sender wrote markup, so the reply quotes markup (#0050 review).
+        let companion = std::fs::read_to_string(path.with_extension("html")).unwrap();
+        assert!(companion.contains("<p>Rich body</p>"), "{companion}");
+
+        // The index holds it under the selector the status line shows.
+        let indexed = fx.resolve(&selector);
+        assert_eq!(indexed.path, path);
+        assert_eq!(indexed.status, "draft");
+        assert!(
+            content.contains(&format!("id: {}", indexed.id)),
+            "the file carries the id it is indexed under: {content}"
+        );
+    }
+
+    /// Reply-all: every other recipient of the source, To and Cc alike, minus
+    /// this account's own address.
+    #[test]
+    fn reply_all_carries_the_other_recipients_and_not_this_account() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Meeting"));
+        let source = fx.source(&row, false);
+
+        let (path, _) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Reply { all: true },
+            None,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("to: \"alice@example.com\""), "{content}");
+        assert!(
+            content.contains("cc: \"bob@example.com, carol@example.com\""),
+            "the other recipients, deduplicated and in order: {content}"
+        );
+        // This account is not copied on its own reply; the only line naming it
+        // is the `from:`.
+        assert_eq!(
+            content
+                .lines()
+                .filter(|l| l.contains("me@example.com"))
+                .collect::<Vec<_>>(),
+            vec!["from: \"me@example.com\""],
+            "{content}"
+        );
+    }
+
+    /// Forward: the forwarded header block plus the body, and the row's
+    /// attachment blobs materialised into the stable per-account mirror that
+    /// outlives the source row (#0006).
+    #[test]
+    fn forward_carries_the_header_block_and_the_materialised_attachments() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("Report");
+        email.has_attachments = true;
+        email.attachments = vec![AttachmentData {
+            filename: "report.pdf".into(),
+            content: b"fake pdf".to_vec(),
+            content_id: None,
+        }];
+        let row = fx.ingest(&email);
+        let source = fx.source(&row, true);
+
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Forward,
+            None,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("subject: \"Fwd: Report\""), "{content}");
+        assert!(content.contains("to: \"\""), "{content}");
+        assert!(
+            content.contains("---------- Forwarded message ----------"),
+            "{content}"
+        );
+        assert!(content.contains("From: Alice <alice@example.com>"), "{content}");
+        assert!(content.contains("Original body"), "{content}");
+
+        let expected = crate::parse::stable_attachments_dir(
+            &crate::config::account_dir("alice"),
+            "<Report@example.com>",
+        )
+        .join("report.pdf");
+        assert!(
+            content.contains(expected.to_string_lossy().as_ref()),
+            "the draft references the stable mirror: {content}"
+        );
+        assert_eq!(std::fs::read(&expected).unwrap(), b"fake pdf");
+
+        assert_eq!(fx.resolve(&selector).path, path);
+    }
+
+    /// The forward wizard's recipients and subject win over the ones the
+    /// builder derived, and the body it wrote is left alone.
+    #[test]
+    fn the_forward_wizard_headers_replace_the_builders() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Report"));
+        let source = fx.source(&row, true);
+
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Forward,
+            Some(&DraftRecipientEdit {
+                to: "dave@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "Fwd: Report (for review)".to_string(),
+            }),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("to: \"dave@example.com\""), "{content}");
+        assert!(
+            content.contains("subject: \"Fwd: Report (for review)\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("---------- Forwarded message ----------"),
+            "the body survives the header rewrite: {content}"
+        );
+
+        // The index holds the edited subject, not the derived one.
+        let indexed = fx.resolve(&selector);
+        assert_eq!(indexed.subject.as_deref(), Some("Fwd: Report (for review)"));
+    }
+
+    /// Edit recipients resolves the draft through the index by its `id:`, not
+    /// through a path the list happened to be holding, and the index is
+    /// refreshed so the row matches the file the wizard just rewrote.
+    #[test]
+    fn edit_recipients_finds_the_draft_through_the_index() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Hello"));
+        let source = fx.source(&row, false);
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Reply { all: false },
+            None,
+        )
+        .unwrap();
+
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        let id = fx.resolve(&selector).id;
+        assert_eq!(indexed_draft_path(&mut app, &id), Some(path.clone()));
+
+        crate::draft::rewrite_draft_recipients(
+            &path,
+            &DraftRecipientEdit {
+                to: "erin@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "Re: Hello, again".to_string(),
+            },
+        )
+        .unwrap();
+        crate::store::drafts::refresh_account("alice").unwrap();
+
+        let indexed = fx.resolve(&selector);
+        assert_eq!(indexed.to.as_deref(), Some("erin@example.com"));
+        assert_eq!(indexed.subject.as_deref(), Some("Re: Hello, again"));
+
+        // A draft the index no longer holds declines instead of guessing.
+        assert_eq!(indexed_draft_path(&mut app, "does-not-exist"), None);
+    }
+
+    /// A server-search hit that resolved to no row still replies: the fetched
+    /// content the overlay is rendering is the source, and the draft it
+    /// produces is the same shape a resolved hit's would be.
+    #[test]
+    fn an_unresolved_search_hit_replies_from_its_fetched_content() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("Never synced");
+        email.attachments = vec![AttachmentData {
+            filename: "notes.txt".into(),
+            content: b"notes".to_vec(),
+            content_id: None,
+        }];
+
+        let source = crate::draft::source_from_fetched(
+            &crate::config::account_dir("alice"),
+            &email,
+            true,
+        )
+        .unwrap();
+
+        let (path, selector) = draft_from_source(
+            "alice",
+            "me@example.com",
+            &source,
+            DraftFromSource::Forward,
+            None,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("subject: \"Fwd: Never synced\""),
+            "{content}"
+        );
+        assert!(content.contains("Original body"), "{content}");
+        let expected = crate::parse::stable_attachments_dir(
+            &crate::config::account_dir("alice"),
+            "<Never synced@example.com>",
+        )
+        .join("notes.txt");
+        assert_eq!(std::fs::read(&expected).unwrap(), b"notes");
+        assert!(
+            content.contains(expected.to_string_lossy().as_ref()),
+            "{content}"
+        );
+        assert_eq!(fx.resolve(&selector).path, path);
     }
 }

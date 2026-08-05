@@ -7,6 +7,7 @@ use email::send::*;
 use email::config_cmd::*;
 use email::graph;
 use email::selector::{Namespace, Selector};
+use email::store::read::materialise_attachments;
 use email::store::Store;
 
 use anyhow::{anyhow, Context, Result};
@@ -918,81 +919,6 @@ fn resolve_received_arg(
 ) -> Result<(email::store::read::MessageRow, Selector)> {
     let query = email::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
     email::selector::resolve_received(store, &query)
-}
-
-/// Materialise one message's attachments into `dest`, returning the files
-/// written.
-///
-/// Attachments are blobs in the account's content-addressed store (#0037), so
-/// this is the one place that turns them back into files, for `mp save` and
-/// for `mp open`'s hand-off to the system opener.
-fn materialise_attachments(
-    store: &Store,
-    blobs: &email::store::BlobStore,
-    row_id: i64,
-    dest: &Path,
-) -> Result<Vec<PathBuf>> {
-    let attachments = email::store::read::attachments_for(store, row_id)?;
-    fs::create_dir_all(dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
-    let mut written = Vec::new();
-    for att in attachments {
-        let Some(bytes) = email::store::read::read_blob(blobs, row_id, &att.hash) else {
-            return Err(anyhow!(
-                "the blob for attachment {} is missing or unreadable",
-                att.name
-            ));
-        };
-        let out = dest.join(&att.name);
-        fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
-        written.push(out);
-    }
-    Ok(written)
-}
-
-/// Build the source of a reply or a forward out of a store row.
-fn source_from_row(
-    store: &Store,
-    blobs: &email::store::BlobStore,
-    row: &email::store::read::MessageRow,
-    with_attachments: bool,
-) -> Result<email::draft::SourceMessage> {
-    let body = email::store::read::load_body(store, blobs, row.id).unwrap_or_default();
-    let attachments = if with_attachments && row.has_attachments {
-        // Forwarded attachments go to the stable per-account mirror keyed by
-        // Message-ID (#0006), so the draft keeps working after the source is
-        // archived or evicted.
-        let dest = email::parse::stable_attachments_dir(
-            &email::config::account_dir(&account_name_of(store)),
-            &row.message_id,
-        );
-        materialise_attachments(store, blobs, row.id, &dest)?
-    } else {
-        Vec::new()
-    };
-    Ok(email::draft::SourceMessage {
-        from: row.from.clone().unwrap_or_default(),
-        to: row.to.clone().unwrap_or_default(),
-        cc: row.cc.clone(),
-        subject: row.subject.clone().unwrap_or_default(),
-        date: row.date_display.clone(),
-        body,
-        attachments,
-        // The quoted HTML companion the file build wrote beside the draft:
-        // without it a reply quotes plain text where the sender wrote markup.
-        html: email::store::read::load_html(store, blobs, row.id),
-    })
-}
-
-/// The account a store belongs to, read back from its own path
-/// (`<data>/<account>/store.sqlite3`).
-fn account_name_of(store: &Store) -> String {
-    store
-        .path()
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 #[tokio::main]

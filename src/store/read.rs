@@ -38,8 +38,9 @@
 //! the agenda (#0038 scope item 6).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use log::warn;
 use rusqlite::OptionalExtension;
 
@@ -341,6 +342,41 @@ pub fn read_blob(blobs: &BlobStore, message_row: i64, hash: &str) -> Option<Vec<
             None
         }
     }
+}
+
+/// Materialise one message's attachments into `dest`, returning the files
+/// written.
+///
+/// Attachments are blobs in the account's content-addressed store (#0037), so
+/// this is the one place that turns them back into files: `mp save`, `mp open`
+/// and the forward path that needs real paths in a draft's `attachments:`
+/// list all come through here.
+///
+/// A missing blob is an error rather than a skipped file: a forward that
+/// silently dropped an attachment would be a worse answer than one that says
+/// which blob is gone.
+pub fn materialise_attachments(
+    store: &Store,
+    blobs: &BlobStore,
+    row_id: i64,
+    dest: &Path,
+) -> Result<Vec<PathBuf>> {
+    let attachments = attachments_for(store, row_id)?;
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut written = Vec::new();
+    for att in attachments {
+        let Some(bytes) = read_blob(blobs, row_id, &att.hash) else {
+            return Err(anyhow!(
+                "the blob for attachment {} is missing or unreadable",
+                att.name
+            ));
+        };
+        let out = dest.join(&att.name);
+        std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+        written.push(out);
+    }
+    Ok(written)
 }
 
 /// The body of one message, or `None` when the row itself is gone.

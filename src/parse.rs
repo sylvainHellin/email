@@ -374,26 +374,6 @@ pub fn stable_attachments_dir(account_dir: &Path, message_id: &str) -> PathBuf {
         .join(sanitize_message_id_for_path(message_id))
 }
 
-/// Best-effort hardlink from `src` to `dst`, falling back to `fs::copy` on
-/// errors that indicate the filesystem doesn't support hardlinks for this
-/// pair (cross-device, permission, unsupported FS, etc.). If `dst` already
-/// exists, this is a no-op (caller assumes the existing entry is correct).
-pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
-    if dst.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst)?;
-            Ok(())
-        }
-    }
-}
-
 /// Given a path to an email `.md` file at `<account>/<mailbox>/<file>.md`,
 /// return `<account>` (i.e. `parent().parent()`).
 /// Returns `None` if the path doesn't have at least two ancestors.
@@ -891,32 +871,6 @@ mod tests {
             stable_attachments_dir(acct, "<m@x.com>"),
             PathBuf::from("/data/accounts/tum/attachments/m@x.com")
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // link_or_copy
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_link_or_copy_creates_link_or_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.bin");
-        let dst = dir.path().join("sub/dst.bin");
-        std::fs::write(&src, b"hello").unwrap();
-        link_or_copy(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn test_link_or_copy_idempotent_when_dst_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src.bin");
-        let dst = dir.path().join("dst.bin");
-        std::fs::write(&src, b"new").unwrap();
-        std::fs::write(&dst, b"old").unwrap();
-        link_or_copy(&src, &dst).unwrap();
-        // Existing destination is left untouched.
-        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
     }
 
     // -----------------------------------------------------------------------

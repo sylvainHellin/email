@@ -881,16 +881,20 @@ impl ComposeField {
     }
 }
 
-/// Wizard mode: blank new draft, or edit the recipient/subject fields of an
-/// existing draft in place.
+/// Wizard mode: blank new draft, forward of a stored message, or edit of the
+/// recipient/subject fields of an existing draft in place.
 ///
-/// The forward mode is not here: forwarding from the TUI is one of the flows
-/// #0052 ports onto the store, and it will build its draft from a store row
-/// the way `mp forward <selector>` already does, not from a source path.
+/// Both non-blank modes name their subject on the substrate that owns it
+/// (#0052): a forward carries the [`MessageRef`] of the row it quotes, the way
+/// `mp forward <selector>` names a row, and an edit carries the draft's `id:`,
+/// which the drafts index turns into a path at the moment it is needed. A
+/// cached path would be a second copy of an answer the index already owns, and
+/// `$EDITOR` can rename the file between opening the wizard and submitting it.
 #[derive(Debug, Clone)]
 pub enum ComposeMode {
     New,
-    EditDraft { source_path: PathBuf },
+    Forward { msg: MessageRef },
+    EditDraft { id: String },
 }
 
 /// A fuzzy-matched contact suggestion under the focused address field.
