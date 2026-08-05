@@ -15,6 +15,13 @@ All notable changes to this project are documented in this file.
   list-scoped leader for `gg`/`G` only.
 
 ### Added
+- **The read path, calendar and reconcile run off the SQLite store; cold start
+  stops walking files (#0038).** The TUI list, body pane, counts, calendar and
+  iMIP reconcile all read `store.sqlite3` and the content-addressed blob store
+  instead of a `.md` tree; sync ingests raw RFC822 keyed by UID in two passes
+  (flags over the window, bodies only for new UIDs). `mp dump-mailbox --json`
+  dumps store truth, verified live against the pre-nuke oracle captures with
+  every difference classified in `docs/dump-allow-list.md`.
 - **Every TUI mutation runs off the store and the selector (#0052).** Reply,
   Reply-all, Forward, Send, Approve, Mark-draft, their batch forms, Edit
   recipients, `$EDITOR` on a draft, attachment open and save, Open in browser

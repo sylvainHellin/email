@@ -3,7 +3,7 @@ id: 0038
 title: Read path, calendar and reconcile on the store; cold start stops walking files
 type: perf
 priority: next
-status: blocked
+status: done
 created: 2026-07-14
 ---
 
@@ -56,9 +56,10 @@ The ticket stays open and is formally resolved by [#0040](0040-drop-file-layer-c
 
 ## Close-out
 
-Blocked, not done: scope items 1 to 7 are implemented and reviewed, and every acceptance criterion is met except one.
-The open criterion is the live envelope dump-parity check, the store-backed dump against the pre-nuke captures in `dumps/pre-nuke-<account>.ndjson`, which needs a full live sync of the three real accounts and is deferred pending the owner's go.
-The intended differences it will be read against are the one-line-per-difference list in [dump-allow-list](../dump-allow-list.md); anything else the check turns up is a regression.
+Done: scope items 1 to 7 are implemented and reviewed, and the last open criterion, the live envelope dump-parity check, ran on 2026-08-05.
+The assistant (Gmail) and tum (IMAP) accounts pass with every difference classified against [dump-allow-list](../dump-allow-list.md), which the live evidence corrected and extended in `ab5dd1f` and `b98006f`; the 4 records missing on tum were proven deleted from the live server by exact `message-id:` search.
+The proton account check was waived by the owner after its scratch store turned out to hold only a stale ~100-per-mailbox window from an earlier limited sync; no branch defect was implicated (the `-n` limit flows uncapped through `fetch_new_raw_on_session`).
+Method and per-account tables: `.agents/research/live-parity-check-2026-08-05.md` (untracked).
 
 Commits, in order: `f1adc0c` (unit A, store-backed read path, counts and dump), `58e97dd` (unit B, lazy body loading and the FTS dedup fix), `e14c5a2` (unit C, calendar and reconcile on the store), `d3e1221` (unit D, optimistic store-backed mutations) and the review-fix commit `fix(cli): boundary declines and dump allow-list entries (#0038 review fixes)`.
 
