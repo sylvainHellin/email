@@ -54,6 +54,25 @@ Named gaps, not captured:
   Out of scope for this unit, which was limited to the two pure helpers.
 - Server-side flag round-trip, `open_file_with_system` and `copy_to_clipboard` (audit gap-list) stay untested: they need a network peer or a desktop session, so neither is an offline oracle.
 
+## Unit 0c capture notes
+
+`mp dump-mailbox --json` ([src/dump.rs](../../src/dump.rs)) emits NDJSON on stdout: one compact JSON object per message, one per line, LF-terminated.
+Every configured account by default; `-A/--account` restricts it to one, `--mailbox` (repeatable, matching the role, the slug or the sidebar label, case-insensitively) restricts the mailboxes.
+`--json` is a required flag rather than a default, so a later format cannot silently change what a recorded dump means.
+
+The record, in serialized field order: `account`, `mailbox`, `message_id`, `from`, `to`, `cc`, `subject`, `date_sort`, `flags`, `attachments` (objects of `name` and `size`), `invite`.
+`mailbox` is the role or slugified server name (`inbox`, `drafts`, `sent`, `archive`, the slug of an extra mailbox), never a path.
+`message_id` and the four header fields are the frontmatter values verbatim, `null` when absent: a missing Message-ID is recorded as missing, because synthesizing an identity is the new stack's behaviour and recording it here would launder it into the oracle.
+`date_sort` is the current build's sort key, from `tui::app::resolve_date`.
+`flags` is a sorted list from the closed set `approved`, `draft`, `seen` (`seen` from `read: true`, the other two from `status:`); the current build tracks no other per-message flag locally.
+`attachments` names come from the `attachments:` frontmatter list, reduced to their file name, with `size` read from the sibling `<stem>_attachments/` directory and `null` when that file is absent.
+`invite` is true when the file carries an `event:` block.
+
+Records are sorted by `(account, mailbox, date_sort, message_id, subject, file name)`; the file name is the final tiebreaker and is never emitted, which keeps the order total without putting a path in the output.
+The contract lives in [tests/dump_mailbox_integration.rs](../../tests/dump_mailbox_integration.rs) as the exact expected NDJSON of a fixture tree, plus a determinism check, all tagged `parity`.
+
+Two findings from the real capture: outgoing mail records the *source path* of an attachment in `attachments:` (`/tmp/audio/briefing.mp3`, and one under `/home/sylvain`), which is why names are reduced to their file name; and three messages across the three accounts have no Message-ID at all, so identity-less mail is not hypothetical.
+
 ## Acceptance criteria
 
 - The golden-frame snapshots are committed, two consecutive runs are identical, and no test reads a live account.

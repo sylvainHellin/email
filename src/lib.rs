@@ -15,6 +15,7 @@ pub mod reconcile;
 pub mod calendar_cmd;
 pub mod imap_client;
 pub mod draft;
+pub mod dump;
 pub mod send;
 pub mod sync;
 pub mod tui;

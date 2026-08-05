@@ -260,6 +260,29 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Dump message envelopes from the local mail tree as NDJSON.
+    ///
+    /// Offline: reads the local `.md` files only, never the network. One
+    /// compact JSON object per line, with the fields account, mailbox,
+    /// message_id, from, to, cc, subject, date_sort, flags, attachments
+    /// (name + size) and invite. No filesystem paths appear in the output.
+    ///
+    /// Records are sorted by account, mailbox, date_sort, message_id and
+    /// subject (the local filename breaks remaining ties without being
+    /// emitted), so two runs over an unchanged tree are byte-identical.
+    ///
+    /// Dumps every configured account by default; `-A/--account` restricts it
+    /// to one, `--mailbox` to the named mailboxes.
+    DumpMailbox {
+        /// Emit newline-delimited JSON. Currently the only output format, and
+        /// required, so a later default cannot silently change this one.
+        #[arg(long, required = true)]
+        json: bool,
+        /// Mailbox to dump (role, slug or sidebar label; repeatable).
+        /// Default: every mailbox of every selected account.
+        #[arg(long)]
+        mailbox: Option<Vec<String>>,
+    },
 }
 
 /// Organizer-side calendar operations (#0030).
@@ -1861,6 +1884,28 @@ async fn main() -> Result<()> {
             } else {
                 print!("{}", email::tui::dump_keys());
             }
+        }
+
+        Some(Commands::DumpMailbox { json: _, mailbox }) => {
+            // `--json` is `required = true`, so the format is already pinned.
+            let accounts: Vec<email::config::AccountConfig> = match cli.account {
+                Some(ref name) => global_config
+                    .accounts
+                    .iter()
+                    .filter(|a| a.name == *name)
+                    .cloned()
+                    .collect(),
+                None => global_config.accounts.clone(),
+            };
+            if accounts.is_empty() {
+                return Err(anyhow!("No account to dump (check `mp config show`)"));
+            }
+            let filter = mailbox.unwrap_or_default();
+            let records = email::dump::collect_records(&accounts, &filter);
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(email::dump::to_ndjson(&records).as_bytes())?;
+            out.flush()?;
         }
 
         Some(Commands::Config { action }) => {

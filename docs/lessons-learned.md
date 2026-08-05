@@ -204,3 +204,10 @@ Snapshotting the CLI surface in-process with `Cli::command().render_long_help()`
 clap only wires `--help` to the long help when the command actually has long help somewhere; `mp send --help` and `mp send -h` are byte-identical compact output, while `mp dump-keys --help` differs from `-h` because that one carries a multi-paragraph doc comment.
 The in-process route also needs `.bin_name("mp")` (clap otherwise prints the `#[command(name)]`, "mailypoppins") and a `cmd.build()` to propagate that name into nested usage lines.
 Running the built binary through `env!("CARGO_BIN_EXE_mp")` avoids all three traps, needs no dependency, and costs about 0.25s for the whole 38-screen walk.
+
+## `attachments:` holds source paths on the send side (2026-08-05)
+
+The frontmatter key means two different things depending on which way the mail went.
+On received mail it lists the file names saved into the sibling `<stem>_attachments/` directory, but on drafts and sent mail it holds whatever the sender typed, which is the *source path* of the file to attach: the real tree has entries like `/tmp/audio-scripts/sql-kg-rag/01-segment1-introduction.mp3` and one under `/home/sylvain`.
+Anything that treats the list as a set of names therefore leaks absolute paths, and any size lookup that joins the entry onto a directory silently resolves against the filesystem root instead (`Path::join` with an absolute argument discards the base).
+`mp dump-mailbox` reduces each entry to its file name before both the output and the size lookup ([src/dump.rs](../src/dump.rs)); the same normalisation is what the SQLite store will need to reproduce the dump.
