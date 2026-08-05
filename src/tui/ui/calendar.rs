@@ -316,7 +316,7 @@ mod tests {
 
     fn event(rsvp: &str, is_organizer: bool, cancelled: bool) -> CalendarEvent {
         CalendarEvent {
-            path: std::path::PathBuf::from("/mail/inbox/a.md"),
+            msg: crate::tui::app::MessageRef::new(1),
             event: crate::types::EventFrontmatter {
                 uid: Some("uid-1".into()),
                 method: Some("REQUEST".into()),

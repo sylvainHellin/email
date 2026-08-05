@@ -1,14 +1,18 @@
 //! CLI handlers for `mp calendar …` (organizer-side iMIP reconciliation).
 
-use crate::config::{account_dir, AccountConfig, GlobalConfig};
+use crate::config::{store_path, AccountConfig, GlobalConfig};
 use crate::reconcile::reconcile_account;
+use crate::store::{BlobStore, Store};
 use anyhow::{anyhow, Result};
 use colored::*;
 
-/// `mp calendar rebuild [--account NAME]`: recompute every locally-stored
-/// invite's attendee statuses from the REPLY emails in the mailstore. Safe to
-/// run repeatedly (idempotent); rebuilds derived state from IMAP-visible
-/// messages alone (design §3, multi-machine consistency).
+/// `mp calendar rebuild [--account NAME]`: report what the stored REPLY
+/// messages resolve on the stored invitations.
+///
+/// It writes nothing. Attendee statuses are derived where they are displayed,
+/// from the `invite.ics` blobs of the account's rows (#0038 scope item 6), so
+/// there is no cached copy left to rebuild and the command exists to show what
+/// the fold sees. Safe to run repeatedly by construction.
 pub fn handle_rebuild(config: &GlobalConfig, account_name: Option<String>) -> Result<()> {
     let accounts: Vec<&AccountConfig> = match account_name {
         Some(name) => vec![config
@@ -25,20 +29,25 @@ pub fn handle_rebuild(config: &GlobalConfig, account_name: Option<String>) -> Re
     };
 
     for account in accounts {
-        let root = account_dir(&account.name);
         println!(
             "{} Reconciling calendar replies for {} …",
             "ℹ".blue(),
             account.name.yellow()
         );
-        let stats = reconcile_account(&root)?;
+        let path = store_path(&account.name);
+        if !path.exists() {
+            println!("{} no store yet for {}", "•".blue(), account.name);
+            continue;
+        }
+        let store = Store::open(&path)?;
+        let blobs = BlobStore::for_account(&account.name);
+        let report = reconcile_account(&store, &blobs, &account.name);
         println!(
-            "{} {} attendee status(es) updated ({} already current) across {} invite(s) / {} reply(ies)",
+            "{} {} attendee status(es) resolved across {} invite(s) / {} reply(ies)",
             "✓".green(),
-            stats.updated.to_string().bold(),
-            stats.unchanged,
-            stats.invites_seen,
-            stats.replies_seen,
+            report.resolved.to_string().bold(),
+            report.invites_seen,
+            report.replies_seen,
         );
     }
     Ok(())

@@ -348,12 +348,21 @@ pub(super) fn handle_action(
         }
 
         Action::Rsvp { msg, choice } => {
-            let Some(path) = message_path(msg) else {
-                app.set_status_level(store_backed_soon("RSVP"), StatusLevel::Warning);
+            // The invitation's own iMIP payload is the source of truth for the
+            // reply, and it lives in the message's blob (#0038 item 6). The
+            // account is the active one by construction: the reference names a
+            // row in its store.
+            let Some(ics) = app.load_message_ics(msg) else {
+                app.set_status_level(
+                    "That message carries no invitation to reply to".to_string(),
+                    StatusLevel::Error,
+                );
                 return Ok(());
             };
-            let (acct_idx, smtp_config, _imap_config, graph_config, account_config, _sig) =
-                resolve_send_account(app, &path);
+            let acct_idx = app.active_account;
+            let smtp_config = app.smtp_config.clone();
+            let graph_config = app.graph_config.clone();
+            let account_config = app.account_config.clone();
 
             if graph_config.is_some()
                 && account_config.auth_method == crate::config::AuthMethod::Graph
@@ -389,7 +398,7 @@ pub(super) fn handle_action(
                     .expect("failed to create tokio runtime");
                 let result = (|| -> anyhow::Result<String> {
                     let outcome = rt.block_on(crate::send::send_rsvp(
-                        &path,
+                        &ics,
                         &account_config,
                         &account_address,
                         rsvp,
@@ -1825,17 +1834,22 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::OpenEventSource { path } => {
-            // The agenda row carries an explicit path (the invite may live in
-            // any mailbox of the account), so this does not go through the
-            // mail cursor like `Action::EditCurrent`.
+        Action::OpenEventSource { msg } => {
+            // The agenda row carries its own message reference (the invite may
+            // live in any mailbox of the account), so this does not go through
+            // the mail cursor like `Action::EditCurrent`; it shares the same
+            // bridge to a file, which #0038 scope item 7 owns.
+            let Some(path) = message_path(msg) else {
+                app.set_status_level(store_backed_soon("Open"), StatusLevel::Warning);
+                return Ok(());
+            };
             suspend_terminal(terminal)?;
             let result = edit_file(&path);
             resume_terminal(terminal)?;
             match result {
                 Ok(()) => {
-                    // The `event:` block may have changed under us, so re-walk
-                    // to match disk. `refresh_calendar` sets its own status;
+                    // The invite may have changed under us, so rebuild the
+                    // agenda. `refresh_calendar` sets its own status;
                     // overwriting it here would hide the reloaded count behind
                     // a bare "Returned from editor", so let that one stand.
                     app.refresh_calendar();

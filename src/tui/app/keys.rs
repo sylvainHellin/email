@@ -365,8 +365,8 @@ impl App {
             A::CalendarOpenSource => {
                 self.pending_prefix = None;
                 if let Some(event) = self.selected_event() {
-                    let path = event.path.clone();
-                    self.push_action(Action::OpenEventSource { path });
+                    let msg = event.msg;
+                    self.push_action(Action::OpenEventSource { msg });
                 }
             }
             A::CalendarRsvp => {
@@ -1131,7 +1131,7 @@ impl App {
         let Some(email) = self.selected_email() else {
             return;
         };
-        if !email.is_invite() {
+        if !email.is_invite {
             self.set_status("Not a calendar invite".to_string());
             return;
         }
@@ -1141,21 +1141,28 @@ impl App {
             );
             return;
         }
-        if !email.is_request_invite() {
+        let subject = email.subject.clone();
+        let Some(msg) = email.msg else {
+            self.set_status("This search hit has no local copy to RSVP from".to_string());
+            return;
+        };
+        // The method and the summary live in the ics blob, which is parsed for
+        // the selected message only (#0038 item 6). The cursor is on it, so
+        // this is the memo the render pass already filled in the common case.
+        let event = self.load_message_invite(msg);
+        let is_request = event
+            .as_ref()
+            .and_then(|e| e.method.as_deref())
+            .is_some_and(|m| m.eq_ignore_ascii_case("REQUEST"));
+        if !is_request {
             self.set_status(
                 "Only received invitations (REQUEST) can be RSVP'd".to_string(),
             );
             return;
         }
-        let summary = email
-            .event
-            .as_ref()
-            .and_then(|e| e.summary.clone())
-            .unwrap_or_else(|| email.subject.clone());
-        let Some(msg) = email.msg else {
-            self.set_status("This search hit has no local copy to RSVP from".to_string());
-            return;
-        };
+        let summary = event
+            .and_then(|e| e.summary)
+            .unwrap_or(subject);
         self.overlay = Overlay::Rsvp(RsvpOverlay {
             msg,
             summary,
@@ -1196,17 +1203,17 @@ impl App {
             );
             return;
         }
-        // The agenda row is still read from the `.md` tree (the calendar
-        // loader is #0038 scope item 6), so it carries a path and no
-        // `MessageRef` to hand the RSVP overlay. Unreachable in practice
-        // while the tree is gone -- the agenda has no rows to select -- but
-        // stated rather than faked: item 6 sources events from `messages`
-        // rows and this becomes a plain `RsvpOverlay { msg }`.
-        let _ = &event.path;
-        self.set_status(
-            "RSVP from the agenda is store-backed soon (#0038); RSVP from the mail list meanwhile"
-                .to_string(),
-        );
+        let summary = event
+            .event
+            .summary
+            .clone()
+            .unwrap_or_else(|| event.subject.clone());
+        let msg = event.msg;
+        self.overlay = Overlay::Rsvp(RsvpOverlay {
+            msg,
+            summary,
+            selected: 0,
+        });
     }
 
     fn handle_rsvp_overlay_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -2113,7 +2120,7 @@ mod tests {
             date_sort: "2026-07-01T00:00:00".to_string(),
             has_attachments: false,
             read: false,
-            event: None,
+            is_invite: false,
         }
     }
 
@@ -3121,7 +3128,7 @@ mod tests {
         method: &str,
     ) -> super::super::CalendarEvent {
         super::super::CalendarEvent {
-            path: PathBuf::from(format!("/mail/inbox/{summary}.md")),
+            msg: ref_for(summary),
             event: crate::types::EventFrontmatter {
                 uid: Some(format!("uid-{summary}")),
                 method: Some(method.to_string()),
@@ -3188,25 +3195,19 @@ mod tests {
         assert_eq!(app.pending_prefix, None);
     }
 
-    /// `V` on a received agenda invite declines while the calendar loader is
-    /// still file-based (#0038 scope item 6 moves it onto `messages` rows).
-    /// The agenda row carries a `.md` path and no `MessageRef`, and the RSVP
-    /// overlay only speaks `MessageRef` now; minting a fake one would let the
-    /// RSVP fire against the wrong message. Unreachable in the running build
-    /// (the agenda has no rows without the `.md` tree), asserted here because
-    /// the fixture builds the rows in memory.
+    /// `V` on a received agenda invite opens the RSVP overlay against that
+    /// row's own message, not the mail cursor's: the agenda carries a
+    /// `MessageRef` since the calendar moved onto the store (#0038 item 6).
     #[test]
-    fn calendar_rsvp_declines_until_the_calendar_moves_onto_the_store() {
+    fn calendar_rsvp_opens_against_the_agenda_rows_message() {
         let mut app = app_in_calendar();
         app.handle_key(KeyEvent::from(KeyCode::Char('V')));
-        assert!(
-            !matches!(app.overlay, Overlay::Rsvp(_)),
-            "the agenda row has no store row to RSVP from yet"
-        );
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|m| m.contains("store-backed soon")));
+        let Overlay::Rsvp(overlay) = &app.overlay else {
+            panic!("V on a received agenda invite must open the RSVP overlay");
+        };
+        assert_eq!(overlay.msg, ref_for("Standup"), "the agenda row's own message");
+        assert_eq!(overlay.summary, "Standup");
+        assert_eq!(overlay.selected, 0);
     }
 
     /// `V` on an invite we sent refuses with a hint (we are the organizer).
@@ -3255,10 +3256,8 @@ mod tests {
     #[test]
     fn calendar_rsvp_overlay_t_selects_tentative_not_scope_toggle() {
         let mut app = app_in_calendar();
-        // Opened directly rather than with `V`: the agenda cannot open it
-        // until the calendar loader moves onto the store (#0038 item 6, see
-        // `calendar_rsvp_declines_until_the_calendar_moves_onto_the_store`),
-        // and what this test is about is key precedence with the overlay up.
+        // Opened directly rather than with `V`: what this test is about is
+        // key precedence with the overlay already up, not how it got there.
         app.overlay = Overlay::Rsvp(RsvpOverlay {
             msg: MessageRef::new(1),
             summary: "Standup".to_string(),
@@ -3306,14 +3305,15 @@ mod tests {
         assert_eq!(visible, vec!["Invitation: Running"]);
     }
 
-    /// `Enter` queues opening the source invite email, carrying its path.
+    /// `Enter` queues opening the source invite email, carrying the agenda
+    /// row's own message reference (the invite may live in any mailbox).
     #[test]
     fn calendar_enter_opens_the_source_invite() {
         let mut app = app_in_calendar();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         match app.pending_actions.pop_front() {
-            Some(Action::OpenEventSource { path }) => {
-                assert_eq!(path, PathBuf::from("/mail/inbox/Standup.md"));
+            Some(Action::OpenEventSource { msg }) => {
+                assert_eq!(msg, ref_for("Standup"));
             }
             other => panic!("expected OpenEventSource, got {other:?}"),
         }

@@ -69,9 +69,6 @@ pub struct SyncResult {
     pub fresh_observations: Vec<FreshObservation>,
     /// Sender + subject of every genuinely new inbox message (#0009).
     pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
-    /// `true` when this sync ingested at least one `METHOD:REPLY` iMIP invite
-    /// (#0030).
-    pub saw_reply_invite: bool,
 }
 
 /// Fetch every target mailbox on one session and ingest what comes back.
@@ -167,14 +164,6 @@ pub async fn sync_mailboxes(
                             &email.from,
                             &email.subject,
                         ));
-                    }
-                    if email
-                        .event
-                        .as_ref()
-                        .and_then(|ev| ev.method.as_deref())
-                        .is_some_and(|m| m.eq_ignore_ascii_case("REPLY"))
-                    {
-                        result.saw_reply_invite = true;
                     }
                     result.fresh_observations.push(FreshObservation {
                         role: target.role.clone(),

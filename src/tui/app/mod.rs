@@ -70,6 +70,9 @@ pub struct App {
     /// selection and memoised (#0038 scope item 5). Refreshed by
     /// [`App::refresh_preview_body`] at the top of the render pass.
     pub preview_body: PreviewBody,
+    /// The parsed invite behind the preview pane's event card, memoised the
+    /// same way (#0038 scope item 6). See [`PreviewInvite`].
+    pub preview_invite: PreviewInvite,
     /// Lowercased bodies of the active mailbox, built only while body search
     /// is on. See [`SearchBodies`] for why this is a blob batch read rather
     /// than an FTS query.
@@ -186,6 +189,7 @@ impl App {
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
+            preview_invite: PreviewInvite::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
@@ -279,6 +283,7 @@ impl App {
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
+            preview_invite: PreviewInvite::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
@@ -503,32 +508,31 @@ impl App {
     // -- Calendar view (#0034) -------------------------------------------
 
     /// Lazily build the active account's agenda the first time the Calendar
-    /// view is shown. The walk is the same one `mp calendar rebuild` performs
-    /// (measured at ~100 ms on the largest local account), so it runs
-    /// synchronously on the UI thread like the Contacts cache load.
+    /// view is shown. One indexed query plus one small blob read per invite
+    /// row (#0038 scope item 6), so it runs synchronously on the UI thread
+    /// like the Contacts cache load, and never at startup.
     pub fn ensure_calendar_loaded(&mut self) {
         if self.calendar_view.loaded {
             return;
         }
-        self.calendar_view.events = match self.calendar_account_root() {
-            Some(root) => calendar_view::load_events_for_account(&root),
-            None => Vec::new(),
-        };
+        self.calendar_view.events = self.load_calendar_events();
         self.calendar_view.loaded = true;
         self.calendar_view.list_index = 0;
         self.recompute_calendar_visible();
     }
 
-    /// The account root to walk for events, or `None` when no account is
-    /// configured. Guarded on a non-empty name because `account_dir("")` is the
-    /// shared `accounts/` parent -- walking it would mix every account's events
-    /// into one agenda.
-    fn calendar_account_root(&self) -> Option<PathBuf> {
-        let name = self.account_config.name.trim();
-        if name.is_empty() {
-            return None;
+    /// Build the agenda from the active account's store, or an empty agenda
+    /// when there is no account or no store yet.
+    fn load_calendar_events(&self) -> Vec<CalendarEvent> {
+        let account = self.account_config.name.trim().to_string();
+        if account.is_empty() {
+            return Vec::new();
         }
-        Some(crate::config::account_dir(name))
+        let Some(store) = open_store(&account) else {
+            return Vec::new();
+        };
+        let blobs = crate::store::BlobStore::for_account(&account);
+        calendar_view::load_events_for_account(&store, &blobs, &account, &self.self_address())
     }
 
     /// Drop the loaded agenda (events are per-account, so the view reloads
@@ -537,12 +541,10 @@ impl App {
         self.calendar_view = CalendarView::default();
     }
 
-    /// Re-walk the account for events (manual refresh key).
+    /// Rebuild the agenda from the store (manual refresh key), picking up
+    /// invites and replies that arrived since it was last built.
     pub fn refresh_calendar(&mut self) {
-        self.calendar_view.events = match self.calendar_account_root() {
-            Some(root) => calendar_view::load_events_for_account(&root),
-            None => Vec::new(),
-        };
+        self.calendar_view.events = self.load_calendar_events();
         self.calendar_view.loaded = true;
         self.recompute_calendar_visible();
         let count = self.calendar_view.visible.len();
@@ -929,6 +931,68 @@ impl App {
         self.preview_body.fill(key, text);
     }
 
+    /// Refresh the preview invite memo, reading and parsing one ics blob when
+    /// the cursor, the account or the list generation moved under it.
+    ///
+    /// Runs beside [`Self::refresh_preview_body`] at the top of the render
+    /// pass, and does nothing at all for the common case of a message that is
+    /// not an invite: the flag on the row answers that without a blob read.
+    pub(crate) fn refresh_preview_invite(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_invite.holds(key) {
+            return;
+        }
+        let is_invite = self.selected_email().is_some_and(|e| e.is_invite);
+        let event = match (key, is_invite) {
+            (Some((_, msg, _)), true) => self.load_message_invite(msg),
+            _ => None,
+        };
+        self.preview_invite.fill(key, event);
+    }
+
+    /// Parse one message's ics blob into the event the card renders, with the
+    /// store's REPLY rows folded in so the card and the agenda agree.
+    ///
+    /// `None` when the row is gone, carries no iMIP payload, or the payload
+    /// does not parse; the preview then shows no card, which is what a
+    /// non-invite looks like.
+    pub(crate) fn load_message_invite(
+        &self,
+        msg: MessageRef,
+    ) -> Option<crate::types::EventFrontmatter> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        let ics = crate::store::read::load_invite_ics(&store, &blobs, msg.row_id())?;
+        let parsed = crate::calendar::parse_ics(&ics)?;
+        let mut event = crate::calendar::event_frontmatter(&parsed);
+        let uid = parsed
+            .uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        let invites = crate::reconcile::load_invites(&store, &blobs, account);
+        let replies = crate::reconcile::fold_replies(&invites);
+        let by_addr = uid.as_deref().and_then(|uid| replies.get(uid));
+        crate::reconcile::apply_replies(&mut event, parsed.sequence, by_addr);
+        event.rsvp = crate::reconcile::own_rsvp(&event, &self.self_address(), by_addr);
+        Some(event)
+    }
+
+    /// The raw `invite.ics` bytes of one message, for the RSVP reply builder.
+    pub(crate) fn load_message_ics(&self, msg: MessageRef) -> Option<Vec<u8>> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        crate::store::read::load_invite_ics(&store, &blobs, msg.row_id())
+    }
+
+    /// The active account's own address, as the iMIP `ATTENDEE` spells it.
+    pub(crate) fn self_address(&self) -> String {
+        crate::parse::extract_email_address(&self.account_config.default_from)
+    }
+
     /// Read one message body from the active account's blob store.
     ///
     /// `None` means the row itself is gone, which is a stale reference rather
@@ -954,6 +1018,14 @@ impl App {
     pub(crate) fn prime_preview_body(&mut self, text: impl Into<String>) {
         let key = self.preview_body_key();
         self.preview_body.fill(key, text.into());
+    }
+
+    /// Park `event` as the preview invite of the current selection, exactly as
+    /// a load would have left it, for fixtures that have no store.
+    #[cfg(test)]
+    pub(crate) fn prime_preview_invite(&mut self, event: crate::types::EventFrontmatter) {
+        let key = self.preview_body_key();
+        self.preview_invite.fill(key, Some(event));
     }
 
     /// Make the body-search index match the mode: built and current for the

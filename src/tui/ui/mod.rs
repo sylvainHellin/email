@@ -74,8 +74,10 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     // blob store for the selected message only (#0038 scope item 5). This is
     // the one place that holds `&mut App` immediately before a frame, so it is
     // where the memo is brought up to date. An unchanged selection costs a
-    // key comparison.
+    // key comparison. The invite behind the event card is memoised beside it
+    // (#0038 scope item 6) and costs nothing for a message that is not one.
     app.refresh_preview_body();
+    app.refresh_preview_invite();
 
     // Bottom rows: a herdr-style mode/hint bar (#0032) above the status bar.
     let outer = Layout::default()

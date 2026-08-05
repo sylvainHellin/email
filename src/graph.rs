@@ -647,14 +647,6 @@ pub async fn sync_mailboxes_graph(
                     if outcome.uid_rebound {
                         result.uid_rebound += 1;
                     }
-                    if email
-                        .event
-                        .as_ref()
-                        .and_then(|ev| ev.method.as_deref())
-                        .is_some_and(|m| m.eq_ignore_ascii_case("REPLY"))
-                    {
-                        result.saw_reply_invite = true;
-                    }
                     result.fresh_observations.push(FreshObservation {
                         role: target.role.clone(),
                         from: email.from.clone(),

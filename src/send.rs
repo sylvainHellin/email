@@ -863,15 +863,21 @@ pub struct RsvpOutcome {
 /// End-to-end attendee RSVP to a received invite (#0029), shared by the CLI
 /// and the TUI so both run identical logic (no subprocess).
 ///
-/// Steps: read the invite email's sidecar `invite.ics` (source of truth for
-/// `UID`/`SEQUENCE`), build a `METHOD:REPLY` with the account's `PARTSTAT`,
-/// email it to the `ORGANIZER`, and — only on a successful send — flip the
-/// local `event.rsvp` frontmatter. The sidecar is never rewritten.
+/// Steps: build a `METHOD:REPLY` from the invitation's own iMIP payload (the
+/// source of truth for `UID`/`SEQUENCE`) carrying the account's `PARTSTAT`,
+/// and email it to the `ORGANIZER`. The payload itself is never rewritten.
 ///
-/// `email_path` is the received invite `.md`; `account_address` is the
-/// responding account's primary address (the REPLY `ATTENDEE`).
+/// Nothing local is flipped afterwards, and there is nothing to flip: the
+/// reply goes out through the durable outbox, which appends it to the server
+/// Sent mailbox and ingests that copy into the store during the send, so our
+/// own `PARTSTAT` is derived from that row the next time an invite is
+/// rendered (#0038 scope item 6, `crate::reconcile::own_rsvp`).
+///
+/// `ics` is the invitation's `invite.ics` bytes, read from the message's blob
+/// by the caller; `account_address` is the responding account's primary
+/// address (the REPLY `ATTENDEE`).
 pub async fn send_rsvp(
-    email_path: &Path,
+    ics: &[u8],
     account_config: &crate::config::AccountConfig,
     account_address: &str,
     rsvp: crate::invite::Rsvp,
@@ -882,17 +888,7 @@ pub async fn send_rsvp(
         return Err(anyhow!("Account has no usable address to RSVP as"));
     }
 
-    // Locate and read the sidecar .ics colocated with the email's attachments.
-    let sidecar = crate::parse::attachments_dir_for(email_path)
-        .join(crate::parse::CALENDAR_SIDECAR_NAME);
-    let ics_bytes = fs::read(&sidecar).with_context(|| {
-        format!(
-            "No calendar sidecar found at {} (is this a received invite?)",
-            sidecar.display()
-        )
-    })?;
-
-    let ctx = crate::invite::reply_context_from_ics(&ics_bytes)?;
+    let ctx = crate::invite::reply_context_from_ics(ics)?;
     let reply_ics = crate::invite::build_reply_ics(&ctx, &account_address, rsvp)?;
 
     let summary = ctx.summary.as_deref().unwrap_or("(no subject)");
@@ -915,17 +911,6 @@ pub async fn send_rsvp(
     let send_result = report.send_result;
     let raw_message = built.raw;
     let message_id = Some(built.message_id);
-
-    // Update local state only after the reply actually left the machine.
-    if send_result.any_succeeded() {
-        if let Err(e) = crate::draft::set_event_rsvp(email_path, rsvp.frontmatter_status()) {
-            log::warn!(
-                "RSVP sent but failed to update event.rsvp in {}: {}",
-                email_path.display(),
-                e
-            );
-        }
-    }
 
     Ok(RsvpOutcome {
         outbox_state: report.state,

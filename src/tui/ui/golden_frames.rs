@@ -206,7 +206,7 @@ fn email(
     date: &str,
     read: bool,
     has_attachments: bool,
-    event: Option<EventFrontmatter>,
+    is_invite: bool,
 ) -> EmailEntry {
     EmailEntry {
         msg: Some(MessageRef::new(row)),
@@ -219,7 +219,7 @@ fn email(
         date_sort: format!("{date}T09:00:00"),
         has_attachments,
         read,
-        event,
+        is_invite,
     }
 }
 
@@ -272,7 +272,7 @@ fn mail_fixture() -> App {
             "2026-07-28",
             false,
             true,
-            Some(invite_frontmatter()),
+            true,
         ),
         email(
             2,
@@ -281,7 +281,7 @@ fn mail_fixture() -> App {
             "2026-07-27",
             true,
             false,
-            None,
+            false,
         ),
         email(
             3,
@@ -290,7 +290,7 @@ fn mail_fixture() -> App {
             "2026-07-26",
             false,
             true,
-            None,
+            false,
         ),
         email(
             4,
@@ -299,7 +299,7 @@ fn mail_fixture() -> App {
             "2026-07-24",
             true,
             false,
-            None,
+            false,
         ),
         email(
             5,
@@ -308,7 +308,7 @@ fn mail_fixture() -> App {
             "2026-07-21",
             true,
             true,
-            None,
+            false,
         ),
     ];
 
@@ -317,6 +317,10 @@ fn mail_fixture() -> App {
     app.rebuild_visible();
     app.list_index = 0;
     app.prime_preview_body(BODY_ROW_1);
+    // The entry carries only the invite flag; the parsed event behind the
+    // card is memoised for the selected row (#0038 item 6), and a fixture
+    // with no store primes that memo the way it primes the body.
+    app.prime_preview_invite(invite_frontmatter());
     app
 }
 
@@ -326,14 +330,15 @@ fn calendar_fixture() -> App {
     let mut app = mail_fixture();
     app.view = View::Calendar;
 
-    let event = |uid: &str,
+    let event = |row: i64,
+                 uid: &str,
                  summary: &str,
                  start: &str,
                  display: &str,
                  rsvp: &str,
                  cancelled: bool,
                  is_organizer: bool| CalendarEvent {
-        path: PathBuf::from(format!("/fixture/inbox/{uid}.md")),
+        msg: MessageRef::new(row),
         event: EventFrontmatter {
             uid: Some(uid.into()),
             method: Some("REQUEST".into()),
@@ -358,6 +363,7 @@ fn calendar_fixture() -> App {
     app.calendar_view.loaded = true;
     app.calendar_view.events = vec![
         event(
+            1,
             "cal-1",
             "Baustellen\u{fc}bergabe",
             "2026-08-03T07:00:00",
@@ -367,6 +373,7 @@ fn calendar_fixture() -> App {
             false,
         ),
         event(
+            2,
             "cal-2",
             "Abgesagter Jour fixe",
             "2026-08-04T08:00:00",
@@ -376,6 +383,7 @@ fn calendar_fixture() -> App {
             false,
         ),
         event(
+            3,
             "cal-3",
             "PhD Kolloquium",
             "2026-08-06T13:00:00",

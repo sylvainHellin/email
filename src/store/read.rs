@@ -26,6 +26,16 @@
 //! Both degrade an unreadable blob to an empty body rather than an error: the
 //! retention sweep is allowed to evict a body, and an evicted body must not
 //! blank a list or fail a search.
+//!
+//! ## Invites
+//!
+//! An invite is a row with an attachment blob named [`CALENDAR_SIDECAR_NAME`],
+//! and the listing carries that as a boolean column computed by an `EXISTS`
+//! subquery ([`MessageRow::is_invite`]). The badge therefore costs one index
+//! probe per row inside the query that was already running, and no blob read:
+//! the ics is only fetched where its contents are actually rendered, by
+//! [`load_invite_ics`] for the previewed message and by [`list_invites`] for
+//! the agenda (#0038 scope item 6).
 
 use std::collections::HashMap;
 
@@ -68,6 +78,10 @@ pub struct MessageRow {
     pub flags: Option<String>,
     pub has_attachments: bool,
     pub body_blob: Option<String>,
+    /// True when the row carries an iMIP payload, i.e. an attachment blob
+    /// named [`CALENDAR_SIDECAR_NAME`]. Computed in SQL so a mailbox listing
+    /// can draw the invite badge without reading a single blob.
+    pub is_invite: bool,
 }
 
 impl MessageRow {
@@ -80,8 +94,19 @@ impl MessageRow {
 }
 
 /// The columns [`MessageRow`] needs, in the order [`row_from_sql`] reads them.
-const ROW_COLUMNS: &str = "id, mailbox, uid, message_id, from_, to_, cc, subject, \
-                           date_display, flags, has_attachments, body_blob";
+///
+/// The last one is not a column: it is the invite predicate, evaluated by the
+/// `message_blobs` primary key rather than by a blob read. It is spelled once
+/// here so every listing answers the same question the same way.
+fn row_columns() -> String {
+    format!(
+        "id, mailbox, uid, message_id, from_, to_, cc, subject, \
+         date_display, flags, has_attachments, body_blob, \
+         EXISTS (SELECT 1 FROM message_blobs b \
+                 WHERE b.message_row = messages.id AND b.kind = 'attachment' \
+                   AND b.filename = '{CALENDAR_SIDECAR_NAME}')"
+    )
+}
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
@@ -97,6 +122,7 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         flags: row.get(9)?,
         has_attachments: row.get::<_, i64>(10)? != 0,
         body_blob: row.get(11)?,
+        is_invite: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -107,8 +133,9 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
 /// `config::mailbox_dir` builds. A mailbox that was never synced returns an
 /// empty list, not an error: it is a mailbox with no mail yet.
 pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<MessageRow>> {
+    let columns = row_columns();
     let sql = format!(
-        "SELECT {ROW_COLUMNS} FROM messages
+        "SELECT {columns} FROM messages
          WHERE account = ?1 AND mailbox = ?2
          ORDER BY date_sort DESC, id DESC"
     );
@@ -126,8 +153,9 @@ pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<M
 /// Used by the envelope dump, which needs the whole account in one pass and
 /// applies its own total order afterwards.
 pub fn list_account(store: &Store, account: &str) -> Result<Vec<MessageRow>> {
+    let columns = row_columns();
     let sql = format!(
-        "SELECT {ROW_COLUMNS} FROM messages
+        "SELECT {columns} FROM messages
          WHERE account = ?1
          ORDER BY mailbox ASC, date_sort DESC, id DESC"
     );
@@ -173,8 +201,9 @@ pub fn find_by_message_id(
     account: &str,
     message_id: &str,
 ) -> Result<Vec<MessageRow>> {
+    let columns = row_columns();
     let sql = format!(
-        "SELECT {ROW_COLUMNS} FROM messages
+        "SELECT {columns} FROM messages
          WHERE account = ?1 AND message_id = ?2
          ORDER BY mailbox ASC, uid ASC"
     );
@@ -189,7 +218,8 @@ pub fn find_by_message_id(
 
 /// One row addressed by its synthetic id.
 pub fn find_by_id(store: &Store, id: i64) -> Result<Option<MessageRow>> {
-    let sql = format!("SELECT {ROW_COLUMNS} FROM messages WHERE id = ?1");
+    let columns = row_columns();
+    let sql = format!("SELECT {columns} FROM messages WHERE id = ?1");
     let row = store
         .conn()
         .query_row(&sql, [id], row_from_sql)
@@ -242,20 +272,75 @@ pub fn attachments_for(store: &Store, message_row: i64) -> Result<Vec<Attachment
     Ok(out)
 }
 
-/// True when the message carries an iMIP payload, i.e. ingest stored an
-/// attachment blob under [`CALENDAR_SIDECAR_NAME`].
+/// Every invite of one account: the row plus the hash of its ics blob.
 ///
-/// The same predicate the pre-store build expressed as "the file has an
-/// `event:` frontmatter block", asked of the store instead. Parsing that ics
-/// into a rendered event is the calendar flip, #0038 scope item 6.
-pub fn is_invite(store: &Store, message_row: i64) -> Result<bool> {
-    let count: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM message_blobs
-         WHERE message_row = ?1 AND kind = 'attachment' AND filename = ?2",
-        rusqlite::params![message_row, CALENDAR_SIDECAR_NAME],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
+/// This is the agenda's and the reconciler's source (#0038 scope item 6). It
+/// replaced a walk of every `.md` under the account root, so the shape is
+/// deliberately the whole account in one query: an invite is a rare row, and
+/// both callers need every mailbox at once to collapse the Inbox / Sent /
+/// Archive copies of one event into a single agenda row.
+///
+/// Ordered by `(mailbox, uid)`, which is the identity tiebreak both callers
+/// use once sequence and `DTSTAMP` have tied, so the result is stable across
+/// runs without a sort at the call site.
+pub fn list_invites(store: &Store, account: &str) -> Result<Vec<(MessageRow, String)>> {
+    let columns = row_columns();
+    let sql = format!(
+        "SELECT {columns}, b.hash FROM messages
+         JOIN message_blobs b ON b.message_row = messages.id
+         WHERE account = ?1 AND b.kind = 'attachment' AND b.filename = ?2
+         ORDER BY mailbox ASC, uid ASC"
+    );
+    let mut stmt = store.conn().prepare(&sql)?;
+    let rows = stmt.query_map((account, CALENDAR_SIDECAR_NAME), |row| {
+        Ok((row_from_sql(row)?, row.get::<_, String>(13)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("reading an invite row")?);
+    }
+    Ok(out)
+}
+
+/// The raw ics bytes of one message, or `None` when it carries no iMIP
+/// payload (or the blob is unreadable, which is logged).
+///
+/// One row, one blob: this is what the preview pane calls for the message
+/// under the cursor, so the event card is paid for by the message on screen
+/// and not by the mailbox behind it.
+pub fn load_invite_ics(store: &Store, blobs: &BlobStore, message_row: i64) -> Option<Vec<u8>> {
+    let hash: String = store
+        .conn()
+        .query_row(
+            "SELECT hash FROM message_blobs
+             WHERE message_row = ?1 AND kind = 'attachment' AND filename = ?2",
+            rusqlite::params![message_row, CALENDAR_SIDECAR_NAME],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!("[store] reading the ics hash of message {message_row}: {e:#}");
+            None
+        })?;
+    read_blob(blobs, message_row, &hash)
+}
+
+/// Read one blob by its hash string, degrading to `None` with a log line.
+pub fn read_blob(blobs: &BlobStore, message_row: i64, hash: &str) -> Option<Vec<u8>> {
+    let hash = match BlobHash::parse(hash) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("[store] message {message_row}: {e:#}");
+            return None;
+        }
+    };
+    match blobs.read(&hash) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            warn!("[store] message {message_row}: blob unreadable: {e:#}");
+            None
+        }
+    }
 }
 
 /// The body of one message, or `None` when the row itself is gone.
@@ -316,21 +401,9 @@ pub fn load_bodies(store: &Store, blobs: &BlobStore, ids: &[i64]) -> HashMap<i64
 /// propagated: the retention sweep is allowed to evict a body, and one evicted
 /// body must not blank the whole mailbox list.
 fn blob_text(blobs: &BlobStore, id: i64, hash: Option<&str>) -> String {
-    hash.and_then(|h| match BlobHash::parse(h) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            warn!("[store] message {id}: {e:#}");
-            None
-        }
-    })
-    .and_then(|h| match blobs.read(&h) {
-        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) => {
-            warn!("[store] message {id}: body blob unreadable: {e:#}");
-            None
-        }
-    })
-    .unwrap_or_default()
+    hash.and_then(|h| read_blob(blobs, id, h))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -530,15 +603,71 @@ mod tests {
         }];
         let id = ingest(&fx, "inbox", 1, &e);
 
-        assert!(is_invite(&fx.store, id).unwrap());
+        assert!(find_by_id(&fx.store, id).unwrap().unwrap().is_invite);
         let atts = attachments_for(&fx.store, id).unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "agenda.pdf");
         assert_eq!(atts[0].size, 8);
 
         let plain = ingest(&fx, "inbox", 2, &email("plain", "Mon, 01 Jan 2024 09:00:00 +0000"));
-        assert!(!is_invite(&fx.store, plain).unwrap());
+        assert!(!find_by_id(&fx.store, plain).unwrap().unwrap().is_invite);
         assert!(attachments_for(&fx.store, plain).unwrap().is_empty());
+    }
+
+    /// The invite flag rides on the listing itself, so the badge costs no
+    /// blob read: the whole mailbox comes back with the predicate answered.
+    #[test]
+    fn the_listing_carries_the_invite_flag() {
+        let fx = fixture();
+        let mut e = email("invite", "Mon, 01 Jan 2024 10:00:00 +0000");
+        e.calendar_ics = Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into());
+        ingest(&fx, "inbox", 1, &e);
+        ingest(&fx, "inbox", 2, &email("plain", "Mon, 01 Jan 2024 09:00:00 +0000"));
+
+        let rows = list_mailbox(&fx.store, "alice", "inbox").unwrap();
+        assert_eq!(rows[0].subject.as_deref(), Some("invite"));
+        assert!(rows[0].is_invite);
+        assert!(!rows[1].is_invite);
+    }
+
+    /// The agenda's source: every invite of the account, whatever mailbox it
+    /// sits in, with the bytes that came off the wire.
+    #[test]
+    fn invites_come_back_across_mailboxes_with_their_ics() {
+        let fx = fixture();
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n";
+        let mut e = email("invite", "Mon, 01 Jan 2024 09:00:00 +0000");
+        e.calendar_ics = Some(ics.into());
+        ingest(&fx, "inbox", 1, &e);
+        ingest(&fx, "sent", 4, &e);
+        ingest(&fx, "inbox", 2, &email("plain", "Mon, 01 Jan 2024 09:00:00 +0000"));
+
+        let invites = list_invites(&fx.store, "alice").unwrap();
+        let boxes: Vec<&str> = invites.iter().map(|(r, _)| r.mailbox.as_str()).collect();
+        assert_eq!(boxes, vec!["inbox", "sent"], "ordered by (mailbox, uid)");
+        for (row, hash) in &invites {
+            assert_eq!(
+                read_blob(&fx.blobs, row.id, hash).unwrap(),
+                ics.as_bytes(),
+                "the ics bytes are the ones ingest stored"
+            );
+            assert_eq!(
+                load_invite_ics(&fx.store, &fx.blobs, row.id).unwrap(),
+                ics.as_bytes(),
+                "the single read must agree with the batch"
+            );
+        }
+        assert!(list_invites(&fx.store, "nobody").unwrap().is_empty());
+    }
+
+    /// A message with no iMIP payload has no ics to load, and an unreadable
+    /// blob degrades to the same `None` rather than to a panic.
+    #[test]
+    fn a_message_without_an_ics_reads_back_as_none() {
+        let fx = fixture();
+        let plain = ingest(&fx, "inbox", 1, &email("plain", "Mon, 01 Jan 2024 09:00:00 +0000"));
+        assert_eq!(load_invite_ics(&fx.store, &fx.blobs, plain), None);
+        assert_eq!(read_blob(&fx.blobs, plain, "not-a-hash"), None);
     }
 
     #[test]

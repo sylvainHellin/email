@@ -311,9 +311,10 @@ enum OutboxAction {
 /// Organizer-side calendar operations (#0030).
 #[derive(Subcommand)]
 enum CalendarAction {
-    /// Reconcile locally-stored invites against attendee REPLY emails,
-    /// recomputing `event.attendees[].status` from the whole mailstore.
-    /// Idempotent and safe to re-run; rebuilds derived state from IMAP alone.
+    /// Report what the stored attendee REPLY emails resolve on the stored
+    /// invitations. Writes nothing: attendee statuses are derived from the
+    /// `invite.ics` payloads wherever they are displayed, so there is no
+    /// cached copy to rebuild.
     Rebuild {
         /// Account name (default: all configured accounts)
         #[arg(long)]
@@ -769,10 +770,15 @@ async fn run_send_invite(
 
 /// RSVP to a received calendar invitation (`mp invite accept|tentative|decline`).
 ///
-/// Reads the invite email's sidecar `invite.ics`, builds a `METHOD:REPLY`
-/// with the account's `PARTSTAT`, emails it to the `ORGANIZER`, and flips the
-/// local `event.rsvp` on success. Appends the reply to the server Sent folder
-/// best-effort. Graph accounts are rejected (Graph RSVP is #0036).
+/// Reads the invitation's `invite.ics` blob out of the account's store, builds
+/// a `METHOD:REPLY` with the account's `PARTSTAT` and emails it to the
+/// `ORGANIZER`. Nothing local is rewritten: our own `PARTSTAT` is derived from
+/// the reply the outbox files in Sent (#0038 scope item 6). Graph accounts are
+/// rejected (Graph RSVP is #0036).
+///
+/// `file` still names a `.md` path, which no longer exists: naming a message
+/// on the command line is the selector contract [#0050] owns, so this command
+/// declines until it lands rather than guessing which row was meant.
 async fn run_invite_rsvp(
     account_config: &email::config::AccountConfig,
     smtp_config: &SmtpConfig,
@@ -786,11 +792,20 @@ async fn run_invite_rsvp(
         ));
     }
 
+    let ics = std::fs::read(file).map_err(|e| {
+        anyhow!(
+            "cannot read {}: {e}. Mail is no longer stored as files; addressing a message on \
+             the command line lands with the selector contract (#0050). RSVP from the TUI \
+             (`V`) meanwhile.",
+            file.display()
+        )
+    })?;
+
     let account_address = email::parse::extract_email_address(&account_config.default_from);
 
     println!("Sending {} reply...", rsvp.subject_verb().to_lowercase());
     let outcome =
-        email::send::send_rsvp(file, account_config, &account_address, rsvp, smtp_config).await?;
+        email::send::send_rsvp(&ics, account_config, &account_address, rsvp, smtp_config).await?;
 
     if !outcome.send_result.any_succeeded() {
         return Err(anyhow!(
@@ -806,7 +821,7 @@ async fn run_invite_rsvp(
         outcome.organizer
     );
     println!(
-        "  {} Local RSVP updated. Note: not synced to the Exchange server calendar (no Graph in v1).",
+        "  {} Note: not synced to the Exchange server calendar (no Graph in v1).",
         "ℹ".blue()
     );
 
@@ -1670,10 +1685,6 @@ async fn main() -> Result<()> {
                     &account_config,
                     &result.fresh_observations,
                 );
-                // Organizer-side REPLY reconciliation (#0030): only walks the
-                // mailstore when this sync ingested a METHOD:REPLY invite.
-                let account_root = email::config::account_dir(&account_config.name);
-                email::reconcile::bump_after_sync(&account_root, result.saw_reply_invite);
             }
 
             let prefix = if dry_run { "[dry-run] " } else { "" };

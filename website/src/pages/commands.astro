@@ -20,7 +20,7 @@ const draftCommands = [
   { command: 'mp send <file> [-y]', description: 'Send a single approved email' },
   { command: 'mp send --invite ...', description: 'Send a calendar invitation (iMIP REQUEST)' },
   { command: 'mp invite accept|tentative|decline <file>', description: 'RSVP to a received invitation (iMIP REPLY)' },
-  { command: 'mp calendar rebuild [--account NAME]', description: 'Reconcile attendee RSVPs into your sent invites' },
+  { command: 'mp calendar rebuild [--account NAME]', description: 'Report the attendee RSVPs resolved against your sent invites' },
   { command: 'mp send-approved [dir] [-y]', description: 'Send all approved emails' },
   { command: 'mp outbox list', description: 'Show queued, retrying and failed submissions' },
   { command: 'mp outbox retry <id>', description: 'Send a failed submission again' },
@@ -209,21 +209,21 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         When someone accepts or declines an invitation you sent with
         <code>mp send --invite</code>, their reply arrives as a
         <code>METHOD:REPLY</code> email during normal sync. mailypoppins matches
-        it by event <code>UID</code> to your locally-stored sent invite and
-        updates that invite's per-attendee <code>status</code> so you can see who
-        responded. This runs automatically after each sync (only when a reply
-        actually arrived), and the preview card reflects the live statuses.
+        it by event <code>UID</code> to your sent invitation and shows that
+        attendee's <code>status</code> on the invite, so you can see who
+        responded. The statuses are computed from the stored invitation and
+        reply messages every time they are shown, so the agenda and the preview
+        card are always current with what has arrived.
       </p>
       <p>
-        <code>mp calendar rebuild [--account NAME]</code> recomputes every
-        invite's attendee statuses from scratch by re-scanning the whole
-        mailstore (defaults to all accounts). It is idempotent and safe to
-        re-run: the attendee statuses are derived state reconstructible from the
-        messages on the server alone, so two machines syncing the same account
-        converge on identical state with no direct machine-to-machine sync.
-        Replies for a <code>SEQUENCE</code> older than the stored invite's are
+        <code>mp calendar rebuild [--account NAME]</code> reports what those
+        replies resolve across every stored invitation (defaults to all
+        accounts). It writes nothing: there is no cached copy of the statuses to
+        rebuild, so it is idempotent by construction, and two machines syncing
+        the same account see identical state with no direct machine-to-machine
+        sync. Replies for a <code>SEQUENCE</code> older than the invitation's are
         ignored, and the most recent reply per attendee wins.
-        <strong>This updates only your local mirror — without Graph, your
+        <strong>Nothing is written back to the server — without Graph, your
         server-side Exchange calendar is never touched.</strong>
       </p>
     </section>

@@ -90,29 +90,16 @@ pub struct EmailEntry {
     pub date_sort: String,
     pub has_attachments: bool,
     pub read: bool,
-    /// Parsed `event:` frontmatter block when the email carries an iMIP
-    /// invite (#0029). `None` for the vast majority of emails. Drives the
-    /// list invite badge and the preview event card.
-    pub event: Option<crate::types::EventFrontmatter>,
-}
-
-impl EmailEntry {
-    /// Whether this email is a received invitation the user can RSVP to
-    /// (`method: REQUEST`). Our own sent invites are `REQUEST` too but the
-    /// caller (TUI) gates RSVP by mailbox kind / organizer, not just this.
-    pub fn is_invite(&self) -> bool {
-        self.event.is_some()
-    }
-
-    /// True when the invite is a received REQUEST (not a REPLY/CANCEL) and so
-    /// is a candidate for RSVP.
-    pub fn is_request_invite(&self) -> bool {
-        self.event
-            .as_ref()
-            .and_then(|e| e.method.as_deref())
-            .map(|m| m.eq_ignore_ascii_case("REQUEST"))
-            .unwrap_or(false)
-    }
+    /// True when the message carries an iMIP payload, i.e. the store row has
+    /// an `invite.ics` attachment blob (#0029, #0038 scope item 6).
+    ///
+    /// A flag rather than the parsed event: the badge is needed for every row
+    /// of the mailbox and the answer rides on the listing query itself, while
+    /// the event card is needed for one row at a time and is parsed from that
+    /// row's ics blob on demand (see [`PreviewInvite`]). Parsing every
+    /// mailbox row's invite eagerly would put back exactly the per-row blob
+    /// read the lazy body work removed.
+    pub is_invite: bool,
 }
 
 impl EmailEntry {
@@ -241,9 +228,9 @@ fn status_for_mailbox(mailbox: &str) -> String {
 /// rule; the path argument is empty because the filename fallback died with
 /// the filenames.
 ///
-/// `event` stays `None`: rendering an invite needs the ics blob parsed, which
-/// is the calendar flip (#0038 scope item 6). The list invite badge and the
-/// preview event card are dark until then.
+/// `is_invite` comes off the listing query, so the badge costs no blob read;
+/// the event card behind it is parsed lazily from the ics blob of the one row
+/// the preview shows (#0038 scope item 6, [`PreviewInvite`]).
 fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     let (date_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
     let read = row.is_read();
@@ -261,7 +248,7 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
         date_sort,
         read,
         has_attachments: row.has_attachments,
-        event: None,
+        is_invite: row.is_invite,
     }
 }
 
@@ -310,6 +297,47 @@ impl PreviewBody {
     pub(crate) fn fill(&mut self, key: Option<BodyKey>, text: String) {
         self.key = key;
         self.text = text;
+    }
+}
+
+/// One-slot memo of the parsed invite behind the preview pane (#0038 scope
+/// item 6).
+///
+/// The sibling of [`PreviewBody`], keyed the same way and refreshed in the
+/// same place, for the same reason: the event card is needed for the message
+/// under the cursor and for no other, so its ics blob is read and parsed once
+/// per cursor move instead of once per mailbox row. `EmailEntry.is_invite`
+/// answers the list badge without any of this, so a mailbox of invites still
+/// loads with zero blob reads.
+///
+/// The parsed event is the ics folded with the replies the store holds
+/// (`crate::reconcile`), so the card shows the same attendee statuses the
+/// agenda does.
+#[derive(Debug, Default, Clone)]
+pub struct PreviewInvite {
+    key: Option<BodyKey>,
+    event: Option<crate::types::EventFrontmatter>,
+}
+
+impl PreviewInvite {
+    /// The memoised event, `None` when the selected message is not an invite.
+    pub fn event(&self) -> Option<&crate::types::EventFrontmatter> {
+        self.event.as_ref()
+    }
+
+    /// True when the memo already answers for `key`.
+    pub(crate) fn holds(&self, key: Option<BodyKey>) -> bool {
+        self.key == key
+    }
+
+    /// Park `event` as the invite for `key`.
+    pub(crate) fn fill(
+        &mut self,
+        key: Option<BodyKey>,
+        event: Option<crate::types::EventFrontmatter>,
+    ) {
+        self.key = key;
+        self.event = event;
     }
 }
 
@@ -879,8 +907,10 @@ pub struct ContactsView {
 /// carry what the agenda list itself needs.
 #[derive(Debug, Clone)]
 pub struct CalendarEvent {
-    /// The source `.md` email the event was read from (RSVP / open-in-editor).
-    pub path: PathBuf,
+    /// The store row the winning copy of this event came from, so an RSVP
+    /// from the agenda addresses the same message the mail list would
+    /// (#0038 scope item 6 replaced the `.md` path with it).
+    pub msg: MessageRef,
     /// The `event:` frontmatter block, rendered by the shared event card.
     pub event: crate::types::EventFrontmatter,
     /// Email subject, used as the row title when the event has no `summary`.
@@ -1056,10 +1086,10 @@ pub enum Action {
         address: String,
     },
     /// Open the invite email an agenda row was derived from in `$EDITOR`
-    /// (#0034). Carries an explicit path: the event may live in any mailbox
-    /// of the active account, not just the one the mail list is showing.
+    /// (#0034). Carries its own message reference: the event may live in any
+    /// mailbox of the active account, not just the one the mail list shows.
     OpenEventSource {
-        path: PathBuf,
+        msg: MessageRef,
     },
 }
 

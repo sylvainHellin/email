@@ -1,491 +1,598 @@
-//! Organizer-side iMIP REPLY reconciliation (#0030).
+//! iMIP invite reconciliation over the store (#0030, moved onto rows and blobs
+//! by [#0038](../docs/tickets/0038-read-path-to-db.md) scope item 6).
 //!
-//! When an attendee accepts/declines an invitation, their mail client sends a
-//! `METHOD:REPLY` email carrying a single `ATTENDEE` with a `PARTSTAT`. Those
-//! replies arrive through normal sync and are saved with an `event:` block +
-//! `invite.ics` sidecar (#0027). This module reconciles them against the
-//! locally-stored `METHOD:REQUEST` invites (the Sent copy, and any archived
-//! copy) so the organizer sees who responded — updating each invite's
-//! `event.attendees[].status` frontmatter.
+//! An organizer's invitation is a `METHOD:REQUEST` message; an attendee's
+//! answer is a `METHOD:REPLY` carrying that attendee's `PARTSTAT`. Both arrive
+//! as ordinary mail and both are ingested as an ordinary row with an
+//! `invite.ics` attachment blob. Reconciliation folds the replies onto the
+//! invite so the organizer sees who responded, and so an attendee sees their
+//! own answer on the invite they answered.
 //!
-//! # Multi-machine consistency (design §3)
+//! # Derived, not stored
 //!
-//! The `event.attendees[]` cache is *local derived state*: it holds nothing
-//! that is not already an IMAP-visible message (the sent invite + incoming
-//! REPLY emails). Reconciliation is therefore designed to be:
+//! Nothing here writes. The pre-store build rewrote `event.attendees[].status`
+//! into the invite's `.md` frontmatter, but the store is a cache in front of
+//! the server (a schema mismatch drops the whole file, `crate::store::schema`),
+//! so a persisted fold would be a second source of truth that can drift from
+//! the blobs it was computed from, and it buys nothing that recomputing does
+//! not. The fold therefore runs where the answer is displayed, over the same
+//! rows every time:
 //!
-//! - **Idempotent** — re-running over the same messages yields byte-identical
-//!   files. The surgical rewriter ([`crate::draft::set_event_attendee_status`])
-//!   returns `Unchanged` and skips the write when the status already matches.
-//! - **Re-runnable over the whole mailstore** — [`reconcile_account`] walks
-//!   every mailbox, recomputing statuses from scratch. This is the primitive
-//!   behind `mp calendar rebuild`; two machines syncing the same account
-//!   converge on identical state with no machine-to-machine sync.
+//! - **Idempotent** by construction: there is no state to converge.
+//! - **Multi-machine consistent** by construction: two machines holding the
+//!   same messages compute the same statuses with no machine-to-machine sync.
+//! - **Cheap**: an invite is a rare row, the query is one index-driven join,
+//!   and each ics is a few kilobytes.
+//!
+//! `mp calendar rebuild` therefore reports what the fold resolves instead of
+//! rewriting files, and [`ReconcileReport`] is a report rather than a diff.
 //!
 //! # Algorithm
 //!
-//! 1. Walk the account root, parsing every `.md`'s `event:` block. For UID and
-//!    SEQUENCE we prefer the sidecar `.ics` (source of truth); we fall back to
-//!    frontmatter when the sidecar is missing (an invite may have been fetched
-//!    before the sidecar convention, or archived without it).
-//! 2. Index invites (`method == REQUEST`) and replies (`method == REPLY`) by
-//!    UID.
-//! 3. For each invite, gather replies with the same UID whose `SEQUENCE` is
-//!    **not older** than the invite's. Group them by attendee address
-//!    (case-insensitive); the winner per address is the reply with the highest
-//!    `(sequence, dtstamp)` — a newer sequence supersedes, ties break on the
-//!    latest `DTSTAMP`.
-//! 4. Apply the winning `PARTSTAT` to the invite's matching `attendees[]`
-//!    entry via the surgical frontmatter rewrite. Unknown attendee addresses
-//!    in a REPLY are ignored (documented decision): the organizer's attendee
-//!    list is the invite's, so a reply from an address that was never invited
-//!    has nothing to update.
+//! 1. [`load_invites`] reads every row of the account that carries an
+//!    `invite.ics` blob and parses it. The ics is the only source: there is no
+//!    frontmatter cache left to drift from it, which also removes the
+//!    attachment-`.md` forgery surface TKT-0047 described (there is no `.md`
+//!    on disk to walk, and an attachment blob is not a message row).
+//! 2. [`fold_replies`] indexes the REPLYs by UID and attendee address
+//!    (case-insensitive). The winner per address is the reply with the highest
+//!    `(sequence, dtstamp)`: a newer sequence supersedes, ties break on the
+//!    later `DTSTAMP`.
+//! 3. [`apply_replies`] writes the winning `PARTSTAT`s onto an invite's
+//!    in-memory attendee list, skipping replies older than the invite's own
+//!    sequence. An address that was never invited is ignored: the attendee
+//!    list belongs to the organizer's invitation.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use gray_matter::{engine::YAML, Matter};
-use walkdir::WalkDir;
+use crate::calendar::ParsedEvent;
+use crate::store::read::{self, MessageRow};
+use crate::store::{BlobStore, Store};
+use crate::types::EventFrontmatter;
 
-use crate::draft::{set_event_attendee_status, AttendeeUpdate};
-use crate::parse::CALENDAR_SIDECAR_NAME;
-use crate::types::InboxFrontmatter;
-
-/// A single REPLY observation: an attendee's PARTSTAT for a given UID.
+/// One stored message carrying an iMIP payload: its row identity and the
+/// parsed contents of its `invite.ics` blob.
 #[derive(Debug, Clone)]
-struct ReplyObs {
-    address: String,
-    status: String,
-    sequence: u32,
+pub struct InviteMessage {
+    /// `messages.id` of the row the payload came from.
+    pub row_id: i64,
+    /// The mailbox the row sits in. `sent` is what makes us the organizer of
+    /// a REQUEST, the way the Sent *directory* used to.
+    pub mailbox: String,
+    /// The row's UID, used only as the final identity tiebreak.
+    pub uid: i64,
+    /// The email subject, the agenda's fallback title when the event carries
+    /// no `SUMMARY`.
+    pub subject: Option<String>,
+    /// The parsed ics. Authoritative for UID, SEQUENCE, DTSTAMP and every
+    /// displayed field.
+    pub parsed: ParsedEvent,
+}
+
+impl InviteMessage {
+    /// The upper-cased `METHOD`, empty when the payload carried none.
+    pub fn method(&self) -> String {
+        self.parsed
+            .method
+            .as_deref()
+            .unwrap_or_default()
+            .to_uppercase()
+    }
+
+    /// The trimmed iCal UID, `None` when it is absent or empty. An invite
+    /// without one is still a real event; it just cannot be deduped or
+    /// matched to a reply.
+    pub fn uid(&self) -> Option<&str> {
+        self.parsed
+            .uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+    }
+
+    /// `DTSTAMP` as a lexicographically comparable string, empty when unknown.
+    pub fn dtstamp(&self) -> &str {
+        self.parsed.dtstamp.as_deref().unwrap_or_default()
+    }
+}
+
+/// A single REPLY observation: one attendee's `PARTSTAT` for one UID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyObs {
+    /// Lowercased attendee address.
+    pub address: String,
+    /// Our lowercase status vocabulary (`accepted`, `declined`, ...).
+    pub status: String,
+    pub sequence: u32,
     /// RFC3339 UTC `DTSTAMP`, or empty when the source omitted it. Compared
-    /// lexicographically — RFC3339 UTC strings sort chronologically.
-    dtstamp: String,
+    /// lexicographically, which is chronological for RFC3339 UTC strings.
+    pub dtstamp: String,
 }
 
-/// A locally-stored invite (`method == REQUEST`) we may update.
-#[derive(Debug, Clone)]
-struct InviteRef {
-    path: PathBuf,
-    sequence: u32,
-}
+/// UID -> attendee address -> the winning reply for that attendee.
+pub type ReplyIndex = HashMap<String, HashMap<String, ReplyObs>>;
 
-/// UID -> the locally-stored invites carrying it (usually one Sent copy).
-type InviteIndex = HashMap<String, Vec<InviteRef>>;
-/// UID -> attendee address -> winning reply for that attendee.
-type ReplyIndex = HashMap<String, HashMap<String, ReplyObs>>;
-
-/// Outcome counters for a reconciliation pass.
+/// What one reconciliation pass saw and resolved. A report, not a diff:
+/// nothing is written, so there is no "updated" count to give.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ReconcileStats {
-    /// Attendee `status:` lines actually rewritten on disk.
-    pub updated: usize,
-    /// Invite files that were inspected and matched a reply but needed no
-    /// change (already up to date) — the idempotent path.
-    pub unchanged: usize,
-    /// REPLY messages seen during the walk.
-    pub replies_seen: usize,
-    /// REQUEST invites seen during the walk.
+pub struct ReconcileReport {
+    /// REQUEST invites read from the store.
     pub invites_seen: usize,
+    /// REPLY messages read from the store.
+    pub replies_seen: usize,
+    /// Attendee statuses the fold resolved onto an invite, counted once per
+    /// (invite, attendee) pair.
+    pub resolved: usize,
 }
 
-/// Read the authoritative UID / SEQUENCE / DTSTAMP for an email by parsing its
-/// sidecar `.ics` when present, falling back to the frontmatter `event:` block.
-/// Returns `(uid, sequence, dtstamp)` with `dtstamp` empty when unknown.
-fn authoritative_ids(md_path: &Path, fm_event: &crate::types::EventFrontmatter) -> (Option<String>, u32, String) {
-    let sidecar = crate::parse::attachments_dir_for(md_path).join(CALENDAR_SIDECAR_NAME);
-    if let Ok(bytes) = fs::read(&sidecar) {
-        if let Some(parsed) = crate::calendar::parse_ics(&bytes) {
-            let uid = parsed.uid.or_else(|| fm_event.uid.clone());
-            let dtstamp = parsed.dtstamp.unwrap_or_default();
-            return (uid, parsed.sequence, dtstamp);
+/// Every invite of one account, parsed, in `(mailbox, uid)` order.
+///
+/// Rows whose ics blob is unreadable (retention evicted it) or unparseable are
+/// skipped rather than failing the pass: one bad payload must not empty an
+/// agenda. A store that cannot be queried yields an empty list, which is what
+/// an account that has never synced looks like anyway.
+pub fn load_invites(store: &Store, blobs: &BlobStore, account: &str) -> Vec<InviteMessage> {
+    let rows = match read::list_invites(store, account) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("[reconcile] listing invites for {account} failed: {e:#}");
+            return Vec::new();
         }
-    }
-    (fm_event.uid.clone(), fm_event.sequence, String::new())
+    };
+    rows.into_iter()
+        .filter_map(|(row, hash)| invite_from_row(blobs, row, &hash))
+        .collect()
 }
 
-/// Reply/invite classification for one email.
-enum Classified {
-    Reply(String, ReplyObs),  // (uid, obs)
-    Invite(String, InviteRef), // (uid, ref)
-    Neither,
+/// Parse one invite row's ics blob into an [`InviteMessage`].
+fn invite_from_row(blobs: &BlobStore, row: MessageRow, hash: &str) -> Option<InviteMessage> {
+    let bytes = read::read_blob(blobs, row.id, hash)?;
+    let parsed = crate::calendar::parse_ics(&bytes)?;
+    Some(InviteMessage {
+        row_id: row.id,
+        mailbox: row.mailbox,
+        uid: row.uid,
+        subject: row.subject,
+        parsed,
+    })
 }
 
-/// Classify a single `.md` file by reading its `event:` block. Best-effort:
-/// any parse failure yields [`Classified::Neither`].
-fn classify(md_path: &Path) -> Classified {
-    let content = match fs::read_to_string(md_path) {
-        Ok(c) => c,
-        Err(_) => return Classified::Neither,
-    };
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(&content);
-    let fm: InboxFrontmatter = match parsed.data.and_then(|d| d.deserialize().ok()) {
-        Some(fm) => fm,
-        None => return Classified::Neither,
-    };
-    let Some(event) = fm.event.as_ref() else {
-        return Classified::Neither;
-    };
-    let method = event.method.as_deref().unwrap_or("").to_uppercase();
-    let (uid_opt, sequence, dtstamp) = authoritative_ids(md_path, event);
-    let Some(uid) = uid_opt else {
-        return Classified::Neither;
-    };
-    let uid = uid.trim().to_string();
-    if uid.is_empty() {
-        return Classified::Neither;
-    }
-
-    match method.as_str() {
-        "REPLY" => {
-            // A REPLY carries exactly the replying attendee. Prefer the sidecar
-            // attendees (authoritative PARTSTAT); fall back to frontmatter.
-            let obs = reply_obs_from(md_path, event, sequence, &dtstamp);
-            match obs {
-                Some(o) => Classified::Reply(uid, o),
-                None => Classified::Neither,
-            }
+/// Index the REPLYs of `invites` by UID and attendee, keeping the winner per
+/// attendee (highest `(sequence, dtstamp)`).
+///
+/// A REPLY carries exactly the replying attendee, so the first attendee with a
+/// usable address is the observation; a REPLY with no attendee at all is not
+/// an observation and is skipped.
+pub fn fold_replies(invites: &[InviteMessage]) -> ReplyIndex {
+    let mut replies: ReplyIndex = HashMap::new();
+    for invite in invites {
+        if invite.method() != "REPLY" {
+            continue;
         }
-        "REQUEST" => Classified::Invite(uid, InviteRef { path: md_path.to_path_buf(), sequence }),
-        _ => Classified::Neither, // CANCEL and anything else: out of scope (#0031)
-    }
-}
-
-/// Extract the single replying attendee's `(address, status)` from a REPLY,
-/// preferring the sidecar `.ics` and falling back to the frontmatter block.
-fn reply_obs_from(
-    md_path: &Path,
-    fm_event: &crate::types::EventFrontmatter,
-    sequence: u32,
-    dtstamp: &str,
-) -> Option<ReplyObs> {
-    // Sidecar first: it is the source of truth for the PARTSTAT.
-    let sidecar = crate::parse::attachments_dir_for(md_path).join(CALENDAR_SIDECAR_NAME);
-    if let Ok(bytes) = fs::read(&sidecar) {
-        if let Some(parsed) = crate::calendar::parse_ics(&bytes) {
-            if let Some(att) = parsed.attendees.into_iter().find(|a| !a.address.trim().is_empty()) {
-                return Some(ReplyObs {
-                    address: att.address.trim().to_lowercase(),
-                    status: att.status,
-                    sequence,
-                    dtstamp: dtstamp.to_string(),
-                });
+        let (Some(uid), Some(obs)) = (invite.uid(), reply_obs(invite)) else {
+            continue;
+        };
+        let by_addr = replies.entry(uid.to_string()).or_default();
+        match by_addr.get(&obs.address) {
+            Some(existing) if !supersedes(&obs, existing) => {}
+            _ => {
+                by_addr.insert(obs.address.clone(), obs);
             }
         }
     }
-    // Frontmatter fallback (missing/unparseable sidecar).
-    fm_event
+    replies
+}
+
+/// The replying attendee's `(address, status)` from a REPLY payload.
+fn reply_obs(invite: &InviteMessage) -> Option<ReplyObs> {
+    let att = invite
+        .parsed
         .attendees
         .iter()
-        .find(|a| !a.address.trim().is_empty())
-        .map(|a| ReplyObs {
-            address: a.address.trim().to_lowercase(),
-            status: a.status.clone(),
-            sequence,
-            dtstamp: dtstamp.to_string(),
-        })
+        .find(|a| !a.address.trim().is_empty())?;
+    Some(ReplyObs {
+        address: att.address.trim().to_lowercase(),
+        status: att.status.clone(),
+        sequence: invite.parsed.sequence,
+        dtstamp: invite.dtstamp().to_string(),
+    })
 }
 
-/// Whether reply `a` supersedes reply `b` for the same attendee+UID: a newer
-/// sequence wins; within a sequence the later `DTSTAMP` wins.
+/// Whether reply `a` supersedes reply `b` for the same attendee and UID: a
+/// newer sequence wins, and within a sequence the later `DTSTAMP` wins.
 fn supersedes(a: &ReplyObs, b: &ReplyObs) -> bool {
     (a.sequence, a.dtstamp.as_str()) > (b.sequence, b.dtstamp.as_str())
 }
 
-/// Walk `account_root`, indexing invites and the winning reply per
-/// attendee+UID. Shared by [`reconcile_account`] and [`bump_after_sync`].
-fn build_index(account_root: &Path) -> (InviteIndex, ReplyIndex, ReconcileStats) {
-    let mut invites: InviteIndex = HashMap::new();
-    // uid -> address -> winning reply
-    let mut replies: ReplyIndex = HashMap::new();
-    let mut stats = ReconcileStats::default();
-
-    for entry in WalkDir::new(account_root).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        match classify(path) {
-            Classified::Reply(uid, obs) => {
-                stats.replies_seen += 1;
-                let by_addr = replies.entry(uid).or_default();
-                match by_addr.get(&obs.address) {
-                    Some(existing) if !supersedes(&obs, existing) => {}
-                    _ => {
-                        by_addr.insert(obs.address.clone(), obs);
-                    }
-                }
-            }
-            Classified::Invite(uid, r) => {
-                stats.invites_seen += 1;
-                invites.entry(uid).or_default().push(r);
-            }
-            Classified::Neither => {}
-        }
-    }
-    (invites, replies, stats)
-}
-
-/// Reconcile every invite under `account_root` against every REPLY under it.
-/// Walks the whole mailstore, so it is safe to run repeatedly (idempotent) and
-/// is the primitive behind `mp calendar rebuild`.
+/// Apply the winning replies for one UID onto an invite's attendee list, and
+/// return how many statuses were resolved.
 ///
-/// `changed` collects the invite `.md` paths whose bytes were actually
-/// rewritten, so callers can invalidate only the affected mailbox caches.
-pub fn reconcile_account(account_root: &Path) -> Result<ReconcileStats> {
-    let mut changed = Vec::new();
-    reconcile_into(account_root, &mut changed)
-}
-
-/// Core reconciliation: applies winning replies to each matching invite,
-/// pushing every invite path whose bytes changed into `changed`.
-fn reconcile_into(account_root: &Path, changed: &mut Vec<PathBuf>) -> Result<ReconcileStats> {
-    if !account_root.is_dir() {
-        return Ok(ReconcileStats::default());
-    }
-    let (invites, replies, mut stats) = build_index(account_root);
-
-    for (uid, invite_list) in &invites {
-        let Some(by_addr) = replies.get(uid) else {
+/// `sequence` is the invite's own: a reply for an older sequence answered a
+/// version of the event that no longer exists and is dropped.
+pub fn apply_replies(
+    event: &mut EventFrontmatter,
+    sequence: u32,
+    by_addr: Option<&HashMap<String, ReplyObs>>,
+) -> usize {
+    let Some(by_addr) = by_addr else { return 0 };
+    let mut resolved = 0;
+    for attendee in &mut event.attendees {
+        let key = attendee.address.trim().to_lowercase();
+        let Some(obs) = by_addr.get(&key) else {
             continue;
         };
-        for invite in invite_list {
-            let mut invite_changed = false;
-            for (address, obs) in by_addr {
-                // Ignore replies for a sequence older than this invite's.
-                if obs.sequence < invite.sequence {
-                    continue;
-                }
-                match set_event_attendee_status(&invite.path, address, &obs.status) {
-                    Ok(AttendeeUpdate::Updated) => {
-                        stats.updated += 1;
-                        invite_changed = true;
-                    }
-                    Ok(AttendeeUpdate::Unchanged) => stats.unchanged += 1,
-                    Ok(AttendeeUpdate::NotFound) => {}
-                    Err(e) => log::warn!(
-                        "reconcile: failed to update {} for {}: {}",
-                        invite.path.display(),
-                        address,
-                        e
-                    ),
-                }
-            }
-            if invite_changed {
-                changed.push(invite.path.clone());
-            }
+        if obs.sequence < sequence {
+            continue;
         }
+        attendee.status = obs.status.clone();
+        resolved += 1;
     }
-
-    Ok(stats)
+    resolved
 }
 
-/// Best-effort incremental hook, called after a sync cycle saves new emails.
-/// Only does work when the sync actually saved a `METHOD:REPLY` invite
-/// (`saw_reply`), keeping the common no-calendar path free. When triggered it
-/// runs the full idempotent account reconciliation (cheap: one mailstore walk)
-/// so a REPLY that arrives before its invite, or vice versa, still converges.
+/// Our own answer to an invite: the winning REPLY we sent for it, falling back
+/// to whatever `PARTSTAT` the organizer's own copy already carries for us.
 ///
-/// Errors are logged, never propagated — a reconciliation hiccup must never
-/// fail a sync. Returns the affected invite paths so callers (the TUI) can
-/// invalidate the relevant mailbox caches.
-pub fn bump_after_sync(account_root: &Path, saw_reply: bool) -> Vec<PathBuf> {
-    if !saw_reply {
-        return Vec::new();
+/// The fallback matters because the two are the same fact from two directions:
+/// once the organizer has processed our reply their next REQUEST carries it,
+/// and before we have replied at all it reads `needs-action`, which is exactly
+/// the pre-store default. Our own sent reply lands in the store during the
+/// send itself (`crate::outbox::ingest_sent_copy` runs from the append), so
+/// this answers correctly without waiting for a sync.
+pub fn own_rsvp(
+    event: &EventFrontmatter,
+    self_address: &str,
+    by_addr: Option<&HashMap<String, ReplyObs>>,
+) -> String {
+    let key = self_address.trim().to_lowercase();
+    if !key.is_empty() {
+        if let Some(obs) = by_addr.and_then(|m| m.get(&key)) {
+            return obs.status.clone();
+        }
+        if let Some(att) = event
+            .attendees
+            .iter()
+            .find(|a| a.address.trim().eq_ignore_ascii_case(&key))
+        {
+            return att.status.clone();
+        }
     }
-    let mut changed = Vec::new();
-    if let Err(e) = reconcile_into(account_root, &mut changed) {
-        log::warn!("reconcile hook failed for {}: {}", account_root.display(), e);
-        return Vec::new();
+    "needs-action".to_string()
+}
+
+/// Reconcile every invite of one account and report what the fold resolved.
+///
+/// The primitive behind `mp calendar rebuild`. It is a read: running it twice
+/// reports the same numbers and changes nothing, because there is nothing to
+/// change.
+pub fn reconcile_account(store: &Store, blobs: &BlobStore, account: &str) -> ReconcileReport {
+    let invites = load_invites(store, blobs, account);
+    let replies = fold_replies(&invites);
+    let mut report = ReconcileReport {
+        replies_seen: invites.iter().filter(|i| i.method() == "REPLY").count(),
+        ..Default::default()
+    };
+    for invite in invites.iter().filter(|i| i.method() == "REQUEST") {
+        report.invites_seen += 1;
+        let mut event = crate::calendar::event_frontmatter(&invite.parsed);
+        let by_addr = invite.uid().and_then(|uid| replies.get(uid));
+        report.resolved += apply_replies(&mut event, invite.parsed.sequence, by_addr);
     }
-    changed
+    report
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::fs;
+    use crate::ingest::{ingest_message, IngestInput};
+    use crate::parse::FetchedEmail;
+    use tempfile::TempDir;
 
-    /// Write an invite/reply `.md` plus its `invite.ics` sidecar in a mailbox
-    /// dir under `root`. Returns the `.md` path.
-    fn write_msg(root: &Path, mailbox: &str, name: &str, md: &str, ics: Option<&str>) -> PathBuf {
-        let dir = root.join(mailbox);
-        fs::create_dir_all(&dir).unwrap();
-        let md_path = dir.join(format!("{name}.md"));
-        fs::write(&md_path, md).unwrap();
-        if let Some(ics) = ics {
-            let att = crate::parse::attachments_dir_for(&md_path);
-            fs::create_dir_all(&att).unwrap();
-            fs::write(att.join(CALENDAR_SIDECAR_NAME), ics).unwrap();
-        }
-        md_path
+    /// A store plus its blob store under one temp directory, with the real
+    /// ingest path as the only writer, so the fixture rows are the rows sync
+    /// writes. Shared with the calendar loader's tests, which need the same
+    /// "ingest an invite" primitive.
+    pub(crate) struct Fixture {
+        _dir: TempDir,
+        pub(crate) store: Store,
+        pub(crate) blobs: BlobStore,
     }
 
-    fn invite_md(uid: &str, seq: u32, attendees: &[(&str, &str)]) -> String {
-        let mut s = String::from("---\nfrom: me@example.com\nto: a@example.com\nsubject: Plan\nstatus: sent\nevent:\n");
-        s.push_str(&format!("  uid: {uid}\n  method: REQUEST\n  sequence: {seq}\n  rsvp: needs-action\n  attendees:\n"));
-        for (addr, status) in attendees {
-            s.push_str(&format!("  - address: {addr}\n    status: {status}\n"));
+    pub(crate) fn fixture() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
+        Fixture {
+            _dir: dir,
+            store,
+            blobs,
         }
-        s.push_str("---\n\nYou are invited.\n");
+    }
+
+    impl Fixture {
+        /// Ingest one message carrying `ics` into `mailbox`; returns its row id.
+        pub(crate) fn ingest_invite(
+            &self,
+            mailbox: &str,
+            uid: i64,
+            subject: &str,
+            ics: &str,
+        ) -> i64 {
+            self.ingest(mailbox, uid, subject, Some(ics))
+        }
+
+        /// Ingest one ordinary message, with no iMIP payload at all.
+        pub(crate) fn ingest_plain(&self, mailbox: &str, uid: i64, subject: &str) -> i64 {
+            self.ingest(mailbox, uid, subject, None)
+        }
+
+        fn ingest(&self, mailbox: &str, uid: i64, subject: &str, ics: Option<&str>) -> i64 {
+            let email = FetchedEmail {
+                from: "Organizer <me@example.com>".into(),
+                to: "a@example.com".into(),
+                cc: None,
+                subject: subject.into(),
+                date: "Mon, 20 Jul 2026 09:00:00 +0000".into(),
+                body_text: "You are invited.".into(),
+                html_body: None,
+                has_attachments: false,
+                message_id: Some(format!("<{mailbox}-{uid}@example.com>")),
+                attachments: Vec::new(),
+                is_read: false,
+                calendar_ics: ics.map(|s| s.as_bytes().to_vec()),
+                event: None,
+            };
+            ingest_message(
+                &self.store,
+                &self.blobs,
+                &IngestInput {
+                    account: "alice",
+                    mailbox,
+                    uid,
+                    email: &email,
+                    raw: None,
+                },
+            )
+            .unwrap()
+            .row_id
+        }
+    }
+
+    /// A `METHOD:REQUEST` payload with `NEEDS-ACTION` attendees.
+    pub(crate) fn invite_ics(uid: &str, seq: u32, attendees: &[&str]) -> String {
+        let mut s = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             SEQUENCE:{seq}\r\nSUMMARY:Plan\r\nDTSTART:20260720T120000Z\r\n\
+             ORGANIZER:mailto:me@example.com\r\n"
+        );
+        for addr in attendees {
+            s.push_str(&format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{addr}\r\n"));
+        }
+        s.push_str("END:VEVENT\r\nEND:VCALENDAR\r\n");
         s
     }
 
-    fn invite_ics(uid: &str, seq: u32) -> String {
+    /// A `METHOD:REPLY` payload carrying one attendee's answer.
+    pub(crate) fn reply_ics(
+        uid: &str,
+        seq: u32,
+        addr: &str,
+        partstat: &str,
+        dtstamp: &str,
+    ) -> String {
         format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSEQUENCE:{seq}\r\nSUMMARY:Plan\r\nDTSTART:20260720T120000Z\r\nORGANIZER:mailto:me@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:a@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             SEQUENCE:{seq}\r\nDTSTAMP:{dtstamp}\r\nORGANIZER:mailto:me@example.com\r\n\
+             ATTENDEE;PARTSTAT={partstat}:mailto:{addr}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         )
     }
 
-    fn reply_md(uid: &str, seq: u32, addr: &str, status: &str) -> String {
-        format!(
-            "---\nfrom: {addr}\nto: me@example.com\nsubject: \"Re: Plan\"\nstatus: inbox\nevent:\n  uid: {uid}\n  method: REPLY\n  sequence: {seq}\n  attendees:\n  - address: {addr}\n    status: {status}\n---\n\nRSVP.\n"
-        )
-    }
-
-    fn reply_ics(uid: &str, seq: u32, addr: &str, partstat: &str, dtstamp: &str) -> String {
-        format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSEQUENCE:{seq}\r\nDTSTAMP:{dtstamp}\r\nORGANIZER:mailto:me@example.com\r\nATTENDEE;PARTSTAT={partstat}:mailto:{addr}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-        )
-    }
-
-    fn status_of(md: &Path, addr: &str) -> Option<String> {
-        let matter = Matter::<YAML>::new();
-        let parsed = matter.parse(&fs::read_to_string(md).unwrap());
-        let fm: InboxFrontmatter = parsed.data.unwrap().deserialize().unwrap();
-        fm.event?
+    /// Fold the store's replies onto one invite and return its attendee list.
+    fn statuses(fx: &Fixture, uid: &str) -> Vec<(String, String)> {
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let replies = fold_replies(&invites);
+        let request = invites
+            .iter()
+            .find(|i| i.method() == "REQUEST" && i.uid() == Some(uid))
+            .expect("the REQUEST is in the store");
+        let mut event = crate::calendar::event_frontmatter(&request.parsed);
+        apply_replies(&mut event, request.parsed.sequence, replies.get(uid));
+        event
             .attendees
             .into_iter()
-            .find(|a| a.address.eq_ignore_ascii_case(addr))
-            .map(|a| a.status)
+            .map(|a| (a.address, a.status))
+            .collect()
     }
 
     #[test]
-    fn reply_flips_matching_attendee() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 0, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T120000Z")));
-
-        let stats = reconcile_account(root).unwrap();
-        assert_eq!(stats.updated, 1);
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("accepted"));
+    fn a_reply_flips_the_matching_attendee() {
+        let fx = fixture();
+        fx.ingest_invite("sent", 1, "Plan", &invite_ics("u1@x", 0, &["a@example.com"]));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T120000Z"),
+        );
+        assert_eq!(
+            statuses(&fx, "u1@x"),
+            vec![("a@example.com".to_string(), "accepted".to_string())]
+        );
     }
 
     #[test]
-    fn case_insensitive_address_match() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("Alice@Example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 0, "alice@example.com", "declined"), Some(&reply_ics("u1@x", 0, "alice@example.com", "DECLINED", "20260710T120000Z")));
-
-        reconcile_account(root).unwrap();
-        assert_eq!(status_of(&inv, "Alice@Example.com").as_deref(), Some("declined"));
+    fn addresses_match_case_insensitively() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "sent",
+            1,
+            "Plan",
+            &invite_ics("u1@x", 0, &["Alice@Example.com"]),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "alice@example.com", "DECLINED", "20260710T120000Z"),
+        );
+        assert_eq!(statuses(&fx, "u1@x")[0].1, "declined");
     }
 
     #[test]
-    fn latest_dtstamp_wins_within_sequence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        // Earlier reply: accepted. Later reply: declined. Declined must win.
-        write_msg(root, "inbox", "r1", &reply_md("u1@x", 0, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T090000Z")));
-        write_msg(root, "inbox", "r2", &reply_md("u1@x", 0, "a@example.com", "declined"), Some(&reply_ics("u1@x", 0, "a@example.com", "DECLINED", "20260711T090000Z")));
-
-        reconcile_account(root).unwrap();
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("declined"));
+    fn the_latest_dtstamp_wins_within_a_sequence() {
+        let fx = fixture();
+        fx.ingest_invite("sent", 1, "Plan", &invite_ics("u1@x", 0, &["a@example.com"]));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T090000Z"),
+        );
+        fx.ingest_invite(
+            "inbox",
+            3,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "a@example.com", "DECLINED", "20260711T090000Z"),
+        );
+        assert_eq!(statuses(&fx, "u1@x")[0].1, "declined");
     }
 
     #[test]
-    fn older_sequence_reply_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        // Invite bumped to sequence 2; a stale reply for sequence 1 must be ignored.
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 2, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 2)));
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 1, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 1, "a@example.com", "ACCEPTED", "20260710T120000Z")));
+    fn a_newer_sequence_reply_wins_and_an_older_one_is_ignored() {
+        let fx = fixture();
+        // The invite was bumped to sequence 2, so a reply for sequence 1
+        // answered a version of the event that no longer exists.
+        fx.ingest_invite("sent", 1, "Plan", &invite_ics("u1@x", 2, &["a@example.com"]));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics("u1@x", 1, "a@example.com", "ACCEPTED", "20260710T120000Z"),
+        );
+        assert_eq!(statuses(&fx, "u1@x")[0].1, "needs-action");
 
-        let stats = reconcile_account(root).unwrap();
-        assert_eq!(stats.updated, 0);
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("needs-action"));
+        fx.ingest_invite(
+            "inbox",
+            3,
+            "Re: Plan",
+            &reply_ics("u1@x", 3, "a@example.com", "TENTATIVE", "20260709T090000Z"),
+        );
+        assert_eq!(statuses(&fx, "u1@x")[0].1, "tentative");
     }
 
     #[test]
-    fn newer_sequence_reply_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 1, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 1)));
-        // Reply for seq 1 accepted, reply for seq 2 declined -> seq2 (newer) wins.
-        write_msg(root, "inbox", "r1", &reply_md("u1@x", 1, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 1, "a@example.com", "ACCEPTED", "20260710T090000Z")));
-        write_msg(root, "inbox", "r2", &reply_md("u1@x", 2, "a@example.com", "declined"), Some(&reply_ics("u1@x", 2, "a@example.com", "DECLINED", "20260709T090000Z")));
-
-        reconcile_account(root).unwrap();
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("declined"));
+    fn a_reply_from_an_uninvited_address_is_ignored() {
+        let fx = fixture();
+        fx.ingest_invite("sent", 1, "Plan", &invite_ics("u1@x", 0, &["a@example.com"]));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics(
+                "u1@x",
+                0,
+                "stranger@example.com",
+                "ACCEPTED",
+                "20260710T120000Z",
+            ),
+        );
+        assert_eq!(statuses(&fx, "u1@x")[0].1, "needs-action");
     }
 
+    /// The report counts what it saw and resolved, and a second pass reports
+    /// the same numbers: with nothing written there is nothing to converge.
     #[test]
-    fn unknown_attendee_in_reply_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        // A reply from an address that was never on the invite: no-op.
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 0, "stranger@example.com", "accepted"), Some(&reply_ics("u1@x", 0, "stranger@example.com", "ACCEPTED", "20260710T120000Z")));
+    fn the_report_is_stable_across_passes() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "sent",
+            1,
+            "Plan",
+            &invite_ics("u1@x", 0, &["a@example.com", "b@example.com"]),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T120000Z"),
+        );
+        fx.ingest_invite(
+            "inbox",
+            3,
+            "Re: Plan",
+            &reply_ics("u1@x", 0, "b@example.com", "DECLINED", "20260710T120000Z"),
+        );
 
-        let stats = reconcile_account(root).unwrap();
-        assert_eq!(stats.updated, 0);
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("needs-action"));
+        let first = reconcile_account(&fx.store, &fx.blobs, "alice");
+        assert_eq!(
+            first,
+            ReconcileReport {
+                invites_seen: 1,
+                replies_seen: 2,
+                resolved: 2,
+            }
+        );
+        assert_eq!(
+            reconcile_account(&fx.store, &fx.blobs, "alice"),
+            first,
+            "a second pass must report the same numbers"
+        );
     }
 
+    /// Our own answer comes from our own sent REPLY, which the outbox ingests
+    /// during the send, so the invite shows it without waiting for a sync.
     #[test]
-    fn missing_sidecar_falls_back_to_frontmatter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        // Neither invite nor reply has a sidecar: UID/sequence/status come from
-        // frontmatter. DTSTAMP is empty, but a single reply still applies.
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action")]), None);
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 0, "a@example.com", "tentative"), None);
+    fn our_own_rsvp_comes_from_our_own_reply() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Plan",
+            &invite_ics("u1@x", 0, &["me@example.com"]),
+        );
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let request = invites.iter().find(|i| i.method() == "REQUEST").unwrap();
+        let event = crate::calendar::event_frontmatter(&request.parsed);
+        assert_eq!(
+            own_rsvp(&event, "me@example.com", None),
+            "needs-action",
+            "before we answer, the organizer's PARTSTAT for us stands"
+        );
 
-        let stats = reconcile_account(root).unwrap();
-        assert_eq!(stats.updated, 1);
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("tentative"));
+        fx.ingest_invite(
+            "sent",
+            2,
+            "Declined: Plan",
+            &reply_ics("u1@x", 0, "me@example.com", "DECLINED", "20260710T120000Z"),
+        );
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let replies = fold_replies(&invites);
+        assert_eq!(
+            own_rsvp(&event, "Me@Example.com", replies.get("u1@x")),
+            "declined"
+        );
     }
 
+    /// An unreadable or unparseable ics costs its own row and nothing else.
     #[test]
-    fn idempotent_second_run_is_byte_identical() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action"), ("b@example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        write_msg(root, "inbox", "ra", &reply_md("u1@x", 0, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T120000Z")));
-        write_msg(root, "inbox", "rb", &reply_md("u1@x", 0, "b@example.com", "declined"), Some(&reply_ics("u1@x", 0, "b@example.com", "DECLINED", "20260710T120000Z")));
+    fn an_unreadable_ics_skips_only_that_invite() {
+        let fx = fixture();
+        let broken = fx.ingest_invite("inbox", 1, "Broken", "not an ics at all");
+        fx.ingest_invite("inbox", 2, "Plan", &invite_ics("u1@x", 0, &["a@example.com"]));
 
-        let s1 = reconcile_account(root).unwrap();
-        assert_eq!(s1.updated, 2);
-        let after_first = fs::read(&inv).unwrap();
-
-        // Second run: nothing changes, bytes are identical, and every match is
-        // counted as unchanged rather than updated.
-        let s2 = reconcile_account(root).unwrap();
-        assert_eq!(s2.updated, 0);
-        assert_eq!(s2.unchanged, 2);
-        let after_second = fs::read(&inv).unwrap();
-        assert_eq!(after_first, after_second, "reconciliation must be idempotent");
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        assert_eq!(invites.len(), 1, "the unparseable payload is skipped");
+        assert_ne!(invites[0].row_id, broken);
+        assert_eq!(invites[0].uid(), Some("u1@x"));
     }
 
+    /// An account with no invites reconciles to an empty report, not an error.
     #[test]
-    fn bump_after_sync_returns_changed_invite_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let inv = write_msg(root, "sent", "inv", &invite_md("u1@x", 0, &[("a@example.com", "needs-action")]), Some(&invite_ics("u1@x", 0)));
-        write_msg(root, "inbox", "rep", &reply_md("u1@x", 0, "a@example.com", "accepted"), Some(&reply_ics("u1@x", 0, "a@example.com", "ACCEPTED", "20260710T120000Z")));
-
-        // saw_reply=false short-circuits (no work).
-        assert!(bump_after_sync(root, false).is_empty());
-        // saw_reply=true reconciles and reports the touched invite.
-        let changed = bump_after_sync(root, true);
-        assert_eq!(changed, vec![inv.clone()]);
-        // Re-running reports no changes (idempotent).
-        assert!(bump_after_sync(root, true).is_empty());
-        assert_eq!(status_of(&inv, "a@example.com").as_deref(), Some("accepted"));
+    fn an_account_with_no_invites_reports_nothing() {
+        let fx = fixture();
+        assert_eq!(
+            reconcile_account(&fx.store, &fx.blobs, "alice"),
+            ReconcileReport::default()
+        );
     }
 }

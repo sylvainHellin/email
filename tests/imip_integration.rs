@@ -517,9 +517,139 @@ fn sent_invite_roundtrips_through_receive_parser() {
     assert!(ics.contains("METHOD:REQUEST"));
 }
 
-// The full-rescan reconciliation test that lived here drove the `.md` writer
-// (`save_fetched_emails`) to lay out a sent invite and an incoming REPLY on
-// disk. That writer is gone with the legacy sync (#0037 unit 4a), and
-// `reconcile_account` still walks the `.md` tree, so the end-to-end coverage
-// moves with the reconcile rewrite in #0038. The per-function behaviour is
-// still covered by the unit tests in `src/reconcile.rs`.
+// ---------------------------------------------------------------------------
+// Reconciliation over the store (tickets #0030, #0038 scope item 6)
+//
+// The full-rescan test that lived here drove the `.md` writer to lay a sent
+// invite and an incoming REPLY out on disk. That writer is gone (#0037 unit
+// 4a) and reconciliation now derives attendee statuses from the `invite.ics`
+// blobs of the account's rows, so the end-to-end coverage runs the same MIME
+// fixtures through ingest and then through `reconcile::load_invites` -- the
+// entry point the Calendar view's agenda is built on.
+// ---------------------------------------------------------------------------
+
+/// One store shared by several ingested messages, so a whole account can be
+/// assembled and then reconciled (the single-message `ingest` above opens a
+/// fresh store per call).
+struct Mailstore {
+    _tmp: tempfile::TempDir,
+    store: email::store::Store,
+    blobs: email::store::BlobStore,
+}
+
+impl Mailstore {
+    fn new() -> Self {
+        let tmp = tempdir().unwrap();
+        let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
+        Mailstore { _tmp: tmp, store, blobs }
+    }
+
+    /// Ingest raw RFC822 bytes through the real parse + ingest path.
+    fn ingest_raw(&self, raw: &[u8], mailbox: &str, uid: i64) -> i64 {
+        let email = parse_rfc822_to_fetched_email(raw).unwrap();
+        email::ingest::ingest_message(
+            &self.store,
+            &self.blobs,
+            &email::ingest::IngestInput {
+                account: "acct",
+                mailbox,
+                uid,
+                email: &email,
+                raw: None,
+            },
+        )
+        .unwrap()
+        .row_id
+    }
+
+    fn invites(&self) -> Vec<email::reconcile::InviteMessage> {
+        email::reconcile::load_invites(&self.store, &self.blobs, "acct")
+    }
+}
+
+/// Only the fixtures classified as iMIP invites reach the calendar path. The
+/// shared `.ics` export, the malformed calendar part and the plain email are
+/// ordinary messages: they carry no `invite.ics` blob, so the invite listing
+/// never sees them and no agenda row can come from them.
+#[test]
+fn only_imip_classified_messages_reach_the_calendar_path() {
+    let ms = Mailstore::new();
+    ms.ingest_raw(OUTLOOK_INLINE_REQUEST.as_bytes(), "inbox", 1);
+    ms.ingest_raw(GOOGLE_ICS_ATTACHMENT_REQUEST.as_bytes(), "inbox", 2);
+    ms.ingest_raw(SHARED_ICS_EXPORT_ONLY.as_bytes(), "inbox", 3);
+    ms.ingest_raw(MALFORMED_INVITE.as_bytes(), "inbox", 4);
+    ms.ingest_raw(PLAIN_MULTIPART.as_bytes(), "inbox", 5);
+
+    let invites = ms.invites();
+    let uids: Vec<Option<&str>> = invites.iter().map(|i| i.uid()).collect();
+    assert_eq!(
+        uids,
+        vec![
+            Some("outlook-uid-1@tum.de"),
+            Some("google-uid-1@google.com")
+        ],
+        "only the two iMIP REQUESTs are invites"
+    );
+    assert!(invites.iter().all(|i| i.method() == "REQUEST"));
+    // The zoned Outlook DTSTART survives the round trip through the blob.
+    assert_eq!(invites[0].parsed.start.as_deref(), Some("2026-07-20T14:00:00+02:00"));
+    assert_eq!(invites[0].parsed.sequence, 2);
+}
+
+/// The attendee's round trip, end to end over the store: an Outlook REQUEST is
+/// ingested, the RSVP reply is built exactly as `send_rsvp` builds it, and its
+/// sent copy is ingested the way the outbox does during the send. Our own
+/// `PARTSTAT` is then derived from that sent REPLY, with nothing written to the
+/// invitation, so a second pass reports the same numbers.
+#[test]
+fn an_rsvp_reply_reconciles_against_the_stored_invite() {
+    use email::invite::Rsvp;
+
+    let ms = Mailstore::new();
+    let request = ms.ingest_raw(OUTLOOK_INLINE_REQUEST.as_bytes(), "inbox", 1);
+
+    // Read the invitation back out of the store, exactly as the TUI does.
+    let ics = email::store::read::load_invite_ics(&ms.store, &ms.blobs, request)
+        .expect("the invite.ics blob");
+    let ctx = email::invite::reply_context_from_ics(&ics).unwrap();
+    let reply_ics = email::invite::build_reply_ics(&ctx, "me@example.com", Rsvp::Declined).unwrap();
+    let built = email::send::build_reply_message(
+        "me@example.com",
+        &ctx.organizer,
+        "Declined: LOC Day planning",
+        "Declined the invitation.",
+        &reply_ics,
+    )
+    .unwrap();
+    // What `outbox::ingest_sent_copy` files during the send itself.
+    ms.ingest_raw(&built.raw, "sent", 1);
+
+    let invites = ms.invites();
+    assert_eq!(invites.len(), 2, "the REQUEST and our sent REPLY");
+    let replies = email::reconcile::fold_replies(&invites);
+    let by_addr = replies.get("outlook-uid-1@tum.de");
+
+    let request = invites
+        .iter()
+        .find(|i| i.method() == "REQUEST")
+        .expect("the REQUEST");
+    let mut event = email::calendar::event_frontmatter(&request.parsed);
+    email::reconcile::apply_replies(&mut event, request.parsed.sequence, by_addr);
+    assert_eq!(event.attendees[0].address, "me@example.com");
+    assert_eq!(event.attendees[0].status, "declined");
+    assert_eq!(
+        email::reconcile::own_rsvp(&event, "me@example.com", by_addr),
+        "declined"
+    );
+
+    // The report is a read: two passes, same numbers, nothing written.
+    let first = email::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct");
+    assert_eq!(first.invites_seen, 1);
+    assert_eq!(first.replies_seen, 1);
+    assert_eq!(first.resolved, 1);
+    assert_eq!(
+        email::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct"),
+        first
+    );
+}

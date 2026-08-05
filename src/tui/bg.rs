@@ -209,12 +209,16 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "RSVP sent".into() } else { msg };
                     app.set_status_level(text, StatusLevel::Success);
-                    // The invite's local event.rsvp frontmatter changed on
-                    // disk; refresh the open mailbox so the preview card and
-                    // list badge reflect the new own-RSVP state.
+                    // Our own reply is now a row in `sent` (the outbox
+                    // ingests the appended copy during the send), so the
+                    // derived own-RSVP has changed: refresh the open mailbox
+                    // and rebuild the agenda from it (#0038 item 6).
                     if account_index == app.active_account {
                         app.invalidate_cache_idx(app.active_mailbox);
                         app.reload_current_mailbox();
+                        if app.calendar_view.loaded {
+                            app.refresh_calendar();
+                        }
                     } else {
                         app.invalidate_all_caches_on(account_index);
                     }

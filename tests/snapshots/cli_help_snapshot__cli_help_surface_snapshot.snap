@@ -537,7 +537,7 @@ Calendar / iMIP invite operations
 Usage: mp calendar [OPTIONS] <COMMAND>
 
 Commands:
-  rebuild  Reconcile locally-stored invites against attendee REPLY emails, recomputing `event.attendees[].status` from the whole mailstore. Idempotent and safe to re-run; rebuilds derived state from IMAP alone
+  rebuild  Report what the stored attendee REPLY emails resolve on the stored invitations. Writes nothing: attendee statuses are derived from the `invite.ics` payloads wherever they are displayed, so there is no cached copy to rebuild
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -547,7 +547,7 @@ Options:
   -h, --help                   Print help
 
 $ mp calendar rebuild --help
-Reconcile locally-stored invites against attendee REPLY emails, recomputing `event.attendees[].status` from the whole mailstore. Idempotent and safe to re-run; rebuilds derived state from IMAP alone
+Report what the stored attendee REPLY emails resolve on the stored invitations. Writes nothing: attendee statuses are derived from the `invite.ics` payloads wherever they are displayed, so there is no cached copy to rebuild
 
 Usage: mp calendar rebuild [OPTIONS]
 

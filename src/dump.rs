@@ -37,8 +37,8 @@
 //!   read from the attachment blobs of the row. `size` is the blob length and
 //!   is therefore always present. The iMIP sidecar is excluded, exactly as the
 //!   `attachments:` frontmatter list excluded it.
-//! - `invite`: `true` when the message carries an iMIP payload (same predicate
-//!   as `store::read::is_invite`).
+//! - `invite`: `true` when the message carries an iMIP payload, i.e. the row
+//!   has an `invite.ics` attachment blob (`MessageRow::is_invite`).
 //!
 //! # Ordering
 //!
@@ -206,11 +206,6 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
         .collect();
     attachments.sort();
 
-    let invite = read::is_invite(store, row.id).unwrap_or_else(|e| {
-        log::warn!("[dump] invite check for message {}: {e:#}", row.id);
-        false
-    });
-
     EnvelopeRecord {
         account: account.to_string(),
         mailbox: row.mailbox.clone(),
@@ -222,7 +217,7 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
         date_sort,
         flags: flags.into_iter().collect(),
         attachments,
-        invite,
+        invite: row.is_invite,
     }
 }
 

@@ -280,3 +280,23 @@ Nothing else changes: a contentless index was already the only thing the code co
 
 A test that evicts "one message's body" by unlinking its blob evicts every message that happens to carry the same bytes, because the hash is the filename and the refcount is per hash.
 Fixtures that need one readable and one evicted body must give the two messages different text (#0038 unit B).
+
+## Our own RSVP needs no stored column, because the sent copy lands during the send
+
+`outbox::ingest_sent_copy` runs inline from `send_durably` -> `settle()`, so the `METHOD:REPLY` we just emailed is already a row in the store's `sent` mailbox by the time the send returns.
+Our own `PARTSTAT` is therefore derivable immediately from the same blobs every other attendee's status comes from, with no sync lag, no extra column and no write against the invitation.
+That is what makes derive-on-read viable for the whole fold: [src/reconcile.rs](../src/reconcile.rs) writes nothing, and `own_rsvp` falls back to whatever `PARTSTAT` the organizer's own REQUEST carries for us, which is the same fact from the other direction once they have processed the reply (#0038 unit C).
+
+## The invite badge is a listing-query column; the event card is a lazy parse
+
+Two things need to know about an iMIP payload and they have opposite shapes.
+The list badge needs an answer for every row of the mailbox, so it rides on the listing query as an `EXISTS (SELECT 1 FROM message_blobs ...)` column (`MessageRow.is_invite`) and costs no blob read at all.
+The preview event card needs a fully parsed event for exactly one row, so it is read and parsed on demand and memoised beside the body in `PreviewInvite`, keyed by `(account, MessageRef, generation)` like `PreviewBody`.
+Parsing every row's ics to fill an `Option<EventFrontmatter>` on the entry, which is what the pre-store build effectively did through frontmatter, would put back the per-row blob read the lazy body work had just removed (#0038 units B and C).
+
+## A self-invited event ties on `(sequence, dtstamp)`, so the sent copy must win explicitly
+
+One event usually exists as several rows: the copy in `sent`, the copy the server dropped in `inbox`, and any archived copy.
+They are deduped by iCal UID keeping the highest `(sequence, dtstamp)`, but a self-invited event shares one `DTSTAMP` across every copy, so that comparison ties and the winner falls to the next component.
+With a plain identity tiebreak the winner is whichever mailbox name sorts last, and `is_organizer` flips off for any custom mailbox sorting after `sent` (`team` beat `sent`).
+The rank is therefore `(sequence, dtstamp, is_organizer, mailbox, uid)`, with the organizer flag load-bearing above the identity, in [src/tui/app/calendar_view.rs](../src/tui/app/calendar_view.rs) (#0034, carried onto rows in #0038).

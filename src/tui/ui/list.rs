@@ -17,7 +17,7 @@ const INVITE_GLYPH: &str = "\u{f00ed}";
 /// the attachment paperclip (if any). Both, one, or neither may apply.
 fn invite_and_attachment_prefix(email: &EmailEntry) -> String {
     let mut prefix = String::new();
-    if email.is_invite() {
+    if email.is_invite {
         prefix.push_str(INVITE_GLYPH);
         prefix.push(' ');
     }
@@ -295,7 +295,6 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod badge_tests {
     use super::*;
-    use crate::types::EventFrontmatter;
 
     fn entry(is_invite: bool, has_att: bool) -> EmailEntry {
         EmailEntry {
@@ -304,12 +303,7 @@ mod badge_tests {
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
             has_attachments: has_att, read: false,
-            event: is_invite.then(|| EventFrontmatter {
-                uid: None, method: Some("REQUEST".into()), sequence: 0,
-                summary: None, start: None, end: None, location: None,
-                organizer: None, rsvp: "needs-action".into(),
-                recurrence: String::new(), attendees: vec![],
-            }),
+            is_invite,
         }
     }
 

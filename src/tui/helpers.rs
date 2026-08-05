@@ -257,11 +257,9 @@ fn finish_sync(
     // Incremental contacts-index update (best-effort, no-op if no cache).
     crate::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
 
-    // Organizer-side REPLY reconciliation (#0030): only walks the mailstore
-    // when this sync ingested a METHOD:REPLY invite. Still file-based, like
-    // the rest of the read path, until #0038.
-    let account_root = crate::config::account_dir(&account_config.name);
-    crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite);
+    // Organizer-side REPLY reconciliation (#0030) has no post-sync hook any
+    // more: the fold runs where the statuses are displayed, over the rows this
+    // sync just ingested (#0038 scope item 6), so there is nothing to bump.
 
     let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
     if result.read_updated > 0 {
@@ -466,7 +464,7 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
         date_sort,
         has_attachments: fetched.has_attachments,
         read: fetched.is_read,
-        event: fetched.event.clone(),
+        is_invite: fetched.event.is_some(),
     }
 }
 
@@ -788,7 +786,7 @@ mod tests {
         assert_eq!(entry.cc.as_deref(), Some("cc@example.com"));
         assert!(entry.has_attachments);
         assert!(entry.read);
-        assert!(entry.event.is_none());
+        assert!(!entry.is_invite);
         assert_eq!(entry.date_display, "2024-01-01");
     }
 
