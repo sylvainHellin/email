@@ -1975,8 +1975,10 @@ async fn main() -> Result<()> {
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
             let blobs = email::store::BlobStore::for_account(&account_config.name);
             // Attachments are blobs; the system opener needs files, so they are
-            // materialised into a temp directory keyed by the row.
-            let dir = std::env::temp_dir().join(format!("mailypoppins-{}", row.id));
+            // materialised into a temp directory keyed by the row. The TUI's
+            // `o` comes through the same helper, so both put them in the same
+            // private place.
+            let dir = email::parse::materialisation_dir(&row.id.to_string())?;
             let files = materialise_attachments(&store, &blobs, row.id, &dir)?;
             if files.is_empty() {
                 return Err(anyhow!("{canonical} has no attachments"));

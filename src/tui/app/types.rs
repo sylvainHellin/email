@@ -1170,7 +1170,6 @@ pub struct MailboxInfo {
 pub enum Action {
     EditCurrent,
     Reply(bool),
-    Forward,
     Send,
     SendApproved,
     NewDraft,

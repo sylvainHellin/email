@@ -43,7 +43,8 @@ No flow re-reads a received `.md` file, because there is not one.
    The pre-nuke interaction is unchanged: no attachment says so, one skips the picker (`o` opens it, `O` goes straight to the directory picker), several open the picker, and a save collision keeps both copies under the `_1` rule `parse::save_attachment` has always applied.
    `mp open`'s own shortcut of opening every attachment at once stays CLI-only: a TUI that opened six windows on one keypress would be the surprising half of the two, and the residual risk recorded for it in #0050's review is a CLI risk, not a shared one.
 9. Open in browser, from the list and from the search-result overlay: the rendered HTML comes from the html blob or the raw blob, not from a `.html` file beside a `.md`.
-   Landed, unit C: `b` reads `store::read::load_html` (the html blob, or the html part of the raw message when there is no blob), writes it to `$TMPDIR/mailypoppins-<row id>.html` and hands the browser that file.
+   Landed, unit C: `b` reads `store::read::load_html` (the html blob, or the html part of the raw message when there is no blob), writes it to `$TMPDIR/mailypoppins-<row id>/render/message.html` and hands the browser that file.
+   The `render/` subdirectory keeps it out of reach of the row's own attachments, whose names are sanitised of path separators and so can never name a subdirectory.
    A sender who wrote no markup still gets the pre-nuke status line rather than an empty page.
 10. Open event source, from the calendar view, through the invite's own row and ics blob.
     Landed, unit C: the agenda row's `MessageRef` resolves `store::read::load_invite_ics`, and `$EDITOR` is handed that `.ics` written to a temp file, where the file build handed it the invite's `.md`.
@@ -105,3 +106,24 @@ The legacy-driver invariant is released with it; installing the branch build ove
 The residual risks above stay open, none of them touched by this ticket.
 One is added by unit C: the temp directory a row's attachments are materialised into is keyed by row id alone (`$TMPDIR/mailypoppins-<row id>`), which is `mp open`'s own name, so two accounts share a directory for the same id.
 Nothing is served from it that was not just written, and only the paths written are opened or saved, so the collision is stale files left behind rather than wrong bytes handed out.
+The permission half of that risk is closed by the follow-up pass below: the directory is created 0700 through `parse::materialisation_dir` and refused if the path is already something else, so the shared name leaks nothing and the stale-file collision is all that remains.
+
+A second is named by the stop-gate review and left open deliberately: a forward whose source has attachments fails wholesale if any one of their blobs is missing, because `store::read::materialise_attachments` errors rather than skipping the file (`src/store/read.rs`).
+A forward that silently dropped an attachment is the worse answer, so the refusal stands; it becomes reachable only once retention evicts attachment blobs, which nothing does yet, and the fix when it does is a partial forward that names what it could not attach.
+
+## Stop-gate review follow-ups
+
+Six findings from the review of unit C, none blocking, all fixed in one pass after the gate:
+
+- The materialisation directories were created with the default mode at a predictable path, so on a shared host a directory (or symlink) an attacker created first received the message bytes.
+  `parse::materialisation_dir` now creates them 0700, refuses a path that is not a real directory owned by this user, and tightens a loose mode left by an older build.
+- `Action::Forward` was dead: `w` pushes `OpenComposeWizard(ComposeMode::Forward)` and nothing constructed the variant.
+  Deleted, with its arm.
+- The `mailypoppins-<row id>` name was spelled out in both `src/tui/actions.rs` and `src/main.rs`.
+  Both now call `parse::materialisation_dir`, so the CLI/TUI parity this ticket asserts is carried by one function.
+- `A` or `D` over a received-mail selection opened "Approve N drafts?" and then reported "Approved 0 drafts", because the batch takes the drafts half of the selection.
+  The confirmation is now guarded on the selection holding at least one draft key, which is what the batch itself filters on, and says so on the status line instead.
+- `materialise_attachments` joined the stored filename unsanitised, safe only because ingest sanitises upstream.
+  It now sanitises at the write seam too, and two attachments sharing a name are disambiguated with the same `_1` rule as a save collision rather than one overwriting the other.
+- The unit-C tests wrote into the real `$TMPDIR`, i.e. into `/tmp/mailypoppins-1`, the path a real `mp open` of row 1 uses.
+  The fixture now moves `$TMPDIR` to a per-process directory under `$TMPDIR/mailypoppins-tests/`.

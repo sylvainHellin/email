@@ -355,6 +355,15 @@ pub fn read_blob(blobs: &BlobStore, message_row: i64, hash: &str) -> Option<Vec<
 /// A missing blob is an error rather than a skipped file: a forward that
 /// silently dropped an attachment would be a worse answer than one that says
 /// which blob is gone.
+///
+/// The stored filename is sanitised again here rather than trusted. Ingest
+/// sanitises what it parses out of a MIME part, so a `../` in a
+/// Content-Disposition never reaches the column, but this is the seam that
+/// turns a stored name into a path, and a write seam that depends on an
+/// upstream guarantee is one migration away from writing outside `dest`.
+/// Two attachments sharing a name are disambiguated with the `_1` rule
+/// [`crate::parse::save_attachment`] uses, so the second no longer
+/// overwrites the first.
 pub fn materialise_attachments(
     store: &Store,
     blobs: &BlobStore,
@@ -365,6 +374,7 @@ pub fn materialise_attachments(
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
     let mut written = Vec::new();
+    let mut used: Vec<String> = Vec::new();
     for att in attachments {
         let Some(bytes) = read_blob(blobs, row_id, &att.hash) else {
             return Err(anyhow!(
@@ -372,11 +382,41 @@ pub fn materialise_attachments(
                 att.name
             ));
         };
-        let out = dest.join(&att.name);
+        let name = unique_in(crate::parse::sanitize_attachment_filename(&att.name), &used);
+        let out = dest.join(&name);
+        used.push(name);
         std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
         written.push(out);
     }
     Ok(written)
+}
+
+/// `name`, or the first `name_1`, `name_2`, ... this call has not used yet.
+///
+/// Collisions are resolved against the names written by this call only, not
+/// against what is on disk: the temp directory a row is materialised into is
+/// rewritten before every open, and a disk-based rule would grow a `_1` copy
+/// on each one.
+fn unique_in(name: String, used: &[String]) -> String {
+    if !used.contains(&name) {
+        return name;
+    }
+    let path = Path::new(&name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for counter in 1u32.. {
+        let candidate = format!("{stem}_{counter}{ext}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the counter is exhausted only after 4 billion identical names")
 }
 
 /// The body of one message, or `None` when the row itself is gone.
@@ -737,6 +777,45 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
         let plain = ingest(&fx, "inbox", 2, &email("plain", "Mon, 01 Jan 2024 09:00:00 +0000"));
         assert!(!find_by_id(&fx.store, plain).unwrap().unwrap().is_invite);
         assert!(attachments_for(&fx.store, plain).unwrap().is_empty());
+    }
+
+    /// Materialising is a write seam, so it sanitises the stored filename
+    /// rather than trusting ingest to have done it, and two attachments
+    /// sharing a name both survive.
+    ///
+    /// The hostile name is ingested as-is, which is what the column holds if
+    /// a future writer skips `parse`'s sanitisation: the guarantee under test
+    /// is that no byte lands outside `dest` whatever the column says.
+    #[test]
+    fn materialising_sanitises_the_stored_name_and_keeps_a_collision() {
+        let fx = fixture();
+        let att = |filename: &str, content: &[u8]| crate::parse::AttachmentData {
+            filename: filename.into(),
+            content: content.to_vec(),
+            content_id: None,
+        };
+        let mut e = email("files", "Mon, 01 Jan 2024 09:00:00 +0000");
+        e.attachments = vec![
+            att("../../escape.txt", b"hostile"),
+            att("notes.txt", b"first"),
+            att("notes.txt", b"second"),
+        ];
+        let id = ingest(&fx, "inbox", 1, &e);
+
+        let dest = TempDir::new().unwrap();
+        let files = materialise_attachments(&fx.store, &fx.blobs, id, dest.path()).unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![".._.._escape.txt", "notes.txt", "notes_1.txt"]);
+        for file in &files {
+            assert_eq!(file.parent().unwrap(), dest.path(), "{file:?}");
+        }
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"hostile");
+        assert_eq!(std::fs::read(&files[1]).unwrap(), b"first");
+        assert_eq!(std::fs::read(&files[2]).unwrap(), b"second");
     }
 
     /// The invite flag rides on the listing itself, so the badge costs no

@@ -27,16 +27,18 @@ use crate::types::EmailStatus;
 // Files materialised out of the store (#0052 scope items 8, 9 and 10)
 // ---------------------------------------------------------------------------
 
-/// The directory `mp open` materialises a row's attachments into: one per
-/// message row, under the system temp dir.
+/// A file the TUI renders out of a message rather than one the message
+/// carries: the browser rendition and the event source.
 ///
-/// The CLI's own name, deliberately. Opening the same message from both halves
-/// of the product then puts the same files in the same place, and the bytes
-/// are rewritten before every open, so a directory two accounts share (row ids
-/// are per-account) never hands the opener a stale file: only the paths just
-/// written are returned.
-fn attachment_temp_dir(row_id: i64) -> PathBuf {
-    std::env::temp_dir().join(format!("mailypoppins-{row_id}"))
+/// It lands in a `render/` subdirectory of the row's materialisation dir
+/// rather than beside its attachments: an attachment filename is sanitised of
+/// path separators, so it can never name a subdirectory, and a message
+/// carrying its own `message.html` cannot overwrite the rendition.
+fn render_temp_file(stem: &str, name: &str) -> Result<PathBuf> {
+    let dir = crate::parse::materialisation_dir(stem)?.join("render");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir.join(name))
 }
 
 /// The message under the cursor for a flow that reads its blobs, or `None`
@@ -77,7 +79,15 @@ pub(super) fn cursor_attachment_files(app: &mut App) -> Option<Vec<PathBuf>> {
 /// server-search hit that resolved to one.
 pub(super) fn row_attachment_files(app: &mut App, row_id: i64) -> Option<Vec<PathBuf>> {
     let (store, blobs) = store_for_mutation(app, "Attachments")?;
-    let dest = attachment_temp_dir(row_id);
+    // The CLI's own directory, through the CLI's own helper: `mp open` and
+    // `o` put the same row's files in the same private place.
+    let dest = match crate::parse::materialisation_dir(&row_id.to_string()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            app.set_status_level(format!("Attachments failed: {e:#}"), StatusLevel::Error);
+            return None;
+        }
+    };
     match crate::store::read::materialise_attachments(&store, &blobs, row_id, &dest) {
         Ok(files) => Some(files),
         Err(e) => {
@@ -99,7 +109,13 @@ pub(super) fn fetched_attachment_files(
     fetched: &crate::parse::FetchedEmail,
     index: usize,
 ) -> Option<Vec<PathBuf>> {
-    let dest = std::env::temp_dir().join(format!("mailypoppins-search-{index}"));
+    let dest = match crate::parse::materialisation_dir(&format!("search-{index}")) {
+        Ok(dir) => dir,
+        Err(e) => {
+            app.set_status_level(format!("Attachments failed: {e:#}"), StatusLevel::Error);
+            return None;
+        }
+    };
     match write_fetched_attachments(fetched, &dest) {
         Ok(files) => Some(files),
         Err(e) => {
@@ -132,10 +148,10 @@ fn write_fetched_attachments(
 /// The file build wrote a `.html` beside every received `.md` and the browser
 /// opened that one; after #0037 the markup is a blob, or the html part of the
 /// raw message, so it is materialised on demand into the same temp area the
-/// attachments use. `stem` names the file: the row id for a stored message,
-/// the hit's position for one that is not stored.
+/// attachments use. `stem` keys the directory: the row id for a stored
+/// message, the hit's position for one that is not stored.
 fn html_temp_file(html: &str, stem: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("mailypoppins-{stem}.html"));
+    let path = render_temp_file(stem, "message.html")?;
     std::fs::write(&path, html)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
@@ -872,17 +888,6 @@ pub(super) fn handle_action(
                 DraftFromSource::Reply { all: reply_all },
                 what,
             )?;
-        }
-        Action::Forward => {
-            // `w` opens the wizard (see `ComposeMode::Forward`); this arm is
-            // the direct path, kept for a caller that already has the row.
-            let Some(msg) = cursor_message(app, "Forward") else {
-                return Ok(());
-            };
-            let Some(source) = source_for_msg(app, msg, "Forward", true) else {
-                return Ok(());
-            };
-            write_draft_and_edit(app, terminal, &source, DraftFromSource::Forward, "Forward")?;
         }
         Action::Send => {
             // `mp send <selector>` in-process (#0052 scope item 3). The draft
@@ -1873,7 +1878,13 @@ pub(super) fn handle_action(
                 );
                 return Ok(());
             };
-            let path = std::env::temp_dir().join(format!("mailypoppins-{row_id}.ics"));
+            let path = match render_temp_file(&row_id.to_string(), "invite.ics") {
+                Ok(path) => path,
+                Err(e) => {
+                    app.set_status_level(format!("Open failed: {e:#}"), StatusLevel::Error);
+                    return Ok(());
+                }
+            };
             if let Err(e) = std::fs::write(&path, &ics) {
                 app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error);
                 return Ok(());
@@ -2841,18 +2852,47 @@ mod store_backed_drafts {
         _dir: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
+        previous_tmp: Option<String>,
+    }
+
+    /// The temp directory this test process materialises message files into.
+    ///
+    /// `parse::materialisation_dir` keys off `$TMPDIR`, so without the
+    /// override the file tests would write `/tmp/mailypoppins-<row id>` --
+    /// the very path a real `mp open` of that row uses, and the path a
+    /// parallel test run uses too.
+    ///
+    /// One directory per process rather than one per fixture, and never
+    /// removed while the process runs: a `tempfile::tempdir()` on another
+    /// test thread resolves `$TMPDIR` too, and a fixture that deleted its own
+    /// tree would pull that directory out from under it. Everything lands
+    /// under one `mailypoppins-tests/` parent, so the run's leftovers are
+    /// `rm -rf "${TMPDIR:-/tmp}/mailypoppins-tests"` rather than a scatter
+    /// among real ones.
+    fn test_temp_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join("mailypoppins-tests")
+                .join(std::process::id().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        })
     }
 
     impl Fixture {
         pub(super) fn new() -> Self {
             let guard = crate::config::data_dir_lock();
             let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+            let previous_tmp = std::env::var("TMPDIR").ok();
             let dir = tempfile::tempdir().unwrap();
             std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+            std::env::set_var("TMPDIR", test_temp_dir());
             Self {
                 _dir: dir,
                 _guard: guard,
                 previous,
+                previous_tmp,
             }
         }
 
@@ -2905,6 +2945,10 @@ mod store_backed_drafts {
             match &self.previous {
                 Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
                 None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+            }
+            match &self.previous_tmp {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
             }
         }
     }
@@ -3515,7 +3559,17 @@ mod store_backed_files {
         let files = cursor_attachment_files(&mut app).unwrap();
 
         assert_eq!(files.len(), 2, "{files:?}");
-        assert_eq!(files[0].parent().unwrap(), attachment_temp_dir(row.id));
+        // The name `mp open` uses, spelled out rather than read back off the
+        // helper: it is the CLI/TUI parity this test exists to pin.
+        let expected = std::env::temp_dir().join(format!("mailypoppins-{}", row.id));
+        assert_eq!(files[0].parent().unwrap(), expected);
+        // And it is private to this user (0700), because `$TMPDIR` is not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&expected).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        }
         let by_name: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())

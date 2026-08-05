@@ -366,3 +366,9 @@ The file build's TUI opened a received message, and a server-search hit, in `$ED
 After #0037 there is no such file, and the tempting port is to materialise the message into a temp file and open that: the window looks the same, the keystroke works again, and no status line says "cannot".
 It is worse than a decline, because the user's edits are accepted, saved, and dropped on the floor, which is the same family as a send that reports success on a failed submission.
 The rule the branch settled on: port a flow only where the artifact behind it is real, decline permanently and say why where it is not, and let a materialised copy carry a flow only when the flow is inspection rather than composition (the calendar's Open event source hands `$EDITOR` a copy of the invite's `.ics`, which is worth reading and was never meant to be written back) ([src/tui/actions.rs](../src/tui/actions.rs), #0052).
+
+## Overriding `$TMPDIR` per test wipes the temp dirs of every parallel test
+
+The store-backed file tests wrote into `/tmp/mailypoppins-<row id>`, which is the exact path a real `mp open` of that row uses, so a test run and a live session collided on the same directory.
+The obvious isolation, pointing `$TMPDIR` at the fixture's own tempdir and removing it on drop, is worse: `$TMPDIR` is process-wide, so every `tempfile::tempdir()` on another test thread lands inside the fixture's tree and disappears mid-test when the fixture drops.
+The isolation has to outlive any single test: one directory per process, created once and never removed while the process runs, with the per-fixture part only setting and restoring the variable ([src/tui/actions.rs](../src/tui/actions.rs), #0052 review).

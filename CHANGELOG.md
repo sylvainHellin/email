@@ -28,7 +28,12 @@ All notable changes to this project are documented in this file.
   that never synced is served from the fetch the overlay is already showing.
   Two flows decline permanently and say why: `$EDITOR` on a received message
   and Open on a search hit, both of which used to open a `.md` file that no
-  longer exists.
+  longer exists. The temp directories those files are materialised into are
+  created private to the user (0700) and refused if something else already
+  holds the path, so a predictable name under a shared `/tmp` cannot be used to
+  intercept message bytes; and `A` / `D` over a received-mail selection now say
+  the selection holds no draft instead of asking to approve N drafts and then
+  approving none.
 - **`mp://` selectors and the drafts index (#0050).** Every command that names a
   message now takes a selector, `mp://<account>/<mailbox>/<key>`, and never a
   file path. The key is the Message-ID without angle brackets for received mail

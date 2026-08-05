@@ -506,12 +506,11 @@ impl App {
             A::Approve => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let count = self.selection.len();
-                    self.overlay = Overlay::Confirm(ConfirmDialog {
-                        title: format!("Approve {} drafts?", count),
-                        detail: format!("{} selected drafts", count),
-                        action: ConfirmAction::Approve,
-                    });
+                    self.confirm_draft_batch(
+                        "Approve",
+                        |count| format!("Approve {count} drafts?"),
+                        ConfirmAction::Approve,
+                    );
                 } else {
                     self.push_action(Action::Approve);
                 }
@@ -519,12 +518,11 @@ impl App {
             A::MarkDraft => {
                 self.pending_prefix = None;
                 if !self.selection.is_empty() {
-                    let count = self.selection.len();
-                    self.overlay = Overlay::Confirm(ConfirmDialog {
-                        title: format!("Mark {} drafts as draft?", count),
-                        detail: format!("{} selected drafts", count),
-                        action: ConfirmAction::MarkDraft,
-                    });
+                    self.confirm_draft_batch(
+                        "Mark as draft",
+                        |count| format!("Mark {count} drafts as draft?"),
+                        ConfirmAction::MarkDraft,
+                    );
                 } else {
                     self.push_action(Action::MarkDraft);
                 }
@@ -661,6 +659,39 @@ impl App {
         }
 
         None
+    }
+
+    /// Open the confirmation for a batch that writes to draft files, or say
+    /// why there is nothing to confirm.
+    ///
+    /// The batch takes the drafts half of the selection (see
+    /// [`Self::handle_confirm_key`]), so a selection holding no draft key --
+    /// `A` over a received-mail selection, which the keymap allows -- has
+    /// nothing to approve. Without this guard the dialog opened on the full
+    /// count and the batch then reported "Approved 0 drafts", asking a
+    /// question whose only honest answer was already known.
+    fn confirm_draft_batch(
+        &mut self,
+        what: &str,
+        title: impl Fn(usize) -> String,
+        action: ConfirmAction,
+    ) {
+        let count = self
+            .selection
+            .iter()
+            .filter(|key| key.draft().is_some())
+            .count();
+        if count == 0 {
+            self.set_status(format!(
+                "{what} needs drafts; the selection has no draft in it"
+            ));
+            return;
+        }
+        self.overlay = Overlay::Confirm(ConfirmDialog {
+            title: title(count),
+            detail: format!("{count} selected drafts"),
+            action,
+        });
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -2348,6 +2379,34 @@ mod tests {
             other => panic!("expected BatchApprove, got {other:?}"),
         }
         assert!(app.selection.is_empty(), "the confirm drained the selection");
+    }
+
+    /// `A` and `D` over a received-mail selection ask nothing: the batch takes
+    /// the drafts half of the set, so a selection with no draft in it would
+    /// have confirmed "Approve 4 drafts?" and then reported "Approved 0
+    /// drafts".
+    #[test]
+    fn a_selection_without_drafts_never_opens_the_draft_confirmation() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.selection.len(), 4, "the received rows are selected");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Approve needs drafts; the selection has no draft in it")
+        );
+        assert!(app.pending_actions.is_empty(), "and nothing is queued");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Mark as draft needs drafts; the selection has no draft in it")
+        );
+        assert!(app.pending_actions.is_empty(), "and nothing is queued");
+        assert_eq!(app.selection.len(), 4, "the selection is left alone");
     }
 
     /// A selection cannot mix the two namespaces in practice -- a mailbox

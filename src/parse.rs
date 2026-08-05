@@ -397,6 +397,76 @@ pub fn list_attachments(email_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The temp directory a message's files are materialised into, created
+/// private to the current user.
+///
+/// One function for both halves of the product: `mp open` and the list's `o`
+/// put the same message's files in the same place, and the bytes are
+/// rewritten before every open, so a directory two accounts share (row ids
+/// are per-account) never hands the opener a stale file -- only the paths
+/// just written are returned. `stem` keys it: the row id for a stored
+/// message, `search-<n>` for a hit that resolved to no row.
+///
+/// The name is predictable, so the directory is not trusted: on a shared host
+/// `$TMPDIR` is world-writable, and a directory (or a symlink to one) an
+/// attacker created first would otherwise receive the message bytes. It is
+/// created 0o700, a pre-existing one must be a real directory owned by this
+/// user, and a loose mode left by an older build is tightened rather than
+/// used.
+pub fn materialisation_dir(stem: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("mailypoppins-{stem}"));
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!("creating {}: {e}", dir.display()));
+        }
+    }
+    // `symlink_metadata`, not `metadata`: a symlink pointing at a directory
+    // someone else owns must be rejected, not followed.
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "{} exists and is not a directory; refusing to materialise message files there",
+            dir.display()
+        );
+    }
+    // Safe: getuid() is always defined on POSIX, never fails.
+    let uid = unsafe { libc_getuid() };
+    if meta.uid() != uid {
+        anyhow::bail!(
+            "{} is owned by another user; refusing to materialise message files there",
+            dir.display()
+        );
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("restricting {} to 0700: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    // WSL is unix; native Windows is not a target, so there is no mode to set.
+    fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))
+}
+
 /// Open a file with the system default application (macOS `open`).
 pub fn open_file_with_system(path: &Path) -> Result<()> {
     let status = std::process::Command::new("open")
@@ -1216,6 +1286,49 @@ mod tests {
         let result = save_attachment(&source, &dest_subdir).unwrap();
         assert!(result.exists());
         assert_eq!(std::fs::read(&result).unwrap(), b"data");
+    }
+
+    /// The materialisation directory is created private to this user, and a
+    /// path an attacker could have put there first is refused rather than
+    /// written into: `$TMPDIR` is world-writable and the name is predictable.
+    ///
+    /// `create_private_dir` is exercised directly rather than through
+    /// `materialisation_dir`, which would need `$TMPDIR` moved under the whole
+    /// test process.
+    #[cfg(unix)]
+    #[test]
+    fn a_materialisation_dir_is_private_and_never_an_attackers_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // Created fresh: 0700, whatever the umask says.
+        let fresh = root.path().join("mailypoppins-1");
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700, "{:o}", mode_of(&fresh));
+
+        // Ours already, but left group- and world-readable by an older build:
+        // tightened, not used as found.
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700, "{:o}", mode_of(&fresh));
+
+        // A file where the directory should be: refused.
+        let as_file = root.path().join("mailypoppins-2");
+        fs::write(&as_file, b"not a directory").unwrap();
+        let err = create_private_dir(&as_file).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink pointing at a directory elsewhere: refused, not followed,
+        // so the message bytes cannot be redirected out of the temp area.
+        let elsewhere = root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let link = root.path().join("mailypoppins-3");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
     }
 
     #[test]
