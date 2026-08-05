@@ -7,6 +7,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 ## Now
 
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
+- [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
 
 ## Next
 
