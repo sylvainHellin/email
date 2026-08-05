@@ -9,7 +9,15 @@ use gray_matter::Matter;
 use serde::Deserialize;
 
 use crate::parse::{FetchedEmail, scan_mailbox_message_ids};
-use crate::imap_client::{load_mailbox_states_cache, MailboxState, MessageIdIndex};
+
+/// In-memory index of the `.md` tree: `local_dir -> {message_id -> file_path}`.
+///
+/// A read-path structure: it is what lets the TUI resolve a Message-ID to a
+/// file without re-walking the mailbox directories. Ingest no longer consumes
+/// it (the store answers that question with a query), and it retires with the
+/// file layer in #0038.
+pub type MessageIdIndex =
+    std::collections::HashMap<PathBuf, std::collections::HashMap<String, PathBuf>>;
 
 // ---------------------------------------------------------------------------
 // EmailEntry (ported from beautifulmail's email.rs)
@@ -268,9 +276,6 @@ pub struct AccountState {
     /// `message_id_index` is empty (or partially populated) and
     /// sync/fetch actions are queued via the existing `bg_count` gate.
     pub indexing: bool,
-    /// Last-seen IMAP mailbox states, keyed by role (e.g. "inbox", "archive").
-    /// Used to decide whether reconciliation is needed on quick sync.
-    pub mailbox_states: std::collections::HashMap<String, MailboxState>,
 }
 
 impl AccountState {
@@ -328,16 +333,6 @@ impl AccountState {
         // via the existing `bg_count` gate in `tui/actions.rs`.
         let message_id_index: MessageIdIndex = std::collections::HashMap::new();
 
-        // Load persisted IMAP mailbox states so the first quick sync after
-        // launch can take the reconcile-skip branch (avoiding the ~14 s
-        // full Message-ID scan that would otherwise fire when prev_states
-        // is empty). `uid_validity` mismatch on the next SELECT falls back
-        // to a full reconcile, so this is safe across other-client
-        // mutations / mailbox renumbering.
-        let account_root = crate::config::account_dir(&account_config.name);
-        let mailbox_states = load_mailbox_states_cache(&account_root);
-        span.mark(&format!("loaded {} mailbox state(s)", mailbox_states.len()));
-
         Self {
             account_config,
             imap_config,
@@ -366,7 +361,6 @@ impl AccountState {
             has_unseen: false,
             message_id_index,
             indexing: true,
-            mailbox_states,
         }
     }
 
@@ -381,27 +375,14 @@ pub enum BgResult {
     Fetch {
         account_index: usize,
         result: Result<String, String>,
-        /// Updated message ID index after sync (for merging back into AccountState).
-        new_index: Option<MessageIdIndex>,
-        /// Updated mailbox states from IMAP SELECT (for state-based reconciliation).
-        new_mailbox_states: Option<std::collections::HashMap<String, MailboxState>>,
-        /// Local mailbox directories the sync actually modified on disk.
-        /// `Some(vec![])` means the sync was a no-op (skip cache invalidation
-        /// and reload entirely); `None` means unknown (fall back to
-        /// invalidating everything, the pre-optimization behavior).
-        touched_dirs: Option<Vec<PathBuf>>,
         /// Sender + subject of every genuinely new inbox email the sync
-        /// saved. Drives the opt-in desktop notification (#0009); empty
+        /// ingested. Drives the opt-in desktop notification (#0009); empty
         /// on failure or when nothing new arrived.
         new_inbox_mail: Vec<crate::notify::NewMailMeta>,
     },
     Sync {
         account_index: usize,
         result: Result<String, String>,
-        /// Updated message ID index after full sync.
-        new_index: Option<MessageIdIndex>,
-        /// Updated mailbox states from IMAP SELECT.
-        new_mailbox_states: Option<std::collections::HashMap<String, MailboxState>>,
     },
     Send {
         account_index: usize,

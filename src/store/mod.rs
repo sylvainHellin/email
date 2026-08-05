@@ -154,6 +154,10 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
         .context("setting busy_timeout")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("setting synchronous = NORMAL")?;
+    // Off by default in SQLite, and `message_blobs` leans on it: the cascade
+    // is what keeps a message's blob-reference list from outliving the row.
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .context("setting foreign_keys = ON")?;
     Ok(())
 }
 
@@ -192,13 +196,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_yields_schema_v1() {
+    fn empty_directory_yields_the_current_schema() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("acct").join("store.sqlite3");
         let store = Store::open(&path).unwrap();
 
         assert!(path.exists(), "store file was not created");
-        assert_eq!(store.schema_version().unwrap(), Some(1));
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
         assert!(schema::all_tables_present(store.conn()).unwrap());
     }
 

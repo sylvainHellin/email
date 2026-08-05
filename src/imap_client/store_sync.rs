@@ -1,0 +1,239 @@
+//! IMAP sync, store-only.
+//!
+//! Replaces the `.md`-writing orchestrator: one IMAP session per sync, and
+//! every message that comes back goes through [`crate::ingest`] into the
+//! per-account `store.sqlite3` plus its blob store. Nothing is written to the
+//! mailbox directories.
+//!
+//! Three things the old path did are gone with it, because the store makes
+//! them unnecessary rather than merely cheaper:
+//!
+//! - the local Message-ID scan that decided what was new (identity is the UID,
+//!   and the store answers "which UIDs do I hold" with one query);
+//! - the dedup pass over the mailbox directory (the unique constraint on
+//!   `(account, mailbox, uid)` makes a duplicate impossible);
+//! - the EXISTS/UIDNEXT reconciliation heuristic and its `mailbox-states.json`
+//!   cache (superseded by `sync_cursors`; server-side moves and deletes land
+//!   with the reconcile work in #0038).
+
+use anyhow::{anyhow, Result};
+use log::{info, warn};
+
+use super::fetch::fetch_new_raw_on_session;
+use super::open_imap_session;
+use crate::config::ImapConfig;
+use crate::ingest::{self, IngestInput, MailboxCursor};
+use crate::parse::parse_rfc822_to_fetched_email;
+use crate::store::{BlobStore, Store};
+use crate::timing::TimingSpan;
+
+/// A mailbox to sync: the configured role and the name on the server.
+///
+/// The local directory and `.md` status the old struct carried are gone: the
+/// ingest path has no filesystem destination.
+#[derive(Debug, Clone)]
+pub struct SyncTarget {
+    pub role: String,
+    pub server_name: String,
+}
+
+/// One fresh address observation captured from a newly-ingested message.
+/// Consumed by the contacts-index hook after a successful sync.
+#[derive(Debug, Clone)]
+pub struct FreshObservation {
+    /// Mailbox role: "inbox", "archive", "sent", or "extra".
+    pub role: String,
+    pub from: String,
+    pub to: String,
+    pub cc: Option<String>,
+    /// RFC-2822 date header from the email, or empty if unavailable.
+    pub date: String,
+}
+
+/// Results from a sync run.
+#[derive(Debug, Default)]
+pub struct SyncResult {
+    /// Messages ingested as new rows.
+    pub saved: usize,
+    /// Messages the store already held (pass 1 hits).
+    pub skipped: usize,
+    /// Rows whose `\Seen` flag was updated from the server.
+    pub read_updated: usize,
+    /// Rows rebound to a new UID after a UIDVALIDITY reset.
+    pub uid_rebound: usize,
+    /// Address observations from newly-ingested messages, ready to be merged
+    /// into the contacts index by the caller. Empty on `dry_run`.
+    pub fresh_observations: Vec<FreshObservation>,
+    /// Sender + subject of every genuinely new inbox message (#0009).
+    pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
+    /// `true` when this sync ingested at least one `METHOD:REPLY` iMIP invite
+    /// (#0030).
+    pub saw_reply_invite: bool,
+}
+
+/// Fetch every target mailbox on one session and ingest what comes back.
+///
+/// `dry_run` opens the session and counts what *would* be ingested without
+/// touching the store or the blob directory.
+pub async fn sync_mailboxes(
+    imap_config: &ImapConfig,
+    account_name: &str,
+    targets: &[SyncTarget],
+    limit: usize,
+    dry_run: bool,
+) -> Result<SyncResult> {
+    info!(
+        "sync_mailboxes: account={account_name}, {} targets, limit={limit}, dry_run={dry_run}",
+        targets.len(),
+    );
+    let span_label = if limit < usize::MAX {
+        "sync_mailboxes:quick"
+    } else {
+        "sync_mailboxes:full"
+    };
+    let mut span = TimingSpan::with_context(span_label, format!("{} targets", targets.len()));
+
+    let store = Store::open_account(account_name)?;
+    let blobs = BlobStore::for_account(account_name);
+    let mut session = open_imap_session(imap_config).await?;
+    span.mark("session_open");
+
+    let mut result = SyncResult::default();
+
+    for target in targets {
+        let known = ingest::known_uids(&store, account_name, &target.role)?;
+        let fetched = fetch_new_raw_on_session(
+            &mut session,
+            &target.server_name,
+            Some(limit),
+            &known,
+        )
+        .await;
+
+        let (new_messages, skipped, known_flags, state) = match fetched {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Failed to sync mailbox '{}': {}. Continuing with next.",
+                    target.server_name, e
+                );
+                continue;
+            }
+        };
+        result.skipped += skipped;
+
+        if dry_run {
+            result.saved += new_messages.len();
+            continue;
+        }
+
+        for message in &new_messages {
+            let Some(mut email) = parse_rfc822_to_fetched_email(&message.raw) else {
+                warn!(
+                    "Skipping UID {} in '{}': the message did not parse",
+                    message.uid, target.server_name
+                );
+                continue;
+            };
+            email.is_read = message.is_read;
+
+            let outcome = ingest::ingest_message(
+                &store,
+                &blobs,
+                &IngestInput {
+                    account: account_name,
+                    mailbox: &target.role,
+                    uid: message.uid as i64,
+                    email: &email,
+                    raw: Some(&message.raw),
+                },
+            );
+            match outcome {
+                Ok(outcome) => {
+                    if outcome.inserted {
+                        result.saved += 1;
+                    }
+                    if outcome.uid_rebound {
+                        result.uid_rebound += 1;
+                    }
+                    if outcome.inserted && target.role.eq_ignore_ascii_case("inbox") {
+                        result.new_inbox_mail.push(crate::notify::NewMailMeta::new(
+                            &email.from,
+                            &email.subject,
+                        ));
+                    }
+                    if email
+                        .event
+                        .as_ref()
+                        .and_then(|ev| ev.method.as_deref())
+                        .is_some_and(|m| m.eq_ignore_ascii_case("REPLY"))
+                    {
+                        result.saw_reply_invite = true;
+                    }
+                    result.fresh_observations.push(FreshObservation {
+                        role: target.role.clone(),
+                        from: email.from.clone(),
+                        to: email.to.clone(),
+                        cc: email.cc.clone(),
+                        date: email.date.clone(),
+                    });
+                }
+                Err(e) => warn!(
+                    "Failed to ingest UID {} from '{}': {:#}",
+                    message.uid, target.server_name, e
+                ),
+            }
+        }
+
+        for (uid, is_read) in known_flags {
+            match ingest::apply_seen_flag(&store, account_name, &target.role, uid as i64, is_read) {
+                Ok(true) => result.read_updated += 1,
+                Ok(false) => {}
+                Err(e) => warn!("Failed to apply the read flag for UID {uid}: {e:#}"),
+            }
+        }
+
+        let highest_uid = new_messages.iter().map(|m| m.uid as i64).max();
+        ingest::record_mailbox_cursor(
+            &store,
+            account_name,
+            &target.role,
+            &MailboxCursor {
+                uidvalidity: state.uid_validity.map(|v| v as i64),
+                last_uid: highest_uid.or_else(|| state.uid_next.map(|n| n as i64 - 1)),
+                uidnext: state.uid_next.map(|v| v as i64),
+                exists: Some(state.exists as i64),
+                deltalink: None,
+            },
+        )?;
+    }
+
+    span.mark("ingest");
+    session.logout().await.ok();
+    span.mark("logout");
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// list_mailboxes
+// ---------------------------------------------------------------------------
+
+pub async fn list_mailboxes(imap_config: &ImapConfig) -> Result<Vec<String>> {
+    use futures::TryStreamExt;
+
+    let mut session = open_imap_session(imap_config).await?;
+
+    let mailboxes: Vec<_> = session
+        .list(None, Some("*"))
+        .await
+        .map_err(|e| anyhow!("Failed to list mailboxes: {}", e))?
+        .try_collect()
+        .await
+        .map_err(|e| anyhow!("Failed to collect mailboxes: {}", e))?;
+
+    let names: Vec<String> = mailboxes.iter().map(|m| m.name().to_string()).collect();
+
+    session.logout().await.ok();
+    Ok(names)
+}

@@ -227,3 +227,18 @@ A caller that releases and then rolls back therefore keeps a row whose `body_blo
 That direction is survivable because the server is truth (a missing blob reads as evicted and is re-fetched), while the opposite direction is not: a committed row pointing at bytes that were never written is a hole in the read path.
 Same reasoning drives the write order on the ingest side, where the blob file is written *before* the transaction that acquires the reference, so a crash leaves an unreferenced orphan rather than a dangling hash.
 The temp file also lives in the destination fan-out directory (`blobs/ab/cd/.<hash>.tmp.<pid>.<n>`), not in a shared temp root, so the rename stays on one filesystem and an interrupted write is invisible to both `contains` and `read`.
+
+## FTS5 external-content: delete before you release the blob you deleted from
+
+`messages_fts` is external-content over a `messages` table that has no
+`body_text` column, so `'rebuild'` and a plain `DELETE FROM messages_fts` both
+fail and the only way to remove an entry is the FTS `'delete'` command with the
+*original* column values.
+On re-ingest those values include the old body text, which lives in the old body
+blob, and `BlobStore::release` unlinks that blob the instant its refcount hits
+zero.
+Releasing the old references before issuing the `'delete'` therefore makes the
+old body unreadable and leaves a stale FTS entry behind that no later write can
+remove (#0037 unit 4a).
+Order is: write the row, delete the old FTS entry, re-point the blob references,
+insert the new FTS entry.

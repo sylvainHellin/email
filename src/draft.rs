@@ -2331,8 +2331,15 @@ mod tests {
         let draft_path =
             create_forward_draft(&src, "me@example.com", Some(&drafts)).unwrap();
 
-        // Move the source from inbox to archive (this also moves _attachments/).
-        crate::sync::move_local_email(&src, &archive, "inbox", "archived").unwrap();
+        // Move the source from inbox to archive, attachments directory
+        // included (the `.md` mover that used to do this went with the
+        // legacy sync in #0037; the draft contract under test is the same).
+        let dest = archive.join(src.file_name().unwrap());
+        fs::rename(&src, &dest).unwrap();
+        let att_src = crate::parse::attachments_dir_for(&src);
+        if att_src.is_dir() {
+            fs::rename(&att_src, crate::parse::attachments_dir_for(&dest)).unwrap();
+        }
 
         // Re-parse the draft and verify every attachment path still exists.
         let draft = parse_email_draft(&draft_path).unwrap();

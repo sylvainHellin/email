@@ -1,32 +1,80 @@
 //! End-to-end iMIP receive tests (ticket #0027): raw RFC822 MIME -> parse ->
-//! save. Verifies that `text/calendar` parts are detected, the sidecar `.ics`
-//! is written next to the email, the `event:` frontmatter block is populated,
-//! and that a plain email without a calendar part is stored exactly as before.
+//! store ingest. Verifies that `text/calendar` parts are classified as invites
+//! or as ordinary attachments, and that the invite payload reaches the store as
+//! the `invite.ics` attachment blob without a duplicate copy.
+//!
+//! Rewritten for #0037 unit 4a: the assertions used to read the `.md` file and
+//! its sidecar, which no ingest writes any more, so they now read the
+//! `message_blobs` rows and the blob bytes. The classification being asserted
+//! is unchanged.
 
-use email::parse::{
-    parse_rfc822_to_fetched_email, save_fetched_emails, CALENDAR_SIDECAR_NAME,
-};
-use email::types::InboxFrontmatter;
-use gray_matter::{engine::YAML, Matter};
-use std::fs;
+use email::parse::{parse_rfc822_to_fetched_email, CALENDAR_SIDECAR_NAME};
 use tempfile::tempdir;
 
-fn parse_frontmatter(content: &str) -> InboxFrontmatter {
-    let matter = Matter::<YAML>::new();
-    let parsed = matter.parse(content);
-    parsed.data.unwrap().deserialize().unwrap()
+/// Ingest one parsed message into a throwaway store and expose what the row
+/// references, so the iMIP classification can be asserted on what actually
+/// landed instead of on a `.md` file that is no longer written (#0037).
+struct Ingested {
+    _tmp: tempfile::TempDir,
+    store: email::store::Store,
+    blobs: email::store::BlobStore,
+    row: i64,
 }
 
-/// Read the single saved .md file in a mailbox directory.
-fn read_only_md(dir: &std::path::Path) -> (std::path::PathBuf, String) {
-    let md = fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "md"))
-        .expect("expected one .md file");
-    let content = fs::read_to_string(&md).unwrap();
-    (md, content)
+fn ingest(email: &email::parse::FetchedEmail, mailbox: &str) -> Ingested {
+    let tmp = tempdir().unwrap();
+    let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+    let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
+    let outcome = email::ingest::ingest_message(
+        &store,
+        &blobs,
+        &email::ingest::IngestInput {
+            account: "acct",
+            mailbox,
+            uid: 1,
+            email,
+            raw: None,
+        },
+    )
+    .unwrap();
+    Ingested { _tmp: tmp, store, blobs, row: outcome.row_id }
+}
+
+impl Ingested {
+    /// Attachment blob filenames in ingest order.
+    fn attachment_names(&self) -> Vec<String> {
+        let mut stmt = self
+            .store
+            .conn()
+            .prepare(
+                "SELECT filename FROM message_blobs
+                 WHERE message_row = ?1 AND kind = 'attachment' ORDER BY ordinal",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([self.row], |r| r.get::<_, Option<String>>(0))
+            .unwrap();
+        rows.map(|r| r.unwrap().unwrap_or_default()).collect()
+    }
+
+    /// Bytes of the attachment blob stored under `filename`.
+    fn attachment_bytes(&self, filename: &str) -> Option<Vec<u8>> {
+        let hash: Option<String> = self
+            .store
+            .conn()
+            .query_row(
+                "SELECT hash FROM message_blobs
+                 WHERE message_row = ?1 AND kind = 'attachment' AND filename = ?2",
+                (self.row, filename),
+                |r| r.get(0),
+            )
+            .ok();
+        hash.map(|h| {
+            self.blobs
+                .read(&email::store::blobs::BlobHash::parse(&h).unwrap())
+                .unwrap()
+        })
+    }
 }
 
 // Outlook-style: multipart/alternative with an inline text/calendar REQUEST
@@ -230,8 +278,6 @@ Content-Type: text/html; charset=UTF-8\r
 
 #[test]
 fn outlook_inline_request_saves_sidecar_and_event() {
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(OUTLOOK_INLINE_REQUEST.as_bytes()).unwrap();
     assert!(email.calendar_ics.is_some());
@@ -246,37 +292,20 @@ fn outlook_inline_request_saves_sidecar_and_event() {
     assert_eq!(ev.rsvp, "needs-action");
     assert_eq!(ev.attendees.len(), 1);
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-
-    // Sidecar written next to the email in its attachments dir.
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    let sidecar = att_dir.join(CALENDAR_SIDECAR_NAME);
-    assert!(sidecar.exists(), "sidecar .ics should exist");
-    let ics = fs::read_to_string(&sidecar).unwrap();
+    // The invite lands as the sidecar-named attachment blob, and as the only
+    // attachment: the inline calendar part is never stored twice.
+    let ingested = ingest(&email, "inbox");
+    assert_eq!(ingested.attachment_names(), vec![CALENDAR_SIDECAR_NAME.to_string()]);
+    let ics = String::from_utf8(
+        ingested.attachment_bytes(CALENDAR_SIDECAR_NAME).expect("sidecar blob"),
+    )
+    .unwrap();
     assert!(ics.contains("UID:outlook-uid-1@tum.de"));
-
-    // Frontmatter carries the event block.
-    assert!(content.contains("event:"));
-    assert!(content.contains("uid: outlook-uid-1@tum.de"));
-    assert!(content.contains("method: REQUEST"));
-    assert!(content.contains("start: 2026-07-20T14:00:00+02:00"));
-    assert!(content.contains("rsvp: needs-action"));
-
-    // The inline calendar part is NOT stored as a duplicate attachment, and the
-    // frontmatter does not claim attachments.
-    let fm = parse_frontmatter(&content);
-    assert!(fm.attachments.is_none());
-    assert!(!att_dir.join("invite-1.ics").exists());
+    assert!(ics.contains("METHOD:REQUEST"));
 }
 
 #[test]
 fn google_ics_attachment_request_saves_sidecar_and_event() {
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(GOOGLE_ICS_ATTACHMENT_REQUEST.as_bytes()).unwrap();
     let ev = email.event.clone().expect("event parsed");
@@ -284,24 +313,9 @@ fn google_ics_attachment_request_saves_sidecar_and_event() {
     assert_eq!(ev.start.as_deref(), Some("2026-07-20T12:00:00Z"));
     assert_eq!(ev.recurrence, "Weekly on Monday");
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    assert!(att_dir.join(CALENDAR_SIDECAR_NAME).exists());
-    assert!(content.contains("recurrence: Weekly on Monday"));
-
-    // The `.ics` attachment is stored as the sidecar, never as a regular
-    // attachment file, so there is no `invite.ics` duplicate outside the sidecar.
-    let entries: Vec<String> = fs::read_dir(&att_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(entries, vec![CALENDAR_SIDECAR_NAME.to_string()]);
+    // The `.ics` attachment becomes the sidecar blob, never a second copy.
+    let ingested = ingest(&email, "inbox");
+    assert_eq!(ingested.attachment_names(), vec![CALENDAR_SIDECAR_NAME.to_string()]);
 }
 
 #[test]
@@ -314,8 +328,6 @@ fn malformed_calendar_part_stays_a_regular_attachment() {
     // bytes are preserved as a regular calendar attachment instead (previously
     // it was lifted to the sidecar -- expectation intentionally changed; the new
     // behavior loses no bytes and is more correct).
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(MALFORMED_INVITE.as_bytes()).unwrap();
     assert!(email.calendar_ics.is_none(), "not lifted to a sidecar");
@@ -333,24 +345,16 @@ fn malformed_calendar_part_stays_a_regular_attachment() {
         "original bytes preserved intact"
     );
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
+    let ingested = ingest(&email, "inbox");
     assert!(
-        !att_dir.join(CALENDAR_SIDECAR_NAME).exists(),
-        "no sidecar for a non-invite calendar part"
+        ingested.attachment_bytes(CALENDAR_SIDECAR_NAME).is_none(),
+        "no sidecar blob for a non-invite calendar part"
     );
-    assert!(!content.contains("event:"), "no event block for a non-invite");
+    assert_eq!(ingested.attachment_names().len(), 1);
 }
 
 #[test]
 fn invite_plus_shared_ics_lifts_invite_and_keeps_document() {
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(INVITE_PLUS_SHARED_ICS.as_bytes()).unwrap();
     // The invite is lifted to the sidecar and parsed into an event block.
@@ -371,21 +375,20 @@ fn invite_plus_shared_ics_lifts_invite_and_keeps_document() {
         "the shared export, not the invite, is the attachment"
     );
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    assert!(att_dir.join(CALENDAR_SIDECAR_NAME).exists(), "sidecar written");
-    assert!(att_dir.join("my-calendar.ics").exists(), "document written");
-    assert!(content.contains("event:"));
+    let ingested = ingest(&email, "inbox");
+    assert_eq!(
+        ingested.attachment_names(),
+        vec![CALENDAR_SIDECAR_NAME.to_string(), "my-calendar.ics".to_string()],
+        "invite first as the sidecar, then the shared document"
+    );
+    assert!(ingested
+        .attachment_bytes("my-calendar.ics")
+        .unwrap()
+        .starts_with(b"BEGIN:VCALENDAR"));
 }
 
 #[test]
 fn non_imip_ics_export_is_a_plain_attachment() {
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(SHARED_ICS_EXPORT_ONLY.as_bytes()).unwrap();
     // No METHOD -> not an invite: no sidecar, no event block.
@@ -395,44 +398,34 @@ fn non_imip_ics_export_is_a_plain_attachment() {
     assert_eq!(email.attachments.len(), 1);
     assert_eq!(email.attachments[0].filename, "schedule.ics");
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    assert!(
-        !att_dir.join(CALENDAR_SIDECAR_NAME).exists(),
-        "no invite.ics sidecar"
-    );
-    assert!(att_dir.join("schedule.ics").exists(), "kept as attachment");
-    assert!(!content.contains("event:"));
+    let ingested = ingest(&email, "inbox");
+    assert_eq!(ingested.attachment_names(), vec!["schedule.ics".to_string()]);
+    assert!(ingested.attachment_bytes(CALENDAR_SIDECAR_NAME).is_none());
 }
 
 #[test]
 fn plain_multipart_email_is_unchanged() {
-    let tmp = tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
 
     let email = parse_rfc822_to_fetched_email(PLAIN_MULTIPART.as_bytes()).unwrap();
     assert!(email.calendar_ics.is_none());
     assert!(email.event.is_none());
     assert!(!email.has_attachments);
 
-    save_fetched_emails(&[email], &inbox, "inbox").unwrap();
-    let (md, content) = read_only_md(&inbox);
-
-    assert!(!content.contains("event:"));
-    // No attachments directory is created for a plain email.
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    assert!(!att_dir.exists());
-
-    let fm = parse_frontmatter(&content);
-    assert!(fm.event.is_none());
-    assert!(fm.attachments.is_none());
+    let ingested = ingest(&email, "inbox");
+    assert!(
+        ingested.attachment_names().is_empty(),
+        "a plain email references no attachment blobs"
+    );
+    let has_attachments: i64 = ingested
+        .store
+        .conn()
+        .query_row(
+            "SELECT has_attachments FROM messages WHERE id = ?1",
+            [ingested.row],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_attachments, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -514,128 +507,19 @@ fn sent_invite_roundtrips_through_receive_parser() {
     assert_eq!(ev.attendees[1].address, "b@example.com");
     assert!(email.calendar_ics.is_some(), "sidecar bytes carried");
 
-    // Save to a mailbox and confirm the sidecar + event block land on disk.
-    let tmp = tempdir().unwrap();
-    let sent = tmp.path().join("acct").join("sent");
-    save_fetched_emails(&[email], &sent, "sent").unwrap();
-    let (md, content) = read_only_md(&sent);
-    let att_dir = md.with_file_name(format!(
-        "{}_attachments",
-        md.file_stem().unwrap().to_string_lossy()
-    ));
-    assert!(att_dir.join(CALENDAR_SIDECAR_NAME).exists(), "sidecar written");
-    assert!(content.contains("event:"));
-    assert!(content.contains(&format!("uid: {}", uid)));
-    assert!(content.contains("method: REQUEST"));
+    // Ingest into the store and confirm the sidecar bytes are the ones kept.
+    let ingested = ingest(&email, "sent");
+    let ics = String::from_utf8(
+        ingested.attachment_bytes(CALENDAR_SIDECAR_NAME).expect("sidecar blob"),
+    )
+    .unwrap();
+    assert!(ics.contains(&format!("UID:{uid}")));
+    assert!(ics.contains("METHOD:REQUEST"));
 }
 
-/// Full-rescan reconciliation (#0030) through the real save path.
-///
-/// Builds a sent REQUEST invite and an incoming REPLY with the same UID via the
-/// live iMIP builders, saves both to disk through `save_fetched_emails` (the
-/// production writer that emits the sidecar + `event:` block), then runs
-/// `reconcile_account` over the account root and asserts the sent invite's
-/// attendee status flips. A second run must be byte-identical (idempotent).
-#[test]
-fn rescan_reconciles_reply_into_sent_invite_and_is_idempotent() {
-    use chrono::{TimeZone, Utc};
-    use email::invite::{
-        build_invite_ics, build_reply_ics, generate_uid, reply_context_from_ics, InviteSpec, Rsvp,
-    };
-    use email::reconcile::reconcile_account;
-    use email::send::build_invite_mime_body;
-    use lettre::message::Message;
-
-    let organizer = "chair@tum.de";
-    let uid = generate_uid(organizer);
-    let spec = InviteSpec {
-        uid: uid.clone(),
-        organizer: organizer.to_string(),
-        attendees: vec!["a@example.com".to_string(), "b@example.com".to_string()],
-        summary: "LOC Day planning".to_string(),
-        start: Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap(),
-        end: Utc.with_ymd_and_hms(2026, 7, 20, 13, 0, 0).unwrap(),
-        location: Some("Room 4.12".to_string()),
-        description: None,
-    };
-    let request_ics = build_invite_ics(&spec).unwrap();
-
-    // --- Sent REQUEST invite (organizer's Sent copy) ---
-    let req_body = build_invite_mime_body("You are invited.", String::new(), &request_ics);
-    let req_msg: Message = Message::builder()
-        .from("Chair <chair@tum.de>".parse().unwrap())
-        .to("a@example.com".parse().unwrap())
-        .cc("b@example.com".parse().unwrap())
-        .subject(&spec.summary)
-        .message_id(Some("<sent-invite-30@tum.de>".to_string()))
-        .multipart(req_body)
-        .unwrap();
-    let req_raw = req_msg.formatted();
-    let req_email = parse_rfc822_to_fetched_email(&req_raw).unwrap();
-
-    // --- Incoming REPLY from attendee A (ACCEPTED) ---
-    let ctx = reply_context_from_ics(request_ics.as_bytes()).unwrap();
-    let reply_ics = build_reply_ics(&ctx, "a@example.com", Rsvp::Accepted).unwrap();
-    let reply_body = build_invite_mime_body("A accepts.", String::new(), &reply_ics);
-    let reply_msg: Message = Message::builder()
-        .from("A <a@example.com>".parse().unwrap())
-        .to("chair@tum.de".parse().unwrap())
-        .subject("Accepted: LOC Day planning")
-        .message_id(Some("<reply-a-30@example.com>".to_string()))
-        .multipart(reply_body)
-        .unwrap();
-    let reply_raw = reply_msg.formatted();
-    let reply_email = parse_rfc822_to_fetched_email(&reply_raw).unwrap();
-    assert_eq!(
-        reply_email.event.as_ref().and_then(|e| e.method.as_deref()),
-        Some("REPLY"),
-        "reply parsed as METHOD:REPLY"
-    );
-
-    // --- Save both through the production writer ---
-    let tmp = tempdir().unwrap();
-    let account_root = tmp.path().join("acct");
-    let sent = account_root.join("sent");
-    let inbox = account_root.join("inbox");
-    save_fetched_emails(&[req_email], &sent, "sent").unwrap();
-    save_fetched_emails(&[reply_email], &inbox, "inbox").unwrap();
-
-    let (sent_md, before) = read_only_md(&sent);
-    // Attendee A starts unresolved on the sent invite.
-    let fm_before = parse_frontmatter(&before).event.unwrap();
-    let a_before = fm_before
-        .attendees
-        .iter()
-        .find(|x| x.address.eq_ignore_ascii_case("a@example.com"))
-        .unwrap();
-    assert_eq!(a_before.status, "needs-action");
-
-    // --- Full-mailstore reconciliation ---
-    let stats = reconcile_account(&account_root).unwrap();
-    assert_eq!(stats.updated, 1, "exactly one attendee status rewritten");
-
-    let after_first = fs::read(&sent_md).unwrap();
-    let fm_after = parse_frontmatter(&String::from_utf8_lossy(&after_first))
-        .event
-        .unwrap();
-    let a_after = fm_after
-        .attendees
-        .iter()
-        .find(|x| x.address.eq_ignore_ascii_case("a@example.com"))
-        .unwrap();
-    assert_eq!(a_after.status, "accepted", "A's RSVP reconciled onto the invite");
-    // B never replied, so stays needs-action.
-    let b_after = fm_after
-        .attendees
-        .iter()
-        .find(|x| x.address.eq_ignore_ascii_case("b@example.com"))
-        .unwrap();
-    assert_eq!(b_after.status, "needs-action");
-
-    // --- Idempotency: second rescan changes nothing, bytes identical ---
-    let stats2 = reconcile_account(&account_root).unwrap();
-    assert_eq!(stats2.updated, 0);
-    assert_eq!(stats2.unchanged, 1);
-    let after_second = fs::read(&sent_md).unwrap();
-    assert_eq!(after_first, after_second, "rescan must be byte-idempotent");
-}
+// The full-rescan reconciliation test that lived here drove the `.md` writer
+// (`save_fetched_emails`) to lay out a sent invite and an incoming REPLY on
+// disk. That writer is gone with the legacy sync (#0037 unit 4a), and
+// `reconcile_account` still walks the `.md` tree, so the end-to-end coverage
+// moves with the reconcile rewrite in #0038. The per-function behaviour is
+// still covered by the unit tests in `src/reconcile.rs`.

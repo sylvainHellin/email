@@ -1,0 +1,793 @@
+//! Store-only ingest: fetched message to one `messages` row plus its blobs.
+//!
+//! This is the only writer on the receive path, and it writes no `.md`.
+//! Everything a fetched message carries ends up in exactly two places: the
+//! per-account `store.sqlite3` row and the content-addressed blob store.
+//!
+//! ## Transaction shape
+//!
+//! Blob *files* are written before the transaction opens and blob *references*
+//! are taken inside it, which is the contract documented on
+//! [`BlobStore::acquire`](crate::store::BlobStore::acquire): an unreferenced
+//! blob file is a harmless orphan that a sweep reclaims, while a row pointing
+//! at a missing blob is a hole in the read path. One transaction per message,
+//! so a crash leaves whole messages behind, never half of one.
+//!
+//! ## Identity, and what re-ingest does
+//!
+//! Identity is `(account, mailbox, uid)`. Re-ingesting the same UID is an
+//! UPSERT on that unique constraint: the row keeps its `id`, its thread
+//! assignment and any local-only state, and blob references are re-pointed
+//! only for the kinds whose content actually changed (new references are
+//! acquired before old ones are released, so a hash shared by both versions
+//! never touches zero and never gets unlinked mid-transaction).
+//!
+//! After a UIDVALIDITY reset the same message reappears under a new UID. The
+//! non-unique `messages_message_id` index finds the prior row in the same
+//! mailbox, and ingest updates its `uid` in place rather than inserting a
+//! second row, so the thread assignment and the blob references survive the
+//! renumbering.
+//!
+//! ## Synthesised Message-ID
+//!
+//! A message with no `Message-ID` header gets `sha256-<hex16>@local.invalid`,
+//! where `<hex16>` is the first 16 lowercase hex characters of a SHA-256 over
+//! bytes that are fixed as follows, so the same message always synthesises the
+//! same id:
+//!
+//! - when the ingest holds the raw RFC822 bytes (every IMAP fetch), the digest
+//!   is over those bytes exactly as they came off the wire;
+//! - when it does not (the Graph path never returns RFC822), the digest is
+//!   over the canonical envelope string
+//!   `from \n to \n cc \n subject \n date \n body_text`, UTF-8, with `cc`
+//!   rendered as the empty string when absent and no trailing newline.
+//!
+//! ## FTS
+//!
+//! `messages_fts` is external-content over a `messages` table that has no
+//! `body_text` column, so `'rebuild'` and a plain `DELETE FROM messages_fts`
+//! both fail (see the schema doc comment). Ingest therefore maintains the
+//! index explicitly: the FTS `'delete'` command with the *old* column values,
+//! then a fresh insert, both inside the message's transaction.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use log::warn;
+use rusqlite::{OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
+
+use crate::parse::FetchedEmail;
+use crate::store::blobs::BlobHash;
+use crate::store::{BlobStore, Store};
+use crate::timing::TimingSpan;
+
+/// How many characters of the body are kept in the `snippet` column.
+const SNIPPET_CHARS: usize = 200;
+
+/// One message handed to [`ingest_message`].
+pub struct IngestInput<'a> {
+    pub account: &'a str,
+    pub mailbox: &'a str,
+    /// IMAP UID, or the synthetic uid the Graph path derives from the Graph
+    /// message id (see [`graph_uid`]).
+    pub uid: i64,
+    /// The parsed message.
+    pub email: &'a FetchedEmail,
+    /// Raw RFC822 bytes when the backend has them (IMAP); `None` for Graph,
+    /// whose API never returns the original MIME.
+    pub raw: Option<&'a [u8]>,
+}
+
+/// What ingest did with one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// `messages.id` of the row that now holds the message.
+    pub row_id: i64,
+    /// The `Message-ID`, synthesised when the header was missing.
+    pub message_id: String,
+    /// Thread the message was assigned to.
+    pub thread_id: String,
+    /// True when a new row was inserted, false when an existing row was updated.
+    pub inserted: bool,
+    /// True when the row was found through the `message_id` index under a
+    /// different UID, i.e. a UIDVALIDITY reset was absorbed.
+    pub uid_rebound: bool,
+}
+
+/// The blob kinds a message row can reference.
+const KIND_BODY: &str = "body";
+const KIND_RAW: &str = "raw";
+const KIND_ATTACHMENT: &str = "attachment";
+
+/// A blob reference about to be written for one message.
+struct BlobRef {
+    kind: &'static str,
+    ordinal: i64,
+    hash: BlobHash,
+    filename: Option<String>,
+    size: u64,
+}
+
+/// Ingest one message into the store.
+///
+/// Writes every blob file first, then does all database work in a single
+/// transaction. See the module docs for the identity and FTS contracts.
+pub fn ingest_message(
+    store: &Store,
+    blobs: &BlobStore,
+    input: &IngestInput<'_>,
+) -> Result<IngestOutcome> {
+    let mut span = TimingSpan::with_context(
+        "store_ingest",
+        format!("{}/{}#{}", input.account, input.mailbox, input.uid),
+    );
+
+    let email = input.email;
+    let message_id = resolve_message_id(email, input.raw);
+    let body_bytes = email.body_text.as_bytes();
+
+    // Blob files first: outside the transaction, idempotent, content-addressed.
+    let mut refs: Vec<BlobRef> = Vec::new();
+    refs.push(BlobRef {
+        kind: KIND_BODY,
+        ordinal: 0,
+        hash: blobs.write(body_bytes)?,
+        filename: None,
+        size: body_bytes.len() as u64,
+    });
+    if let Some(raw) = input.raw {
+        refs.push(BlobRef {
+            kind: KIND_RAW,
+            ordinal: 0,
+            hash: blobs.write(raw)?,
+            filename: None,
+            size: raw.len() as u64,
+        });
+    }
+    let mut ordinal = 0i64;
+    if let Some(ics) = email.calendar_ics.as_deref() {
+        // The iMIP payload is an attachment blob like any other, under the
+        // sidecar name the rest of the codebase already knows it by, so the
+        // read path can find an invite without re-walking the MIME tree.
+        refs.push(BlobRef {
+            kind: KIND_ATTACHMENT,
+            ordinal,
+            hash: blobs.write(ics)?,
+            filename: Some(crate::parse::CALENDAR_SIDECAR_NAME.to_string()),
+            size: ics.len() as u64,
+        });
+        ordinal += 1;
+    }
+    for att in &email.attachments {
+        refs.push(BlobRef {
+            kind: KIND_ATTACHMENT,
+            ordinal,
+            hash: blobs.write(&att.content)?,
+            filename: Some(att.filename.clone()),
+            size: att.content.len() as u64,
+        });
+        ordinal += 1;
+    }
+    span.mark("blobs_written");
+
+    let (in_reply_to, references) = input.raw.map(threading_headers).unwrap_or((None, None));
+
+    let tx = store
+        .conn()
+        .unchecked_transaction()
+        .context("opening ingest transaction")?;
+    let outcome = ingest_in_tx(&tx, blobs, input, &message_id, &in_reply_to, &references, &refs)?;
+    tx.commit().context("committing ingest transaction")?;
+    span.mark("committed");
+
+    Ok(outcome)
+}
+
+/// The database half of [`ingest_message`], so the transaction boundary stays
+/// visible in one place.
+#[allow(clippy::too_many_arguments)]
+fn ingest_in_tx(
+    tx: &Transaction<'_>,
+    blobs: &BlobStore,
+    input: &IngestInput<'_>,
+    message_id: &str,
+    in_reply_to: &Option<String>,
+    references: &Option<String>,
+    refs: &[BlobRef],
+) -> Result<IngestOutcome> {
+    let email = input.email;
+
+    // 1. Find the row this message belongs in: by identity first, then
+    //    through the message_id index (UIDVALIDITY reset).
+    let existing: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT id, thread_id, subject, from_, body_blob
+             FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            (input.account, input.mailbox, input.uid),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .context("looking up the message by identity")?;
+
+    let mut uid_rebound = false;
+    let existing = match existing {
+        Some(found) => Some(found),
+        None => {
+            let by_mid = tx
+                .query_row(
+                    "SELECT id, thread_id, subject, from_, body_blob
+                     FROM messages
+                     WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3
+                     ORDER BY id LIMIT 1",
+                    (input.account, input.mailbox, message_id),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .context("looking up the message through the message_id index")?;
+            uid_rebound = by_mid.is_some();
+            by_mid
+        }
+    };
+
+    // 2. Thread assignment: an existing row keeps the thread it was put in,
+    //    a new one inherits from its parent and otherwise starts its own.
+    let thread_id = match existing.as_ref().and_then(|(_, thread, _, _, _)| thread.clone()) {
+        Some(thread) => thread,
+        None => resolve_thread_id(tx, input.account, message_id, in_reply_to, references)?,
+    };
+
+    let now = unix_now();
+    let date_sort = date_sort_for(&email.date);
+    let snippet = snippet_for(&email.body_text);
+    let flags = if email.is_read { "\\Seen" } else { "" };
+    let body_blob = refs
+        .iter()
+        .find(|r| r.kind == KIND_BODY)
+        .map(|r| r.hash.as_str().to_string());
+    let raw_blob = refs
+        .iter()
+        .find(|r| r.kind == KIND_RAW)
+        .map(|r| r.hash.as_str().to_string());
+    let size: i64 = input
+        .raw
+        .map(|r| r.len() as i64)
+        .unwrap_or_else(|| refs.iter().map(|r| r.size as i64).sum());
+    let has_attachments =
+        email.has_attachments || refs.iter().any(|r| r.kind == KIND_ATTACHMENT);
+
+    // 3. Write the row.
+    let row_id = match existing.as_ref() {
+        Some((id, _, _, _, _)) => {
+            tx.execute(
+                "UPDATE messages SET
+                    uid = ?2, message_id = ?3, from_ = ?4, to_ = ?5, cc = ?6, subject = ?7,
+                    date_sort = ?8, date_display = ?9, flags = ?10, in_reply_to = ?11,
+                    references_ = ?12, thread_id = ?13, snippet = ?14, has_attachments = ?15,
+                    body_blob = ?16, raw_blob = ?17, size = ?18, mtime = ?19
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    input.uid,
+                    message_id,
+                    email.from,
+                    email.to,
+                    email.cc,
+                    email.subject,
+                    date_sort,
+                    email.date,
+                    flags,
+                    in_reply_to,
+                    references,
+                    thread_id,
+                    snippet,
+                    has_attachments as i64,
+                    body_blob,
+                    raw_blob,
+                    size,
+                    now,
+                ],
+            )
+            .context("updating the message row")?;
+            *id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO messages (
+                    account, mailbox, uid, message_id, from_, to_, cc, subject,
+                    date_sort, date_display, flags, in_reply_to, references_, thread_id,
+                    snippet, has_attachments, body_blob, raw_blob, size, mtime
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                    ?17, ?18, ?19, ?20
+                 )",
+                rusqlite::params![
+                    input.account,
+                    input.mailbox,
+                    input.uid,
+                    message_id,
+                    email.from,
+                    email.to,
+                    email.cc,
+                    email.subject,
+                    date_sort,
+                    email.date,
+                    flags,
+                    in_reply_to,
+                    references,
+                    thread_id,
+                    snippet,
+                    has_attachments as i64,
+                    body_blob,
+                    raw_blob,
+                    size,
+                    now,
+                ],
+            )
+            .context("inserting the message row")?;
+            tx.last_insert_rowid()
+        }
+    };
+
+    // 4. Remove the previous FTS entry, explicitly and with the *old* column
+    //    values (see the module docs). This runs before the blob references
+    //    are re-pointed, because the old body text is read back from the old
+    //    body blob and the release below may unlink it.
+    if let Some((_, _, old_subject, old_from, old_body_blob)) = existing.as_ref() {
+        let old_body = old_body_blob
+            .as_deref()
+            .and_then(|h| BlobHash::parse(h).ok())
+            .and_then(|h| blobs.read(&h).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        match old_body {
+            Some(body) => {
+                tx.execute(
+                    "INSERT INTO messages_fts (messages_fts, rowid, subject, from_, body_text)
+                     VALUES ('delete', ?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        row_id,
+                        old_subject.clone().unwrap_or_default(),
+                        old_from.clone().unwrap_or_default(),
+                        body
+                    ],
+                )
+                .context("removing the previous FTS row")?;
+            }
+            None => {
+                // The old body blob is gone (evicted, or never written), so the
+                // exact values the index was built from are unavailable and the
+                // FTS 'delete' command cannot be issued honestly. Leave the old
+                // entry in place rather than corrupt the index with a guess: a
+                // stale hit resolves to a row that is still correct, and the
+                // whole store is dropped and refilled if it ever matters.
+                warn!(
+                    "[ingest] message {row_id}: previous body blob unreadable, \
+                     leaving the stale FTS entry in place"
+                );
+            }
+        }
+    }
+    // 5. Re-point blob references. Acquire first, release second: a hash that
+    //    both versions share must never pass through refcount zero, because
+    //    `release` unlinks the file the moment it does.
+    let previous = load_blob_refs(tx, row_id)?;
+    for r in refs {
+        blobs.acquire(tx, &r.hash, r.size)?;
+    }
+    tx.execute(
+        "DELETE FROM message_blobs WHERE message_row = ?1",
+        [row_id],
+    )
+    .context("clearing the previous blob references")?;
+    for r in refs {
+        tx.execute(
+            "INSERT INTO message_blobs (message_row, kind, ordinal, hash, filename, size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![row_id, r.kind, r.ordinal, r.hash.as_str(), r.filename, r.size as i64],
+        )
+        .context("recording a blob reference")?;
+    }
+    for hash in previous {
+        blobs.release(tx, &hash)?;
+    }
+
+    // 6. Index the new content.
+    tx.execute(
+        "INSERT INTO messages_fts (rowid, subject, from_, body_text) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![row_id, email.subject, email.from, email.body_text],
+    )
+    .context("inserting the FTS row")?;
+
+    Ok(IngestOutcome {
+        row_id,
+        message_id: message_id.to_string(),
+        thread_id,
+        inserted: existing.is_none(),
+        uid_rebound,
+    })
+}
+
+/// Every blob hash currently referenced by a message row.
+fn load_blob_refs(tx: &Transaction<'_>, row_id: i64) -> Result<Vec<BlobHash>> {
+    let mut stmt = tx.prepare("SELECT hash FROM message_blobs WHERE message_row = ?1")?;
+    let rows = stmt.query_map([row_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for hash in rows {
+        match BlobHash::parse(&hash?) {
+            Ok(h) => out.push(h),
+            Err(e) => warn!("[ingest] ignoring unparseable blob reference: {e:#}"),
+        }
+    }
+    Ok(out)
+}
+
+/// The thread a new message joins: its parent's thread when `In-Reply-To` or
+/// the last `References` entry resolves to a row in this account, else a new
+/// thread rooted at its own Message-ID.
+fn resolve_thread_id(
+    tx: &Transaction<'_>,
+    account: &str,
+    message_id: &str,
+    in_reply_to: &Option<String>,
+    references: &Option<String>,
+) -> Result<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(irt) = in_reply_to {
+        candidates.extend(split_message_ids(irt));
+    }
+    if let Some(refs) = references {
+        // Nearest ancestor first: the last entry of References is the parent.
+        let mut ids = split_message_ids(refs);
+        ids.reverse();
+        candidates.extend(ids);
+    }
+
+    for candidate in candidates {
+        let thread: Option<Option<String>> = tx
+            .query_row(
+                "SELECT thread_id FROM messages WHERE account = ?1 AND message_id = ?2
+                 ORDER BY id LIMIT 1",
+                (account, candidate.as_str()),
+                |row| row.get(0),
+            )
+            .optional()
+            .context("resolving a parent message for threading")?;
+        if let Some(Some(thread)) = thread {
+            return Ok(thread);
+        }
+    }
+    Ok(message_id.to_string())
+}
+
+/// Split a `References` / `In-Reply-To` header value into bracketed ids.
+fn split_message_ids(value: &str) -> Vec<String> {
+    value
+        .split('>')
+        .filter_map(|part| {
+            let start = part.find('<')?;
+            Some(format!("{}>", &part[start..]))
+        })
+        .collect()
+}
+
+/// `In-Reply-To` and `References` from the raw bytes.
+///
+/// Read here rather than carried on [`FetchedEmail`] because only ingest needs
+/// them, and the second parse costs far less than widening a struct every
+/// fetch path and test constructs.
+fn threading_headers(raw: &[u8]) -> (Option<String>, Option<String>) {
+    use mailparse::MailHeaderMap;
+    match mailparse::parse_mail(raw) {
+        Ok(parsed) => (
+            parsed.headers.get_first_value("In-Reply-To"),
+            parsed.headers.get_first_value("References"),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// The message's `Message-ID`, or a synthesised one. See the module docs for
+/// exactly which bytes are hashed.
+pub fn resolve_message_id(email: &FetchedEmail, raw: Option<&[u8]>) -> String {
+    match email.message_id.as_deref() {
+        Some(mid) if !mid.trim().is_empty() => mid.trim().to_string(),
+        _ => synthesize_message_id(email, raw),
+    }
+}
+
+/// `sha256-<hex16>@local.invalid` over the raw bytes, or over the canonical
+/// envelope when there are none.
+pub fn synthesize_message_id(email: &FetchedEmail, raw: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    match raw {
+        Some(raw) => hasher.update(raw),
+        None => hasher.update(canonical_envelope(email).as_bytes()),
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("<sha256-{hex}@local.invalid>")
+}
+
+/// The exact bytes hashed when no raw message is available.
+fn canonical_envelope(email: &FetchedEmail) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        email.from,
+        email.to,
+        email.cc.as_deref().unwrap_or(""),
+        email.subject,
+        email.date,
+        email.body_text
+    )
+}
+
+/// A stable positive uid for a backend that has no UIDs of its own: the first
+/// 8 bytes of the SHA-256 of the message's `Message-ID` (the synthesised one
+/// when the header is absent), cleared of the sign bit. Graph identifies a
+/// message by `internetMessageId` on every endpoint this client uses, so this
+/// is as stable an identity as the UID it stands in for.
+pub fn graph_uid(message_id: &str) -> i64 {
+    let digest = Sha256::digest(message_id.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (i64::from_be_bytes(bytes) & i64::MAX) as i64
+}
+
+/// Sortable timestamp for a `Date:` header; `0` when it cannot be parsed, so
+/// an undated message sorts to the bottom instead of disappearing.
+fn date_sort_for(date: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc2822(date)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+/// List-preview text: the first [`SNIPPET_CHARS`] characters of the body with
+/// runs of whitespace collapsed.
+fn snippet_for(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(SNIPPET_CHARS).collect()
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Mailbox and cursor bookkeeping
+// ---------------------------------------------------------------------------
+
+/// What a fetch learned about a mailbox from the server, and what the next
+/// incremental fetch needs to resume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailboxCursor {
+    pub uidvalidity: Option<i64>,
+    /// Highest UID seen by the fetch that recorded this cursor.
+    pub last_uid: Option<i64>,
+    pub uidnext: Option<i64>,
+    pub exists: Option<i64>,
+    /// Graph `deltaLink` (unused until the delta fetch lands, see
+    /// `TODO(#0037-4b-or-0038)` in `src/graph.rs`).
+    pub deltalink: Option<String>,
+}
+
+/// Record what ingest knows about a mailbox: the `mailboxes` row the read path
+/// will list from, and the `sync_cursors` row the next fetch resumes from.
+///
+/// A UIDVALIDITY change is *not* handled by wiping the mailbox: the messages
+/// reappear under new UIDs and ingest rebinds each row through the
+/// `message_id` index, which is what keeps thread assignments and blob
+/// references across a renumbering.
+pub fn record_mailbox_cursor(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    cursor: &MailboxCursor,
+) -> Result<()> {
+    let conn = store.conn();
+    conn.execute(
+        "INSERT INTO mailboxes (account, name, uidvalidity, uidnext, exists_count)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (account, name) DO UPDATE SET
+            uidvalidity = excluded.uidvalidity,
+            uidnext = excluded.uidnext,
+            exists_count = excluded.exists_count",
+        rusqlite::params![account, mailbox, cursor.uidvalidity, cursor.uidnext, cursor.exists],
+    )
+    .context("recording the mailbox row")?;
+
+    conn.execute(
+        "INSERT INTO sync_cursors (mailbox, uidvalidity, highest_modseq, deltalink)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (mailbox) DO UPDATE SET
+            uidvalidity = excluded.uidvalidity,
+            highest_modseq = excluded.highest_modseq,
+            deltalink = excluded.deltalink",
+        rusqlite::params![mailbox, cursor.uidvalidity, cursor.last_uid, cursor.deltalink],
+    )
+    .context("recording the sync cursor")?;
+    Ok(())
+}
+
+/// The cursor a previous fetch left for `mailbox`, if any.
+pub fn load_mailbox_cursor(store: &Store, mailbox: &str) -> Result<Option<MailboxCursor>> {
+    let cursor = store
+        .conn()
+        .query_row(
+            "SELECT uidvalidity, highest_modseq, deltalink FROM sync_cursors WHERE mailbox = ?1",
+            [mailbox],
+            |row| {
+                Ok(MailboxCursor {
+                    uidvalidity: row.get(0)?,
+                    last_uid: row.get(1)?,
+                    uidnext: None,
+                    exists: None,
+                    deltalink: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .context("loading the sync cursor")?;
+    Ok(cursor)
+}
+
+/// The Message-IDs already ingested for `(account, mailbox)`. The Graph path
+/// dedups on this rather than on UIDs, because Graph has none.
+pub fn known_message_ids(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT message_id FROM messages WHERE account = ?1 AND mailbox = ?2")?;
+    let rows = stmt.query_map((account, mailbox), |row| row.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for id in rows {
+        out.insert(id?);
+    }
+    Ok(out)
+}
+
+/// Apply the server's `\Seen` state to a row that is already in the store.
+///
+/// Returns true when the stored flags actually changed. The server is truth
+/// here, so there is no cutoff guard: a local flag change becomes a
+/// `pending_ops` entry (#0039) rather than a file the sync must not clobber.
+pub fn apply_seen_flag(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    uid: i64,
+    is_read: bool,
+) -> Result<bool> {
+    let flags = if is_read { "\\Seen" } else { "" };
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE messages SET flags = ?4
+             WHERE account = ?1 AND mailbox = ?2 AND uid = ?3 AND IFNULL(flags, '') <> ?4",
+            rusqlite::params![account, mailbox, uid, flags],
+        )
+        .context("applying a server read flag")?;
+    Ok(changed > 0)
+}
+
+/// The UIDs already ingested for `(account, mailbox)`, so a fetch can skip
+/// bodies it already holds. This is the store-side replacement for the
+/// Message-ID scan of the `.md` tree the old sync ran on every pass.
+pub fn known_uids(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2")?;
+    let rows = stmt.query_map((account, mailbox), |row| row.get::<_, i64>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for uid in rows {
+        out.insert(uid?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn email(subject: &str) -> FetchedEmail {
+        FetchedEmail {
+            from: "a@example.com".into(),
+            to: "b@example.com".into(),
+            cc: None,
+            subject: subject.into(),
+            date: "Mon, 01 Jan 2024 12:00:00 +0000".into(),
+            body_text: "body".into(),
+            html_body: None,
+            has_attachments: false,
+            message_id: None,
+            attachments: Vec::new(),
+            is_read: false,
+            calendar_ics: None,
+            event: None,
+        }
+    }
+
+    #[test]
+    fn synthesised_ids_are_deterministic_and_content_bound() {
+        let e = email("hello");
+        let raw = b"From: a@example.com\r\n\r\nbody\r\n";
+        assert_eq!(
+            synthesize_message_id(&e, Some(raw)),
+            synthesize_message_id(&e, Some(raw))
+        );
+        assert_ne!(
+            synthesize_message_id(&e, Some(raw)),
+            synthesize_message_id(&e, Some(b"From: a@example.com\r\n\r\nother\r\n"))
+        );
+        // The envelope form is used only when there are no raw bytes, and the
+        // two forms are different digests of different inputs.
+        assert_ne!(
+            synthesize_message_id(&e, None),
+            synthesize_message_id(&e, Some(raw))
+        );
+
+        let id = synthesize_message_id(&e, None);
+        assert!(id.starts_with("<sha256-"), "{id}");
+        assert!(id.ends_with("@local.invalid>"), "{id}");
+        assert_eq!(id.len(), "<sha256-".len() + 16 + "@local.invalid>".len());
+    }
+
+    #[test]
+    fn a_present_header_wins_over_synthesis() {
+        let mut e = email("hello");
+        e.message_id = Some("  <real@example.com>  ".into());
+        assert_eq!(resolve_message_id(&e, None), "<real@example.com>");
+        e.message_id = Some("   ".into());
+        assert!(resolve_message_id(&e, None).ends_with("@local.invalid>"));
+    }
+
+    #[test]
+    fn graph_uids_are_stable_and_positive() {
+        assert_eq!(graph_uid("AAMkAGI2"), graph_uid("AAMkAGI2"));
+        assert_ne!(graph_uid("AAMkAGI2"), graph_uid("AAMkAGI3"));
+        assert!(graph_uid("AAMkAGI2") >= 0);
+    }
+
+    #[test]
+    fn message_ids_split_out_of_a_references_header() {
+        assert_eq!(
+            split_message_ids("<a@x> <b@x>\r\n <c@x>"),
+            vec!["<a@x>", "<b@x>", "<c@x>"]
+        );
+        assert!(split_message_ids("garbage").is_empty());
+    }
+
+    #[test]
+    fn snippets_collapse_whitespace_and_are_bounded() {
+        assert_eq!(snippet_for("hello\r\n\r\n  world\t"), "hello world");
+        assert_eq!(snippet_for(&"x ".repeat(400)).chars().count(), SNIPPET_CHARS);
+    }
+}

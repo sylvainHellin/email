@@ -150,8 +150,8 @@ fn test_forward_with_attachments() {
 
 /// Ticket #0006: forwarding an email and then archiving the source must not
 /// invalidate the attachment paths in the draft. The forward draft should
-/// reference the per-account stable attachments mirror, which survives
-/// `move_local_email` of the source.
+/// reference the per-account stable attachments mirror, which survives a
+/// move of the source out of the inbox.
 #[test]
 fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     let tmp = tempdir().unwrap();
@@ -174,8 +174,10 @@ fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     let draft_path =
         create_forward_draft(&source, "me@example.com", Some(drafts.as_path())).unwrap();
 
-    // Move the source into archive (this also moves the per-mailbox _attachments/).
-    email::sync::move_local_email(&source, &archive, "inbox", "archived").unwrap();
+    // Move the source into archive, per-mailbox _attachments/ included.
+    let dest = archive.join(source.file_name().unwrap());
+    fs::rename(&source, &dest).unwrap();
+    fs::rename(&att_dir, archive.join("email_attachments")).unwrap();
     assert!(!source.exists());
 
     // Re-parse the draft and resolve every attachment path on disk.

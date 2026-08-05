@@ -2,13 +2,12 @@ mod batch;
 mod fetch;
 mod ops;
 pub mod search;
-mod sync;
+mod store_sync;
 mod watch;
 
 pub use batch::{batch_archive_emails_locally, batch_delete_emails_locally};
 pub use fetch::{
-    fetch_emails, fetch_emails_on_session, fetch_new_emails_on_session,
-    fetch_server_message_ids, fetch_server_message_ids_on_session,
+    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, FetchedRaw, MailboxState,
 };
 pub use ops::{
     append_to_sent_folder, archive_email_locally, archive_email_on_server,
@@ -21,15 +20,9 @@ pub use search::{
     bracketed_message_id, normalize_message_id, parse_search_query, retain_exact_message_id,
     FetchCriteria,
 };
-pub use sync::{
-    list_mailboxes, load_mailbox_states_cache, mailbox_states_cache_path,
-    save_mailbox_states_cache, sync_mailboxes, FreshObservation, MailboxState, MessageIdIndex,
-    SyncResult, SyncTarget,
+pub use store_sync::{
+    list_mailboxes, sync_mailboxes, FreshObservation, SyncResult, SyncTarget,
 };
-// Shared with the Graph sync path (src/graph.rs) so both backends apply
-// server read flags through the same frontmatter-aware, cutoff-guarded
-// helper. Public for integration-test coverage of the #0004 regression.
-pub use sync::sync_local_read_flags;
 pub use watch::watch_mailbox;
 
 use std::fmt;

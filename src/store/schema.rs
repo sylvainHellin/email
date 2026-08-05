@@ -12,7 +12,9 @@ use rusqlite::Connection;
 /// Version stamped into `meta.schema_version`. Bump this whenever any
 /// statement in [`SCHEMA_SQL`] changes; every existing store is then dropped
 /// and rebuilt on the next open.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 added `message_blobs` for the ingest path (#0037 unit 4a).
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -28,6 +30,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "meta",
     "mailboxes",
     "messages",
+    "message_blobs",
     "blobs",
     "drafts",
     "outbox",
@@ -55,6 +58,18 @@ pub const REQUIRED_TABLES: &[&str] = &[
 ///   [`super::blobs`]. It lives here rather than on disk so a reference can be
 ///   taken in the same transaction as the `messages` / `outbox` row that
 ///   carries the hash; the file itself is the disposable side of the pair.
+/// - `message_blobs` is the per-message list of blob references: one row per
+///   `(message, kind, ordinal)`, where `kind` is `body`, `raw` or
+///   `attachment`. It is the *source of truth* for refcounting, and
+///   `messages.body_blob` / `messages.raw_blob` are a convenience
+///   denormalisation of the two singleton kinds. It exists because retention
+///   evicts attachment blobs and body blobs on separate horizons, so eviction
+///   and refcount auditing must be able to enumerate one row's blob
+///   references with a query rather than a parse loop over a JSON column; it
+///   is also what lets re-ingest release exactly the references whose content
+///   actually changed. `ON DELETE CASCADE` keeps the list from outliving its
+///   message, but the *refcount* is only decremented by an explicit
+///   [`super::blobs::BlobStore::release`], never by the cascade.
 /// - `messages_fts` is external-content over `messages`, as the plan sketches,
 ///   with `body_text` as a third indexed column. `messages` has no `body_text`
 ///   column (the body lives in a blob), so the index is written explicitly by
@@ -105,6 +120,18 @@ CREATE TABLE messages (
 );
 
 CREATE INDEX messages_message_id ON messages (message_id);
+
+CREATE TABLE message_blobs (
+    message_row INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL CHECK (kind IN ('body', 'raw', 'attachment')),
+    ordinal     INTEGER NOT NULL DEFAULT 0,
+    hash        TEXT NOT NULL,
+    filename    TEXT,
+    size        INTEGER,
+    PRIMARY KEY (message_row, kind, ordinal)
+);
+
+CREATE INDEX message_blobs_hash ON message_blobs (hash);
 
 CREATE TABLE blobs (
     hash     TEXT PRIMARY KEY,

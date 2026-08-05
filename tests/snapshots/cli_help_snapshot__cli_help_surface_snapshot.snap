@@ -20,7 +20,7 @@ Commands:
   invite          RSVP to a received calendar invitation (iMIP REPLY over SMTP)
   list-mailboxes  List available IMAP mailboxes/folders
   fetch           Fetch emails from IMAP server
-  sync            Sync local mailbox folders with IMAP server
+  sync            Sync mailboxes from the server into the local store
   watch           Watch a mailbox for changes using IMAP IDLE
   archive         Archive an inbox email (server + local)
   delete          Delete an inbox email (server + local)
@@ -274,15 +274,14 @@ Options:
   -h, --help                   Print help
 
 $ mp sync --help
-Sync local mailbox folders with IMAP server
+Sync mailboxes from the server into the local store
 
 Usage: mp sync [OPTIONS]
 
 Options:
   -n, --limit <LIMIT>          Max messages per mailbox (default: 50) [default: 50]
       --mailbox <MAILBOX>      Mailboxes to sync (default: INBOX, Archive, Sent)
-      --reconcile              Reconcile local files against server (detect moves/deletes)
-      --dry-run                Show what would change without making any modifications
+      --dry-run                Show what would be ingested without writing anything
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

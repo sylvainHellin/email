@@ -4,7 +4,6 @@ use email::parse::*;
 use email::imap_client::{self, *};
 use email::draft::*;
 use email::send::*;
-use email::sync::*;
 use email::config_cmd::*;
 use email::graph;
 
@@ -171,7 +170,7 @@ enum Commands {
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
     },
-    /// Sync local mailbox folders with IMAP server
+    /// Sync mailboxes from the server into the local store
     Sync {
         /// Max messages per mailbox (default: 50)
         #[arg(short = 'n', long, default_value = "50")]
@@ -179,10 +178,7 @@ enum Commands {
         /// Mailboxes to sync (default: INBOX, Archive, Sent)
         #[arg(long)]
         mailbox: Option<Vec<String>>,
-        /// Reconcile local files against server (detect moves/deletes)
-        #[arg(long)]
-        reconcile: bool,
-        /// Show what would change without making any modifications
+        /// Show what would be ingested without writing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -1457,7 +1453,6 @@ async fn main() -> Result<()> {
             full,
             mailbox,
         }) => {
-            let mailbox_for_save = mailbox.clone();
 
             let emails = if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
@@ -1482,90 +1477,61 @@ async fn main() -> Result<()> {
 
             display_fetched_emails(&emails, full);
 
-            // Determine save directory and status from the mailbox
-            let (save_dir, status) = match resolve_mailbox_dir(&account_config, &mailbox_for_save) {
-                Ok(dir) => {
-                    (Some(dir), mailbox_status(&mailbox_for_save))
-                }
-                Err(_) => {
-                    // Fallback to inbox_dir for unknown mailboxes
-                    (inbox_dir.clone(), "inbox")
-                }
-            };
-
-            if let Some(ref save_dir) = save_dir {
-                if !emails.is_empty() {
-                    match save_fetched_emails(&emails, save_dir, status) {
-                        Ok((saved, skipped)) => {
-                            if saved > 0 {
-                                println!(
-                                    "\n{} Saved {} email(s) to {}",
-                                    "✓".green(),
-                                    saved,
-                                    save_dir.display()
-                                );
-                            }
-                            if skipped > 0 {
-                                println!(
-                                    "{} Skipped {} duplicate(s)",
-                                    "ℹ".blue(),
-                                    skipped
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("{} Failed to save emails: {}", "✗".red(), e);
-                        }
-                    }
-                }
-            } else if !emails.is_empty() {
-                println!(
-                    "\n{} No local directory configured for mailbox '{}'. Check [mailboxes] in {}.",
-                    "ℹ".blue(),
-                    mailbox_for_save,
-                    config_path().display()
-                );
-            }
+            // `mp fetch` is a lookup, not an ingest: it prints what the server
+            // has and writes nothing. Messages enter the store through
+            // `mp sync` (#0037), which is the only path that fetches by UID
+            // and can key a row.
         }
 
-        Some(Commands::Sync { limit, mailbox, reconcile, dry_run }) => {
+        Some(Commands::Sync { limit, mailbox, dry_run }) => {
             let targets: Vec<imap_client::SyncTarget> = if let Some(ref user_mailboxes) = mailbox {
-                user_mailboxes.iter().map(|mb| {
-                    imap_client::SyncTarget {
+                user_mailboxes
+                    .iter()
+                    .map(|mb| imap_client::SyncTarget {
                         role: mb.clone(),
                         server_name: find_server_name_for_role(&account_config, mb),
-                        local_dir: resolve_mailbox_dir(&account_config, mb)
-                            .unwrap_or_else(|_| PathBuf::from(mb)),
-                        status: mailbox_status(mb).to_string(),
-                    }
-                }).collect()
+                    })
+                    .collect()
             } else {
-                all_configured_mailboxes(&account_config).iter().map(|(role, mapping)| {
-                    imap_client::SyncTarget {
+                all_configured_mailboxes(&account_config)
+                    .iter()
+                    .map(|(role, mapping)| imap_client::SyncTarget {
                         role: role.clone(),
                         server_name: mapping.server.clone(),
-                        local_dir: email::config::mailbox_dir(&account_config.name, role),
-                        status: mailbox_status(role).to_string(),
-                    }
-                }).collect()
+                    })
+                    .collect()
             };
 
             let result = if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
-                graph::sync_mailboxes_graph(&graph_config, &targets, limit, reconcile, dry_run).await?
+                graph::sync_mailboxes_graph(
+                    &graph_config,
+                    &account_config.name,
+                    &targets,
+                    limit,
+                    dry_run,
+                )
+                .await?
             } else {
                 let imap_config = ImapConfig::load(&account_config)?;
-                sync_mailboxes(&imap_config, &targets, limit, reconcile, dry_run, None, None).await?
+                sync_mailboxes(
+                    &imap_config,
+                    &account_config.name,
+                    &targets,
+                    limit,
+                    dry_run,
+                )
+                .await?
             };
 
-            // Incremental contacts-index update (best-effort, no-op on dry_run).
             if !dry_run {
+                // Incremental contacts-index update (best-effort).
                 email::contacts::hooks::bump_after_sync(
                     &account_config,
                     &result.fresh_observations,
                 );
                 // Organizer-side REPLY reconciliation (#0030): only walks the
-                // mailstore when this sync saved a METHOD:REPLY invite.
+                // mailstore when this sync ingested a METHOD:REPLY invite.
                 let account_root = email::config::account_dir(&account_config.name);
                 email::reconcile::bump_after_sync(&account_root, result.saw_reply_invite);
             }
@@ -1586,24 +1552,25 @@ async fn main() -> Result<()> {
                     "✓".green(),
                     prefix,
                     result.saved,
-                    if dry_run { "to download" } else { "saved" },
+                    if dry_run { "to download" } else { "ingested" },
                 );
             }
 
-            if reconcile {
-                if result.moved > 0 || result.removed > 0 {
-                    println!(
-                        "{} {}Reconciled: {} {}, {} {}",
-                        "ℹ".blue(),
-                        prefix,
-                        result.moved,
-                        if dry_run { "to move" } else { "moved" },
-                        result.removed,
-                        if dry_run { "to remove" } else { "removed" },
-                    );
-                } else {
-                    println!("{} {}Reconciled: already in sync", "✓".green(), prefix);
-                }
+            if result.read_updated > 0 {
+                println!(
+                    "{} {}Read status updated on {} message(s)",
+                    "ℹ".blue(),
+                    prefix,
+                    result.read_updated,
+                );
+            }
+            if result.uid_rebound > 0 {
+                println!(
+                    "{} {}Rebound {} message(s) to new UIDs after a UIDVALIDITY reset",
+                    "ℹ".blue(),
+                    prefix,
+                    result.uid_rebound,
+                );
             }
         }
 

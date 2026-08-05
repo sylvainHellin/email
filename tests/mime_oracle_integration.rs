@@ -19,8 +19,7 @@
 //! crate is needed to produce them and nothing about the fixture depends on the
 //! developer's locale.
 
-use email::parse::{parse_rfc822_to_fetched_email, save_fetched_emails, FetchedEmail};
-use email::tui::app::load_emails;
+use email::parse::{parse_rfc822_to_fetched_email, FetchedEmail};
 
 /// Assemble a raw RFC822 message. `headers` must end with CRLF; the blank line
 /// that terminates the header block is added here.
@@ -33,6 +32,64 @@ fn message(headers: &str, body: &[u8]) -> Vec<u8> {
 
 fn parse(raw: &[u8]) -> FetchedEmail {
     parse_rfc822_to_fetched_email(raw).expect("fixture must parse")
+}
+
+/// One fixture ingested into a throwaway store, with accessors for the row and
+/// its blobs. This is the store-side replacement for reading the `.md` file
+/// the old save path wrote.
+struct IngestedRow {
+    _tmp: tempfile::TempDir,
+    store: email::store::Store,
+    blobs: email::store::BlobStore,
+    row: i64,
+}
+
+fn ingest_raw(raw: &[u8]) -> IngestedRow {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+    let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
+    let fetched = parse(raw);
+    let outcome = email::ingest::ingest_message(
+        &store,
+        &blobs,
+        &email::ingest::IngestInput {
+            account: "acct",
+            mailbox: "inbox",
+            uid: 1,
+            email: &fetched,
+            raw: Some(raw),
+        },
+    )
+    .unwrap();
+    IngestedRow { _tmp: tmp, store, blobs, row: outcome.row_id }
+}
+
+impl IngestedRow {
+    fn text(&self, column: &str) -> String {
+        self.store
+            .conn()
+            .query_row(
+                &format!("SELECT IFNULL({column}, '') FROM messages WHERE id = ?1"),
+                [self.row],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    fn blob(&self, column: &str) -> Vec<u8> {
+        let hash = self.text(column);
+        self.blobs
+            .read(&email::store::blobs::BlobHash::parse(&hash).unwrap())
+            .unwrap()
+    }
+
+    fn body(&self) -> String {
+        String::from_utf8(self.blob("body_blob")).unwrap()
+    }
+
+    fn raw(&self) -> Vec<u8> {
+        self.blob("raw_blob")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,15 +267,12 @@ fn rfc2047_and_rfc2231_attachment_filenames_decode() {
 }
 
 /// parity. End to end: a latin-1 encoded-word Subject and display name survive
-/// the decode, the YAML frontmatter write (the subject here contains a colon,
-/// which must end up quoted), and the reload into an `EmailEntry`. The filename
-/// slug keeps the non-ASCII characters lowercased rather than transliterating
-/// or stripping them.
+/// the decode and the store ingest, and come back out of the `messages` row
+/// unchanged. The `.md` era asserted the YAML quoting of a subject containing
+/// a colon and the slugged filename; neither exists any more (#0037), and the
+/// column round-trip is the surviving contract.
 #[test]
-fn rfc2047_headers_survive_save_and_reload() {
-    let tmp = tempfile::tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
-
+fn rfc2047_headers_survive_ingest() {
     let mut raw = b"From: =?ISO-8859-1?Q?J=FCrgen_M=FCller?= <juergen@example.de>\r\n\
                     To: c@example.com\r\n\
                     Subject: =?UTF-8?B?R3LDvMOfZTogTcO8bmNoZW4=?=\r\n\
@@ -228,27 +282,12 @@ fn rfc2047_headers_survive_save_and_reload() {
         .to_vec();
     raw.extend_from_slice(b"Gr\xfc\xdfe\r\n");
 
-    let fetched = parse(&raw);
-    let (saved, skipped) = save_fetched_emails(&[fetched], &inbox, "inbox").unwrap();
-    assert_eq!((saved, skipped), (1, 0));
-
-    let file = inbox.join("2024-01-01-1200_jürgen-müller_grüße-münchen.md");
-    let on_disk = std::fs::read_to_string(&file).expect("slugged filename");
-    assert!(
-        on_disk.contains("from: Jürgen Müller <juergen@example.de>\n"),
-        "frontmatter: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("subject: 'Grüße: München'\n"),
-        "a subject containing a colon must be quoted: {on_disk}"
-    );
-
-    let entries = load_emails(&inbox);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].subject, "Grüße: München");
-    // The list shows the display name only; the address is dropped here.
-    assert_eq!(entries[0].from, "Jürgen Müller");
-    assert_eq!(entries[0].body, "Grüße");
+    let store = ingest_raw(&raw);
+    assert_eq!(store.text("from_"), "Jürgen Müller <juergen@example.de>");
+    assert_eq!(store.text("subject"), "Grüße: München");
+    assert_eq!(store.text("message_id"), "<m1@example.de>");
+    assert_eq!(store.body(), "Grüße\r\n");
+    assert_eq!(store.text("snippet"), "Grüße");
 }
 
 // ---------------------------------------------------------------------------
@@ -337,15 +376,15 @@ fn body_quoted_printable_latin1_decodes() {
     assert_eq!(parse(&raw).body_text, "Grüße aus München\r\n");
 }
 
-/// parity. A latin-1 HTML body is decoded for the plain-text projection, and
-/// the saved companion `.html` is rewritten to UTF-8: the stale
-/// `<meta charset="iso-8859-1">` is replaced, so a browser opening the file
-/// does not re-misinterpret the now-UTF-8 bytes.
+/// parity. A latin-1 HTML body is decoded for the plain-text projection that
+/// the store keeps as the body blob.
+///
+/// The `.md` era also wrote a companion `.html` whose stale
+/// `<meta charset="iso-8859-1">` was rewritten to UTF-8; ingest writes no
+/// companion file (#0037), so what is asserted here is the decoded projection
+/// that reaches the row. The HTML itself is recoverable from the raw blob.
 #[test]
-fn html_body_iso8859_1_is_transcoded_to_utf8_on_disk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let inbox = tmp.path().join("acct").join("inbox");
-
+fn html_body_iso8859_1_is_decoded_for_the_body_blob() {
     let mut raw = b"From: a@example.com\r\n\
                     Subject: html\r\n\
                     Date: Mon, 01 Jan 2024 12:00:00 +0000\r\n\
@@ -358,12 +397,12 @@ fn html_body_iso8859_1_is_transcoded_to_utf8_on_disk() {
 
     let fetched = parse(&raw);
     assert_eq!(fetched.body_text, "Grüße\n");
-    save_fetched_emails(&[fetched], &inbox, "inbox").unwrap();
 
-    let html = std::fs::read_to_string(inbox.join("2024-01-01-1200_a_html.html")).unwrap();
-    assert!(html.contains(r#"<meta charset="UTF-8">"#), "{html}");
-    assert!(!html.contains("iso-8859-1"), "{html}");
-    assert!(html.contains("<p>Grüße</p>"), "{html}");
+    let store = ingest_raw(&raw);
+    assert_eq!(store.body(), "Grüße\n");
+    // The raw blob is byte-identical to what came off the wire, so the HTML
+    // part is never lost even though no `.html` companion is written.
+    assert_eq!(store.raw(), raw);
 }
 
 // ---------------------------------------------------------------------------

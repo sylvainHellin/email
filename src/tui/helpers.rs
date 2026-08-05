@@ -12,14 +12,12 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{App, EmailEntry, SearchHit, SearchTarget};
 
-use crate::config::{all_configured_mailboxes, mailbox_dir, AccountConfig, ImapConfig};
+use crate::config::{all_configured_mailboxes, AccountConfig, ImapConfig};
 use crate::draft::parse_email_draft;
 use crate::imap_client::{
-    fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes,
-    MailboxState, MessageIdIndex, SyncTarget,
+    fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes, SyncTarget,
 };
 use crate::parse::FetchedEmail;
-use crate::sync::mailbox_status;
 
 // ---------------------------------------------------------------------------
 // Watcher
@@ -225,9 +223,6 @@ pub(super) async fn lib_do_sync(
     account_config: &AccountConfig,
     imap_config: &ImapConfig,
     limit: usize,
-    reconcile: bool,
-    known_index: Option<&mut MessageIdIndex>,
-    prev_states: Option<&std::collections::HashMap<String, MailboxState>>,
 ) -> anyhow::Result<(String, SyncResultMeta)> {
     let span_label = if limit < usize::MAX { "lib_do_sync:quick" } else { "lib_do_sync:full" };
     let _span = crate::timing::TimingSpan::with_context(span_label, account_config.name.clone());
@@ -237,68 +232,47 @@ pub(super) async fn lib_do_sync(
         .map(|(role, mapping)| SyncTarget {
             role: role.clone(),
             server_name: mapping.server.clone(),
-            local_dir: mailbox_dir(&account_config.name, role),
-            status: mailbox_status(role).to_string(),
         })
         .collect();
 
-    let result = sync_mailboxes(imap_config, &targets, limit, reconcile, false, known_index, prev_states).await?;
+    let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false).await?;
+    Ok((finish_sync(account_config, &result), SyncResultMeta {
+        new_inbox_mail: result.new_inbox_mail.clone(),
+    }))
+}
 
+/// Post-sync hooks shared by both backends, and the one-line status message.
+///
+/// The `.md` era also returned the directories a sync had touched so the TUI
+/// could invalidate its caches; ingest writes no files, so there is nothing to
+/// invalidate until the read path moves onto the store (#0038).
+fn finish_sync(
+    account_config: &AccountConfig,
+    result: &crate::imap_client::SyncResult,
+) -> String {
     // Incremental contacts-index update (best-effort, no-op if no cache).
     crate::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
 
     // Organizer-side REPLY reconciliation (#0030): only walks the mailstore
-    // when this sync actually saved a METHOD:REPLY invite. Fold the invites it
-    // rewrote into touched_dirs so the affected mailbox cache is invalidated
-    // and the event card reloads with the updated attendee statuses.
-    let mut touched_dirs = result.touched_dirs;
+    // when this sync ingested a METHOD:REPLY invite. Still file-based, like
+    // the rest of the read path, until #0038.
     let account_root = crate::config::account_dir(&account_config.name);
-    for invite_path in
-        crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite)
-    {
-        if let Some(dir) = invite_path.parent() {
-            let dir = dir.to_path_buf();
-            if !touched_dirs.contains(&dir) {
-                touched_dirs.push(dir);
-            }
-        }
-    }
+    crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite);
 
     let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
     if result.read_updated > 0 {
         msg.push_str(&format!(", {} read status updated", result.read_updated));
     }
-    if result.deduped > 0 {
-        msg.push_str(&format!(", {} duplicates removed", result.deduped));
+    if result.uid_rebound > 0 {
+        msg.push_str(&format!(", {} renumbered", result.uid_rebound));
     }
-    if reconcile {
-        if result.moved > 0 || result.removed > 0 {
-            msg.push_str(&format!(
-                " | Reconciled: {} moved, {} removed",
-                result.moved, result.removed
-            ));
-        } else {
-            msg.push_str(" | Already in sync");
-        }
-    }
-    let meta = SyncResultMeta {
-        mailbox_states: result.mailbox_states,
-        touched_dirs,
-        new_inbox_mail: result.new_inbox_mail,
-    };
-    Ok((msg, meta))
+    msg
 }
 
-/// Metadata returned alongside the status message from lib_do_sync.
-/// Carries state that needs to be persisted back to AccountState.
+/// Metadata returned alongside the status message from a sync.
 pub(super) struct SyncResultMeta {
-    pub mailbox_states: std::collections::HashMap<String, MailboxState>,
-    /// Local mailbox directories the sync actually modified on disk.
-    /// Empty when the sync was a no-op (lets the UI skip cache
-    /// invalidation and mailbox reload entirely).
-    pub touched_dirs: Vec<std::path::PathBuf>,
     /// Sender + subject of every genuinely new inbox email this sync
-    /// saved, for the desktop notification (#0009).
+    /// ingested, for the desktop notification (#0009).
     pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
 }
 
@@ -367,68 +341,27 @@ pub(super) async fn lib_do_sync_graph(
     account_config: &AccountConfig,
     graph_config: &crate::config::GraphConfig,
     limit: usize,
-    reconcile: bool,
-) -> anyhow::Result<(String, GraphSyncMeta)> {
+) -> anyhow::Result<(String, SyncResultMeta)> {
     let targets: Vec<SyncTarget> = all_configured_mailboxes(account_config)
         .iter()
         .map(|(role, mapping)| SyncTarget {
             role: role.clone(),
             server_name: mapping.server.clone(),
-            local_dir: mailbox_dir(&account_config.name, role),
-            status: mailbox_status(role).to_string(),
         })
         .collect();
 
-    let result =
-        crate::graph::sync_mailboxes_graph(graph_config, &targets, limit, reconcile, false)
-            .await?;
+    let result = crate::graph::sync_mailboxes_graph(
+        graph_config,
+        &account_config.name,
+        &targets,
+        limit,
+        false,
+    )
+    .await?;
 
-    crate::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
-
-    // Organizer-side REPLY reconciliation (#0030); see the IMAP path above.
-    let mut touched_dirs = result.touched_dirs;
-    let account_root = crate::config::account_dir(&account_config.name);
-    for invite_path in
-        crate::reconcile::bump_after_sync(&account_root, result.saw_reply_invite)
-    {
-        if let Some(dir) = invite_path.parent() {
-            let dir = dir.to_path_buf();
-            if !touched_dirs.contains(&dir) {
-                touched_dirs.push(dir);
-            }
-        }
-    }
-
-    let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
-    if result.read_updated > 0 {
-        msg.push_str(&format!(", {} read status updated", result.read_updated));
-    }
-    if result.deduped > 0 {
-        msg.push_str(&format!(", {} duplicates removed", result.deduped));
-    }
-    if reconcile {
-        if result.moved > 0 || result.removed > 0 {
-            msg.push_str(&format!(
-                " | Reconciled: {} moved, {} removed",
-                result.moved, result.removed
-            ));
-        } else {
-            msg.push_str(" | Already in sync");
-        }
-    }
-    let meta = GraphSyncMeta {
-        touched_dirs,
-        new_inbox_mail: result.new_inbox_mail,
-    };
-    Ok((msg, meta))
-}
-
-/// Metadata returned alongside the status message from `lib_do_sync_graph`.
-pub(super) struct GraphSyncMeta {
-    pub touched_dirs: Vec<std::path::PathBuf>,
-    /// Sender + subject of every genuinely new inbox email this sync
-    /// saved, for the desktop notification (#0009).
-    pub new_inbox_mail: Vec<crate::notify::NewMailMeta>,
+    Ok((finish_sync(account_config, &result), SyncResultMeta {
+        new_inbox_mail: result.new_inbox_mail.clone(),
+    }))
 }
 
 pub(super) async fn lib_do_multi_search_graph(
@@ -555,6 +488,14 @@ pub(super) fn resolve_send_account(
 // Search result helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve a server-search hit to a local file, when one exists.
+///
+/// This used to *write* the hit to the mailbox directory as `.md` so the rest
+/// of the TUI could open it. Ingest no longer writes files, so the hit is only
+/// openable when a previous sync already put it on disk; the lookup is by
+/// Message-ID in frontmatter (never a whole-file substring match, which could
+/// false-match an ID quoted in another email's body). Server-only hits become
+/// openable again when the read path moves onto the store (#0038).
 pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
     let idx = app.server_search_index;
     let result = app.server_search_results.get(idx)?;
@@ -564,60 +505,13 @@ pub(super) fn ensure_search_result_saved(app: &mut App) -> Option<PathBuf> {
     }
 
     let save_dir = result.source_local_dir.clone();
-    let status = result.source_status.clone();
+    let message_id = result.fetched.message_id.clone()?;
 
-    log::info!(
-        "Search result save: source_label={}, status={}, dir={}, subject={}",
-        result.source_label,
-        status,
-        save_dir.display(),
-        result.entry.subject,
-    );
-
-    let fetched_clone = result.fetched.clone();
-    let message_id = result.fetched.message_id.clone();
-
-    let mut known_ids = crate::parse::scan_existing_message_ids(&save_dir).unwrap_or_default();
-    match crate::parse::save_fetched_emails_with_known_ids(
-        &[fetched_clone],
-        &save_dir,
-        &status,
-        &mut known_ids,
-    ) {
-        Ok((saved, _skipped, saved_paths)) => {
-            if saved > 0 {
-                if let Some((_mid, path)) = saved_paths.into_iter().next() {
-                    let result = app.server_search_results.get_mut(idx)?;
-                    result.saved_path = Some(path.clone());
-                    if let Some(cache_idx) = app.mailbox_index_for_dir(&save_dir) {
-                        app.invalidate_cache_idx(cache_idx);
-                    }
-                    return Some(path);
-                }
-                if let Some(cache_idx) = app.mailbox_index_for_dir(&save_dir) {
-                    app.invalidate_cache_idx(cache_idx);
-                }
-                None
-            } else {
-                // Skipped as duplicate: the email already exists on disk, so no
-                // path was returned. Look it up by message_id in frontmatter
-                // (never by whole-file substring, which could false-match an
-                // ID quoted in another email's body).
-                if let Some(ref mid) = message_id {
-                    if let Ok(ids) = crate::parse::scan_mailbox_message_ids(&save_dir) {
-                        if let Some(path) = ids.get(mid) {
-                            let path = path.clone();
-                            let result = app.server_search_results.get_mut(idx)?;
-                            result.saved_path = Some(path.clone());
-                            return Some(path);
-                        }
-                    }
-                }
-                None
-            }
-        }
-        Err(_) => None,
-    }
+    let ids = crate::parse::scan_mailbox_message_ids(&save_dir).ok()?;
+    let path = ids.get(&message_id)?.clone();
+    let result = app.server_search_results.get_mut(idx)?;
+    result.saved_path = Some(path.clone());
+    Some(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +571,6 @@ mod tests {
             has_unseen: false,
             message_id_index: Default::default(),
             indexing: false,
-            mailbox_states: Default::default(),
         }
     }
 
