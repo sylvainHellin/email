@@ -66,7 +66,7 @@ pub struct OAuth2Settings {
     pub tenant_id: String,
 }
 
-/// Per-account configuration (one entry in [[accounts]]).
+/// Per-account configuration (one entry in `[[accounts]]`).
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AccountConfig {
     #[serde(default)]

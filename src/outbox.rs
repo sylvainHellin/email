@@ -12,11 +12,14 @@
 //! ```text
 //!            enqueue                submit 250              append acked
 //!   (nothing) ------> pending_send ------------> sent_pending_append ------> done
-//!                          |                            ^     |
+//!                          |  ^                         ^     |
 //!         clean pre-submission failure                  |     | append failed
-//!                          '--> stays pending_send      '-----'  (attempts += 1)
+//!                          |  |  (attempts += 1,        '-----'  (attempts += 1)
+//!                          |  |   marker cleared)
+//!                          |  '------------------ retry (operator, from failed)
 //!                          |
 //!            ambiguous SMTP failure --> failed  (manual inspection, never re-sent)
+//!            crash after the marker --> failed  (same rule, decided on resume)
 //! ```
 //!
 //! Every arrow is one committed transaction, and each state answers exactly one
@@ -25,6 +28,12 @@
 //! - `pending_send`: SMTP has provably not been accepted, so the resume path
 //!   submits. A crash between the commit and the SMTP conversation lands here,
 //!   and re-sending is correct because the server never saw the message.
+//!   "Provably" is what `submission_started_at` buys: the sender commits that
+//!   marker immediately before it opens the SMTP session, so a `pending_send`
+//!   row found on restart with a NULL marker was never attempted, while one
+//!   with a marker died somewhere inside the conversation and is as ambiguous
+//!   as a dropped connection. [`sweep_pending_sends`] hands the first kind
+//!   back for submission and moves the second to `failed`.
 //! - `sent_pending_append`: the server returned 250 and owns the message now.
 //!   SMTP must never run again for this row; only the APPEND is retried. A crash
 //!   between the 250 and the APPEND lands here.
@@ -37,7 +46,11 @@
 //! ## Exactly once
 //!
 //! SMTP runs at most once per row: [`record_submission`] is the only writer that
-//! leaves `pending_send`, and the driver only submits rows still in that state.
+//! leaves `pending_send`, the marker turns "we may have submitted" into a
+//! committed fact, and the driver only submits rows still in that state with no
+//! marker. [`retry`] re-arms a `failed` row for a human who has established
+//! that the message did not arrive; it clears the marker, so the row is again a
+//! single-attempt row rather than a second attempt on top of an unknown first.
 //! The APPEND is idempotent by construction instead: a retry (`attempts > 0`)
 //! first runs `UID SEARCH HEADER MESSAGE-ID` in the Sent mailbox and skips the
 //! APPEND on a hit, because the previous attempt may have been ambiguous in the
@@ -135,6 +148,73 @@ pub struct OutboxRow {
     pub appended_uid: Option<i64>,
     pub created: i64,
     pub updated: i64,
+    /// When the sender last committed "the SMTP session is about to open".
+    /// `None` means the transport was provably never entered for this row.
+    pub submission_started_at: Option<i64>,
+    /// The envelope the row was enqueued with, when it is readable.
+    pub envelope: Option<Envelope>,
+}
+
+/// The SMTP envelope a resumed submission needs.
+///
+/// Stored on the row rather than recovered from the message bytes because the
+/// two are not the same thing: lettre drops the `Bcc` header when it builds the
+/// message (that is what makes a Bcc blind), so a submission rebuilt from
+/// headers alone would silently lose every blind recipient. The envelope is
+/// the sender's own record of who the message is going to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Envelope {
+    /// Envelope sender, as the `MAIL FROM` address is derived from it.
+    pub from: String,
+    /// Every recipient with its header role, in the order they were built.
+    pub recipients: Vec<(String, crate::send::RecipientRole)>,
+}
+
+impl Envelope {
+    /// One `role:address` per line, `from` first.
+    ///
+    /// A hand-rolled encoding rather than JSON because the shape is two fields
+    /// of plain text and an address can hold neither a newline nor a colon
+    /// before its role prefix.
+    pub fn encode(&self) -> String {
+        let mut out = format!("from:{}", self.from);
+        for (addr, role) in &self.recipients {
+            out.push('\n');
+            out.push_str(match role {
+                crate::send::RecipientRole::To => "to:",
+                crate::send::RecipientRole::Cc => "cc:",
+                crate::send::RecipientRole::Bcc => "bcc:",
+            });
+            out.push_str(addr);
+        }
+        out
+    }
+
+    /// Parse [`Envelope::encode`]. Unknown lines are skipped rather than
+    /// failing the row: a readable partial envelope is still better than
+    /// refusing to load a submission that has to be shown to a human.
+    pub fn decode(text: &str) -> Self {
+        use crate::send::RecipientRole;
+        let mut env = Envelope::default();
+        for line in text.lines() {
+            let Some((role, addr)) = line.split_once(':') else {
+                continue;
+            };
+            match role {
+                "from" => env.from = addr.to_string(),
+                "to" => env.recipients.push((addr.to_string(), RecipientRole::To)),
+                "cc" => env.recipients.push((addr.to_string(), RecipientRole::Cc)),
+                "bcc" => env.recipients.push((addr.to_string(), RecipientRole::Bcc)),
+                _ => {}
+            }
+        }
+        env
+    }
+
+    /// True when there is enough here to submit from.
+    pub fn is_submittable(&self) -> bool {
+        !self.from.is_empty() && !self.recipients.is_empty()
+    }
 }
 
 /// What the SMTP conversation did, from the state machine's point of view.
@@ -258,6 +338,7 @@ pub fn enqueue(
     target_mailbox: Option<&str>,
     message_id: &str,
     raw: &[u8],
+    envelope: &Envelope,
 ) -> Result<i64> {
     let mut span = TimingSpan::with_context("outbox_enqueue", format!("{} bytes", raw.len()));
     let hash = blobs.write(raw)?;
@@ -271,9 +352,16 @@ pub fn enqueue(
     tx.execute(
         "INSERT INTO outbox (
             account, target_mailbox, message_id, raw_blob, state, attempts,
-            last_error, appended_uid, created, updated
-         ) VALUES (?1, ?2, ?3, ?4, 'pending_send', 0, NULL, NULL, ?5, ?5)",
-        rusqlite::params![account, target_mailbox, message_id, hash.as_str(), now],
+            last_error, appended_uid, created, updated, submission_started_at, envelope
+         ) VALUES (?1, ?2, ?3, ?4, 'pending_send', 0, NULL, NULL, ?5, ?5, NULL, ?6)",
+        rusqlite::params![
+            account,
+            target_mailbox,
+            message_id,
+            hash.as_str(),
+            now,
+            envelope.encode()
+        ],
     )
     .context("inserting the outbox row")?;
     let id = tx.last_insert_rowid();
@@ -283,6 +371,33 @@ pub fn enqueue(
 
     info!("[outbox] queued {message_id} as row {id} for {account}");
     Ok(id)
+}
+
+/// Commit "the SMTP session is about to open" for a `pending_send` row.
+///
+/// The marker is what makes the resume path decidable: without it a
+/// `pending_send` row found after a crash could equally be one that never
+/// reached the transport (safe to send) and one that died between the first
+/// byte and the 250 (a possible duplicate). Called immediately before the
+/// submission and committed on its own, so the window it does not cover is the
+/// one instruction between the commit and the connect.
+///
+/// Refuses any state but `pending_send`, so a caller that re-runs a send cannot
+/// re-arm a row that has already left the transport.
+pub fn mark_submission_started(store: &Store, id: i64) -> Result<()> {
+    let now = unix_now();
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE outbox SET submission_started_at = ?2, updated = ?2
+             WHERE id = ?1 AND state = 'pending_send'",
+            rusqlite::params![id, now],
+        )
+        .context("marking the outbox row as entering submission")?;
+    if changed == 0 {
+        warn!("[outbox] row {id} is not pending_send; not marking a submission start");
+    }
+    Ok(())
 }
 
 /// Record what SMTP did. The only transition out of `pending_send`.
@@ -327,10 +442,16 @@ pub fn record_submission(
             }
         }
         SubmitOutcome::CleanPreSubmission(err) => {
+            // The row stays submittable, so it must also stay *decidable*: the
+            // marker goes back to NULL because this failure proves the server
+            // never took the message, and `attempts` is bumped so the automatic
+            // resubmission on the next resume backs off instead of hammering a
+            // server that is refusing the message for a standing reason.
             store
                 .conn()
                 .execute(
-                    "UPDATE outbox SET last_error = ?2, updated = ?3 WHERE id = ?1",
+                    "UPDATE outbox SET attempts = attempts + 1, last_error = ?2, updated = ?3,
+                     submission_started_at = NULL WHERE id = ?1",
                     rusqlite::params![id, err, now],
                 )
                 .context("recording a clean pre-submission failure")?;
@@ -363,6 +484,18 @@ pub fn record_append(
 ) -> Result<OutboxState> {
     let row = load(store, id)?
         .with_context(|| format!("outbox row {id} disappeared before its APPEND result"))?;
+    if row.state != OutboxState::SentPendingAppend {
+        // Same belt and braces as `record_submission`: only a row that is
+        // actually waiting for an APPEND may be completed by one. A second
+        // result for a row already `done` would run `finish_done` twice and
+        // release the raw blob twice, unlinking bytes another reference still
+        // points at.
+        warn!(
+            "[outbox] ignoring an APPEND result for row {id}, already in state {}",
+            row.state
+        );
+        return Ok(row.state);
+    }
     let now = unix_now();
     match outcome {
         AppendOutcome::Appended { uid } | AppendOutcome::AlreadyPresent { uid } => {
@@ -473,7 +606,8 @@ pub fn load(store: &Store, id: i64) -> Result<Option<OutboxRow>> {
         .conn()
         .query_row(
             "SELECT id, account, target_mailbox, message_id, raw_blob, state, attempts,
-                    last_error, appended_uid, created, updated
+                    last_error, appended_uid, created, updated, submission_started_at,
+                    envelope
              FROM outbox WHERE id = ?1",
             [id],
             row_from_sql,
@@ -485,19 +619,114 @@ pub fn load(store: &Store, id: i64) -> Result<Option<OutboxRow>> {
 
 /// Every row in a non-terminal state, oldest first.
 pub fn open_rows(store: &Store, account: &str) -> Result<Vec<OutboxRow>> {
-    let mut stmt = store.conn().prepare(
+    rows_in_states(
+        store,
+        account,
+        "state IN ('pending_send', 'sent_pending_append')",
+    )
+}
+
+/// Every row that is not `done`, oldest first: what `mp outbox list` shows.
+///
+/// `done` rows are the boring majority and say nothing an operator can act on,
+/// so they are left out rather than paged over.
+pub fn unfinished_rows(store: &Store, account: &str) -> Result<Vec<OutboxRow>> {
+    rows_in_states(store, account, "state <> 'done'")
+}
+
+fn rows_in_states(store: &Store, account: &str, predicate: &str) -> Result<Vec<OutboxRow>> {
+    let mut stmt = store.conn().prepare(&format!(
         "SELECT id, account, target_mailbox, message_id, raw_blob, state, attempts,
-                last_error, appended_uid, created, updated
+                last_error, appended_uid, created, updated, submission_started_at,
+                envelope
          FROM outbox
-         WHERE account = ?1 AND state IN ('pending_send', 'sent_pending_append')
+         WHERE account = ?1 AND {predicate}
          ORDER BY id",
-    )?;
+    ))?;
     let rows = stmt.query_map([account], row_from_sql)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// What a resume pass decided about this account's `pending_send` rows.
+#[derive(Debug, Default)]
+pub struct PendingSends {
+    /// Rows whose marker is NULL: the transport was never entered, so the send
+    /// path may submit them exactly as if they had just been enqueued.
+    pub resubmittable: Vec<OutboxRow>,
+    /// Rows that carried a marker and have just been moved to `failed`. The
+    /// message may or may not have been delivered, so nothing automatic can be
+    /// safe; a human reads them with `mp outbox list`.
+    pub stranded: Vec<i64>,
+}
+
+/// Classify (and part-resolve) the `pending_send` rows left by a crash.
+///
+/// Runs before any resubmission, on startup and on the sync tick. The stranded
+/// rows are transitioned here, one committed transaction each; the
+/// resubmittable ones are handed back because SMTP belongs to the caller that
+/// owns the credentials (see [`crate::send::resume_outbox`]).
+pub fn sweep_pending_sends(store: &Store, account: &str) -> Result<PendingSends> {
+    let mut out = PendingSends::default();
+    let now = unix_now();
+    for row in open_rows(store, account)? {
+        if row.state != OutboxState::PendingSend {
+            continue;
+        }
+        match row.submission_started_at {
+            None => out.resubmittable.push(row),
+            Some(started) => {
+                let err = format!(
+                    "submission started at {started} and never returned a verdict; \
+                     the message may or may not have been delivered"
+                );
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE outbox SET state = 'failed', last_error = ?2, updated = ?3
+                         WHERE id = ?1 AND state = 'pending_send'",
+                        rusqlite::params![row.id, err, now],
+                    )
+                    .context("failing a stranded submission")?;
+                warn!(
+                    "[outbox] row {} ({}) died inside its SMTP session; parked as failed, \
+                     never auto re-sent",
+                    row.id, row.message_id
+                );
+                out.stranded.push(row.id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Re-arm a `failed` row for one more submission.
+///
+/// The operator's half of the exactly-once rule: automatic recovery cannot know
+/// whether an ambiguous submission arrived, a human can find out. The marker is
+/// cleared, so the row goes back to being a never-attempted `pending_send` and
+/// the next resume submits it exactly once.
+pub fn retry(store: &Store, id: i64) -> Result<()> {
+    let row = load(store, id)?.with_context(|| format!("no outbox row {id}"))?;
+    if row.state != OutboxState::Failed {
+        return Err(anyhow::anyhow!(
+            "outbox row {id} is {}, and only a failed row can be retried",
+            row.state
+        ));
+    }
+    store
+        .conn()
+        .execute(
+            "UPDATE outbox SET state = 'pending_send', last_error = NULL,
+             submission_started_at = NULL, updated = ?2 WHERE id = ?1",
+            rusqlite::params![id, unix_now()],
+        )
+        .context("re-arming a failed outbox row")?;
+    info!("[outbox] row {id} ({}) re-armed for one more send", row.message_id);
+    Ok(())
 }
 
 /// How many rows are not `done`, split into "still working" and "parked".
@@ -573,6 +802,11 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         appended_uid: row.get(8)?,
         created: row.get(9).unwrap_or(0),
         updated: row.get(10).unwrap_or(0),
+        submission_started_at: row.get(11).unwrap_or(None),
+        envelope: row
+            .get::<_, Option<String>>(12)
+            .unwrap_or(None)
+            .map(|text| Envelope::decode(&text)),
     })
 }
 
@@ -603,10 +837,11 @@ pub struct DrainResult {
 
 /// Drive every `sent_pending_append` row for `account` towards `done`.
 ///
-/// This is the resume path: it runs on startup and on the normal sync tick, and
+/// Half of the resume path: it runs on startup and on the normal sync tick, and
 /// it drives the APPEND only. Rows in `pending_send` are counted and left
 /// alone, because re-submitting them needs the SMTP transport and the account's
-/// credentials, which the caller owns (see [`crate::send::resume_pending_sends`]).
+/// credentials, which the caller owns: [`crate::send::resume_outbox`] runs
+/// [`sweep_pending_sends`] and the resubmission around this pass.
 ///
 /// Retries are safe by construction: a row that has already been attempted
 /// (`attempts > 0`) runs the Message-ID dedup search first and skips the APPEND

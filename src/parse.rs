@@ -508,7 +508,7 @@ pub fn parse_rfc822_to_fetched_email(rfc822_body: &[u8]) -> Option<FetchedEmail>
 }
 
 /// Compress a sorted list of UIDs into IMAP sequence set format using ranges.
-/// e.g., [1,2,3,5,7,8,9] -> "1:3,5,7:9"
+/// e.g., `[1,2,3,5,7,8,9]` -> `"1:3,5,7:9"`
 pub fn compress_uid_set(uids: &[u32]) -> String {
     if uids.is_empty() {
         return String::new();

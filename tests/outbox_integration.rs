@@ -16,8 +16,9 @@ use email::config::{
     SmtpSettings,
 };
 use email::outbox::{
-    self, OutboxState, SentMailbox, SubmitOutcome,
+    self, Envelope, OutboxState, SentMailbox, SubmitOutcome,
 };
+use email::send::RecipientRole;
 use email::store::{BlobStore, Store};
 use tempfile::TempDir;
 
@@ -160,6 +161,18 @@ impl SentMailbox for FakeSent {
     }
 }
 
+/// The envelope every fixture is queued with: one visible recipient and one
+/// blind one, because the blind one is the part the message bytes cannot carry.
+fn envelope() -> Envelope {
+    Envelope {
+        from: "alice@example.com".into(),
+        recipients: vec![
+            ("bob@example.com".into(), RecipientRole::To),
+            ("blind@example.com".into(), RecipientRole::Bcc),
+        ],
+    }
+}
+
 /// A row that has been queued but never submitted, as the moment before SMTP.
 fn enqueue(account: &Account, message_id: &str, target: Option<&str>) -> i64 {
     let (store, blobs) = account.open();
@@ -170,6 +183,7 @@ fn enqueue(account: &Account, message_id: &str, target: Option<&str>) -> i64 {
         target,
         message_id,
         &raw(message_id),
+        &envelope(),
     )
     .unwrap()
 }
@@ -210,8 +224,8 @@ async fn a_crash_before_smtp_leaves_the_row_submittable_and_sends_once() {
     // message, so re-sending it is the correct move rather than a duplicate.
     assert_eq!(state_of(&account, id), OutboxState::PendingSend);
 
-    // The resume path does not submit (SMTP belongs to the send path that owns
-    // the credentials), it reports the row as awaiting submission.
+    // The APPEND driver does not submit (SMTP belongs to the send path that
+    // owns the credentials), it reports the row as awaiting submission.
     let (store, blobs) = account.open();
     let mut sent = FakeSent::new();
     let drained = outbox::drain(&store, &blobs, ACCOUNT, &mut sent, outbox::unix_now())
@@ -221,7 +235,19 @@ async fn a_crash_before_smtp_leaves_the_row_submittable_and_sends_once() {
     assert_eq!(*sent.appends.borrow(), 0, "nothing to append yet");
     assert_eq!(state_of(&account, id), OutboxState::PendingSend);
 
-    // The send path submits it, exactly once, and the copy follows.
+    // The resume sweep hands the row back for submission: no marker means the
+    // transport was provably never entered, so sending it is not a duplicate.
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert!(sweep.stranded.is_empty());
+    assert_eq!(sweep.resubmittable.len(), 1);
+    assert_eq!(sweep.resubmittable[0].id, id);
+    assert!(
+        sweep.resubmittable[0].submission_started_at.is_none(),
+        "a never-attempted row carries no marker"
+    );
+
+    // The send path marks, submits, records: exactly once, and the copy follows.
+    outbox::mark_submission_started(&store, id).unwrap();
     outbox::record_submission(&store, &blobs, id, &SubmitOutcome::Accepted).unwrap();
     assert_eq!(state_of(&account, id), OutboxState::SentPendingAppend);
     outbox::drain(&store, &blobs, ACCOUNT, &mut sent, outbox::unix_now())
@@ -234,6 +260,101 @@ async fn a_crash_before_smtp_leaves_the_row_submittable_and_sends_once() {
     // retries the whole send cannot produce a second SMTP delivery.
     outbox::record_submission(&store, &blobs, id, &SubmitOutcome::Accepted).unwrap();
     assert_eq!(state_of(&account, id), OutboxState::Done);
+}
+
+/// The crash window the marker exists for: the process died *inside* the SMTP
+/// conversation, so nobody knows whether the message was delivered. Automatic
+/// recovery cannot be safe in either direction, so the row is parked.
+#[tokio::test]
+async fn a_crash_after_the_marker_fails_the_row_and_is_never_auto_re_sent() {
+    let account = Account::new();
+    let mid = "<crash-inside-smtp@example.com>";
+    let id = enqueue(&account, mid, Some(SENT));
+    {
+        let (store, _) = account.open();
+        outbox::mark_submission_started(&store, id).unwrap();
+    }
+
+    // ---- kill -9 here: the marker is committed, no verdict ever came back. ----
+
+    assert_eq!(state_of(&account, id), OutboxState::PendingSend);
+    let (store, blobs) = account.open();
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+
+    assert!(
+        sweep.resubmittable.is_empty(),
+        "an attempted submission must never be handed back for an automatic re-send"
+    );
+    assert_eq!(sweep.stranded, vec![id]);
+    assert_eq!(state_of(&account, id), OutboxState::Failed);
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    assert!(row.last_error.unwrap().contains("never returned a verdict"));
+
+    // Every later resume leaves it alone, and its bytes stay readable.
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert!(sweep.resubmittable.is_empty() && sweep.stranded.is_empty());
+    let mut sent = FakeSent::new();
+    outbox::drain(&store, &blobs, ACCOUNT, &mut sent, outbox::unix_now())
+        .await
+        .unwrap();
+    assert_eq!(*sent.appends.borrow(), 0);
+    assert_eq!(state_of(&account, id), OutboxState::Failed);
+    assert_eq!(blobs.read(&row.raw_blob).unwrap(), raw(mid));
+}
+
+/// `mp outbox retry`: the only way out of `failed`, and it puts the row back in
+/// the never-attempted shape rather than stacking a second attempt on an
+/// unknown first one.
+#[test]
+fn retrying_a_failed_row_re_arms_it_as_never_attempted() {
+    let account = Account::new();
+    let id = enqueue(&account, "<retry-me@example.com>", Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
+    outbox::record_submission(&store, &blobs, id, &SubmitOutcome::Ambiguous("lost".into()))
+        .unwrap();
+    assert_eq!(state_of(&account, id), OutboxState::Failed);
+
+    outbox::retry(&store, id).unwrap();
+
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    assert_eq!(row.state, OutboxState::PendingSend);
+    assert_eq!(row.submission_started_at, None, "the marker must be cleared");
+    assert_eq!(row.last_error, None);
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert_eq!(sweep.resubmittable.len(), 1, "the next resume submits it once");
+
+    // Only from `failed`: a row that is mid-flight cannot be re-armed under the
+    // send path's feet.
+    outbox::mark_submission_started(&store, id).unwrap();
+    outbox::record_submission(&store, &blobs, id, &SubmitOutcome::Accepted).unwrap();
+    assert!(outbox::retry(&store, id).is_err());
+}
+
+/// The envelope is stored because the message bytes cannot carry it: lettre
+/// drops the `Bcc` header when it builds, so a submission resumed from headers
+/// alone would silently lose every blind recipient.
+#[test]
+fn the_stored_envelope_keeps_the_blind_recipients_a_resumed_send_needs() {
+    let account = Account::new();
+    let mid = "<bcc-survives@example.com>";
+    let id = enqueue(&account, mid, Some(SENT));
+    let (store, _) = account.open();
+
+    // The bytes on the wire hold no trace of the blind recipient.
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    assert!(!String::from_utf8_lossy(&raw(mid)).contains("blind@example.com"));
+
+    let envelope = row.envelope.expect("the row must carry its envelope");
+    assert!(envelope.is_submittable());
+    assert_eq!(envelope, self::envelope());
+    assert!(envelope
+        .recipients
+        .iter()
+        .any(|(addr, role)| addr == "blind@example.com" && *role == RecipientRole::Bcc));
+
+    // And it round-trips through its stored form unchanged.
+    assert_eq!(Envelope::decode(&envelope.encode()), envelope);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,10 +515,11 @@ async fn an_ambiguous_smtp_failure_fails_the_row_and_is_never_re_sent() {
 }
 
 #[test]
-fn a_clean_pre_submission_failure_stays_submittable() {
+fn a_clean_pre_submission_failure_stays_submittable_and_backs_off() {
     let account = Account::new();
     let id = enqueue(&account, "<clean-failure@example.com>", Some(SENT));
     let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
 
     let state = outbox::record_submission(
         &store,
@@ -410,6 +532,63 @@ fn a_clean_pre_submission_failure_stays_submittable() {
     assert_eq!(state, OutboxState::PendingSend);
     let row = outbox::load(&store, id).unwrap().unwrap();
     assert!(row.last_error.unwrap().contains("could not resolve"));
+    // The failure proves nothing was delivered, so the marker goes back to
+    // NULL: the row is a never-attempted row again, not an ambiguous one.
+    assert_eq!(row.submission_started_at, None);
+    // And the attempt is counted, so the automatic resubmission on the next
+    // resume waits instead of hammering a server that is refusing the message.
+    assert_eq!(row.attempts, 1);
+    assert!(outbox::backoff_secs(row.attempts) > 0);
+    assert_eq!(
+        outbox::sweep_pending_sends(&store, ACCOUNT).unwrap().resubmittable.len(),
+        1
+    );
+}
+
+/// `record_append` refuses a result for a row that is not waiting for an
+/// APPEND. Without the guard a second call would run the completion path twice
+/// and release the raw blob twice, unlinking bytes the ingested message still
+/// references.
+#[tokio::test]
+async fn a_second_append_result_cannot_release_the_blob_twice() {
+    let account = Account::new();
+    let mid = "<double-append@example.com>";
+    let id = enqueue(&account, mid, Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::record_submission(&store, &blobs, id, &SubmitOutcome::Accepted).unwrap();
+
+    let mut sent = FakeSent::new();
+    outbox::drain(&store, &blobs, ACCOUNT, &mut sent, outbox::unix_now())
+        .await
+        .unwrap();
+    let hash = outbox::load(&store, id).unwrap().unwrap().raw_blob;
+    assert_eq!(state_of(&account, id), OutboxState::Done);
+    assert_eq!(
+        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        1,
+        "the ingested message owns the reference now"
+    );
+
+    let state = outbox::record_append(
+        &store,
+        &blobs,
+        id,
+        &email::outbox::AppendOutcome::Appended { uid: Some(999) },
+    )
+    .unwrap();
+
+    assert_eq!(state, OutboxState::Done);
+    assert_eq!(
+        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        1,
+        "a repeated result must not decrement the reference again"
+    );
+    assert!(blobs.contains(&hash), "and the bytes must still be there");
+    assert_eq!(
+        outbox::load(&store, id).unwrap().unwrap().appended_uid,
+        Some(100),
+        "the original acknowledgement stands"
+    );
 }
 
 // ---------------------------------------------------------------------------

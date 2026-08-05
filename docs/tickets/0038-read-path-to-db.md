@@ -30,6 +30,9 @@ The one durability item already banked is send, because the outbox ships in [#00
 
 Nothing writes `.md` and nothing falls back to a file walk on a store miss: a store miss is a bug, and a fallback path would hide it.
 
+Known issue inherited from [#0037](0037-sqlite-store-engine-skeleton.md), to be fixed with the search work here: when a message is re-ingested and its previous body blob is unreadable (evicted, or never written), `ingest_in_tx` cannot issue the FTS `'delete'` command with the old column values and leaves the stale entry in place, so that row ends up indexed twice (`src/ingest.rs`, step 4).
+The duplicate resolves to a row that is still correct, so it costs a redundant hit rather than a wrong one.
+
 ## Acceptance criteria
 
 - The golden frames captured by [#0049](0049-pre-nuke-oracle-capture.md) reproduce over the same fixture corpus. A diff is a look-and-feel regression, not a snapshot to accept.

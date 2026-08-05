@@ -28,7 +28,19 @@ All notable changes to this project are documented in this file.
   Gmail, Microsoft Graph and Proton accounts, whose servers file the copy
   themselves. Non-`done` rows show as an `OUTBOX n` badge in the TUI status bar,
   and `mp send` reports honestly: *sent + saved*, *sent + append pending*, or
-  *failed*.
+  *failed*. A crash before the SMTP session opens no longer strands the
+  message: the row records the moment submission starts, so the next startup or
+  sync sends the ones that provably never reached the transport and parks the
+  ones that died inside it. `mp outbox list` shows every queued, retrying and
+  failed submission, `mp outbox retry <id>` sends a failed one again after you
+  have checked it did not arrive, and `mp outbox discard <id>` drops it and
+  releases its bytes.
+- **UIDVALIDITY reset detection on sync (#0037).** A server that renumbers a
+  mailbox hands the same low UIDs to different messages. The sync now compares
+  the server's `UIDVALIDITY` against the stored cursor and refetches the whole
+  window when they differ, instead of skipping bodies it has never seen;
+  messages that only moved are rebound through their `Message-ID`, keeping
+  their thread assignment and stored blobs.
 
 ### Removed
 - **The local sent `.md` copy.** `update_status_to_sent` is now

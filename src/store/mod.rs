@@ -106,7 +106,7 @@ impl Store {
     }
 }
 
-/// Open an existing file and prove it is a usable v1 store: readable as a
+/// Open an existing file and prove it is a usable v2 store: readable as a
 /// database, passing `integrity_check`, stamped with the current version and
 /// structurally complete.
 fn open_validated(path: &Path) -> Result<Connection> {
@@ -133,7 +133,7 @@ fn open_validated(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Create the file and stamp schema v1.
+/// Create the file and stamp schema v2.
 fn create_fresh(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("creating {}", path.display()))?;
     apply_pragmas(&conn)?;

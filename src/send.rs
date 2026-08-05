@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn normalize_extracts_email_via_mailbox_for_envelope() {
-        // Regression for "Partial: 1/2 succeeded": send_email's per-recipient
+        // Regression for "Partial: 1/2 succeeded": `submit`'s per-recipient
         // RCPT TO loop parses the address again to extract `mbox.email` for
         // the SMTP envelope. If we forget to normalize there, lettre rejects
         // bracketed display names and that recipient silently fails while
@@ -733,8 +733,8 @@ pub fn build_invite_mime_body(plain: &str, html: String, ics: &str) -> MultiPart
 
 /// Build the SMTP transport (implicit TLS on :465, STARTTLS otherwise),
 /// honouring the account's OAuth2/password auth and `accept_invalid_certs`
-/// opt-in. Shared by `send_email` and `send_reply` so both apply identical
-/// transport policy.
+/// opt-in. The single transport builder behind [`submit`], so every SMTP
+/// submission applies identical transport policy.
 fn build_smtp_transport(
     smtp_config: &SmtpConfig,
 ) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
@@ -1003,6 +1003,10 @@ impl DurableSend {
             target.as_deref(),
             &built.message_id,
             &built.raw,
+            &crate::outbox::Envelope {
+                from: built.from.clone(),
+                recipients: built.recipients.clone(),
+            },
         )?;
         Ok(Self {
             store,
@@ -1014,6 +1018,23 @@ impl DurableSend {
 
     pub fn row_id(&self) -> i64 {
         self.row_id
+    }
+
+    /// Commit "the transport is about to be entered" for this row.
+    ///
+    /// Called immediately before the submission, and never batched with
+    /// anything else: the marker is what tells a later resume whether a
+    /// `pending_send` row it finds was ever attempted (see
+    /// [`crate::outbox::sweep_pending_sends`]). A failure to write it is
+    /// logged, not propagated, because refusing to send over a bookkeeping
+    /// error would be a worse outcome than the ambiguity it protects against.
+    pub fn mark_started(&self) {
+        if let Err(e) = crate::outbox::mark_submission_started(&self.store, self.row_id) {
+            error!(
+                "[outbox] could not mark row {} as entering submission: {e:#}",
+                self.row_id
+            );
+        }
     }
 
     /// Record what the submission did, committing the transition immediately.
@@ -1052,6 +1073,9 @@ pub async fn send_durably(
         }
     };
 
+    if let Some(durable) = durable.as_ref() {
+        durable.mark_started();
+    }
     let send_result = submit(built, smtp_config).await?;
 
     let Some(durable) = durable else {
@@ -1096,6 +1120,9 @@ where
         }
     };
 
+    if let Some(durable) = durable.as_ref() {
+        durable.mark_started();
+    }
     let submitted = submission.await;
     let outcome = match &submitted {
         Ok(()) => crate::outbox::SubmitOutcome::Accepted,
@@ -1188,8 +1215,15 @@ pub async fn drain_account(
 /// Resume the outbox for one account: the startup and sync-tick entry point.
 ///
 /// Opens the account's store only when there is one, so a fresh account costs
-/// nothing. Rows still in `pending_send` are reported, not re-submitted: SMTP
-/// runs from the send path that owns the credentials.
+/// nothing. Three things happen, in this order and for this reason:
+///
+/// 1. [`crate::outbox::sweep_pending_sends`] reads the exactly-once marker on
+///    every `pending_send` row. A row that died inside its SMTP session is
+///    parked in `failed` for a human and never re-sent.
+/// 2. The rows that provably never reached the transport are submitted here,
+///    which is the half of the crash story the driver cannot do: it needs the
+///    credentials and the envelope, and both live on this side.
+/// 3. [`drain_account`] finishes the outstanding APPENDs, this pass's included.
 pub async fn resume_outbox(account: &crate::config::AccountConfig) -> crate::outbox::DrainResult {
     let path = crate::config::store_path(&account.name);
     if !path.exists() {
@@ -1203,7 +1237,118 @@ pub async fn resume_outbox(account: &crate::config::AccountConfig) -> crate::out
         }
     };
     let blobs = crate::store::BlobStore::for_account(&account.name);
+    resubmit_pending(&store, &blobs, account).await;
     drain_account(&store, &blobs, account).await
+}
+
+/// Send the `pending_send` rows that a crash left behind, exactly once each.
+///
+/// Never returns an error: this runs on startup and on the sync tick, where a
+/// server that is still down must not fail the caller. A row that cannot be
+/// submitted now stays `pending_send` and is tried again next time, under the
+/// same backoff the APPEND retries use.
+async fn resubmit_pending(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    account: &crate::config::AccountConfig,
+) {
+    let sweep = match crate::outbox::sweep_pending_sends(store, &account.name) {
+        Ok(sweep) => sweep,
+        Err(e) => {
+            log::warn!(
+                "[outbox] could not classify the pending sends for {}: {e:#}",
+                account.name
+            );
+            return;
+        }
+    };
+    if !sweep.stranded.is_empty() {
+        log::warn!(
+            "[outbox] {} submission(s) for {} died mid-SMTP and are parked as failed; \
+             inspect them with `mp outbox list`",
+            sweep.stranded.len(),
+            account.name
+        );
+    }
+    if sweep.resubmittable.is_empty() {
+        return;
+    }
+
+    if account.auth_method == crate::config::AuthMethod::Graph {
+        // The Graph transport sends a structured JSON message, not the RFC822
+        // bytes the row holds, so there is nothing here to resubmit from. The
+        // rows stay visible in `mp outbox list` for a human to discard or to
+        // re-send from the draft.
+        log::warn!(
+            "[outbox] {} has {} queued message(s) that were never submitted, and the Graph \
+             transport cannot resend stored RFC822 bytes; see `mp outbox list`",
+            account.name,
+            sweep.resubmittable.len()
+        );
+        return;
+    }
+
+    let smtp_config = match SmtpConfig::load(account) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "[outbox] {} has {} queued message(s) but no usable SMTP config: {e:#}",
+                account.name,
+                sweep.resubmittable.len()
+            );
+            return;
+        }
+    };
+
+    let now = crate::outbox::unix_now();
+    for row in sweep.resubmittable {
+        if row.updated + crate::outbox::backoff_secs(row.attempts) > now {
+            // A previous clean failure (no transport, a rejected address) bumped
+            // the counter; wait it out rather than hammer the server.
+            continue;
+        }
+        if let Err(e) = resubmit_row(store, blobs, &row, &smtp_config).await {
+            log::warn!("[outbox] could not resubmit row {}: {e:#}", row.id);
+        }
+    }
+}
+
+/// Submit one never-attempted row, marker first.
+async fn resubmit_row(
+    store: &crate::store::Store,
+    blobs: &crate::store::BlobStore,
+    row: &crate::outbox::OutboxRow,
+    smtp_config: &SmtpConfig,
+) -> Result<crate::outbox::OutboxState> {
+    let Some(envelope) = row.envelope.clone().filter(|e| e.is_submittable()) else {
+        // Without an envelope there is no honest way to address the message,
+        // and guessing from the headers would drop the blind recipients.
+        crate::outbox::record_submission(
+            store,
+            blobs,
+            row.id,
+            &crate::outbox::SubmitOutcome::Ambiguous(
+                "the queued submission has no usable envelope; it cannot be resent \
+                 automatically"
+                    .to_string(),
+            ),
+        )?;
+        return Ok(crate::outbox::OutboxState::Failed);
+    };
+    let raw = blobs
+        .read(&row.raw_blob)
+        .with_context(|| format!("reading the queued message of outbox row {}", row.id))?;
+    let built = BuiltMessage {
+        raw,
+        message_id: row.message_id.clone(),
+        recipients: envelope.recipients,
+        from: envelope.from,
+    };
+
+    info!("[outbox] resubmitting row {} ({})", row.id, row.message_id);
+    crate::outbox::mark_submission_started(store, row.id)?;
+    let result = submit(&built, smtp_config).await?;
+    crate::outbox::record_submission(store, blobs, row.id, &result.submit_outcome())
 }
 
 /// A message that is fully built and not yet submitted.
@@ -1250,25 +1395,6 @@ pub fn message_id_of(raw: &[u8]) -> String {
             }
         },
     }
-}
-
-pub async fn send_email(
-    draft: &EmailDraft,
-    smtp_config: &SmtpConfig,
-    email_config: &EmailSettings,
-    signature: Option<&str>,
-    invite_ics: Option<&str>,
-) -> Result<(SendResult, Vec<u8>, Option<String>)> {
-    let built = build_draft_message(
-        draft,
-        &smtp_config.default_from,
-        email_config,
-        signature,
-        invite_ics,
-    )?;
-    let result = submit(&built, smtp_config).await?;
-    let message_id = built.message_id.clone();
-    Ok((result, built.raw, Some(message_id)))
 }
 
 /// Build the message a draft describes, without touching the network.

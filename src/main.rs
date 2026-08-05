@@ -245,6 +245,11 @@ enum Commands {
         #[command(subcommand)]
         action: CalendarAction,
     },
+    /// Inspect and unblock the durable send queue
+    Outbox {
+        #[command(subcommand)]
+        action: OutboxAction,
+    },
     /// Dump the TUI key bindings from the single KEYMAP source of truth.
     ///
     /// Markdown by default; `--json` emits the section-grouped shape the
@@ -278,6 +283,28 @@ enum Commands {
         /// Default: every mailbox of every selected account.
         #[arg(long)]
         mailbox: Option<Vec<String>>,
+    },
+}
+
+/// Operator commands for the durable outbox (#0037).
+///
+/// The outbox drives itself: queued messages are submitted and their Sent copy
+/// appended on the next startup or sync. These are for the one case it cannot
+/// decide alone, a submission that died without a verdict and may or may not
+/// have been delivered.
+#[derive(Subcommand)]
+enum OutboxAction {
+    /// List every queued, retrying or failed submission for the account
+    List,
+    /// Send a failed submission again (only after checking it did not arrive)
+    Retry {
+        /// Outbox row id, as shown by `mp outbox list`
+        id: i64,
+    },
+    /// Drop a submission and release the message bytes it holds
+    Discard {
+        /// Outbox row id, as shown by `mp outbox list`
+        id: i64,
     },
 }
 
@@ -437,12 +464,122 @@ struct InviteArgs {
     yes: bool,
 }
 
+/// `mp outbox <list|retry|discard>`: the operator surface of the durable send
+/// queue (#0037 item 5).
+///
+/// Everything here is deliberately manual. A submission that died without a
+/// verdict may or may not have been delivered, and no automatic rule can tell
+/// the difference, so the row waits in `failed` until a human has looked in the
+/// recipient's mailbox and decided between `retry` and `discard`.
+async fn cmd_outbox(
+    account_config: &email::config::AccountConfig,
+    action: OutboxAction,
+) -> Result<()> {
+    use email::outbox::{self, OutboxState};
+
+    let path = email::config::store_path(&account_config.name);
+    if !path.exists() {
+        println!("  {} nothing has been queued for {} yet", "·".dimmed(), account_config.name);
+        return Ok(());
+    }
+    let store = email::store::Store::open(&path)?;
+    let blobs = email::store::BlobStore::for_account(&account_config.name);
+
+    match action {
+        OutboxAction::List => {
+            let rows = outbox::unfinished_rows(&store, &account_config.name)?;
+            if rows.is_empty() {
+                println!(
+                    "  {} the outbox for {} is clear",
+                    "\u{2713}".green(),
+                    account_config.name
+                );
+                return Ok(());
+            }
+            for row in &rows {
+                let state = match row.state {
+                    OutboxState::Failed => row.state.to_string().red(),
+                    OutboxState::PendingSend => row.state.to_string().yellow(),
+                    _ => row.state.to_string().normal(),
+                };
+                println!(
+                    "  {:>4}  {:<20} {}  {}",
+                    row.id,
+                    state,
+                    format_unix_time(row.updated).dimmed(),
+                    row.message_id
+                );
+                if let Some(target) = row.target_mailbox.as_deref() {
+                    println!("        {} {target}", "sent copy ->".dimmed());
+                }
+                if row.state == OutboxState::PendingSend && row.submission_started_at.is_none() {
+                    println!("        {}", "never submitted; the next sync sends it".dimmed());
+                }
+                if let Some(err) = row.last_error.as_deref() {
+                    println!("        {} {err}", "last error:".dimmed());
+                }
+            }
+            let counts = outbox::counts(&store, &account_config.name)?;
+            println!(
+                "  {} {} working, {} failed",
+                "\u{21bb}".dimmed(),
+                counts.open,
+                counts.failed
+            );
+        }
+        OutboxAction::Retry { id } => {
+            outbox::retry(&store, id)?;
+            println!(
+                "  {} row {id} is queued again; sending it now",
+                "\u{21bb}".dimmed()
+            );
+            // Drop the handle first: the resume path opens the store itself.
+            drop(store);
+            let result = email::send::resume_outbox(account_config).await;
+            let store = email::store::Store::open(&path)?;
+            match outbox::load(&store, id)? {
+                Some(row) => println!("  {} row {id} is now {}", "\u{2713}".green(), row.state),
+                None => println!("  {} row {id} is gone", "\u{2713}".green()),
+            }
+            if result.completed > 0 {
+                println!("  {} {} sent copy/copies filed", "\u{2713}".green(), result.completed);
+            }
+        }
+        OutboxAction::Discard { id } => {
+            let Some(row) = outbox::load(&store, id)? else {
+                return Err(anyhow!("no outbox row {id}"));
+            };
+            outbox::discard(&store, &blobs, id)?;
+            println!(
+                "  {} discarded row {id} ({}); its bytes are released",
+                "\u{2713}".green(),
+                row.message_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A unix timestamp as local `YYYY-MM-DD HH:MM`, or `-` when it is unset.
+fn format_unix_time(ts: i64) -> String {
+    if ts <= 0 {
+        return "-".to_string();
+    }
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
 /// Send an iMIP calendar invitation (`METHOD:REQUEST`) over SMTP.
 ///
 /// Builds the `VEVENT` (via `email::invite`), assembles the iMIP MIME tree
-/// (via `send_email(..., Some(ics))`), sends it, and persists the sent invite
-/// locally as an email `.md` with an `event:` block plus a sidecar `invite.ics`
-/// so the #0027 receive path (and #0030 reconciliation) can pick it up.
+/// (via `build_draft_message(..., Some(ics))`) and submits it through the
+/// durable outbox, which also files the local Sent copy so the #0027 receive
+/// path (and #0030 reconciliation) can pick it up.
 async fn run_send_invite(
     account_config: &email::config::AccountConfig,
     smtp_config: &SmtpConfig,
@@ -1847,6 +1984,10 @@ async fn main() -> Result<()> {
                 email::calendar_cmd::handle_rebuild(&global_config, acct)?;
             }
         },
+
+        Some(Commands::Outbox { action }) => {
+            cmd_outbox(&account_config, action).await?;
+        }
 
         Some(Commands::DumpKeys { json }) => {
             if json {

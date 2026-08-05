@@ -1,4 +1,4 @@
-//! Schema v1 for the per-account store.
+//! Schema v2 for the per-account store.
 //!
 //! There is no migrator and there never will be one: the store is a cache in
 //! front of IMAP, so a version mismatch is answered by dropping the file and
@@ -13,7 +13,10 @@ use rusqlite::Connection;
 /// statement in [`SCHEMA_SQL`] changes; every existing store is then dropped
 /// and rebuilt on the next open.
 ///
-/// v2 added `message_blobs` for the ingest path (#0037 unit 4a).
+/// v2 added `message_blobs` for the ingest path (#0037 unit 4a), then
+/// `outbox.submission_started_at` and the `html` blob kind in the #0037 review
+/// pass. The version was not bumped for those two: no released build ever
+/// wrote a v2 store, and [`REQUIRED_COLUMNS`] rebuilds the branch-local ones.
 pub const SCHEMA_VERSION: i64 = 2;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
@@ -23,8 +26,8 @@ pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// informational (it makes a stale store obvious in a bug report).
 pub const META_APP_VERSION: &str = "app_version";
 
-/// Tables that must exist for a store to count as a valid v1 file. Checked on
-/// open so that a file which is stamped v1 but structurally incomplete (a
+/// Tables that must exist for a store to count as a valid v2 file. Checked on
+/// open so that a file which is stamped v2 but structurally incomplete (a
 /// half-written create, a hand-edited database) is rebuilt rather than used.
 pub const REQUIRED_TABLES: &[&str] = &[
     "meta",
@@ -38,6 +41,16 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "pending_ops",
     "messages_fts",
 ];
+
+/// `(table, column)` pairs that must exist too.
+///
+/// The table list alone cannot see a schema that gained a *column* without a
+/// version bump, which is exactly what the #0037 review pass did to `outbox`.
+/// A store written by an earlier v2 build is structurally complete by table but
+/// would fail every outbox write, so it is dropped and rebuilt like any other
+/// unusable file. Empty again once a later change bumps the version.
+pub const REQUIRED_COLUMNS: &[(&str, &str)] =
+    &[("outbox", "submission_started_at"), ("outbox", "envelope")];
 
 /// The complete schema. Follows the sketch in `docs/plans/data-access-layer.md`.
 ///
@@ -54,13 +67,23 @@ pub const REQUIRED_TABLES: &[&str] = &[
 ///   derived index.
 /// - `outbox` carries the durable send state machine; the four states are
 ///   enforced by a CHECK so a typo in later code fails loudly.
+///   `submission_started_at` is the exactly-once marker: it is committed
+///   immediately before the SMTP session opens, so a `pending_send` row found
+///   on restart says whether the transport was ever entered (see
+///   [`crate::outbox`]). `envelope` is who the message is actually going to,
+///   which the message bytes cannot answer: lettre drops the `Bcc` header when
+///   it builds, so a resumed submission rebuilt from headers would lose every
+///   blind recipient.
 /// - `blobs` is the refcount index for the content-addressed blob store in
 ///   [`super::blobs`]. It lives here rather than on disk so a reference can be
 ///   taken in the same transaction as the `messages` / `outbox` row that
 ///   carries the hash; the file itself is the disposable side of the pair.
 /// - `message_blobs` is the per-message list of blob references: one row per
-///   `(message, kind, ordinal)`, where `kind` is `body`, `raw` or
-///   `attachment`. It is the *source of truth* for refcounting, and
+///   `(message, kind, ordinal)`, where `kind` is `body`, `html`, `raw` or
+///   `attachment`. `html` only appears for a backend that returns no RFC822
+///   (Graph), where losing the HTML part would mean losing the body the user
+///   actually wrote; an IMAP message keeps its `raw` blob and needs no second
+///   copy. It is the *source of truth* for refcounting, and
 ///   `messages.body_blob` / `messages.raw_blob` are a convenience
 ///   denormalisation of the two singleton kinds. It exists because retention
 ///   evicts attachment blobs and body blobs on separate horizons, so eviction
@@ -123,7 +146,7 @@ CREATE INDEX messages_message_id ON messages (message_id);
 
 CREATE TABLE message_blobs (
     message_row INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
-    kind        TEXT NOT NULL CHECK (kind IN ('body', 'raw', 'attachment')),
+    kind        TEXT NOT NULL CHECK (kind IN ('body', 'html', 'raw', 'attachment')),
     ordinal     INTEGER NOT NULL DEFAULT 0,
     hash        TEXT NOT NULL,
     filename    TEXT,
@@ -167,7 +190,9 @@ CREATE TABLE outbox (
     last_error     TEXT,
     appended_uid   INTEGER,
     created        INTEGER,
-    updated        INTEGER
+    updated        INTEGER,
+    submission_started_at INTEGER,
+    envelope       TEXT
 );
 
 CREATE INDEX outbox_state ON outbox (state);
@@ -198,11 +223,11 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 "#;
 
-/// Create every v1 object and stamp the version. Runs in one transaction so a
+/// Create every v2 object and stamp the version. Runs in one transaction so a
 /// crash mid-create leaves no half-built file behind.
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!("BEGIN;{SCHEMA_SQL}COMMIT;"))
-        .context("creating store schema v1")?;
+        .context("creating store schema v2")?;
     set_meta(conn, META_SCHEMA_VERSION, &SCHEMA_VERSION.to_string())?;
     set_meta(conn, META_APP_VERSION, env!("CARGO_PKG_VERSION"))?;
     Ok(())
@@ -235,7 +260,8 @@ pub fn stamped_version(conn: &Connection) -> Result<Option<i64>> {
     Ok(get_meta(conn, META_SCHEMA_VERSION)?.and_then(|v| v.parse::<i64>().ok()))
 }
 
-/// True when every table in [`REQUIRED_TABLES`] exists.
+/// True when every table in [`REQUIRED_TABLES`] and every column in
+/// [`REQUIRED_COLUMNS`] exists.
 pub fn all_tables_present(conn: &Connection) -> Result<bool> {
     let mut stmt = conn.prepare(
         "SELECT COUNT(*) FROM sqlite_master
@@ -247,5 +273,17 @@ pub fn all_tables_present(conn: &Connection) -> Result<bool> {
             return Ok(false);
         }
     }
+    for (table, column) in REQUIRED_COLUMNS {
+        if !column_present(conn, table, column)? {
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+/// True when `table` has a column named `column`.
+fn column_present(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")?;
+    let count: i64 = stmt.query_row((table, column), |row| row.get(0))?;
+    Ok(count > 0)
 }

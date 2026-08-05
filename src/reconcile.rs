@@ -15,7 +15,7 @@
 //! REPLY emails). Reconciliation is therefore designed to be:
 //!
 //! - **Idempotent** — re-running over the same messages yields byte-identical
-//!   files. The surgical rewriter ([`draft::set_event_attendee_status`])
+//!   files. The surgical rewriter ([`crate::draft::set_event_attendee_status`])
 //!   returns `Unchanged` and skips the write when the status already matches.
 //! - **Re-runnable over the whole mailstore** — [`reconcile_account`] walks
 //!   every mailbox, recomputing statuses from scratch. This is the primitive

@@ -4,6 +4,14 @@
 //! Everything a fetched message carries ends up in exactly two places: the
 //! per-account `store.sqlite3` row and the content-addressed blob store.
 //!
+//! ## Bodies, and the HTML the Graph path would otherwise lose
+//!
+//! Every message stores its plain-text body as a `body` blob. An IMAP message
+//! also stores the RFC822 bytes as a `raw` blob, so any richer rendition can be
+//! re-derived from them. Graph never returns RFC822, so its HTML part is
+//! stored as an `html` blob instead; without it the HTML the sender wrote is
+//! gone the moment the message is ingested.
+//!
 //! ## Transaction shape
 //!
 //! Blob *files* are written before the transaction opens and blob *references*
@@ -97,6 +105,7 @@ pub struct IngestOutcome {
 
 /// The blob kinds a message row can reference.
 const KIND_BODY: &str = "body";
+const KIND_HTML: &str = "html";
 const KIND_RAW: &str = "raw";
 const KIND_ATTACHMENT: &str = "attachment";
 
@@ -136,14 +145,31 @@ pub fn ingest_message(
         filename: None,
         size: body_bytes.len() as u64,
     });
-    if let Some(raw) = input.raw {
-        refs.push(BlobRef {
-            kind: KIND_RAW,
-            ordinal: 0,
-            hash: blobs.write(raw)?,
-            filename: None,
-            size: raw.len() as u64,
-        });
+    match (input.raw, email.html_body.as_deref()) {
+        (Some(raw), _) => {
+            refs.push(BlobRef {
+                kind: KIND_RAW,
+                ordinal: 0,
+                hash: blobs.write(raw)?,
+                filename: None,
+                size: raw.len() as u64,
+            });
+        }
+        (None, Some(html)) => {
+            // No RFC822 to fall back on (the Graph path), so the HTML part is
+            // kept as its own blob: it is the body the sender actually wrote,
+            // and the plain-text rendition beside it is a downgrade the read
+            // path should not be forced to display (#0038).
+            let bytes = html.as_bytes();
+            refs.push(BlobRef {
+                kind: KIND_HTML,
+                ordinal: 0,
+                hash: blobs.write(bytes)?,
+                filename: None,
+                size: bytes.len() as u64,
+            });
+        }
+        (None, None) => {}
     }
     let mut ordinal = 0i64;
     if let Some(ics) = email.calendar_ics.as_deref() {
@@ -694,9 +720,63 @@ pub fn apply_seen_flag(
     Ok(changed > 0)
 }
 
+/// What the store already holds for a mailbox, and the UIDVALIDITY it holds it
+/// under.
+///
+/// The pair travels together because a UID means nothing on its own: after a
+/// server-side renumbering the same numbers are handed out again to different
+/// messages, so a skip list carried across a UIDVALIDITY change makes the fetch
+/// skip bodies it has never seen while a stale row keeps the old content under
+/// the recycled number. [`KnownUids::resolve`] is where that is caught.
+#[derive(Debug, Clone, Default)]
+pub struct KnownUids {
+    /// UIDs the store holds for this mailbox.
+    pub uids: std::collections::HashSet<i64>,
+    /// UIDVALIDITY recorded by the fetch that last wrote those rows, when the
+    /// store has a cursor for the mailbox at all.
+    pub uidvalidity: Option<i64>,
+}
+
+impl KnownUids {
+    /// The UIDs the fetch may skip, given the UIDVALIDITY the server reported
+    /// in its SELECT response, plus whether a reset was detected.
+    ///
+    /// A mismatch empties the skip list: every UID in the window is refetched,
+    /// and ingest then either UPSERTs the row that holds the recycled UID or
+    /// rebinds the message through the `message_id` index, keeping its thread
+    /// assignment and blob references (see the module docs). Nothing is
+    /// deleted here, because "the server renumbered" says nothing about which
+    /// messages are gone; that is the reconcile pass's job (#0038).
+    ///
+    /// No stored UIDVALIDITY (a first sync) and no reported one (a server that
+    /// omits it) are both "cannot tell", which leaves the skip list alone.
+    pub fn resolve(mut self, server_uidvalidity: Option<u32>) -> (std::collections::HashSet<i64>, bool) {
+        let reset = matches!(
+            (self.uidvalidity, server_uidvalidity),
+            (Some(stored), Some(seen)) if stored != seen as i64
+        );
+        if reset {
+            self.uids.clear();
+        }
+        (self.uids, reset)
+    }
+}
+
+/// Everything a fetch needs to decide what to skip: the stored UIDs and the
+/// UIDVALIDITY they were recorded under.
+pub fn known_uids_with_cursor(store: &Store, account: &str, mailbox: &str) -> Result<KnownUids> {
+    Ok(KnownUids {
+        uids: known_uids(store, account, mailbox)?,
+        uidvalidity: load_mailbox_cursor(store, mailbox)?.and_then(|c| c.uidvalidity),
+    })
+}
+
 /// The UIDs already ingested for `(account, mailbox)`, so a fetch can skip
 /// bodies it already holds. This is the store-side replacement for the
 /// Message-ID scan of the `.md` tree the old sync ran on every pass.
+///
+/// Callers on the sync path want [`known_uids_with_cursor`] instead: a bare UID
+/// set cannot see a UIDVALIDITY reset.
 pub fn known_uids(
     store: &Store,
     account: &str,

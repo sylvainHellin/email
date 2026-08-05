@@ -333,7 +333,7 @@ pub struct KeyBinding {
     /// This is the display form used by help/hint/website.
     pub keys: &'static str,
     /// The physical chord the runtime resolver matches (continuation key for
-    /// prefixed bindings). [`Chord::Manual`] for hand-dispatched rows.
+    /// prefixed bindings). `Chord::Manual` for hand-dispatched rows.
     pub chord: Chord,
     /// Optional leader prefix that must be pressed first (`' '` for the Space
     /// view switcher, `'g'` for the List `gg`/`G` jumps).

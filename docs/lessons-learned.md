@@ -256,3 +256,15 @@ Completion also ingests the sent copy *before* releasing, so the raw hash passes
 What survives is still a definitive acknowledgement, because `async-imap` turns any non-`OK` tagged response into an error, so a successful return means the server filed the message.
 `ImapSentMailbox::append` ([src/imap_client/sent.rs](../src/imap_client/sent.rs)) therefore recovers the UID with the same `UID SEARCH HEADER MESSAGE-ID` the dedup path runs and stores it on the row.
 Reading the real `APPENDUID` needs a patched or vendored `async-imap`; the `SentMailbox` seam is where that would land.
+
+## lettre drops the Bcc header, so the envelope has to be stored separately
+
+`Message::builder().bcc(...)` puts the address in the envelope and then removes the `Bcc` header from the built message, unless `keep_bcc()` is called (lettre 0.11, `message/mod.rs`).
+That is correct for a blind copy and fatal for anything that tries to reconstruct a submission from the message bytes: the blind recipients are simply not in there.
+The durable outbox therefore stores an `envelope` column (`from:` plus one `to:`/`cc:`/`bcc:` line per recipient) alongside the raw blob, and a resumed send addresses from that, never from the headers (#0037 review).
+
+## A schema amended in place needs a column check, not just a table check
+
+The store has no migrator: a version mismatch or a missing table drops and rebuilds the file.
+A column added to an existing version is invisible to both checks, so a store written by an earlier build of the same version passes validation and then fails every write against the new column.
+`schema::REQUIRED_COLUMNS` exists for exactly that window and is checked beside `REQUIRED_TABLES` on open; it is emptied again whenever a change bumps `SCHEMA_VERSION` (#0037 review).

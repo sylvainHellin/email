@@ -61,6 +61,9 @@ pub struct SyncResult {
     pub read_updated: usize,
     /// Rows rebound to a new UID after a UIDVALIDITY reset.
     pub uid_rebound: usize,
+    /// Mailboxes whose server-side UIDVALIDITY no longer matched the stored
+    /// cursor, and were therefore refetched in full.
+    pub uidvalidity_resets: usize,
     /// Address observations from newly-ingested messages, ready to be merged
     /// into the contacts index by the caller. Empty on `dry_run`.
     pub fresh_observations: Vec<FreshObservation>,
@@ -101,16 +104,14 @@ pub async fn sync_mailboxes(
     let mut result = SyncResult::default();
 
     for target in targets {
-        let known = ingest::known_uids(&store, account_name, &target.role)?;
-        let fetched = fetch_new_raw_on_session(
-            &mut session,
-            &target.server_name,
-            Some(limit),
-            &known,
-        )
-        .await;
+        // The skip list travels with the UIDVALIDITY it was recorded under, so
+        // the fetch can throw it away when the server has renumbered; carrying
+        // it across a reset would skip bodies that were never downloaded.
+        let known = ingest::known_uids_with_cursor(&store, account_name, &target.role)?;
+        let fetched =
+            fetch_new_raw_on_session(&mut session, &target.server_name, Some(limit), known).await;
 
-        let (new_messages, skipped, known_flags, state) = match fetched {
+        let fetched = match fetched {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -120,7 +121,12 @@ pub async fn sync_mailboxes(
                 continue;
             }
         };
-        result.skipped += skipped;
+        let new_messages = fetched.messages;
+        let state = fetched.state;
+        result.skipped += fetched.skipped;
+        if fetched.uidvalidity_reset {
+            result.uidvalidity_resets += 1;
+        }
 
         if dry_run {
             result.saved += new_messages.len();
@@ -185,7 +191,7 @@ pub async fn sync_mailboxes(
             }
         }
 
-        for (uid, is_read) in known_flags {
+        for (uid, is_read) in fetched.known_flags {
             match ingest::apply_seen_flag(&store, account_name, &target.role, uid as i64, is_read) {
                 Ok(true) => result.read_updated += 1,
                 Ok(false) => {}

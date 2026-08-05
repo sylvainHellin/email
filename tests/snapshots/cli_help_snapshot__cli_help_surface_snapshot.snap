@@ -30,6 +30,7 @@ Commands:
   config          Manage configuration
   contacts        Contact index operations
   calendar        Calendar / iMIP invite operations
+  outbox          Inspect and unblock the durable send queue
   dump-keys       Dump the TUI key bindings from the single KEYMAP source of truth
   dump-mailbox    Dump message envelopes from the local mail tree as NDJSON
   help            Print this message or the help of the given subcommand(s)
@@ -554,6 +555,62 @@ Options:
       --account <ACCOUNT>      Account name (default: all configured accounts)
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
+  -h, --help                   Print help
+
+$ mp outbox --help
+Inspect and unblock the durable send queue
+
+Usage: mp outbox [OPTIONS] <COMMAND>
+
+Commands:
+  list     List every queued, retrying or failed submission for the account
+  retry    Send a failed submission again (only after checking it did not arrive)
+  discard  Drop a submission and release the message bytes it holds
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp outbox list --help
+List every queued, retrying or failed submission for the account
+
+Usage: mp outbox list [OPTIONS]
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp outbox retry --help
+Send a failed submission again (only after checking it did not arrive)
+
+Usage: mp outbox retry [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Outbox row id, as shown by `mp outbox list`
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp outbox discard --help
+Drop a submission and release the message bytes it holds
+
+Usage: mp outbox discard [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Outbox row id, as shown by `mp outbox list`
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
 
 $ mp dump-keys --help

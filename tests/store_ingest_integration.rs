@@ -529,6 +529,115 @@ fn uidvalidity_reset_rebinds_the_row_and_keeps_thread_and_refs() {
     }
 }
 
+/// The sync path's half of a UIDVALIDITY reset (#0037 review).
+///
+/// Rebinding only works if the bodies are downloaded again in the first place,
+/// and they are not: the fetch skips every UID the store already holds, and
+/// after a renumbering those numbers have been handed to *different* messages.
+/// [`KnownUids::resolve`] is what catches that, by throwing the skip list away
+/// when the server's UIDVALIDITY no longer matches the stored cursor.
+#[test]
+fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
+    let f = Fixture::new();
+    let root = message(
+        "From: a@example.com\r\n\
+         Subject: thread root\r\n\
+         Message-ID: <reset-root@example.com>\r\n",
+        b"root body\r\n",
+    );
+    let reply = message(
+        "From: b@example.com\r\n\
+         Subject: Re: thread root\r\n\
+         Message-ID: <reset-reply@example.com>\r\n\
+         In-Reply-To: <reset-root@example.com>\r\n",
+        b"reply body\r\n",
+    );
+    f.ingest_raw("inbox", 1, &root);
+    let before = f.ingest_raw("inbox", 2, &reply);
+    let refs_before = f.blob_refs(before.row_id);
+    email::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(1),
+            last_uid: Some(2),
+            uidnext: Some(3),
+            exists: Some(2),
+            deltalink: None,
+        },
+    )
+    .unwrap();
+
+    // The server renumbers. UID 1 now holds a different message entirely, and
+    // the reply has moved to UID 9.
+    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    assert_eq!(known.uids, HashSet::from([1, 2]));
+    assert_eq!(known.uidvalidity, Some(1));
+    let (skip, reset) = known.resolve(Some(2));
+    assert!(reset, "the UIDVALIDITY change must be detected");
+    assert!(
+        skip.is_empty(),
+        "a recycled UID must not be treated as a body the store already holds"
+    );
+
+    // So pass 2 downloads both, and ingest sorts out what each one is.
+    let stranger = message(
+        "From: c@example.com\r\n\
+         Subject: brand new\r\n\
+         Message-ID: <reset-stranger@example.com>\r\n",
+        b"stranger body\r\n",
+    );
+    let recycled = f.ingest_raw("inbox", 1, &stranger);
+    let moved = f.ingest_raw("inbox", 9, &reply);
+
+    assert_eq!(
+        f.body(recycled.row_id),
+        "stranger body\r\n",
+        "the recycled UID must carry the body that was refetched for it"
+    );
+    assert!(moved.uid_rebound, "the moved message is rebound, not duplicated");
+    assert_eq!(moved.row_id, before.row_id);
+    assert_eq!(moved.thread_id, before.thread_id, "the thread must survive");
+    assert_eq!(f.blob_refs(moved.row_id), refs_before, "and so must the blob refs");
+    assert_eq!(f.message_rows(), 2, "a reset must not duplicate the mailbox");
+
+    // Once the new cursor is recorded, the next sync skips normally again.
+    email::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(2),
+            last_uid: Some(9),
+            uidnext: Some(10),
+            exists: Some(2),
+            deltalink: None,
+        },
+    )
+    .unwrap();
+    let (skip, reset) = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+        .unwrap()
+        .resolve(Some(2));
+    assert!(!reset);
+    assert_eq!(skip, HashSet::from([1, 9]));
+
+    // A first sync (no stored cursor) and a server that reports no UIDVALIDITY
+    // are both "cannot tell", and must not throw the skip list away.
+    let (skip, reset) = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+        .unwrap()
+        .resolve(None);
+    assert!(!reset);
+    assert_eq!(skip.len(), 2);
+    let (skip, reset) = email::ingest::KnownUids {
+        uids: HashSet::from([7]),
+        uidvalidity: None,
+    }
+    .resolve(Some(42));
+    assert!(!reset);
+    assert_eq!(skip, HashSet::from([7]));
+}
+
 /// The same Message-ID in another mailbox is a copy, not the same row: identity
 /// is `(account, mailbox, uid)`, and the `message_id` index is deliberately
 /// non-unique.
@@ -670,4 +779,63 @@ fn a_message_without_raw_bytes_ingests_and_upserts() {
     let again = f.ingest("inbox", uid, &email, None);
     assert!(!again.inserted);
     assert_eq!(f.message_rows(), 1);
+}
+
+/// A Graph message keeps its HTML part.
+///
+/// There are no RFC822 bytes to re-derive it from, so without an `html` blob
+/// the body the sender actually wrote is gone the moment the message is
+/// ingested and the read path (#0038) can only ever show the plain-text
+/// downgrade. An IMAP message needs no such blob: its `raw` blob holds the
+/// whole MIME tree.
+#[test]
+fn a_graph_message_keeps_its_html_body_as_a_blob() {
+    let f = Fixture::new();
+    let html = "<html><body><p>graph <b>body</b></p></body></html>";
+    let mut email = FetchedEmail {
+        from: "a@example.com".into(),
+        to: "b@example.com".into(),
+        cc: None,
+        subject: "graph html".into(),
+        date: "Mon, 01 Jan 2024 12:00:00 +0000".into(),
+        body_text: "graph body".into(),
+        html_body: Some(html.to_string()),
+        has_attachments: false,
+        message_id: Some("<g-html@example.com>".into()),
+        attachments: Vec::new(),
+        is_read: true,
+        calendar_ics: None,
+        event: None,
+    };
+
+    let outcome = f.ingest("inbox", email::ingest::graph_uid("<g-html@example.com>"), &email, None);
+    let refs = f.blob_refs(outcome.row_id);
+    let (_, _, hash, _) = refs
+        .iter()
+        .find(|r| r.0 == "html")
+        .expect("the HTML part must be persisted");
+    assert_eq!(
+        String::from_utf8(f.blobs.read(&BlobHash::parse(hash).unwrap()).unwrap()).unwrap(),
+        html
+    );
+    assert_eq!(f.refcount(hash), 1);
+
+    // Re-ingesting with new HTML re-points the reference and releases the old.
+    let old_hash = hash.clone();
+    email.html_body = Some("<html><body><p>edited</p></body></html>".into());
+    let again = f.ingest("inbox", email::ingest::graph_uid("<g-html@example.com>"), &email, None);
+    let refs = f.blob_refs(again.row_id);
+    let (_, _, new_hash, _) = refs.iter().find(|r| r.0 == "html").unwrap();
+    assert_ne!(new_hash, &old_hash);
+    assert_eq!(f.refcount(&old_hash), 0, "the superseded HTML is released");
+
+    // An IMAP message stores the raw bytes instead, and no html blob.
+    let raw = message(
+        "From: a@example.com\r\nSubject: imap\r\nMessage-ID: <imap-html@example.com>\r\n",
+        b"body\r\n",
+    );
+    let imap = f.ingest_raw("inbox", 5, &raw);
+    let kinds: Vec<String> = f.blob_refs(imap.row_id).into_iter().map(|r| r.0).collect();
+    assert!(kinds.contains(&"raw".to_string()));
+    assert!(!kinds.contains(&"html".to_string()));
 }

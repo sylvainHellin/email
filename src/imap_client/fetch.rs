@@ -1,11 +1,10 @@
-use std::collections::HashSet;
-
 use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
-use log::info;
+use log::{info, warn};
 
 use super::{ImapSession, search::{FetchCriteria, build_imap_search_query}, open_imap_session};
 use crate::config::ImapConfig;
+use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
 use crate::timing::TimingSpan;
 
@@ -100,6 +99,22 @@ pub struct MailboxState {
     pub exists: u32,
 }
 
+/// What one store fetch brought back.
+pub struct StoreFetch {
+    /// Messages the store does not hold yet, with their bodies.
+    pub messages: Vec<FetchedRaw>,
+    /// How many UIDs in the window the store already held.
+    pub skipped: usize,
+    /// The `\Seen` state of those already-held UIDs, the only server-to-local
+    /// read-status channel (#0004).
+    pub known_flags: Vec<(u32, bool)>,
+    /// What SELECT said about the mailbox.
+    pub state: MailboxState,
+    /// True when the server's UIDVALIDITY no longer matches the stored one, so
+    /// this fetch deliberately skipped nothing and redownloaded the window.
+    pub uidvalidity_reset: bool,
+}
+
 /// Two-pass fetch for the store ingest path.
 ///
 /// Pass 1 fetches `UID FLAGS` over the whole window, pass 2 downloads
@@ -112,14 +127,16 @@ pub struct MailboxState {
 /// (ticket #0004), so shrinking the window silently drops flag changes made in
 /// other clients. Pass 2 is skipped entirely when nothing is new.
 ///
-/// Returns the new messages, the number of UIDs already held, the `\Seen`
-/// state of those already-held UIDs, and the mailbox state from SELECT.
+/// The skip list is resolved against the server's UIDVALIDITY *after* SELECT
+/// (see [`KnownUids::resolve`]): a renumbering hands recycled UIDs to different
+/// messages, so carrying the stored list across one would make pass 2 skip
+/// bodies that were never downloaded.
 pub async fn fetch_new_raw_on_session(
     session: &mut ImapSession,
     mailbox: &str,
     limit: Option<usize>,
-    known_uids: &HashSet<i64>,
-) -> Result<(Vec<FetchedRaw>, usize, Vec<(u32, bool)>, MailboxState)> {
+    known: KnownUids,
+) -> Result<StoreFetch> {
     let mut span = TimingSpan::with_context("fetch_new_raw", mailbox.to_string());
 
     let imap_mailbox = session
@@ -133,13 +150,30 @@ pub async fn fetch_new_raw_on_session(
         exists: imap_mailbox.exists,
     };
 
+    let stored_uidvalidity = known.uidvalidity;
+    let (known_uids, uidvalidity_reset) = known.resolve(state.uid_validity);
+    if uidvalidity_reset {
+        warn!(
+            "UIDVALIDITY for '{}' changed from {:?} to {:?}: refetching the whole window, \
+             the rows are rebound through their Message-IDs",
+            mailbox, stored_uidvalidity, state.uid_validity
+        );
+    }
+    let empty = |state: MailboxState| StoreFetch {
+        messages: Vec::new(),
+        skipped: 0,
+        known_flags: Vec::new(),
+        state,
+        uidvalidity_reset,
+    };
+
     let uids = session
         .uid_search("ALL")
         .await
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
     span.mark("uid_search");
     if uids.is_empty() {
-        return Ok((Vec::new(), 0, Vec::new(), state));
+        return Ok(empty(state));
     }
 
     let mut uid_list: Vec<u32> = uids.into_iter().collect();
@@ -150,7 +184,7 @@ pub async fn fetch_new_raw_on_session(
     };
     window.sort_unstable();
     if window.is_empty() {
-        return Ok((Vec::new(), 0, Vec::new(), state));
+        return Ok(empty(state));
     }
 
     // Pass 1: UID + FLAGS over the whole window (~40 bytes per message).
@@ -178,7 +212,13 @@ pub async fn fetch_new_raw_on_session(
     let skipped = known_flags.len();
 
     if new_uids.is_empty() {
-        return Ok((Vec::new(), skipped, known_flags, state));
+        return Ok(StoreFetch {
+            messages: Vec::new(),
+            skipped,
+            known_flags,
+            state,
+            uidvalidity_reset,
+        });
     }
     info!(
         "Store fetch for '{}': {} new, {} already ingested",
@@ -209,5 +249,11 @@ pub async fn fetch_new_raw_on_session(
         });
     }
 
-    Ok((out, skipped, known_flags, state))
+    Ok(StoreFetch {
+        messages: out,
+        skipped,
+        known_flags,
+        state,
+        uidvalidity_reset,
+    })
 }

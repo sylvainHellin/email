@@ -1131,7 +1131,8 @@ enum FieldWrite {
 /// preserving the body and every other frontmatter byte.
 ///
 /// This is the shared write path behind the status transitions
-/// ([`mark_as_approved`], [`mark_as_draft`], [`update_status_to_sent`]).
+/// ([`mark_as_approved`] and [`mark_as_draft`]; the `sent` transition went
+/// with the local sent `.md` in #0037).
 /// They used to parse into [`EmailFrontmatter`] and re-serialize, which
 /// silently dropped every field that struct does not model -- including
 /// `date:`, the key the TUI sorts on, so an approved draft teleported to
@@ -1313,7 +1314,7 @@ pub fn validate_draft(draft: &EmailDraft) -> Result<Vec<String>> {
 
     // Validate email format (basic check). Display names that are not raw
     // RFC 5322 atext are auto-quoted before parsing, mirroring what
-    // `send_email` does, so the validator does not flag addresses that we
+    // the send path does, so the validator does not flag addresses that we
     // know we will be able to send.
     let validate_field = |field: Option<&String>, name: &str| -> Result<()> {
         if let Some(value) = field {

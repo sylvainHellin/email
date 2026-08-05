@@ -373,7 +373,7 @@ pub fn load_or_refresh_token_blocking(
 // ---------------------------------------------------------------------------
 
 /// Build the XOAUTH2 SASL string for IMAP/SMTP authentication.
-/// Format: base64("user=<email>\x01auth=Bearer <token>\x01\x01")
+/// Format: `base64("user=<email>\x01auth=Bearer <token>\x01\x01")`
 pub fn build_xoauth2_string(username: &str, access_token: &str) -> String {
     use base64::Engine;
     let raw = format!("user={}\x01auth=Bearer {}\x01\x01", username, access_token);
