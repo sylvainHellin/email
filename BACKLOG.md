@@ -6,8 +6,9 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055 and #0056 have shipped.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055 and #0056 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0068.
 
+- [#0065 Graph prune and batch hardening (Sent-copy deletion, trim, paging, batch ids)](docs/tickets/0065-graph-prune-batch-hardening.md) -- bug _(item 1 ships before any Graph account sends mail)_
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
 - [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
 
@@ -15,6 +16,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
+- [#0066 A drop-and-rebuild discards outbox rows and orphans blob files](docs/tickets/0066-store-rebuild-loses-outbox-and-blobs.md) -- bug
+- [#0068 Investigate why the perso account's store holds no message rows](docs/tickets/0068-perso-store-holds-no-messages.md) -- bug
 - [#0057 Delete the dead file-era code](docs/tickets/0057-dead-file-era-code-deletion.md) -- chore
 - [#0058 One send implementation for the CLI and the TUI](docs/tickets/0058-send-path-unification.md) -- refactor
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
@@ -32,6 +35,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0062 CLI read surface over the store (mp show, mp list-messages)](docs/tickets/0062-cli-store-read-surface.md) -- feature
 - [#0063 Send durability gaps (partial recipients, Graph resume)](docs/tickets/0063-send-durability-gaps.md) -- bug
 - [#0064 Retire path-shaped identity (MailboxRole, MailboxInfo.id, EmailStatus)](docs/tickets/0064-identity-type-cleanup.md) -- refactor _(before #TKT-0051; concrete half of #0022)_
+- [#0067 Contacts guard refinements (observed_at, corrupt cache, partial erosion)](docs/tickets/0067-contacts-guard-refinements.md) -- bug
 - [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037; absorbs mutation unification and the engine lock)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_

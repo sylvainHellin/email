@@ -29,6 +29,16 @@ async-imap 0.11.2 surface is confirmed (see plan "Resolved unknowns"): typed `se
 `sync_cursors.highest_modseq` held a UID, not a modseq, so scope item 3 above would issue `CHANGEDSINCE` with a UID-sized number, get an empty response and no error, and silently reproduce the [#0004](0004-fix-read-unread-sync.md) failure mode.
 Cleared: #0054 shipped as schema v4, `last_uid` and `highest_modseq` are separate columns and the latter is NULL until this ticket writes a real modseq into it.
 
+## Carry-forward hazard in the cursor UPSERT (added 2026-08-06)
+
+From the fresh-context review of #0054 (commit `3d00aff`), deferred note 4.
+`record_mailbox_cursor`'s UPSERT sets `highest_modseq` and `deltalink` unconditionally from the caller's struct (`src/ingest.rs:602-606`), and both backends pass `None` on the full-window path (`src/graph.rs:682`, `src/imap_client/store_sync.rs:216`).
+The moment scope item 3 below writes a real modseq from the CONDSTORE path, the next full sync wipes it, and the ticket's own failure mode returns: a NULL modseq falls back to the full window, silently, with no error.
+The same trap is already latent for `deltalink` and [#0042](0042-graph-delta-sync.md).
+
+Fix it here, before writing the first modseq: load the existing cursor and carry the value forward, or write `COALESCE(excluded.highest_modseq, highest_modseq)` (and the same for `deltalink`) into the `ON CONFLICT` clause.
+A test that records a modseq, then records a full-window cursor with `None`, then asserts the modseq survived, pins it.
+
 ## Acceptance criteria
 
 - Quick-sync `[TIMING]` drops sharply; no fresh LOGIN per op.

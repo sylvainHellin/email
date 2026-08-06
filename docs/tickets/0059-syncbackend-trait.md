@@ -19,6 +19,9 @@ The abstraction already exists implicitly, which is why [#0055](0055-graph-sync-
 - `src/graph.rs` already imports `FreshObservation`, `SyncResult` and `SyncTarget` from `imap_client`, which is the abstraction admitting it exists in the wrong module.
 - The orchestration that would be written once is ingest, fresh observations, notify, cursor recording, prune and the contacts hook; `sync_mailboxes_graph` (`src/graph.rs:598-686`) is that sequence minus prune.
 - `src/imap_client/store_sync.rs`, `ops.rs` and `batch.rs` have zero tests despite three recent prune fixes in the same 264 lines; there is no mockable boundary to test against.
+- The Graph half is worse, and the fresh-context review of [#0055](0055-graph-sync-parity.md) (deferred note 7) is the evidence: dev-dependencies are `tempfile` and `insta` only, with no HTTP mock, so there is no test of `fetch_new_messages` or `sync_mailboxes_graph` at all.
+  The six unit tests #0055 added exercise only the helpers it introduced, so none of them could have failed against the old code; the second-pass prune ordering itself is verified by reading `graph.rs` against `store_sync.rs` and calling it parity.
+  A fake backend behind this trait is what makes that orchestration testable, which is the concrete reason to sequence it before the next Graph change rather than after.
 
 ## Scope
 
