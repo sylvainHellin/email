@@ -1130,7 +1130,12 @@ async fn main() -> Result<()> {
                     ));
                 }
 
-                settle_sent_draft(&draft, &report.send_result, Some(&built.message_id))?;
+                // The message is out; a bookkeeping failure here is a warning,
+                // not a failed send.
+                if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
+                    warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
+                    println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
+                }
                 info!("Email sent via Graph and marked as sent: {}", draft.path.display());
                 email::contacts::hooks::bump_after_send(&account_config, &draft);
                 reindex_drafts(&account_config.name);
@@ -1186,7 +1191,10 @@ async fn main() -> Result<()> {
                 }
 
                 if send_result.all_succeeded() {
-                    settle_sent_draft(&draft, send_result, Some(&built.message_id))?;
+                    if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
+                        warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
+                        println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
+                    }
                     info!("Email marked as sent: {}", draft.path.display());
 
                     // Incremental contacts-index update (best-effort, no-op if no cache)
@@ -1200,7 +1208,10 @@ async fn main() -> Result<()> {
                         report.status_line()
                     );
                 } else if send_result.any_succeeded() {
-                    settle_sent_draft(&draft, send_result, Some(&built.message_id))?;
+                    if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
+                        warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
+                        println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
+                    }
                     warn!(
                         "Partial send: {} succeeded, {} failed for {}",
                         send_result.succeeded().len(),
@@ -1365,8 +1376,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                     if report.send_result.any_succeeded() {
-                        if let Err(e) =
-                            settle_sent_draft(&draft, &report.send_result, Some(&built.message_id))
+                        if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id))
                         {
                             println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                         } else {
@@ -1411,7 +1421,7 @@ async fn main() -> Result<()> {
                             let send_result = &report.send_result;
                             if send_result.any_succeeded() {
                                 if let Err(e) =
-                                    settle_sent_draft(&draft, send_result, Some(&built.message_id))
+                                    settle_sent_draft(&draft, &report, Some(&built.message_id))
                                 {
                                     println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                                 } else {

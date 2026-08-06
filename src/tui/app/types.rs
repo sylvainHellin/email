@@ -231,9 +231,10 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
 /// Every status the index holds is listed, `sent` included: the lister filters
 /// nothing, so a file someone hand-edited to `status: sent` still shows, which
 /// is the escape hatch it should be. What no longer shows is a draft this
-/// application sent to every recipient, because the send retires the file (see
-/// [`crate::draft::settle_sent_draft`]); a *partial* send keeps it, marked
-/// `sent` and addressable for the retry.
+/// application sent to every recipient and recorded in the outbox, because
+/// such a send retires the file (see [`crate::draft::settle_sent_draft`]); a
+/// *partial* send, or one with no durable record, keeps it, marked `sent` and
+/// addressable.
 fn load_drafts(account: &str) -> Vec<EmailEntry> {
     indexed_drafts(account).into_iter().map(entry_from_draft).collect()
 }
@@ -1855,14 +1856,18 @@ mod tests {
         let partial = external_draft("2026-07-02-later.md", "b@example.com", "Later", "approved");
         assert_eq!(load_emails("alice", "drafts").len(), 2);
 
-        let outcome = |ok: bool| crate::send::SendResult {
-            results: vec![crate::send::RecipientResult {
-                address: "a@example.com".to_string(),
-                role: crate::send::RecipientRole::To,
-                success: ok,
-                error: None,
-                ambiguous: false,
-            }],
+        let outcome = |ok: bool| crate::send::SendReport {
+            send_result: crate::send::SendResult {
+                results: vec![crate::send::RecipientResult {
+                    address: "a@example.com".to_string(),
+                    role: crate::send::RecipientRole::To,
+                    success: ok,
+                    error: None,
+                    ambiguous: false,
+                }],
+            },
+            state: Some(crate::outbox::OutboxState::Done),
+            row_id: Some(1),
         };
         let settle = |path: &std::path::Path, ok: bool| {
             let draft = crate::draft::parse_email_draft(path).unwrap();

@@ -641,9 +641,9 @@ fn draft_attachments(draft: &crate::types::EmailDraft) -> Result<Vec<(String, Ve
 /// is enforced, by [`crate::send::build_draft_message`]), committed to the
 /// outbox, submitted, and only a submission that reached at least one
 /// recipient rewrites the draft's `status:` to `sent`. A submission that
-/// reached *every* recipient additionally takes the file out of `drafts/`; see
-/// [`crate::draft::settle_sent_draft`]. The sent copy is the outbox's
-/// business, not this function's.
+/// reached *every* recipient and got an outbox row additionally takes the file
+/// out of `drafts/`; see [`crate::draft::settle_sent_draft`]. The sent copy is
+/// the outbox's business, not this function's.
 ///
 /// The drafts index is refreshed afterwards so the retirement (or the `sent`
 /// status a partial send leaves) is the answer the next selector resolution
@@ -721,7 +721,7 @@ fn send_one_draft(
     };
 
     if report.send_result.any_succeeded() {
-        settle_sent_draft(draft, &report.send_result, Some(&built.message_id))?;
+        settle_sent_draft(draft, &report, Some(&built.message_id))?;
         crate::contacts::hooks::bump_after_send(&ctx.account, draft);
         if let Err(e) = crate::store::drafts::refresh_account(&ctx.account.name) {
             log::warn!("[drafts] refreshing after the send failed: {e:#}");
@@ -1175,7 +1175,7 @@ pub(super) fn handle_action(
                                     Ok((message_id, report)) => {
                                         let _ = settle_sent_draft(
                                             draft,
-                                            &report.send_result,
+                                            &report,
                                             Some(&message_id),
                                         );
                                         crate::contacts::hooks::bump_after_send(
@@ -1252,7 +1252,7 @@ pub(super) fn handle_action(
                                         if report.send_result.any_succeeded() {
                                             let _ = settle_sent_draft(
                                                 draft,
-                                                &report.send_result,
+                                                &report,
                                                 Some(&built.message_id),
                                             );
                                             crate::contacts::hooks::bump_after_send(

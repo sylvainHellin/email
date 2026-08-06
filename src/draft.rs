@@ -1561,7 +1561,7 @@ pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<(
 }
 
 /// Settle a draft after a finished send: mark it sent, and retire the file
-/// when every recipient took it.
+/// when every recipient took it *and* the send left a durable record.
 ///
 /// A send that reached all of its recipients is over. The copy that matters
 /// from then on is the server's, which the durable outbox APPENDs to Sent and
@@ -1570,9 +1570,22 @@ pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<(
 /// up in the TUI's Drafts list and in `mp list` with nothing left to do to it.
 /// It goes.
 ///
-/// A *partial* send keeps the marked file, because it is the only thing that
-/// still names the recipients who did not get it: the draft stays addressable
-/// by its selector, and a retry is a `mp send` away.
+/// That argument rests entirely on the outbox row existing. A
+/// [`SendReport`](crate::send::SendReport) whose `state` is `None` is a
+/// submission the store could not be opened for: nothing will APPEND it to
+/// Sent and nothing will ingest it back, so the draft file is the last local
+/// copy of a message the recipients now hold. Such a send marks the file and
+/// keeps it.
+///
+/// A *partial* send keeps the marked file too, because it is the only thing
+/// that still names the recipients who did not get it, and it stays
+/// addressable by its selector. Retrying it is a hand edit rather than a
+/// command: [`crate::send::build_draft_message`] only builds an `approved`
+/// draft, and both [`mark_as_approved`] and [`mark_as_draft`] refuse a file
+/// that says `status: sent`, so the user edits `status:` back to `approved`
+/// themselves. The recipient lines want trimming to the addresses that failed
+/// first, because a re-send delivers to everyone the file still lists,
+/// including the ones who already received it.
 ///
 /// [`mark_draft_sent`] runs first either way, so a file that survives carries
 /// `status: sent`, and re-running the whole settle is a no-op: marking
@@ -1583,13 +1596,24 @@ pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<(
 /// reader that does.
 pub fn settle_sent_draft(
     draft: &EmailDraft,
-    result: &crate::send::SendResult,
+    report: &crate::send::SendReport,
     message_id: Option<&str>,
 ) -> Result<()> {
     mark_draft_sent(draft, message_id)?;
 
+    // A submission with no outbox row behind it has no second copy anywhere:
+    // keep the file, whatever the recipients did with it.
+    if report.state.is_none() {
+        info!(
+            "Kept the sent draft {}: the send has no durable record",
+            draft.path.display()
+        );
+        return Ok(());
+    }
+
     // `all_succeeded` is vacuously true for a result with no recipients at
     // all, which is not a send that happened: such a draft keeps its file.
+    let result = &report.send_result;
     if !(result.any_succeeded() && result.all_succeeded()) {
         return Ok(());
     }
@@ -2738,6 +2762,26 @@ mod tests {
         }
     }
 
+    /// A finished send that got an outbox row: the durable path, where the
+    /// server's copy is the one that survives the file.
+    fn durable_report(outcomes: &[(&str, bool)]) -> crate::send::SendReport {
+        crate::send::SendReport {
+            send_result: send_result(outcomes),
+            state: Some(crate::outbox::OutboxState::Done),
+            row_id: Some(1),
+        }
+    }
+
+    /// The same send with the outbox store unopenable: submitted, but with no
+    /// record anywhere (`state: None`).
+    fn undurable_report(outcomes: &[(&str, bool)]) -> crate::send::SendReport {
+        crate::send::SendReport {
+            send_result: send_result(outcomes),
+            state: None,
+            row_id: None,
+        }
+    }
+
     /// A send every recipient took retires the draft: the file leaves
     /// `drafts/`, so it stops showing up in the Drafts list and in `mp list`
     /// with nothing left to do to it. The Sent copy is the server's.
@@ -2751,13 +2795,36 @@ mod tests {
 
         settle_sent_draft(
             &draft,
-            &send_result(&[("alice@example.com", true), ("bob@example.com", true)]),
+            &durable_report(&[("alice@example.com", true), ("bob@example.com", true)]),
             Some("<abc@example.com>"),
         )
         .unwrap();
 
         assert!(!path.exists(), "the fully sent draft is gone");
         assert!(!companion.exists(), "and so is its companion HTML");
+    }
+
+    /// A send with no durable record keeps the file even when every recipient
+    /// took it: the outbox store could not be opened, so nothing will APPEND
+    /// the message to Sent and nothing will ingest it back, and deleting the
+    /// draft would leave the recipients holding the only copy.
+    #[test]
+    fn a_fully_sent_draft_with_no_durable_record_keeps_its_marked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let draft = parse_email_draft(&path).unwrap();
+
+        settle_sent_draft(
+            &draft,
+            &undurable_report(&[("alice@example.com", true), ("bob@example.com", true)]),
+            Some("<abc@example.com>"),
+        )
+        .unwrap();
+
+        assert!(path.exists(), "a send with no durable record keeps the file");
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("status: sent\n"), "{after}");
+        assert!(after.contains("message_id: \"<abc@example.com>\"\n"), "{after}");
     }
 
     /// A partial send keeps the marked file: it is the only thing that still
@@ -2773,7 +2840,7 @@ mod tests {
 
         settle_sent_draft(
             &draft,
-            &send_result(&[("alice@example.com", true), ("bob@example.com", false)]),
+            &durable_report(&[("alice@example.com", true), ("bob@example.com", false)]),
             Some("<abc@example.com>"),
         )
         .unwrap();
@@ -2795,10 +2862,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let failed = draft_with_unknown_fields(tmp.path(), "approved");
         let draft = parse_email_draft(&failed).unwrap();
-        settle_sent_draft(&draft, &send_result(&[("alice@example.com", false)]), None).unwrap();
+        settle_sent_draft(&draft, &durable_report(&[("alice@example.com", false)]), None).unwrap();
         assert!(failed.exists());
 
-        settle_sent_draft(&draft, &send_result(&[]), None).unwrap();
+        settle_sent_draft(&draft, &durable_report(&[]), None).unwrap();
         assert!(failed.exists(), "no recipients is not a completed send");
     }
 
@@ -2810,7 +2877,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = draft_with_unknown_fields(tmp.path(), "approved");
         let draft = parse_email_draft(&path).unwrap();
-        let all_good = send_result(&[("alice@example.com", true)]);
+        let all_good = durable_report(&[("alice@example.com", true)]);
 
         settle_sent_draft(&draft, &all_good, None).unwrap();
         settle_sent_draft(&draft, &all_good, None).unwrap();
