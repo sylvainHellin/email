@@ -26,7 +26,8 @@ async-imap 0.11.2 surface is confirmed (see plan "Resolved unknowns"): typed `se
 ## Prerequisite (added 2026-08-06)
 
 [#0054](0054-schema-bump-bundle.md) must land first.
-`sync_cursors.highest_modseq` currently holds a UID, not a modseq (`src/ingest.rs:606-614`), so scope item 3 above would issue `CHANGEDSINCE` with a UID-sized number, get an empty response and no error, and silently reproduce the [#0004](0004-fix-read-unread-sync.md) failure mode.
+`sync_cursors.highest_modseq` held a UID, not a modseq, so scope item 3 above would issue `CHANGEDSINCE` with a UID-sized number, get an empty response and no error, and silently reproduce the [#0004](0004-fix-read-unread-sync.md) failure mode.
+Cleared: #0054 shipped as schema v4, `last_uid` and `highest_modseq` are separate columns and the latter is NULL until this ticket writes a real modseq into it.
 
 ## Acceptance criteria
 

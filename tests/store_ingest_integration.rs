@@ -616,6 +616,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
             last_uid: Some(2),
             uidnext: Some(3),
             exists: Some(2),
+            highest_modseq: None,
             deltalink: None,
         },
     )
@@ -664,6 +665,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
             last_uid: Some(9),
             uidnext: Some(10),
             exists: Some(2),
+            highest_modseq: None,
             deltalink: None,
         },
     )
@@ -727,13 +729,30 @@ fn mailbox_cursors_round_trip() {
         last_uid: Some(1234),
         uidnext: Some(1235),
         exists: Some(56),
+        highest_modseq: Some(7),
         deltalink: None,
     };
     email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor).unwrap();
 
-    let loaded = email::ingest::load_mailbox_cursor(&f.store, "inbox").unwrap().unwrap();
+    let loaded = email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap();
     assert_eq!(loaded.uidvalidity, Some(42));
     assert_eq!(loaded.last_uid, Some(1234));
+    assert_eq!(loaded.highest_modseq, Some(7));
+
+    // The UID and the modseq live in their own columns (#0054): a UID written
+    // into `highest_modseq` would make a later CHANGEDSINCE fetch return
+    // nothing and no error.
+    let (stored_uid, stored_modseq): (i64, i64) = f
+        .store
+        .conn()
+        .query_row(
+            "SELECT last_uid, highest_modseq FROM sync_cursors
+             WHERE account = 'acct' AND mailbox = 'inbox'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((stored_uid, stored_modseq), (1234, 7));
 
     // The mailbox row carries what the read path lists from.
     let (uidvalidity, uidnext, exists): (i64, i64, i64) = f
@@ -753,7 +772,11 @@ fn mailbox_cursors_round_trip() {
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor { uidvalidity: Some(43), last_uid: Some(1), ..cursor },
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(43),
+            last_uid: Some(1),
+            ..cursor.clone()
+        },
     )
     .unwrap();
     let cursors: i64 = f
@@ -763,8 +786,22 @@ fn mailbox_cursors_round_trip() {
         .unwrap();
     assert_eq!(cursors, 1);
     assert_eq!(
-        email::ingest::load_mailbox_cursor(&f.store, "inbox").unwrap().unwrap().uidvalidity,
+        email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
         Some(43)
+    );
+
+    // The row is keyed on (account, mailbox), like every other table.
+    email::ingest::record_mailbox_cursor(&f.store, "other", "inbox", &cursor).unwrap();
+    let cursors: i64 = f
+        .store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sync_cursors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cursors, 2);
+    assert_eq!(
+        email::ingest::load_mailbox_cursor(&f.store, "other", "inbox").unwrap().unwrap().uidvalidity,
+        Some(42),
+        "another account's cursor for the same mailbox name is a separate row"
     );
 }
 
@@ -990,6 +1027,7 @@ fn a_uidvalidity_reset_prunes_nothing() {
             last_uid: Some(3),
             uidnext: Some(4),
             exists: Some(3),
+            highest_modseq: None,
             deltalink: None,
         },
     )

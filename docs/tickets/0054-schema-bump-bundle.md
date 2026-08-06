@@ -3,7 +3,7 @@ id: 0054
 title: Schema bump bundle (modseq/UID split, pending_ops.updated, account convention, dead columns)
 type: refactor
 priority: now
-status: open
+status: done
 created: 2026-08-06
 ---
 
@@ -31,6 +31,16 @@ The first of them is a correctness trap for [#0041](0041-persistent-conn-condsto
 4. Drop `messages.mtime` and `mailboxes.unread_count`, and the writes that populate them.
 5. Bump `SCHEMA_VERSION` once for the bundle.
    Existing stores are rebuilt by sync, so a drop-and-recreate on version mismatch is acceptable if that is the established path; state the choice in the ticket when it is made.
+
+## Decisions taken (2026-08-06, shipped as schema v4)
+
+- Account convention: every table carries `account`.
+  `sync_cursors` is keyed `PRIMARY KEY (account, mailbox)` and `pending_ops` gains `account TEXT NOT NULL`, which settles the keying inconsistency the same way.
+  The redundancy in a per-account file is deliberate and is now stated once in the `SCHEMA_SQL` doc comment: it keeps a future shared database a schema change rather than a rewrite of every query in the store, and the alternative (dropping `account` from `messages`, `mailboxes`, `drafts` and `outbox`) rewrites every SELECT and INSERT in `store/read.rs`, `store/write.rs`, `ingest.rs`, `outbox.rs` and `drafts.rs` for no behavioural gain.
+- Version mismatch: the established drop-and-rebuild path, unchanged.
+  There is no migrator; `Store::open` drops a v3 file and creates an empty v4 one, and the next sync refills it.
+- `messages.size` stays (retention input) and `mailboxes.uidnext` / `exists_count` stay, each marked in the SQL as a sync diagnostic rather than an input.
+- `MailboxCursor.highest_modseq` is carried through the struct and written as NULL by both backends until #0041 issues `CHANGEDSINCE`, documented the way `deltalink` already was.
 
 ## Acceptance criteria
 

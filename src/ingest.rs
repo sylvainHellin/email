@@ -63,8 +63,6 @@
 //! previous body blob had been evicted could not produce them, so it skipped
 //! the delete and left the row indexed twice.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result};
 use log::{info, warn};
 use rusqlite::{OptionalExtension, Transaction};
@@ -270,7 +268,6 @@ fn ingest_in_tx(
         None => resolve_thread_id(tx, input.account, message_id, in_reply_to, references)?,
     };
 
-    let now = unix_now();
     let date_sort = date_sort_for(&email.date);
     let snippet = snippet_for(&email.body_text);
     let flags = if email.is_read { "\\Seen" } else { "" };
@@ -297,7 +294,7 @@ fn ingest_in_tx(
                     uid = ?2, message_id = ?3, from_ = ?4, to_ = ?5, cc = ?6, subject = ?7,
                     date_sort = ?8, date_display = ?9, flags = ?10, in_reply_to = ?11,
                     references_ = ?12, thread_id = ?13, snippet = ?14, has_attachments = ?15,
-                    body_blob = ?16, raw_blob = ?17, size = ?18, mtime = ?19
+                    body_blob = ?16, raw_blob = ?17, size = ?18
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -318,7 +315,6 @@ fn ingest_in_tx(
                     body_blob,
                     raw_blob,
                     size,
-                    now,
                 ],
             )
             .context("updating the message row")?;
@@ -329,10 +325,10 @@ fn ingest_in_tx(
                 "INSERT INTO messages (
                     account, mailbox, uid, message_id, from_, to_, cc, subject,
                     date_sort, date_display, flags, in_reply_to, references_, thread_id,
-                    snippet, has_attachments, body_blob, raw_blob, size, mtime
+                    snippet, has_attachments, body_blob, raw_blob, size
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20
+                    ?17, ?18, ?19
                  )",
                 rusqlite::params![
                     input.account,
@@ -354,7 +350,6 @@ fn ingest_in_tx(
                     body_blob,
                     raw_blob,
                     size,
-                    now,
                 ],
             )
             .context("inserting the message row")?;
@@ -553,13 +548,6 @@ fn snippet_for(body: &str) -> String {
     collapsed.chars().take(SNIPPET_CHARS).collect()
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Mailbox and cursor bookkeeping
 // ---------------------------------------------------------------------------
@@ -573,6 +561,10 @@ pub struct MailboxCursor {
     pub last_uid: Option<i64>,
     pub uidnext: Option<i64>,
     pub exists: Option<i64>,
+    /// CONDSTORE `HIGHESTMODSEQ`, and never anything else: it held a UID until
+    /// #0054 split the column, which would have made `CHANGEDSINCE` return
+    /// nothing and no error. Unused until #0041 issues that fetch.
+    pub highest_modseq: Option<i64>,
     /// Graph `deltaLink` (unused until the delta fetch lands, see
     /// `TODO(#0037-4b-or-0038)` in `src/graph.rs`).
     pub deltalink: Option<String>,
@@ -604,32 +596,47 @@ pub fn record_mailbox_cursor(
     .context("recording the mailbox row")?;
 
     conn.execute(
-        "INSERT INTO sync_cursors (mailbox, uidvalidity, highest_modseq, deltalink)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (mailbox) DO UPDATE SET
+        "INSERT INTO sync_cursors
+            (account, mailbox, uidvalidity, last_uid, highest_modseq, deltalink)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (account, mailbox) DO UPDATE SET
             uidvalidity = excluded.uidvalidity,
+            last_uid = excluded.last_uid,
             highest_modseq = excluded.highest_modseq,
             deltalink = excluded.deltalink",
-        rusqlite::params![mailbox, cursor.uidvalidity, cursor.last_uid, cursor.deltalink],
+        rusqlite::params![
+            account,
+            mailbox,
+            cursor.uidvalidity,
+            cursor.last_uid,
+            cursor.highest_modseq,
+            cursor.deltalink
+        ],
     )
     .context("recording the sync cursor")?;
     Ok(())
 }
 
-/// The cursor a previous fetch left for `mailbox`, if any.
-pub fn load_mailbox_cursor(store: &Store, mailbox: &str) -> Result<Option<MailboxCursor>> {
+/// The cursor a previous fetch left for `(account, mailbox)`, if any.
+pub fn load_mailbox_cursor(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+) -> Result<Option<MailboxCursor>> {
     let cursor = store
         .conn()
         .query_row(
-            "SELECT uidvalidity, highest_modseq, deltalink FROM sync_cursors WHERE mailbox = ?1",
-            [mailbox],
+            "SELECT uidvalidity, last_uid, highest_modseq, deltalink FROM sync_cursors
+             WHERE account = ?1 AND mailbox = ?2",
+            [account, mailbox],
             |row| {
                 Ok(MailboxCursor {
                     uidvalidity: row.get(0)?,
                     last_uid: row.get(1)?,
                     uidnext: None,
                     exists: None,
-                    deltalink: row.get(2)?,
+                    highest_modseq: row.get(2)?,
+                    deltalink: row.get(3)?,
                 })
             },
         )
@@ -770,7 +777,7 @@ impl KnownUids {
 pub fn known_uids_with_cursor(store: &Store, account: &str, mailbox: &str) -> Result<KnownUids> {
     Ok(KnownUids {
         uids: known_uids(store, account, mailbox)?,
-        uidvalidity: load_mailbox_cursor(store, mailbox)?.and_then(|c| c.uidvalidity),
+        uidvalidity: load_mailbox_cursor(store, account, mailbox)?.and_then(|c| c.uidvalidity),
     })
 }
 

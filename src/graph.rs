@@ -679,6 +679,7 @@ pub async fn sync_mailboxes_graph(
                 last_uid: None,
                 uidnext: None,
                 exists: Some(server_flags.len() as i64),
+                highest_modseq: None,
                 deltalink: None,
             },
         )?;

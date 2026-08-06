@@ -1,4 +1,4 @@
-//! Schema v3 for the per-account store.
+//! Schema v4 for the per-account store.
 //!
 //! There is no migrator and there never will be one: the store is a cache in
 //! front of IMAP, so a version mismatch is answered by dropping the file and
@@ -18,8 +18,12 @@ use rusqlite::Connection;
 /// pass. v3 turned `messages_fts` from an external-content index into a
 /// contentless one with `contentless_delete=1` (#0038 unit B), which is a
 /// change to the virtual table's declaration and therefore a real version
-/// bump.
-pub const SCHEMA_VERSION: i64 = 3;
+/// bump. v4 is the #0054 bundle: `sync_cursors` splits its UID out of
+/// `highest_modseq` into `last_uid`, `sync_cursors` and `pending_ops` gain the
+/// `account` column the rest of the schema carries, `pending_ops` gains
+/// `updated`, and the two write-only columns (`messages.mtime`,
+/// `mailboxes.unread_count`) come out.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -28,8 +32,8 @@ pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// informational (it makes a stale store obvious in a bug report).
 pub const META_APP_VERSION: &str = "app_version";
 
-/// Tables that must exist for a store to count as a valid v3 file. Checked on
-/// open so that a file which is stamped v3 but structurally incomplete (a
+/// Tables that must exist for a store to count as a valid v4 file. Checked on
+/// open so that a file which is stamped v4 but structurally incomplete (a
 /// half-written create, a hand-edited database) is rebuilt rather than used.
 pub const REQUIRED_TABLES: &[&str] = &[
     "meta",
@@ -48,7 +52,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
 ///
 /// The table list alone cannot see a schema that gained a *column* without a
 /// version bump, which is exactly what the #0037 review pass did to `outbox`.
-/// The v3 bump makes every one of those stores unusable by version anyway, so
+/// The v4 bump makes every one of those stores unusable by version anyway, so
 /// the list is empty again; it fills up the next time a column is added
 /// without a bump.
 pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
@@ -57,6 +61,12 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///
 /// Identity notes that are load-bearing rather than cosmetic:
 ///
+/// - Every table carries `account`, although one store file only ever holds
+///   one account. The redundancy is deliberate (#0054): it keeps a future
+///   shared database a schema change rather than a rewrite of every query, and
+///   it is cheaper to carry the column than to explain per table why this one
+///   is exempt. `sync_cursors` and `pending_ops` were the two exceptions and
+///   are no longer.
 /// - `messages` has a synthetic `id` so a move or a UIDVALIDITY reset does not
 ///   invalidate references held elsewhere; `UNIQUE (account, mailbox, uid)` is
 ///   the real identity and the target of the ingest UPSERT.
@@ -108,6 +118,19 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   usable (`snippet()`, `highlight()` and selecting a column value all fail),
 ///   and there is nothing to rebuild from, because a store that loses its index
 ///   is dropped and refilled by the next sync.
+/// - `sync_cursors` keeps the two resume points apart, because they are not
+///   the same number: `last_uid` is the highest UID the recording fetch saw
+///   and is what the IMAP pull resumes from today, while `highest_modseq` is a
+///   CONDSTORE modification sequence and stays NULL until #0041 issues
+///   `CHANGEDSINCE`. Until then it is unused, like `deltalink` (Graph's
+///   `deltaLink`, waiting on #0042). They were one column until #0054, which
+///   stored a UID in `highest_modseq`: a UID-sized number read as a modseq
+///   makes the server return nothing and no error, which is the #0004 failure
+///   mode with no symptom.
+/// - `pending_ops` is the durable mutation queue #0039 will drain; only its
+///   shape lives here so far. `updated` is the last-attempt timestamp the
+///   backoff is a function of (`updated + backoff_secs(attempts) > now`, the
+///   formula `outbox` already uses), which `created` cannot answer.
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
@@ -118,9 +141,10 @@ CREATE TABLE mailboxes (
     account      TEXT NOT NULL,
     name         TEXT NOT NULL,
     uidvalidity  INTEGER,
+    -- uidnext and exists_count are what the server last reported: sync
+    -- diagnostics, not inputs to any decision the client takes.
     uidnext      INTEGER,
     exists_count INTEGER,
-    unread_count INTEGER,
     PRIMARY KEY (account, name)
 );
 
@@ -144,8 +168,8 @@ CREATE TABLE messages (
     has_attachments  INTEGER NOT NULL DEFAULT 0,
     body_blob        TEXT,
     raw_blob         TEXT,
+    -- size is the retention input: eviction picks its victims by it.
     size             INTEGER,
-    mtime            INTEGER,
     UNIQUE (account, mailbox, uid)
 );
 
@@ -205,21 +229,28 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_state ON outbox (state);
 
 CREATE TABLE sync_cursors (
-    mailbox        TEXT PRIMARY KEY,
+    account        TEXT NOT NULL,
+    mailbox        TEXT NOT NULL,
     uidvalidity    INTEGER,
+    last_uid       INTEGER,
+    -- A CONDSTORE modification sequence and nothing else; NULL until #0041.
     highest_modseq INTEGER,
-    deltalink      TEXT
+    -- Graph deltaLink; NULL until #0042.
+    deltalink      TEXT,
+    PRIMARY KEY (account, mailbox)
 );
 
 CREATE TABLE pending_ops (
     id                INTEGER PRIMARY KEY,
+    account           TEXT NOT NULL,
     kind              TEXT NOT NULL,
     target_message_id INTEGER,
     payload           TEXT,
     state             TEXT,
     attempts          INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
-    created           INTEGER
+    created           INTEGER,
+    updated           INTEGER
 );
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(

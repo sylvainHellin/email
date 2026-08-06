@@ -213,6 +213,7 @@ pub async fn sync_mailboxes(
                 last_uid: highest_uid.or_else(|| state.uid_next.map(|n| n as i64 - 1)),
                 uidnext: state.uid_next.map(|v| v as i64),
                 exists: Some(state.exists as i64),
+                highest_modseq: None,
                 deltalink: None,
             },
         )?;

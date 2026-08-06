@@ -76,6 +76,21 @@ All notable changes to this project are documented in this file.
   rather than remembered as checked.
 
 ### Changed
+- **Store schema v4: the sync cursor stops storing a UID as a modification
+  sequence (#0054).** `sync_cursors.highest_modseq` held the highest UID a
+  fetch had seen, which nothing read as a modseq yet. It is now split in two:
+  `last_uid` is what the incremental fetch resumes from, and `highest_modseq`
+  only ever holds a CONDSTORE modification sequence, staying NULL until #0041
+  issues `CHANGEDSINCE`. A UID-sized number passed as a modseq makes the server
+  return nothing **and no error**, so the trap would have been silent. Three
+  smaller corrections ride the same version bump: `sync_cursors` and
+  `pending_ops` now carry the `account` column the rest of the schema carries
+  (the cursor row is keyed `(account, mailbox)` like every other per-mailbox
+  row), `pending_ops` gains the `updated` timestamp the #0039 backoff is a
+  function of, and the two write-only columns (`messages.mtime`,
+  `mailboxes.unread_count`) are gone. As always there is no migrator: an
+  existing store is dropped and rebuilt empty on first open, and the next sync
+  refills it from the server.
 - **View switching moved to a `Space` leader; list toggle-select moved to `v`
   (#0033 follow-up).** The TUI view switcher is now **`Space m`** (Mail),
   **`Space c`** (Contacts), and **`Space a`** (Calendar) — replacing the earlier

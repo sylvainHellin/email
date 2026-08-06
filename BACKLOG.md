@@ -6,9 +6,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053 has shipped.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053 and #0054 have shipped.
 
-- [#0054 Schema bump bundle (modseq/UID split, pending_ops.updated, dead columns)](docs/tickets/0054-schema-bump-bundle.md) -- refactor _(prerequisite for #0041)_
 - [#0055 Graph backend sync parity (prune, converge, watcher, timing)](docs/tickets/0055-graph-sync-parity.md) -- bug
 - [#0056 Rewrite docs/architecture.md, fix the wizard and dump-mailbox help](docs/tickets/0056-architecture-docs-rewrite.md) -- chore
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
@@ -38,7 +37,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037; absorbs mutation unification and the engine lock)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_
-- [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5; blocked on #0054, sequenced after #0059)_
+- [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5; #0054 has landed, sequenced after #0059)_
 - [#0042 Graph /messages/delta + deltaLink](docs/tickets/0042-graph-delta-sync.md) -- perf _(data layer, Stage 5; sequenced after #0059)_
 - [#0043 FTS5 full-text search](docs/tickets/0043-fts5-search.md) -- feature _(data layer, Stage 5)_
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
