@@ -66,7 +66,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use log::warn;
+use log::{info, warn};
 use rusqlite::{OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
@@ -691,17 +691,24 @@ pub fn apply_seen_flag(
 /// where the message went. The store is a droppable cache in front of the
 /// server (see [`crate::store::write`]), and a message archived in another
 /// client is re-ingested under the destination mailbox by the same sync, so
-/// deleting the source row leaves exactly the one row the server has. A row the
-/// user is previewing can go out from under them, which is the row-id reuse
-/// hazard the write path already documents; the list is rebuilt from the store
-/// after every sync, which is where a stale reference is dropped.
+/// deleting the source row leaves exactly the one row the server has. That
+/// ordering is the caller's to keep: the sync ingests every target mailbox
+/// first and prunes afterwards (see [`crate::imap_client::sync_mailboxes`]),
+/// because pruning the inbox before the archive pass runs would leave the
+/// message with no row anywhere. A row the user is previewing can go out from
+/// under them, which is the row-id reuse hazard the write path already
+/// documents; the list is rebuilt from the store after every sync, which is
+/// where a stale reference is dropped.
+///
+/// Best-effort by construction: a row that refuses to delete is logged and the
+/// rest still go, so there is no error to return.
 pub fn prune_vanished(
     store: &Store,
     blobs: &BlobStore,
     account: &str,
     mailbox: &str,
     vanished: &[u32],
-) -> Result<usize> {
+) -> usize {
     let mut pruned = 0;
     for uid in vanished {
         match crate::store::write::delete_by_uid(store, blobs, account, mailbox, *uid as i64) {
@@ -711,9 +718,9 @@ pub fn prune_vanished(
         }
     }
     if pruned > 0 {
-        warn!("Pruned {pruned} row(s) from '{mailbox}': gone from the server");
+        info!("Pruned {pruned} row(s) from '{mailbox}': no longer listed there by the server");
     }
-    Ok(pruned)
+    pruned
 }
 
 /// What the store already holds for a mailbox, and the UIDVALIDITY it holds it

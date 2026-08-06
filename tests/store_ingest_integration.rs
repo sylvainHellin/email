@@ -900,9 +900,15 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
 /// sync does with it. Both halves run here so the tests read like one sync
 /// pass without needing a server.
 fn sync_prune(f: &Fixture, mailbox: &str, window: &[u32]) -> usize {
+    let vanished = fetch_diff(f, mailbox, window);
+    email::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished)
+}
+
+/// The diff half on its own, for the test that has to hold a prune back until
+/// every target mailbox has been ingested, the way the sync does.
+fn fetch_diff(f: &Fixture, mailbox: &str, window: &[u32]) -> Vec<u32> {
     let known = email::ingest::known_uids(&f.store, "acct", mailbox).unwrap();
-    let vanished = email::imap_client::vanished_uids(&known, window);
-    email::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished).unwrap()
+    email::imap_client::vanished_uids(&known, window)
 }
 
 fn plain(name: &str) -> Vec<u8> {
@@ -996,7 +1002,7 @@ fn a_uidvalidity_reset_prunes_nothing() {
     let vanished = email::imap_client::vanished_uids(&resolved, &[90, 91, 92]);
     assert!(vanished.is_empty(), "a reset must never prune");
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished).unwrap(),
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished),
         0
     );
     assert_eq!(f.message_rows(), 3);
@@ -1006,6 +1012,13 @@ fn a_uidvalidity_reset_prunes_nothing() {
 /// the inbox window and reappears in the archive. Ingest inserts the archive
 /// copy (identity is per mailbox), the prune drops the inbox row, and the user
 /// sees the message exactly once, in the archive.
+///
+/// The order below is the sync's own, and it is the point of the test: targets
+/// are synced inbox, archive, sent, so each target's diff is computed against
+/// the store as its fetch found it, every target is ingested, and only then do
+/// the prunes go. Pruning inside the per-target loop instead deleted the inbox
+/// row before the archive pass ran, and the message spent that window with no
+/// row anywhere, its body blob at refcount zero and unlinked from disk.
 #[test]
 fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
     let f = Fixture::new();
@@ -1013,16 +1026,48 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
     let inbox = f.ingest_raw("inbox", 7, &raw);
     f.ingest_raw("inbox", 8, &plain("other"));
     let hash = f.text(inbox.row_id, "body_blob");
+    let blob = BlobHash::parse(&hash).unwrap();
+    let rows_for_message = || -> i64 {
+        f.store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+                ["<archived-elsewhere@example.com>"],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(rows_for_message(), 1);
     assert_eq!(f.refcount(&hash), 1);
+    assert!(f.blobs.contains(&blob));
 
-    // The same sync ingests the archive copy at its new UID ...
+    // Inbox pass: the server stopped listing UID 7, which the fetch reports
+    // and the sync holds back.
+    let inbox_vanished = fetch_diff(&f, "inbox", &[6, 8]);
+    assert_eq!(inbox_vanished, vec![7]);
+
+    // Archive pass: its own diff, then the ingest of the moved copy at its new
+    // UID. The message now has two rows, never fewer.
+    let archive_vanished = fetch_diff(&f, "archive", &[31]);
+    assert!(archive_vanished.is_empty());
     let archived = f.ingest_raw("archive", 31, &raw);
     assert!(archived.inserted);
+    assert_eq!(rows_for_message(), 2);
     assert_eq!(f.refcount(&hash), 2, "both rows reference the deduped body blob");
+    assert!(f.blobs.contains(&blob));
 
-    // ... and prunes the inbox row, whose UID the server stopped listing.
-    assert_eq!(sync_prune(&f, "inbox", &[6, 8]), 1);
-    assert_eq!(sync_prune(&f, "archive", &[31]), 0);
+    // Prune pass, after every target has been ingested.
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &inbox_vanished),
+        1
+    );
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "archive", &archive_vanished),
+        0
+    );
+    assert_eq!(rows_for_message(), 1, "the archive row, and it never went to zero");
+    assert_eq!(f.refcount(&hash), 1, "the inbox row released its reference");
+    assert!(f.blobs.contains(&blob), "the body blob was never unlinked");
 
     assert_eq!(f.message_rows(), 2, "the archived message plus the untouched one");
     let mailboxes: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
@@ -1037,5 +1082,4 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
         .map(|e| e.message_id.clone())
         .collect();
     assert_eq!(archive, vec!["<archived-elsewhere@example.com>".to_string()]);
-    assert_eq!(f.refcount(&hash), 1, "the inbox row released its reference");
 }

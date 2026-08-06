@@ -132,6 +132,12 @@ pub struct StoreFetch {
 /// Negative UIDs are skipped: they are the `-id` sentinel a local move parks a
 /// row on (see [`crate::store::write`]), a row waiting for the destination's
 /// next sync to give it a real UID, not something the server ever knew about.
+///
+/// The same clamp saves the other placeholder, from the other end of the
+/// number line: a Sent copy appended without an `APPENDUID` is stored under
+/// [`crate::ingest::graph_uid`], a 63-bit hash of the Message-ID that is
+/// always far above any real `hi`, so it falls outside the window's range and
+/// survives until a real sync rebinds it to the server's UID.
 pub fn vanished_uids(known: &std::collections::HashSet<i64>, window: &[u32]) -> Vec<u32> {
     let (Some(&lo), Some(&hi)) = (window.iter().min(), window.iter().max()) else {
         return Vec::new();

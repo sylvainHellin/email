@@ -104,6 +104,9 @@ pub async fn sync_mailboxes(
     span.mark("session_open");
 
     let mut result = SyncResult::default();
+    // Every prune this run will apply, collected here and applied after the
+    // loop: see the second pass below for why it cannot run per target.
+    let mut prunes: Vec<(String, Vec<u32>)> = Vec::new();
 
     for target in targets {
         // The skip list travels with the UIDVALIDITY it was recorded under, so
@@ -193,19 +196,11 @@ pub async fn sync_mailboxes(
             }
         }
 
-        // The other half of the same diff: the UIDs the store holds inside the
-        // window's range that the server did not list. Applied after the
-        // ingest of `new_messages`, so a message that merely moved mailboxes
-        // is already present at its destination before its source row goes.
-        match ingest::prune_vanished(
-            &store,
-            &blobs,
-            account_name,
-            &target.role,
-            &fetched.vanished,
-        ) {
-            Ok(n) => result.pruned += n,
-            Err(e) => warn!("Failed to prune '{}': {e:#}", target.server_name),
+        // The other half of the same diff: the UIDs the store holds inside
+        // the window's range that the server did not list. Held back until
+        // every target has been ingested (see the second pass below).
+        if !fetched.vanished.is_empty() {
+            prunes.push((target.role.clone(), fetched.vanished));
         }
 
         let highest_uid = new_messages.iter().map(|m| m.uid as i64).max();
@@ -224,6 +219,21 @@ pub async fn sync_mailboxes(
     }
 
     span.mark("ingest");
+
+    // Second pass: every prune, after every target has been ingested.
+    //
+    // Targets are synced in order (inbox, archive, sent), so pruning inside
+    // the loop deletes the inbox row of a message archived in another client
+    // *before* the archive pass ingests it: a window in which the store holds
+    // no row for that message at all, its blobs drop to refcount zero and are
+    // unlinked, and a failed archive fetch (the `continue` above) loses it
+    // locally until a later sync. Applying the prunes here means the
+    // destination row already exists when the source row goes.
+    for (role, vanished) in &prunes {
+        result.pruned += ingest::prune_vanished(&store, &blobs, account_name, role, vanished);
+    }
+    span.mark("prune");
+
     session.logout().await.ok();
     span.mark("logout");
 
