@@ -15,11 +15,17 @@ All notable changes to this project are documented in this file.
 - **A sent draft leaves `drafts/`.** Sending rewrote the draft's `status:` to
   `sent` and left the file where it was, so a message that was already gone sat
   in the TUI's Drafts list and in `mp list` forever with nothing left to do to
-  it. A send that reached **every** recipient now deletes the draft file: the
-  copy that matters lives on the server, which the durable outbox APPENDs to
-  Sent and ingest reads back into the store. A **partial** send still keeps the
-  file, marked `sent`, because it is the only thing that names the recipients
-  who did not get it and it has to stay addressable for the retry. Applies to
+  it. A send that reached **every** recipient and got an outbox row now deletes
+  the draft file: the copy that matters lives on the server, which the durable
+  outbox APPENDs to Sent and ingest reads back into the store. A **partial**
+  send keeps the file, marked `sent`, because it is the only thing that names
+  the recipients who did not get it, and so does a send the outbox store could
+  not record, whose only local copy the file is. Sending such a draft again is
+  a hand edit rather than a command: `mp send` only builds an `approved` draft
+  and neither `mark-approved` nor `mark-draft` will touch a file that says
+  `status: sent`, so the user edits `status:` back to `approved` themselves,
+  after trimming the recipient lines, because a re-send delivers to everyone
+  the file still lists including the ones who already received it. Applies to
   `mp send`, `mp send-approved` and both of their TUI equivalents, over SMTP and
   over Graph. A file hand-edited to `status: sent` is still listed, unchanged.
 - **Sync prunes the rows the server no longer lists (#0038 follow-up).** A

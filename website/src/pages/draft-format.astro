@@ -142,9 +142,22 @@ Email body here.`;
         When an email is sent, the file is updated in-place. The <code>status</code> changes
         to <code>sent</code>, and three fields are added: <code>sent_at</code> (ISO 8601 timestamp),
         <code>sent_via</code> (tool version), and <code>message_id</code> (the RFC 822 Message-ID,
-        used for sync deduplication). If a sent directory is configured, the file is moved there.
+        used for sync deduplication).
       </p>
       <Code code={sentExample} lang="markdown" theme="catppuccin-mocha" />
+      <p>
+        A send that reached every recipient and was recorded in the outbox then deletes
+        the draft file: the copy that matters lives on the server, where the outbox appends
+        it to Sent and sync reads it back into the local store.
+      </p>
+      <p>
+        A partial send, or one the outbox store could not record, keeps the file with
+        <code>status: sent</code>, because it is the only local copy left. Sending it again means
+        editing <code>status:</code> back to <code>approved</code> by hand, because
+        <code>mp send</code> refuses anything that is not approved and <code>mp mark-approved</code>
+        refuses anything already sent. Trim the recipient lines first: a re-send delivers to
+        everyone the file still lists, including the ones who already received it.
+      </p>
       <p>
         The raw RFC 822 message is also appended to the server-side Sent folder
         via IMAP APPEND with the <code>\Seen</code> flag. This is best-effort -- a failed

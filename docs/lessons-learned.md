@@ -418,3 +418,11 @@ Sending a draft rewrote its `status:` to `sent` in place, which was correct whil
 After #0037 the sent copy is the server's, APPENDed by the durable outbox and read back into the store, so the annotated draft became a second and staler copy of a message that had already left, sitting in the Drafts list and in `mp list` with nothing left to do to it.
 An in-place status flag is the file build's way of saying "this moved on"; once something else owns the moved-on copy, the flag has to become a deletion.
 The exception is the partial send: it keeps the marked file because the file is the only thing that still names the recipients who did not get it ([src/draft.rs](../src/draft.rs), `settle_sent_draft`).
+
+## Deleting the local copy is only safe once the replacement copy exists
+
+`settle_sent_draft` retired a fully sent draft on the argument that the server's copy replaces it: the durable outbox APPENDs the message to Sent and ingest reads it back into the store.
+The argument holds only when there is an outbox row, and `send_durably` deliberately sends without one when the store cannot be opened, reporting `state: None` rather than refusing the send.
+That branch is rare enough to be invisible in testing and is exactly the one where the deletion is unrecoverable: no APPEND, no ingest, and the recipients hold the only copy of the message.
+A retirement now requires the report to be both complete and durable, which is a precondition on the *replacement* rather than on the send ([src/draft.rs](../src/draft.rs), `settle_sent_draft`).
+When a fallback is written that trades a guarantee for availability, every later step that assumed the guarantee has to name it in its own condition; the fallback's own comment will not find them.

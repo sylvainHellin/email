@@ -149,7 +149,10 @@ Inbox emails follow a separate flow: `inbox -> archived` (via the `archive` comm
 
 ### After sending
 
-The file is updated in-place with `status: sent`, `sent_at` timestamp, `sent_via` version, and `message_id`. If a sent directory is configured, the file is moved there.
+The file is updated in-place with `status: sent`, `sent_at` timestamp, `sent_via` version, and `message_id`.
+A send that reached every recipient and was recorded in the outbox then deletes the draft file: the copy that matters lives on the server, where the outbox appends it to Sent and sync reads it back into the local store.
+A partial send, or one the outbox store could not record, keeps the file with `status: sent`, because it is the only local copy left.
+Sending such a draft again means editing `status:` back to `approved` by hand, since `send` refuses anything that is not approved and `mark-approved` refuses anything already sent; trim the recipient lines first, because a re-send delivers to everyone the file still lists.
 
 ## Commands
 
