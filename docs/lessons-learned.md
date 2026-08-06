@@ -372,3 +372,20 @@ The rule the branch settled on: port a flow only where the artifact behind it is
 The store-backed file tests wrote into `/tmp/mailypoppins-<row id>`, which is the exact path a real `mp open` of that row uses, so a test run and a live session collided on the same directory.
 The obvious isolation, pointing `$TMPDIR` at the fixture's own tempdir and removing it on drop, is worse: `$TMPDIR` is process-wide, so every `tempfile::tempdir()` on another test thread lands inside the fixture's tree and disappears mid-test when the fixture drops.
 The isolation has to outlive any single test: one directory per process, created once and never removed while the process runs, with the per-fixture part only setting and restoring the variable ([src/tui/actions.rs](../src/tui/actions.rs), #0052 review).
+
+## A per-open integrity check turns every read into a walk of the whole file
+
+`Store::open` ran `PRAGMA integrity_check` on every open, which is a full walk of every page: 240 ms on a 44 MB store.
+The TUI opens a store per call rather than parking one, because `rusqlite::Connection` is not `Sync`, so the check ran once per `j`/`k` (the preview-body memo misses on every cursor move) and ten times before the first paint.
+The startup and keypress latency the owner reported was one line of validation multiplied by an access pattern nothing had measured against it.
+Deleting the check was not available either: the store has no migrator, and drop-and-rebuild-on-corruption is what stands in for one.
+The shape that keeps both is amortisation, a process-wide registry keyed by canonical store path, so the first open of each file still validates in full and still triggers the rebuild while later opens skip it ([src/store/mod.rs](../src/store/mod.rs)).
+The general form: a validation whose cost is proportional to the whole artifact must be tied to the artifact's lifetime, never to the handle's.
+
+## A comment explaining why nothing needs invalidating is a landmine once the read path moves
+
+`BgResult::Fetch` and `BgResult::Sync` set a status line and stopped, under a comment reading "Ingest writes no `.md`, so a sync never changes what the list is reading and there is nothing to invalidate".
+That was true for exactly one ticket, the #0037 interim state where ingest wrote to the store and the list still read files.
+#0038 moved the list onto the store and nobody went back for the comment, so refresh stopped refreshing: new mail, applied read flags and rows the server had dropped were all invisible until a mailbox switch or a restart.
+The comment is what made it survive review, because it reads as a considered decision rather than as a gap.
+A comment that justifies an absence should name the condition it depends on, so that grepping for the condition finds the comment when the condition changes ([src/tui/bg.rs](../src/tui/bg.rs), #0038 follow-up).
