@@ -4,8 +4,8 @@ use std::fs;
 use std::io::{self, Write};
 
 use crate::config::{
-    account_dir, config_path, drafts_dir, load_global_config, mailbox_dir,
-    mailypoppins_data_dir, set_secret, tokens_dir, AccountConfig,
+    account_dir, blobs_dir, config_path, drafts_dir, load_global_config,
+    mailypoppins_data_dir, set_secret, store_path, tokens_dir, AccountConfig,
 };
 use crate::imap_client::list_mailboxes;
 
@@ -13,6 +13,41 @@ use super::helpers::{
     prompt_input, run_async_blocking, select_mailbox, test_imap_connection,
     test_smtp_connection,
 };
+
+/// Create the account directory and say what it will hold.
+///
+/// The four wizard flows used to print an Inbox, a Sent and an Archive
+/// directory per account: paths from the file era that nothing has created
+/// since received mail moved into the store. What the directory really holds
+/// is `store.sqlite3`, the blob store beside it and the drafts the user
+/// writes, so that is what this prints. The directory itself is created here
+/// so the first path on screen is one that exists; the store and its blobs are
+/// made by the first sync and the drafts directory by the first `mp new`, and
+/// each line says so.
+pub(super) fn print_account_data_paths(account_name: &str) {
+    let acct_dir = account_dir(account_name);
+    if let Err(e) = fs::create_dir_all(&acct_dir) {
+        println!(
+            "{} could not create {}: {e}",
+            "\u{26a0}".yellow(),
+            acct_dir.display()
+        );
+    }
+    println!("{}", "Local data for this account:".bold());
+    println!("  Directory: {}", acct_dir.display());
+    println!(
+        "  Store:     {} (message store, created by the first sync)",
+        store_path(account_name).display()
+    );
+    println!(
+        "  Blobs:     {} (bodies and attachments, created by the first sync)",
+        blobs_dir(account_name).display()
+    );
+    println!(
+        "  Drafts:    {} (Markdown files, created by `mp new`)",
+        drafts_dir(account_name).display()
+    );
+}
 
 /// Interactive setup wizard for creating the config file.
 pub fn cmd_config_init() -> Result<()> {
@@ -368,21 +403,7 @@ pub fn cmd_config_init() -> Result<()> {
 
     println!();
 
-    // -- Derived local paths (from mailypoppins data dir)
-    println!("{}", "Local mail tree:".bold());
-    let acct_dir = account_dir(&account_name);
-    println!("  Inbox:   {}", mailbox_dir(&account_name, "inbox").display());
-    println!("  Drafts:  {}", drafts_dir(&account_name).display());
-    println!("  Sent:    {}", mailbox_dir(&account_name, "sent").display());
-    println!("  Archive: {}", mailbox_dir(&account_name, "archive").display());
-    for mb in &extra_mailboxes {
-        println!("  {}: {}", mb, mailbox_dir(&account_name, mb).display());
-    }
-    println!(
-        "  ({} symlink {} into your Obsidian vault if you want it visible there.)",
-        "\u{2139}".blue(),
-        acct_dir.display(),
-    );
+    print_account_data_paths(&account_name);
 
     // Check if existing config.toml has account signature settings to preserve
     let existing_config: Option<crate::config::GlobalConfig> = if path.exists() {
@@ -716,21 +737,7 @@ pub fn cmd_config_add_account() -> Result<()> {
     } else { Vec::new() };
     println!();
 
-    // -- Derived local paths (from mailypoppins data dir)
-    println!("{}", "Local mail tree:".bold());
-    let acct_dir = account_dir(&account_name);
-    println!("  Inbox:   {}", mailbox_dir(&account_name, "inbox").display());
-    println!("  Drafts:  {}", drafts_dir(&account_name).display());
-    println!("  Sent:    {}", mailbox_dir(&account_name, "sent").display());
-    println!("  Archive: {}", mailbox_dir(&account_name, "archive").display());
-    for mb in &extra_mailboxes {
-        println!("  {}: {}", mb, mailbox_dir(&account_name, mb).display());
-    }
-    println!(
-        "  ({} symlink {} into your Obsidian vault if you want it visible there.)",
-        "\u{2139}".blue(),
-        acct_dir.display(),
-    );
+    print_account_data_paths(&account_name);
 
     // -- Append to config file
     let oauth2_cfg = if is_exchange {
@@ -909,21 +916,7 @@ fn graph_init_flow(path: &std::path::Path) -> Result<()> {
     };
     println!();
 
-    // -- Derived local paths (from mailypoppins data dir)
-    println!("{}", "Local mail tree:".bold());
-    let acct_dir = account_dir(&account_name);
-    println!("  Inbox:   {}", mailbox_dir(&account_name, "inbox").display());
-    println!("  Drafts:  {}", drafts_dir(&account_name).display());
-    println!("  Sent:    {}", mailbox_dir(&account_name, "sent").display());
-    println!("  Archive: {}", mailbox_dir(&account_name, "archive").display());
-    for mb in &extra_mailboxes {
-        println!("  {}: {}", mb, mailbox_dir(&account_name, mb).display());
-    }
-    println!(
-        "  ({} symlink {} into your Obsidian vault if you want it visible there.)",
-        "\u{2139}".blue(),
-        acct_dir.display(),
-    );
+    print_account_data_paths(&account_name);
 
     // -- Build config TOML
     let mut toml_content = String::new();
@@ -1103,21 +1096,7 @@ fn graph_add_account_flow(path: &std::path::Path, existing_names: &[&str]) -> Re
     };
     println!();
 
-    // -- Derived local paths (from mailypoppins data dir)
-    println!("{}", "Local mail tree:".bold());
-    let acct_dir = account_dir(&account_name);
-    println!("  Inbox:   {}", mailbox_dir(&account_name, "inbox").display());
-    println!("  Drafts:  {}", drafts_dir(&account_name).display());
-    println!("  Sent:    {}", mailbox_dir(&account_name, "sent").display());
-    println!("  Archive: {}", mailbox_dir(&account_name, "archive").display());
-    for mb in &extra_mailboxes {
-        println!("  {}: {}", mb, mailbox_dir(&account_name, mb).display());
-    }
-    println!(
-        "  ({} symlink {} into your Obsidian vault if you want it visible there.)",
-        "\u{2139}".blue(),
-        acct_dir.display(),
-    );
+    print_account_data_paths(&account_name);
 
     // -- Append to config file
     let block = format!("\n{}", build_graph_account_toml(

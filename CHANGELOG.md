@@ -100,6 +100,25 @@ All notable changes to this project are documented in this file.
   rather than remembered as checked.
 
 ### Changed
+- **The documentation and the two outputs that still described the file era
+  (#0056).** `docs/architecture.md` is the file every session is told to read
+  first, and it still taught "emails are files": a `.md` per message with an
+  `.html` companion, a module map naming files that were deleted with the
+  cutover, an in-memory Message-ID index that no longer exists and a test count
+  from three hundred tests ago. It has been rewritten against the tree that
+  exists: the store as a cache in front of the server and its drop-and-rebuild
+  contract, the blob store, the ingest, read, mutate and send paths, both sync
+  backends with their shared prune ordering, the selector grammar, and the TUI
+  layering as it really is (`ui/` renders from state alone, `app/` opens the
+  store synchronously, the protocol boundary is the part that is absolute).
+  Two user-facing strings advertised the same retired model and are now true:
+  `mp dump-mailbox` said it reads the local `.md` files, and `mp contacts
+  rebuild` said it reads local mailbox files. The `config init` and
+  `config add-account` wizards printed an Inbox, a Sent and an Archive
+  directory per account that nothing has created since the cutover; all four
+  completion blocks now print the account directory, which the wizard creates,
+  plus the store, blob and drafts paths that go inside it and what makes each
+  of them.
 - **Store schema v4: the sync cursor stops storing a UID as a modification
   sequence (#0054).** `sync_cursors.highest_modseq` held the highest UID a
   fetch had seen, which nothing read as a modseq yet. It is now split in two:

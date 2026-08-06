@@ -1,98 +1,245 @@
 # Architecture
 
-How mailypoppins is put together. Read this before non-trivial changes.
+How mailypoppins is put together.
+Read this before non-trivial changes.
 
 ## Project invariants
 
-- TUI never implements email logic. It dispatches `Action` variants and handles `BgResult` callbacks; all IMAP/SMTP/MIME/parsing/auth code lives in the library. The TEA section below covers the mechanics.
-- No migration paths until v1.0. When changing data formats, secret storage, or wire protocols, drop the old code and prompt the user to reconfigure. Do not write v1->v2 migrators.
-- Windows is targeted via WSL only. No native-Windows code paths (registry, Credential Manager, etc.).
+- The server is truth, the store is a cache.
+Received mail lives in a per-account SQLite file plus a content-addressed blob store, and both are disposable: a schema mismatch, a failed integrity check or an unreadable file is answered by deleting the store and letting the next sync refill it.
+Nothing in the store may be the only copy of anything the user typed.
+- Drafts are the only local truth.
+They are Markdown files with YAML frontmatter under `<account_dir>/drafts/`, written by `mp new` and by `$EDITOR`, and the `drafts` table is a derived index over them.
+- Received mail is read-only locally.
+The client never edits a message body; it changes flags and mailbox membership, and the server is told immediately.
+- No migration paths until v1.0.
+When changing data formats, secret storage or wire protocols, drop the old code and prompt the user to reconfigure.
+Do not write v1 to v2 migrators.
+- The TUI implements no email logic.
+No SMTP, IMAP, MIME or Graph REST code belongs in `tui/app/` or `tui/ui/`; the TUI layering section below states what those two layers do and do not touch today.
+- Windows is targeted via WSL only.
+No native-Windows code paths (registry, Credential Manager).
 
 ## Crate shape
 
-Single crate, library + binary. All logic lives in `src/lib.rs` modules so the TUI can call them directly without subprocess spawning. Config types derive `Clone` so they can be moved into background threads.
+Single crate, library plus binary.
+All logic lives in `src/lib.rs` modules so the TUI can call them directly without subprocess spawning.
+Config types derive `Clone` so they can be moved into background threads.
 
-The installed binary is `mp` (`cargo install --path .`). The Cargo package and library are still named `email` internally for historical reasons -- that name is invisible to users (it only shows up in `use email::...` imports), so it was left untouched during the `email` -> `mp` binary rename. The user-facing name/version string is `mailypoppins X.Y.Z`, set via clap `#[command(name = "mailypoppins")]` + `#[command(version)]` in `src/main.rs`; the Homebrew formula test asserts against that string.
+The installed binary is `mp` (`cargo install --path .`).
+The Cargo package and library are still named `email` internally for historical reasons.
+That name is invisible to users (it only shows up in `use email::...` imports), so it was left untouched during the `email` to `mp` binary rename.
+The user-facing name and version string is `mailypoppins X.Y.Z`, set via clap `#[command(name = "mailypoppins")]` and `#[command(version)]` in `src/main.rs`; the Homebrew formula test asserts against that string.
 
-## Big-picture design
+## The store
 
-- **Multi-account.** Config uses a `[[accounts]]` array. Each account has independent IMAP/SMTP/directories/signatures. The TUI shows one account at a time, switching via backtick or Ctrl+1-9. All accounts are watched for new mail simultaneously. CLI commands target an account via `--account` (defaults to first). Secret keys are namespaced: `smtp-password-{name}`, `imap-password-{name}`.
-- **TUI follows The Elm Architecture (TEA).** `App::update()` is a pure state machine (`Message -> State`). Side effects (IMAP, SMTP, filesystem) are dispatched as `Action` variants and executed in `tui/actions.rs::handle_action()`. Background operations run on threads and report back via `mpsc` as `BgResult` variants (each tagged with `account_index`). Mutations (archive, delete) are optimistic: local state updates immediately, server follows async.
-- **Account state proxy pattern.** `App` holds a `Vec<AccountState>` plus top-level proxy fields (mailboxes, list_index, etc.) that mirror the active account. `save_to_account()` / `load_from_account()` sync state on account switch. This avoids refactoring every key handler to use indirect access.
-- **Emails are files.** Each email is a `.md` file with YAML frontmatter. Incoming HTML bodies are saved as a companion `.html` file. Attachments go in a `<stem>_attachments/` directory alongside the `.md`. The three companion files (`.md`, `.html`, `_attachments/`) are always moved/deleted together. In addition, every fetched attachment is hardlinked into a per-account stable mirror at `<account_dir>/attachments/<sanitized-message-id>/<file>` (copy fallback on filesystems that disallow hardlinks). The mirror exists so forward drafts keep working when the source email is later archived; it is removed only when the email disappears from every synced mailbox. See [tickets/0006-attachment-paths-after-archive.md](tickets/0006-attachment-paths-after-archive.md).
-- **IMAP uses one session per operation.** `sync_mailboxes()` opens one TLS connection for the entire sync. A two-pass fetch (headers first, full body only for new UIDs) minimizes bandwidth. Core functions have `_on_session` variants for session reuse, plus thin wrappers for standalone use. IMAP supports both implicit TLS (port 993) and STARTTLS (any other port, e.g. 1143 for Proton Bridge). The `ImapStream` wrapper injects a fake greeting for STARTTLS connections since `async_imap` expects one.
-- **Sending is per-recipient.** Each recipient gets an individual SMTP envelope, while the visible To/Cc headers are preserved for all. This gives per-recipient success/failure tracking. After a successful send, the raw RFC 822 message is appended to the server Sent folder (best-effort, non-fatal on failure). SMTP uses implicit TLS for port 465, STARTTLS for other ports. Both paths support `accept_invalid_certs` for self-signed certificates (e.g. Proton Bridge); the flag only applies to loopback hosts -- for any remote host it is refused at connect time.
-- **Two transports.** IMAP/SMTP for password and OAuth2-XOAUTH2 accounts; Microsoft Graph REST for tenants that block IMAP/SMTP. TUI actions branch on `app.is_graph()`. See [auth.md](auth.md).
+One `store.sqlite3` per account, in the account directory, opened in WAL mode with a 5 s busy timeout and `synchronous = NORMAL` (`src/store/mod.rs`).
+
+The drop-and-rebuild contract is the reason there is no migrator.
+`Store::open` rebuilds the file from scratch when the stamped schema version is not the current one, when a required table is missing, when `PRAGMA integrity_check` fails, or when the file does not open as a database at all.
+None of those is a user-visible error: the store holds no truth, so the answer is a log line and an empty file.
+The integrity check walks the whole file, so it runs once per file per process rather than on every open.
+
+Schema v4 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
+
+- `messages` is one row per message per mailbox, with a synthetic `id` and `UNIQUE (account, mailbox, uid)` as the real identity.
+The same message in two mailboxes is two rows.
+The `messages_message_id` index is deliberately non-unique: it serves threading, idempotent re-ingest, cross-mailbox copy detection and selector resolution.
+- `blobs` is the refcount index for the content-addressed blob store, and `message_blobs` is the per-message list of `body`, `html`, `raw` and `attachment` references.
+Refcounts live in the database so a reference can be taken in the same transaction as the row that carries the hash.
+- `messages_fts` is a contentless FTS5 index (`content=''`, `contentless_delete=1`) over subject, from and body text.
+Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, and nothing needs to be, because a store that loses its index is dropped.
+- `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (Graph, NULL until #0042).
+The two were one column until #0054, which stored a UID where a modseq was read back.
+- `outbox` carries the durable send state machine described below.
+- `drafts` is the derived index over the drafts directory.
+- `pending_ops` is shape only so far: the durable mutation queue is #0039.
+- Every table carries `account`, although one file holds one account.
+The redundancy keeps a future shared database a schema change rather than a rewrite of every query.
+
+The blob store (`src/store/blobs.rs`) is `<account_dir>/blobs/ab/cd/<sha256>`: every raw message, decoded body and attachment is a file named by the hex SHA-256 of its own bytes.
+The name is the content, which buys dedup, verification (a read re-hashes and refuses bytes that no longer match their name) and immutability.
+Blob files are written before the transaction that references them, never inside it: an unreferenced blob is a harmless orphan a sweep reclaims, while a row pointing at a missing blob is a hole in the read path.
+
+## Data flow
+
+### Receive
+
+A sync backend hands raw messages to `src/ingest.rs`, the only writer on the receive path.
+One transaction per message writes the `messages` row, its blob references and its FTS entry, so a crash leaves whole messages behind and never half of one.
+Re-ingesting a UID is an UPSERT that keeps the row `id`, its thread assignment and the blob references whose content did not change.
+After a UIDVALIDITY reset the row is found by Message-ID and rebound to the new UID in place.
+A message with no `Message-ID` header gets a deterministic `sha256-<hex16>@local.invalid` synthetic id.
+
+### Read
+
+Everything the TUI, `mp dump-mailbox` and the contact index show comes from `src/store/read.rs` and `src/store/drafts.rs`.
+There is no directory-walk fallback: nothing writes `.md` for received mail, so a missing row is a bug in ingest and a walk that quietly produced the message anyway would hide it.
+Attachments are blobs, so anything that needs a file materialises them: `mp open` and the TUI's `o` into a private temp directory keyed by the row, a forward draft into `<account_dir>/attachments/<message-id>/` so the draft keeps resolving them after the source row is archived or evicted.
+
+### Mutate
+
+A flag, move, archive or delete is one local write plus one server op.
+`src/tui/mutations.rs` pairs them: the `prepare_*` functions apply the local write through `src/store/write.rs` and hand back the `ServerOp` to fire in the background plus the row's previous coordinates, so a failed op rolls back.
+The CLI calls the server first and then writes the store.
+Neither ordering survives a crash between the halves; the durable queue that would fix that is #0039.
+
+### Send
+
+`src/send.rs` builds the message, then `DurableSend::begin` commits the raw bytes as a blob and a `pending_send` outbox row *before* SMTP opens.
+Submission is per recipient: each recipient gets an individual envelope while the visible To and Cc headers are preserved for all, which gives per-recipient success and failure tracking.
+`src/outbox.rs` owns the four-state machine (`pending_send`, `sent_pending_append`, `done`, `failed`) and the exactly-once marker: `submission_started_at` is committed immediately before the SMTP session opens, so a `pending_send` row found on restart says whether the transport was ever entered.
+Rows that provably never reached it are resubmitted; rows that died inside it are parked in `failed` for a human and never auto re-sent.
+The APPEND to the server's Sent mailbox is retried until acknowledged, and a retry first searches Sent by Message-ID so it cannot duplicate.
+Accounts whose server files its own Sent copy (Gmail, Graph, Proton) skip the APPEND entirely.
+A fully sent draft with a durable record behind it is removed from `drafts/`; anything less keeps its file.
+
+## Sync backends
+
+Two transports, one ingest path and one `SyncResult` shape: IMAP/SMTP for password and OAuth2 XOAUTH2 accounts, Microsoft Graph REST for tenants that block IMAP/SMTP (see [auth.md](auth.md)).
+TUI actions branch on `app.is_graph()`.
+
+### IMAP
+
+The orchestrator is `src/imap_client/store_sync.rs`.
+One session for the whole sync.
+Per mailbox, `UID SEARCH ALL` gives the UID list, the last `limit` UIDs are the window, pass 1 fetches `(UID FLAGS)` over the whole window and pass 2 downloads `BODY.PEEK[]` only for UIDs the store does not hold.
+The store answers "which UIDs do I hold" with one query, so there is no local scan and no dedup pass.
+IMAP supports implicit TLS (port 993) and STARTTLS (any other port, for example 1143 for Proton Bridge); the `ImapStream` wrapper injects a fake greeting for STARTTLS because `async_imap` expects one.
+
+### Graph
+
+The client and its orchestrator are `src/graph.rs`.
+The folder enumeration returns every message's `internetMessageId`, read flag and received date; the messages the store does not hold are downloaded by id, twenty per `/$batch` call, newest first so a capped pass still takes the arrivals a user is waiting for.
+Graph never returns RFC822, so rows get `raw_blob` NULL and the HTML part is stored as an `html` blob instead.
+Graph has no UID, so the row's `uid` is a 63-bit hash of the Message-ID (`ingest::graph_uid`), which keeps the `(account, mailbox, uid)` identity meaningful.
+Since #0055 the orchestration mirrors the IMAP one line for line, prune pass included.
+
+### Watchers
+
+One IMAP IDLE thread per password or OAuth2 account, and one polling thread per Graph account that compares the *set* of inbox ids rather than its cardinality.
+Both emit `WatchEvent::{Changed, Reconnected, Error}` on a shared channel tagged with `account_index`, and both widen their retry interval after consecutive failures instead of hammering a server that is down.
+Changes on a non-active account set `has_unseen`, which is the badge in the status bar.
 
 ## Module map
 
 | File | Responsibility |
 |------|---------------|
-| `src/types.rs` | Shared types: `EmailStatus`, `EmailFrontmatter`, `EmailDraft`, `InboxFrontmatter`, `SaveFrontmatter`, `collapse_hyphens` |
-| `src/config.rs` | Config loading (`~/.config/email/config.toml`), secrets-backend dispatch, app data dir helpers (`mailypoppins_data_dir`, `account_dir`, `mailbox_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
-| `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). `encrypt_blob` / `decrypt_blob` reused by `oauth2.rs`. See [secrets.md](secrets.md). |
-| `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL string builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |
-| `src/graph.rs` | Microsoft Graph REST client: list folders, fetch / sync / send / archive / delete / mark-read / search. Used when `auth_method = "graph"`. |
-| `src/contacts/` + `src/contacts_cmd.rs` | Contact mining from local mail, frecency ranking, per-account cache at `account_dir(name)/contacts-cache.json`. CLI: `mp contacts {rebuild,stats,list}`. |
+| `src/types.rs` | Shared types: `EmailStatus`, `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
+| `src/config.rs` | Config loading (`~/.config/email/config.toml`), secrets-backend dispatch, data dir helpers (`mailypoppins_data_dir`, `account_dir`, `store_path`, `blobs_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
+| `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). See [secrets.md](secrets.md). |
+| `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |
+| `src/ingest.rs` | The receive-path writer: fetched message to one `messages` row plus blobs, FTS maintenance, cursors, `prune_vanished`, `apply_seen_flags`, `graph_uid` |
+| `src/selector.rs` | The `mp://account/mailbox/key` grammar: parse, resolve, format. Namespace fixed by the command, never sniffed. |
+| `src/dump.rs` | `mp dump-mailbox`: path-free NDJSON envelope dump of the store, the parity harness for the data-layer rewrite |
+| `src/reconcile.rs` | iMIP invite reconciliation, folded over the rows at display time and never persisted |
+| `src/parse.rs` | RFC822 parsing, attachment extraction and sanitisation, `open_file_with_system()`, `materialisation_dir()`, `stable_attachments_dir()`, `ensure_utf8_charset()` |
+| `src/draft.rs` | Draft parsing and validation, reply and forward creation, `source_from_row`, status transitions, `settle_sent_draft` |
+| `src/send.rs` | `markdown_to_html`, message building, per-recipient submission, `DurableSend`, `resume_outbox` |
+| `src/outbox.rs` | The durable send state machine and its blob refcounting |
+| `src/graph.rs` | Microsoft Graph REST client: folders, fetch, sync, send, move, delete, read flags, search |
+| `src/calendar.rs` + `src/invite.rs` | iCalendar receive-side parsing and send-side building |
+| `src/contacts/` + `src/contacts_cmd.rs` | Contact index built from `messages` rows, frecency ranking, per-account cache at `account_dir(name)/contacts-cache.json`. CLI: `mp contacts {rebuild,stats,list}`. |
 | `src/config_cmd/` | Config subcommands: init wizard, add-account, show, set-password, oauth2-login, reset-secrets, path |
-| `src/parse.rs` | RFC822 parsing, saving emails to disk, attachment extraction, `open_file_with_system()`, `attachments_dir_for()`, `stable_attachments_dir()`, `link_or_copy()`, `account_dir_for_email()`, `ensure_utf8_charset()` |
-| `src/draft.rs` | Draft parsing/validation, reply/forward creation, status transitions |
-| `src/send.rs` | `markdown_to_html`, per-recipient `send_email`, IMAP APPEND to Sent |
-| `src/sync.rs` | Local file scanning, mailbox dir resolution, reconciliation helpers |
-| `src/timing.rs` | `TimingSpan` -- emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
+| `src/calendar_cmd.rs` | `mp calendar rebuild`: reports what the invite fold resolves, writes nothing |
+| `src/notify.rs` | Desktop notifications for new mail, shelling out to `osascript` / `notify-send` |
+| `src/timing.rs` | `TimingSpan`, which emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
+| **`src/store/`** | |
+| `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
+| `schema.rs` | Schema v4 SQL, version stamping, required-table validation, and the identity notes |
+| `read.rs` | Listings, counts, Message-ID lookup, body and HTML loading, `materialise_attachments` |
+| `write.rs` | The optimistic local half of a flag, move or delete |
+| `drafts.rs` | The derived index over `<account_dir>/drafts/` |
+| `blobs.rs` | The content-addressed blob store and its refcount discipline |
 | **`src/imap_client/`** | |
 | `mod.rs` | `ImapStream` wrapper, `open_imap_session()`, re-exports |
-| `fetch.rs` | `fetch_emails*`, `fetch_new_emails*`, `fetch_server_message_ids*` |
-| `sync.rs` | `sync_mailboxes()`, `list_mailboxes()`, `SyncTarget`, `SyncResult`, `MailboxState`, `MessageIdIndex` |
+| `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, `MailboxState` |
+| `store_sync.rs` | `sync_mailboxes()`, `list_mailboxes()`, `SyncTarget`, `SyncResult` |
 | `search.rs` | `parse_search_query()`, `build_imap_search_query()`, `FetchCriteria` |
 | `watch.rs` | `watch_mailbox()` (IMAP IDLE) |
-| `ops.rs` | `archive_email_on_server/locally`, `delete_email_on_server/locally`, `append_to_sent_folder`, `mark_read/unread_on_server`, `update_read_status_locally`, `get_message_id_from_file` |
-| `batch.rs` | `batch_archive_emails_locally`, `batch_delete_emails_locally` |
+| `ops.rs` | Single-message server ops: move, delete, read flags |
+| `batch.rs` | `batch_move_on_server`, `batch_delete_on_server` |
+| `sent.rs` | `ImapSentMailbox`: the APPEND seam the outbox drives, faked in tests |
 | **`src/tui/`** | |
-| `mod.rs` | Event loop (`run_loop`), watcher spawn, bg result drain |
-| `actions.rs` | `handle_action()` -- side-effect dispatch for all `Action` variants. Branches on `is_graph()`. |
-| `bg.rs` | `handle_bg_result()` -- process background task completions |
-| `helpers.rs` | Terminal suspend/resume, editor, clipboard, watcher loop, `lib_do_sync`, `lib_do_sync_graph`, `resolve_send_account` |
+| `mod.rs` | Event loop (`run_loop`), watcher spawn, background result drain |
+| `actions.rs` | `handle_action()`, the side-effect dispatch for all `Action` variants. Branches on `is_graph()`. |
+| `mutations.rs` | The local write plus server op pairing, testable without a terminal |
+| `bg.rs` | `handle_bg_result()`, processing background task completions |
+| `helpers.rs` | Terminal suspend and resume, editor, clipboard, the two watcher loops, `lib_do_sync`, `lib_do_sync_graph`, `resolve_send_account` |
 | `event.rs` | Crossterm event polling |
-| `theme.rs` | Catppuccin Mocha palette constants |
+| `theme.rs` | Named themes, semantic colour slots |
 | **`src/tui/app/`** | |
 | `mod.rs` | `App` struct, `new()`, `update()`, account sync, core state helpers |
-| `types.rs` | `EmailEntry`, `AccountState`, `BgResult`, `Action`, `Focus`, `MailboxKind`, mailbox builders |
-| `keys.rs` | `handle_key()` dispatch + all `handle_*_key()` methods |
+| `types.rs` | `EmailEntry`, `AccountState`, `BgResult`, `Action`, `Focus`, `MailboxKind`, `open_store`, mailbox builders |
+| `keys.rs` | `handle_key()` dispatch and all `handle_*_key()` methods |
+| `keymap.rs` | The single `KEYMAP` table behind the help overlay, the hint bar and `mp dump-keys` |
+| `calendar_view.rs` | Agenda rows built from the iMIP messages the store holds |
 | **`src/tui/ui/`** | |
-| `mod.rs` | `view()` -- top-level layout dispatch |
-| `sidebar.rs` | `render_sidebar()` |
-| `activity.rs` | `render_activity_log()` |
-| `list.rs` | `render_email_list()` |
-| `headers.rs` | `render_headers()`, `header_line()` |
-| `preview.rs` | `render_body()`, markdown parsing + word wrap |
-| `compose.rs` | Compose-related rendering |
-| `status.rs` | `render_status_bar()` |
-| `overlays.rs` | Confirm dialog, attachment picker, persistent error, help overlay |
-| `search.rs` | Server search overlay + sub-renderers |
-| `util.rs` | `pane_border_style`, `hint_span`, `desc_span`, `truncate` |
+| `mod.rs` | `view()`, the top-level layout dispatch |
+| `views.rs` | View switcher chrome |
+| `sidebar.rs`, `list.rs`, `headers.rs`, `preview.rs`, `compose.rs`, `status.rs`, `activity.rs` | Mail view panes |
+| `calendar.rs`, `contacts.rs` | The other two views |
+| `overlays.rs`, `search.rs` | Confirm dialog, attachment picker, persistent error, help overlay, server search |
+| `widgets.rs`, `util.rs` | Shared widgets, `pane_border_style`, `hint_span`, `truncate` |
+
+## TUI layering
+
+- The TUI follows The Elm Architecture.
+`App::update()` is a state machine (`Message -> State`).
+Side effects are dispatched as `Action` variants and executed in `tui/actions.rs::handle_action()`.
+Background operations run on threads and report back over an `mpsc` channel as `BgResult` variants, each tagged with `account_index`.
+- `ui/` renders from `App` state only.
+It opens no store, runs no SQL and performs no I/O.
+- `app/` is not pure in that sense.
+It opens the account store synchronously to load listings, counts, drafts and the preview body, through `open_store` in `app/types.rs` and nine other call sites across `app/mod.rs` and `app/types.rs`.
+Those reads are local, indexed and memoised, so they cost little today, but a new one is a synchronous disk hit inside the update pass and belongs behind an `Action` if it can be slow.
+What stays absolute is the protocol boundary: no SMTP, IMAP, MIME or Graph code in `app/` or `ui/`.
+- Account state proxy pattern.
+`App` holds a `Vec<AccountState>` plus top-level proxy fields (mailboxes, list index) that mirror the active account, with `save_to_account()` and `load_from_account()` syncing on switch.
+This avoids routing every key handler through indirect access.
+- Mutations are optimistic: local state and store update immediately, the server follows in the background, and a failed op rolls the row back.
+
+## Multi-account
+
+Config uses an `[[accounts]]` array.
+Each account has independent IMAP/SMTP settings, mailbox mappings and signatures, and its own store, blob directory and secrets keys (`smtp-password-{name}`, `imap-password-{name}`).
+The TUI shows one account at a time, switching via backtick or Ctrl+1-9, and watches all of them for new mail simultaneously.
+CLI commands target an account via `--account` and default to the first.
+
+## Selector contract
+
+No CLI input position takes a filesystem path (#0050).
+A message is named by `[mp://<account>/][<mailbox>/]<key>`, and the canonical form every command prints is the fully qualified `mp://<account>/<mailbox>/<key>`.
+Elision is positional: without the scheme, the account comes from `-A/--account` or the default account and the mailbox from `--mailbox` or the command's declared default scope.
+The namespace (received mail or drafts) is fixed by the command, never sniffed from the string, so a Message-ID that happens to look like a draft id cannot be reinterpreted.
+Resolution is one indexed lookup; an ambiguous key lists every candidate and asks for `--mailbox` rather than picking one.
 
 ## Performance-critical invariants
 
 These exist for measured reasons; do not regress them without re-measuring.
 
-- **In-memory message-ID index.** `AccountState.message_id_index` is a `HashMap<PathBuf, HashMap<String, PathBuf>>` mapping local dir to {message_id -> file_path}. Built once at startup from disk. Quick sync uses it instead of re-scanning directories (zero disk I/O for known-ID checks). Updated incrementally on save, archive, delete, and reconciliation. Full sync rebuilds from disk.
-- **IMAP mailbox state caching.** `AccountState.mailbox_states` stores `MailboxState { uid_validity, uid_next, exists }` per role from the last sync's SELECT response. On quick sync, the new SELECT response is compared to the cached state to skip reconciliation when only pure additions occurred (most common case). Reconciliation only runs when `exists` decreased or `uid_next`/`exists` deltas indicate moves/deletes.
-- **Two-pass fetch.** Pass 1 fetches `BODY.PEEK[HEADER.FIELDS (Message-ID)] FLAGS` only (~50 bytes / msg) over the full quick-sync window. Pass 2 fetches full `RFC822` for unknown Message-IDs and is skipped entirely when nothing is new. Both passes share one IMAP session. Pass 1 must always cover the full window: its `\Seen` flags are the only server->local read-status channel, so any "probe fewer UIDs first and bail early" optimization silently breaks read/unread sync (this happened -- ticket #0004).
-- **Queued mutations.** Fetch/sync are deferred while mutations are in-flight (`bg_mutations > 0`) and auto-triggered on completion.
-- **Per-account watchers.** One IMAP IDLE thread per password/OAuth2 account, plus one 60s-poll thread per Graph account. All emit to a shared channel tagged with `account_index`. Non-active account changes set `has_unseen` (badge in status bar).
-
-## Reconciliation scope
-
-- Only **INBOX** and **Archive** participate in server-driven reconciliation.
-- The **Sent** directory is never reconciled -- locally-authored files are the source of truth. Sent `.md` files store `message_id` in frontmatter, and sync skips uploading emails already present on the server by Message-ID.
+- **Pass 1 covers the full window.**
+The `\Seen` flags it collects are the only server-to-local read-status channel, so any "probe fewer UIDs first and bail early" optimisation silently breaks read/unread sync.
+This happened once already (#0004).
+- **The prune is clamped to the window's UID range.**
+`UID SEARCH ALL` returns the whole mailbox but the window is only its newest `limit` UIDs, so only a known UID *between* the window's lowest and highest is provably gone from the server.
+Negative UIDs (the local-move sentinel) and hash-sized UIDs (an APPEND with no `APPENDUID`) fall outside by construction.
+- **Prunes run after every target is ingested.**
+Targets sync in order, so pruning inside the loop would delete the inbox row of a message archived elsewhere before the archive pass ingests it, leaving a window with no row anywhere and blobs dropping to refcount zero.
+Both backends hold their prunes back for this reason.
+- **The integrity check is amortised.**
+It is a full walk of the file, so it runs once per file per process, not once per open.
+- **Read-flag updates land in one transaction per mailbox**, not one commit per message.
+- **Queued mutations.**
+Fetch and sync are deferred while mutations are in flight (`bg_mutations > 0`) and auto-triggered on completion.
 
 ## Data and config layout
 
 User-owned config:
 
-- **Config:** `~/.config/email/config.toml` (multi-account `[[accounts]]` array). User-edited; references signature paths and account-level settings.
-- **Secrets:** `~/.config/email/secrets.enc` (machine-bound encrypted; see [secrets.md](secrets.md))
+- The config file is `~/.config/email/config.toml`, a multi-account `[[accounts]]` array.
+  It is user-edited and references signature paths and account-level settings.
+- The secrets file is `~/.config/email/secrets.enc`, machine-bound encrypted (see [secrets.md](secrets.md)).
 
 App-managed data, all under `mailypoppins_data_dir()`:
 
@@ -105,28 +252,29 @@ Layout under the data dir:
 
 ```
 <data_dir>/
-  accounts/<name>/{inbox,archive,sent,drafts,<extra_slug>}/
-  accounts/<name>/attachments/<sanitized-message-id>/   # stable hardlink mirror (#0006)
+  accounts/<name>/store.sqlite3          # the per-account store (plus -wal, -shm)
+  accounts/<name>/blobs/ab/cd/<sha256>   # bodies, raw messages, attachments
+  accounts/<name>/drafts/*.md            # the only local truth
+  accounts/<name>/attachments/<message-id>/   # materialised for forward drafts (#0006)
   accounts/<name>/contacts-cache.json
-  tokens/<name>.enc       # OAuth2 / Graph encrypted refresh tokens
+  tokens/<name>.enc                      # OAuth2 / Graph encrypted refresh tokens
   logs/mailypoppins-YYYY-MM-DD.log
 ```
 
-Override via the `MAILYPOPPINS_DATA_DIR` env var (used by tests; also a single escape hatch for power users who need a portable / non-default location). Users who want the mail tree visible inside an Obsidian vault should symlink `accounts/<name>/` into their vault.
+Nothing under `accounts/<name>/` is created eagerly: `mp config init` makes the account directory, the first sync makes the store and its blob directory, and the first draft makes `drafts/`.
+Override the root via the `MAILYPOPPINS_DATA_DIR` env var, which tests use and which doubles as the escape hatch for a portable location.
 
-The OS keyring service name (when keyring backend is opted into) remains `email-cli` (constant `KEYRING_SERVICE` in `src/secrets.rs`).
+`retention` is parsed and validated in config but not enforced yet: the blob store grows without bound until #0060 lands.
+
+The OS keyring service name (when the keyring backend is opted into) remains `email-cli` (constant `KEYRING_SERVICE` in `src/secrets.rs`).
 
 ## Testing
 
-- **252 tests** (210 unit, 42 integration). All run offline in <0.5s. `cargo test`.
-- Unit tests are inline `#[cfg(test)] mod tests` in each module.
-- Integration tests live in `tests/` and use `tempfile::tempdir()` for isolation.
-- `insta` snapshot tests for `markdown_to_html` output. `cargo insta review` to approve changes.
-- Some private helpers are `pub(crate)` for testability: `ensure_utf8_charset`, `sanitize_attachment_filename`, `floor_char_boundary`, `build_imap_search_query`, `parse_date_to_imap`, `parse_message_id_from_header_bytes`, `scan_mailbox_message_ids`, `collapse_hyphens`. `update_read_status_locally`, `get_message_id_from_file` are `pub` for TUI use.
-- No IMAP/SMTP mock server yet -- only pure logic and filesystem tests.
-
-## TUI invariants
-
-- The TUI is a human-facing interface only. It must **never** implement email logic directly. ALL email operations (send, fetch, archive, delete, move, search) live in library modules. The TUI dispatches `Action` variants and handles `BgResult` callbacks.
-- No email protocol code (SMTP, IMAP, MIME, Graph REST) belongs in `tui/app/` or `tui/ui/`. If you find yourself writing email logic in a TUI component, stop and put it in the appropriate library module instead.
-- `tui/actions.rs::handle_action()` is the boundary: it may call library functions to perform side effects, but `app/` (state) and `ui/` (rendering) must stay pure.
+- **811 tests**: 691 unit and 120 integration, run by `cargo test`.
+All of them run offline in under a second.
+- Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_DATA_DIR` for isolation.
+- `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
+`cargo insta review` approves changes; a diff there is a decision, not an approval reflex.
+- The store side is fixture-driven: `tests/store_ingest_integration.rs` ingests real RFC822 bytes and asserts rows, blobs, refcounts and FTS state; `tests/outbox_integration.rs` drives the state machine against a fake Sent mailbox.
+- The sync orchestrators themselves (`store_sync.rs`, `ops.rs`, `batch.rs`) have no tests: they need a server seam, which is #0059.
+- There is no IMAP/SMTP mock server.

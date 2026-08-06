@@ -306,16 +306,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Dump message envelopes from the local mail tree as NDJSON.
+    /// Dump message envelopes from the local message store as NDJSON.
     ///
-    /// Offline: reads the local `.md` files only, never the network. One
-    /// compact JSON object per line, with the fields account, mailbox,
-    /// message_id, from, to, cc, subject, date_sort, flags, attachments
-    /// (name + size) and invite. No filesystem paths appear in the output.
+    /// Offline: reads the local store only, never the network. One compact
+    /// JSON object per line, with the fields account, mailbox, message_id,
+    /// from, to, cc, subject, date_sort, flags, attachments (name + size) and
+    /// invite. No filesystem paths appear in the output.
     ///
     /// Records are sorted by account, mailbox, date_sort, message_id and
-    /// subject (the local filename breaks remaining ties without being
-    /// emitted), so two runs over an unchanged tree are byte-identical.
+    /// subject (the message's uid breaks remaining ties without being
+    /// emitted), so two runs over an unchanged store are byte-identical.
     ///
     /// Dumps every configured account by default; `-A/--account` restricts it
     /// to one, `--mailbox` to the named mailboxes.
@@ -417,7 +417,7 @@ enum ContactsAction {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Rebuild the contact index from local mailbox files
+    /// Rebuild the contact index from the local message store
     Rebuild {
         /// Account name (default: all configured accounts)
         #[arg(long)]

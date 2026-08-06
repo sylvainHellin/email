@@ -6,9 +6,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054 and #0055 have shipped.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055 and #0056 have shipped.
 
-- [#0056 Rewrite docs/architecture.md, fix the wizard and dump-mailbox help](docs/tickets/0056-architecture-docs-rewrite.md) -- chore
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
 - [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
 

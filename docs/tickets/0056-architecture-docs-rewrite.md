@@ -3,7 +3,7 @@ id: 0056
 title: Rewrite docs/architecture.md for the store era, fix the wizard and dump-mailbox help
 type: chore
 priority: now
-status: open
+status: done
 created: 2026-08-06
 ---
 

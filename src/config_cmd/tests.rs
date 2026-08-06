@@ -231,3 +231,30 @@ fn test_build_init_toml_password_no_oauth2_section() {
     assert_eq!(config.accounts[0].auth_method, crate::config::AuthMethod::Password);
     assert!(config.accounts[0].oauth2.is_none());
 }
+
+/// The wizard's completion block promises a directory that exists.
+///
+/// The file-era block printed an inbox, a sent and an archive directory that
+/// nothing created; this pins the replacement, whose first line is the account
+/// directory the store and its blobs are written into.
+#[test]
+fn account_data_paths_creates_the_directory_it_prints() {
+    let _guard = crate::config::data_dir_lock();
+    let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("MAILYPOPPINS_DATA_DIR", tmp.path());
+
+    let acct_dir = crate::config::account_dir("wizard");
+    assert!(!acct_dir.exists());
+    super::init::print_account_data_paths("wizard");
+
+    assert!(acct_dir.is_dir(), "{} was not created", acct_dir.display());
+    assert_eq!(crate::config::store_path("wizard").parent(), Some(acct_dir.as_path()));
+    assert_eq!(crate::config::blobs_dir("wizard").parent(), Some(acct_dir.as_path()));
+    assert_eq!(crate::config::drafts_dir("wizard").parent(), Some(acct_dir.as_path()));
+
+    match prev {
+        Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+        None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+    }
+}
