@@ -228,9 +228,12 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
 /// exactly the moment the answer has to be current; the one-second fingerprint
 /// poll in the event loop is what notices a change *between* loads.
 ///
-/// Every status is listed, `sent` included, which is the file build's
-/// behaviour: sending rewrites the draft's status in place and leaves the file
-/// in `drafts/`.
+/// Every status the index holds is listed, `sent` included: the lister filters
+/// nothing, so a file someone hand-edited to `status: sent` still shows, which
+/// is the escape hatch it should be. What no longer shows is a draft this
+/// application sent to every recipient, because the send retires the file (see
+/// [`crate::draft::settle_sent_draft`]); a *partial* send keeps it, marked
+/// `sent` and addressable for the retry.
 fn load_drafts(account: &str) -> Vec<EmailEntry> {
     indexed_drafts(account).into_iter().map(entry_from_draft).collect()
 }
@@ -1811,10 +1814,19 @@ mod tests {
         let subjects: HashSet<&str> = entries.iter().map(|e| e.subject.as_str()).collect();
         assert_eq!(subjects, HashSet::from(["Hello", "Later"]));
 
-        // Every status is listed, `sent` included: sending rewrites the status
-        // in place and leaves the file in `drafts/`.
+        // The lister filters nothing: a hand-written `status: sent` file is
+        // listed like any other. A draft a *send* retired is gone from the
+        // directory, so it is not a status the list has to hide.
         let statuses: HashSet<&str> = entries.iter().map(|e| e.status.as_str()).collect();
         assert_eq!(statuses, HashSet::from(["draft", "approved"]));
+        external_draft("2026-07-03-done.md", "c@example.com", "Done", "sent");
+        let statuses: HashSet<String> = load_emails("alice", "drafts")
+            .iter()
+            .map(|e| e.status.clone())
+            .collect();
+        assert!(statuses.contains("sent"), "{statuses:?}");
+        std::fs::remove_file(crate::config::drafts_dir("alice").join("2026-07-03-done.md"))
+            .unwrap();
 
         // And the sidebar agrees with the list it is counting.
         let mailboxes = vec![mb(
@@ -1823,6 +1835,53 @@ mod tests {
             MailboxKind::Drafts,
         )];
         assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
+    }
+
+    /// A send that reached every recipient retires the draft, so the row
+    /// leaves the Drafts list, the sidebar count and `mp list`'s query with
+    /// the file. A partial send keeps all three, marked `sent`, so the retry
+    /// still has something to name.
+    #[test]
+    fn a_fully_sent_draft_leaves_the_drafts_list_and_a_partial_one_stays() {
+        let _data = DataDir::new();
+        let done = external_draft("2026-07-01-note.md", "a@example.com", "Hello", "approved");
+        let partial = external_draft("2026-07-02-later.md", "b@example.com", "Later", "approved");
+        assert_eq!(load_emails("alice", "drafts").len(), 2);
+
+        let outcome = |ok: bool| crate::send::SendResult {
+            results: vec![crate::send::RecipientResult {
+                address: "a@example.com".to_string(),
+                role: crate::send::RecipientRole::To,
+                success: ok,
+                error: None,
+                ambiguous: false,
+            }],
+        };
+        let settle = |path: &std::path::Path, ok: bool| {
+            let draft = crate::draft::parse_email_draft(path).unwrap();
+            crate::draft::settle_sent_draft(&draft, &outcome(ok), None).unwrap();
+        };
+        settle(&done, true);
+        settle(&partial, false);
+
+        assert!(!done.exists(), "the fully sent draft left drafts/");
+        let entries = load_emails("alice", "drafts");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].subject, "Later");
+        assert_eq!(entries[0].status, "sent", "a partial send stays addressable");
+        assert_eq!(
+            count_all_emails(
+                "alice",
+                &[mb("Drafts", crate::config::drafts_dir("alice"), MailboxKind::Drafts)]
+            ),
+            vec![1]
+        );
+
+        // And `mp list` reads the same table the list just refreshed.
+        let store = Store::open(crate::config::store_path("alice")).unwrap();
+        let rows = crate::store::drafts::list(&store, "alice", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject.as_deref(), Some("Later"));
     }
 
     /// The sidebar count and the Drafts list read the same index through the

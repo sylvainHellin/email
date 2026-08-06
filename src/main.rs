@@ -1130,9 +1130,10 @@ async fn main() -> Result<()> {
                     ));
                 }
 
-                mark_draft_sent(&draft, Some(&built.message_id))?;
+                settle_sent_draft(&draft, &report.send_result, Some(&built.message_id))?;
                 info!("Email sent via Graph and marked as sent: {}", draft.path.display());
                 email::contacts::hooks::bump_after_send(&account_config, &draft);
+                reindex_drafts(&account_config.name);
                 println!(
                     "{} Email sent successfully via Graph API [{}]",
                     "✓".green().bold(),
@@ -1185,11 +1186,12 @@ async fn main() -> Result<()> {
                 }
 
                 if send_result.all_succeeded() {
-                    mark_draft_sent(&draft, Some(&built.message_id))?;
+                    settle_sent_draft(&draft, send_result, Some(&built.message_id))?;
                     info!("Email marked as sent: {}", draft.path.display());
 
                     // Incremental contacts-index update (best-effort, no-op if no cache)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
+                    reindex_drafts(&account_config.name);
 
                     println!(
                         "{} Email sent successfully to all {} recipient(s) [{}]",
@@ -1198,7 +1200,7 @@ async fn main() -> Result<()> {
                         report.status_line()
                     );
                 } else if send_result.any_succeeded() {
-                    mark_draft_sent(&draft, Some(&built.message_id))?;
+                    settle_sent_draft(&draft, send_result, Some(&built.message_id))?;
                     warn!(
                         "Partial send: {} succeeded, {} failed for {}",
                         send_result.succeeded().len(),
@@ -1208,6 +1210,7 @@ async fn main() -> Result<()> {
 
                     // Incremental contacts-index update (best-effort)
                     email::contacts::hooks::bump_after_send(&account_config, &draft);
+                    reindex_drafts(&account_config.name);
 
                     println!(
                         "{} Partial send: {} succeeded, {} failed [{}] (marked as sent -- see logs for details)",
@@ -1362,7 +1365,9 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                     if report.send_result.any_succeeded() {
-                        if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
+                        if let Err(e) =
+                            settle_sent_draft(&draft, &report.send_result, Some(&built.message_id))
+                        {
                             println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                         } else {
                             email::contacts::hooks::bump_after_send(&account_config, &draft);
@@ -1405,7 +1410,9 @@ async fn main() -> Result<()> {
                         Ok(report) => {
                             let send_result = &report.send_result;
                             if send_result.any_succeeded() {
-                                if let Err(e) = mark_draft_sent(&draft, Some(&built.message_id)) {
+                                if let Err(e) =
+                                    settle_sent_draft(&draft, send_result, Some(&built.message_id))
+                                {
                                     println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
                                 } else {
                                     // Incremental contacts-index update (best-effort)

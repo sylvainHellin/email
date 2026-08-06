@@ -1560,6 +1560,57 @@ pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// Settle a draft after a finished send: mark it sent, and retire the file
+/// when every recipient took it.
+///
+/// A send that reached all of its recipients is over. The copy that matters
+/// from then on is the server's, which the durable outbox APPENDs to Sent and
+/// ingest reads back into the store, so a file left behind in `drafts/` is a
+/// second, staler copy of a message that is no longer a draft: it kept showing
+/// up in the TUI's Drafts list and in `mp list` with nothing left to do to it.
+/// It goes.
+///
+/// A *partial* send keeps the marked file, because it is the only thing that
+/// still names the recipients who did not get it: the draft stays addressable
+/// by its selector, and a retry is a `mp send` away.
+///
+/// [`mark_draft_sent`] runs first either way, so a file that survives carries
+/// `status: sent`, and re-running the whole settle is a no-op: marking
+/// tolerates a missing file and so does the removal.
+///
+/// The drafts *index* is the caller's business, as it already was for the
+/// status rewrite: every send path either refreshes it or hands back to a
+/// reader that does.
+pub fn settle_sent_draft(
+    draft: &EmailDraft,
+    result: &crate::send::SendResult,
+    message_id: Option<&str>,
+) -> Result<()> {
+    mark_draft_sent(draft, message_id)?;
+
+    // `all_succeeded` is vacuously true for a result with no recipients at
+    // all, which is not a send that happened: such a draft keeps its file.
+    if !(result.any_succeeded() && result.all_succeeded()) {
+        return Ok(());
+    }
+
+    match fs::remove_file(&draft.path) {
+        Ok(()) => info!("Retired the fully sent draft: {}", draft.path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!(
+                "No draft file at {}; nothing to retire",
+                draft.path.display()
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .context(format!("retiring the sent draft {}", draft.path.display()))
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve the drafts directory using a fallback chain:
 /// 1. If the user passed an explicit (non-default) path, use it as-is.
 /// 2. Else if config_drafts_dir is set and points to an existing directory, use that.
@@ -2665,6 +2716,106 @@ mod tests {
             !draft.path.exists(),
             "a draft with no file must not be materialised by marking it sent"
         );
+    }
+
+    /// One recipient result, as a send path would have recorded it.
+    fn recipient(address: &str, success: bool) -> crate::send::RecipientResult {
+        crate::send::RecipientResult {
+            address: address.to_string(),
+            role: crate::send::RecipientRole::To,
+            success,
+            error: (!success).then(|| "550 no such mailbox".to_string()),
+            ambiguous: false,
+        }
+    }
+
+    fn send_result(outcomes: &[(&str, bool)]) -> crate::send::SendResult {
+        crate::send::SendResult {
+            results: outcomes
+                .iter()
+                .map(|(addr, ok)| recipient(addr, *ok))
+                .collect(),
+        }
+    }
+
+    /// A send every recipient took retires the draft: the file leaves
+    /// `drafts/`, so it stops showing up in the Drafts list and in `mp list`
+    /// with nothing left to do to it. The Sent copy is the server's.
+    #[test]
+    fn a_fully_sent_draft_is_retired_from_the_drafts_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let companion = path.with_extension("html");
+        fs::write(&companion, "<p>quoted</p>").unwrap();
+        let draft = parse_email_draft(&path).unwrap();
+
+        settle_sent_draft(
+            &draft,
+            &send_result(&[("alice@example.com", true), ("bob@example.com", true)]),
+            Some("<abc@example.com>"),
+        )
+        .unwrap();
+
+        assert!(!path.exists(), "the fully sent draft is gone");
+        assert!(!companion.exists(), "and so is its companion HTML");
+    }
+
+    /// A partial send keeps the marked file: it is the only thing that still
+    /// names the recipients who did not get it, so it stays addressable by its
+    /// selector for the retry.
+    #[test]
+    fn a_partially_sent_draft_keeps_its_marked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let companion = path.with_extension("html");
+        fs::write(&companion, "<p>quoted</p>").unwrap();
+        let draft = parse_email_draft(&path).unwrap();
+
+        settle_sent_draft(
+            &draft,
+            &send_result(&[("alice@example.com", true), ("bob@example.com", false)]),
+            Some("<abc@example.com>"),
+        )
+        .unwrap();
+
+        assert!(path.exists(), "a partial send leaves the draft addressable");
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("status: sent\n"), "{after}");
+        assert!(after.contains("message_id: \"<abc@example.com>\"\n"), "{after}");
+        // The companion HTML is dead weight once submitted either way: that
+        // behaviour belongs to `mark_draft_sent` and is unchanged.
+        assert!(!companion.exists());
+    }
+
+    /// A send that reached nobody is not a send: nothing is retired. Neither
+    /// is the degenerate result with no recipients at all, for which
+    /// `all_succeeded` is vacuously true.
+    #[test]
+    fn a_send_that_reached_nobody_retires_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let failed = draft_with_unknown_fields(tmp.path(), "approved");
+        let draft = parse_email_draft(&failed).unwrap();
+        settle_sent_draft(&draft, &send_result(&[("alice@example.com", false)]), None).unwrap();
+        assert!(failed.exists());
+
+        settle_sent_draft(&draft, &send_result(&[]), None).unwrap();
+        assert!(failed.exists(), "no recipients is not a completed send");
+    }
+
+    /// Retiring twice is a no-op, which is what makes a retried settle safe:
+    /// `mark_draft_sent` already tolerates a missing file and the removal does
+    /// too.
+    #[test]
+    fn settling_an_already_retired_draft_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = draft_with_unknown_fields(tmp.path(), "approved");
+        let draft = parse_email_draft(&path).unwrap();
+        let all_good = send_result(&[("alice@example.com", true)]);
+
+        settle_sent_draft(&draft, &all_good, None).unwrap();
+        settle_sent_draft(&draft, &all_good, None).unwrap();
+
+        assert!(!path.exists());
     }
 
     /// `write_atomic` renames a fresh temp file over the destination, which

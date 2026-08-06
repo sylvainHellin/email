@@ -17,9 +17,10 @@ use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
 use crate::draft::{
-    find_drafts, mark_draft_sent, new_draft_skeleton, DraftRecipientEdit, SourceMessage,
+    find_drafts, new_draft_skeleton, settle_sent_draft, DraftRecipientEdit, SourceMessage,
 };
 use crate::selector::Selector;
+use crate::send::SendReport;
 use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
@@ -639,17 +640,20 @@ fn draft_attachments(draft: &crate::types::EmailDraft) -> Result<Vec<(String, Ve
 /// the bytes are built first (which is where the approved-status requirement
 /// is enforced, by [`crate::send::build_draft_message`]), committed to the
 /// outbox, submitted, and only a submission that reached at least one
-/// recipient rewrites the draft's `status:` to `sent`. The sent copy is the
-/// outbox's business, not this function's.
+/// recipient rewrites the draft's `status:` to `sent`. A submission that
+/// reached *every* recipient additionally takes the file out of `drafts/`; see
+/// [`crate::draft::settle_sent_draft`]. The sent copy is the outbox's
+/// business, not this function's.
 ///
-/// The drafts index is refreshed afterwards so the `sent` status is the answer
-/// the next selector resolution gives, without waiting for the one-second
-/// poll (#0050's post-write refresh discipline).
+/// The drafts index is refreshed afterwards so the retirement (or the `sent`
+/// status a partial send leaves) is the answer the next selector resolution
+/// gives, without waiting for the one-second poll (#0050's post-write refresh
+/// discipline).
 fn send_one_draft(
     rt: &tokio::runtime::Runtime,
     draft: &crate::types::EmailDraft,
     ctx: &SendCtx,
-) -> Result<crate::send::SendReport> {
+) -> Result<SendReport> {
     // The Graph path has no SMTP config to take a `from` fallback from, so it
     // takes the account's; identical bytes either way (see
     // `build_draft_message`).
@@ -717,7 +721,7 @@ fn send_one_draft(
     };
 
     if report.send_result.any_succeeded() {
-        mark_draft_sent(draft, Some(&built.message_id))?;
+        settle_sent_draft(draft, &report.send_result, Some(&built.message_id))?;
         crate::contacts::hooks::bump_after_send(&ctx.account, draft);
         if let Err(e) = crate::store::drafts::refresh_account(&ctx.account.name) {
             log::warn!("[drafts] refreshing after the send failed: {e:#}");
@@ -728,7 +732,7 @@ fn send_one_draft(
 
 /// The status line one finished send shows, which is the CLI's own report:
 /// how many recipients took it, and where the message actually is (#0037).
-fn send_status_line(report: &crate::send::SendReport) -> Result<String> {
+fn send_status_line(report: &SendReport) -> Result<String> {
     let result = &report.send_result;
     if result.all_succeeded() {
         Ok(format!(
@@ -1086,7 +1090,7 @@ pub(super) fn handle_action(
                             let mut failed = 0usize;
 
                             for draft in &drafts {
-                                let send_result = (|| -> anyhow::Result<String> {
+                                let send_result = (|| -> anyhow::Result<(String, SendReport)> {
                                     let to = parse_graph_recipients(
                                         draft.frontmatter.to.as_deref(),
                                     );
@@ -1164,12 +1168,16 @@ pub(super) fn handle_action(
                                     if !report.send_result.any_succeeded() {
                                         anyhow::bail!("Graph send failed");
                                     }
-                                    Ok(built.message_id)
+                                    Ok((built.message_id, report))
                                 })();
 
                                 match send_result {
-                                    Ok(message_id) => {
-                                        let _ = mark_draft_sent(draft, Some(&message_id));
+                                    Ok((message_id, report)) => {
+                                        let _ = settle_sent_draft(
+                                            draft,
+                                            &report.send_result,
+                                            Some(&message_id),
+                                        );
                                         crate::contacts::hooks::bump_after_send(
                                             &account_config,
                                             draft,
@@ -1242,8 +1250,11 @@ pub(super) fn handle_action(
                                 )) {
                                     Ok(report) => {
                                         if report.send_result.any_succeeded() {
-                                            let _ =
-                                                mark_draft_sent(draft, Some(&built.message_id));
+                                            let _ = settle_sent_draft(
+                                                draft,
+                                                &report.send_result,
+                                                Some(&built.message_id),
+                                            );
                                             crate::contacts::hooks::bump_after_send(
                                                 &account_config,
                                                 draft,
@@ -3338,6 +3349,7 @@ mod store_backed_drafts {
 mod store_backed_mutations {
     use super::store_backed_drafts::{fixture_email, Fixture};
     use super::*;
+    use crate::draft::mark_draft_sent;
     use crate::tui::app::EmailEntry;
 
     /// An account that submits to a closed port: the SMTP conversation fails

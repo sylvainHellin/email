@@ -403,3 +403,10 @@ When a destructive step is justified by a compensating step elsewhere, the two b
 `open_validated` noted the file as integrity-checked and then compared the result, so a store that failed the walk was recorded as checked for the rest of the process.
 Only `Store::open`'s own `forget_integrity_check` on the rebuild path hid it, which makes the correctness of a cache entry depend on what the caller does with the error.
 A memo of "this was verified" is written on the success branch, never before the branch ([src/store/mod.rs](../src/store/mod.rs)).
+
+## Under server-as-truth, a local artifact that has been submitted has to be retired, not annotated
+
+Sending a draft rewrote its `status:` to `sent` in place, which was correct while `sent/` was a directory of `.md` files and the draft was the only local record.
+After #0037 the sent copy is the server's, APPENDed by the durable outbox and read back into the store, so the annotated draft became a second and staler copy of a message that had already left, sitting in the Drafts list and in `mp list` with nothing left to do to it.
+An in-place status flag is the file build's way of saying "this moved on"; once something else owns the moved-on copy, the flag has to become a deletion.
+The exception is the partial send: it keeps the marked file because the file is the only thing that still names the recipients who did not get it ([src/draft.rs](../src/draft.rs), `settle_sent_draft`).
