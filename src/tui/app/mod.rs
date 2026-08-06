@@ -14,6 +14,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::store::open_store;
+
 /// Top-level application state.
 pub struct App {
     pub focus: Focus,
@@ -85,11 +87,8 @@ pub struct App {
     pub smtp_config: Option<crate::config::SmtpConfig>,
     pub graph_config: Option<crate::config::GraphConfig>,
     pub signature_content: Option<String>,
-    pub sent_dir: Option<PathBuf>,
-    pub archive_dir: Option<PathBuf>,
     pub archive_server_name: String,
     pub drafts_dir: Option<PathBuf>,
-    pub inbox_dir: Option<PathBuf>,
     pub account_config: crate::config::AccountConfig,
 
     // --- Global state ---
@@ -199,11 +198,8 @@ impl App {
             smtp_config: None,
             graph_config: None,
             signature_content: None,
-            sent_dir: None,
-            archive_dir: None,
             archive_server_name: "Archive".to_string(),
             drafts_dir: None,
-            inbox_dir: None,
             account_config: crate::config::AccountConfig::default(),
             pending_actions: VecDeque::new(),
             overlay: Overlay::None,
@@ -293,11 +289,8 @@ impl App {
             smtp_config: None,
             graph_config: None,
             signature_content: None,
-            sent_dir: None,
-            archive_dir: None,
             archive_server_name: "Archive".to_string(),
             drafts_dir: None,
-            inbox_dir: None,
             account_config: crate::config::AccountConfig::default(),
             pending_actions: VecDeque::new(),
             overlay: Overlay::None,
@@ -372,11 +365,8 @@ impl App {
             self.smtp_config = acct.smtp_config.clone();
             self.graph_config = acct.graph_config.clone();
             self.signature_content = acct.signature_content.clone();
-            self.sent_dir = acct.sent_dir.clone();
-            self.archive_dir = acct.archive_dir.clone();
             self.archive_server_name = acct.archive_server_name.clone();
             self.drafts_dir = acct.drafts_dir.clone();
-            self.inbox_dir = acct.inbox_dir.clone();
             self.account_config = acct.account_config.clone();
         }
     }

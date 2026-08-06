@@ -20,6 +20,7 @@ use crate::imap_client::{
     fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes, SyncTarget,
 };
 use crate::parse::FetchedEmail;
+use crate::store::open_store;
 
 // ---------------------------------------------------------------------------
 // Watcher
@@ -552,7 +553,7 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
 /// search that just did a network round trip.
 fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageRef> {
     let message_id = fetched.message_id.as_deref()?;
-    let store = crate::tui::app::open_store(account)?;
+    let store = open_store(account)?;
     match crate::store::read::find_by_message_id(&store, account, message_id) {
         Ok(rows) => rows.first().map(|row| MessageRef::new(row.id)),
         Err(e) => {
@@ -644,11 +645,8 @@ mod tests {
             smtp_config: None,
             graph_config: None,
             signature_content: Some(format!("-- \n{name}")),
-            sent_dir: Some(PathBuf::from(format!("/tmp/{name}/sent"))),
-            archive_dir: None,
             archive_server_name: "Archive".to_string(),
             drafts_dir: None,
-            inbox_dir: None,
             mailboxes: Vec::new(),
             mailbox_counts: Vec::new(),
             email_cache: Vec::new(),

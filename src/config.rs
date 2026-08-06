@@ -830,40 +830,6 @@ fn find_mailbox_mapping<'a>(account: &'a AccountConfig, mailbox: &str) -> Option
     None
 }
 
-/// Resolve a mailbox name to its local directory from the config.
-/// The directory is derived from the app data dir + account name + role/slug;
-/// the config only confirms that the named mailbox is configured for the account.
-pub fn resolve_mailbox_dir(account: &AccountConfig, mailbox: &str) -> Result<PathBuf> {
-    // Determine the role label for this mailbox.
-    if let Some(ref m) = account.mailboxes.inbox {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("inbox") {
-            return Ok(mailbox_dir(&account.name, "inbox"));
-        }
-    }
-    if let Some(ref m) = account.mailboxes.archive {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("archive") {
-            return Ok(mailbox_dir(&account.name, "archive"));
-        }
-    }
-    if let Some(ref m) = account.mailboxes.sent {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("sent") {
-            return Ok(mailbox_dir(&account.name, "sent"));
-        }
-    }
-    if let Some(ref extras) = account.mailboxes.extra {
-        for m in extras {
-            if m.server.eq_ignore_ascii_case(mailbox) {
-                return Ok(mailbox_dir(&account.name, &m.server));
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "No mailbox configured for '{}'. Check [mailboxes] in {}",
-        mailbox,
-        config_path().display()
-    ))
-}
-
 /// Return all configured mailboxes: (role_or_server_name, mapping)
 /// Roles: "inbox", "archive", "sent", plus extra server names.
 pub fn all_configured_mailboxes(account: &AccountConfig) -> Vec<(String, &MailboxMapping)> {
@@ -1230,82 +1196,6 @@ name = "test"
         assert_eq!(settings.font_family, "Helvetica, Arial, sans-serif");
         assert_eq!(settings.font_size, "12pt");
         assert!(settings.include_signature);
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_mailbox_dir
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_resolve_mailbox_dir_by_role_name() {
-        let account = AccountConfig {
-            name: "acc1".to_string(),
-            mailboxes: MailboxesConfig {
-                inbox: Some(MailboxMapping {
-                    server: "INBOX".to_string(),
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = resolve_mailbox_dir(&account, "inbox").unwrap();
-        assert!(result.ends_with("accounts/acc1/inbox"));
-    }
-
-    #[test]
-    fn test_resolve_mailbox_dir_by_server_name() {
-        let account = AccountConfig {
-            name: "acc1".to_string(),
-            mailboxes: MailboxesConfig {
-                inbox: Some(MailboxMapping {
-                    server: "INBOX".to_string(),
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let result = resolve_mailbox_dir(&account, "INBOX").unwrap();
-        assert!(result.ends_with("accounts/acc1/inbox"));
-    }
-
-    #[test]
-    fn test_resolve_mailbox_dir_case_insensitive() {
-        let account = AccountConfig {
-            name: "acc1".to_string(),
-            mailboxes: MailboxesConfig {
-                archive: Some(MailboxMapping {
-                    server: "Archive".to_string(),
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(resolve_mailbox_dir(&account, "archive").is_ok());
-        assert!(resolve_mailbox_dir(&account, "ARCHIVE").is_ok());
-        assert!(resolve_mailbox_dir(&account, "Archive").is_ok());
-    }
-
-    #[test]
-    fn test_resolve_mailbox_dir_unknown_mailbox() {
-        let account = AccountConfig::default();
-        let result = resolve_mailbox_dir(&account, "NonExistent");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_mailbox_dir_extra_mailbox() {
-        let account = AccountConfig {
-            name: "acc1".to_string(),
-            mailboxes: MailboxesConfig {
-                extra: Some(vec![MailboxMapping {
-                    server: "Junk Mail".to_string(),
-                }]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let dir = resolve_mailbox_dir(&account, "Junk Mail").unwrap();
-        assert!(dir.ends_with("accounts/acc1/junk-mail"));
     }
 
     // -----------------------------------------------------------------------

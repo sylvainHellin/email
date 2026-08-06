@@ -60,7 +60,7 @@ use serde::Serialize;
 
 use crate::config::AccountConfig;
 use crate::store::read::{self, MessageRow};
-use crate::store::Store;
+use crate::store::{open_store, Store};
 use crate::tui::app::{build_mailboxes, resolve_date};
 
 /// One attachment, name and size only.
@@ -95,7 +95,7 @@ pub fn collect_records(accounts: &[AccountConfig], mailbox_filter: &[String]) ->
     let mut rows: Vec<(SortKey, EnvelopeRecord)> = Vec::new();
 
     for account in accounts {
-        let Some(store) = crate::tui::app::open_store(&account.name) else {
+        let Some(store) = open_store(&account.name) else {
             continue;
         };
         // The configured mailboxes decide what the filter can name and what a

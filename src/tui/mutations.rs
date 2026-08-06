@@ -21,7 +21,7 @@ use anyhow::Result;
 use super::app::MessageRef;
 use crate::config::{GraphConfig, ImapConfig};
 use crate::store::write::{self, MutatedRow};
-use crate::store::{BlobStore, Store};
+use crate::store::{open_store, BlobStore, Store};
 
 /// What the background thread will ask the server to do.
 ///
@@ -159,7 +159,7 @@ pub(crate) fn prepare_read_flag(
 /// and ingest re-inserts it, which is what the failure status already tells the
 /// user to do (see `crate::store::write`).
 pub(crate) fn rollback_move(account: &str, previous: &MutatedRow) {
-    let Some(store) = super::app::open_store(account) else {
+    let Some(store) = open_store(account) else {
         log::warn!("[store] no store to roll {} back into", previous.id);
         return;
     };
@@ -170,7 +170,7 @@ pub(crate) fn rollback_move(account: &str, previous: &MutatedRow) {
 
 /// Put a read flag back after its server op failed.
 pub(crate) fn rollback_read_flag(account: &str, msg: MessageRef, read: bool) {
-    let Some(store) = super::app::open_store(account) else {
+    let Some(store) = open_store(account) else {
         return;
     };
     if let Err(e) = write::set_read(&store, msg.row_id(), read) {

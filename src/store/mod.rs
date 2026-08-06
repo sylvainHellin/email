@@ -117,14 +117,41 @@ impl Store {
     }
 }
 
+/// Open the account's store, or `None` when there is not one yet.
+///
+/// A missing file is the normal state of an account that has never synced, so
+/// it is not logged; anything else is, because [`Store::open`] already rebuilds
+/// every recoverable case and only reports genuine filesystem failures.
+///
+/// This is the read-only opener: unlike [`Store::open_account`] it never
+/// creates a store file, which is why a caller that only wants to look at what
+/// has already synced uses it.
+///
+/// Stores are opened per call rather than parked on `AccountState`, because
+/// `rusqlite::Connection` is not `Sync` and the TUI clones account state
+/// across threads. This follows `crate::outbox::counts_for_account`.
+pub fn open_store(account: &str) -> Option<Store> {
+    let path = crate::config::store_path(account);
+    if !path.exists() {
+        return None;
+    }
+    match Store::open(&path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            warn!("[store] could not open the store for {account}: {e:#}");
+            None
+        }
+    }
+}
+
 /// Files whose `integrity_check` this process has already run and passed,
 /// keyed by canonical path, with the number of checks run against each.
 ///
 /// `PRAGMA integrity_check` walks every page of the database file: 240 ms on a
 /// 44 MB store. The TUI opens a store per call rather than parking one (see
-/// `tui::app::types::open_store`), so an unconditional check ran once per
-/// keypress and ten times before the first paint. The check stays load-bearing
-/// for the drop-and-rebuild contract in the module docs, so it is amortised
+/// [`open_store`]), so an unconditional check ran once per keypress and ten
+/// times before the first paint. The check stays load-bearing for the
+/// drop-and-rebuild contract in the module docs, so it is amortised
 /// rather than removed: the first open of a given file in a given process
 /// still validates it in full and still triggers the rebuild on failure, and
 /// every later open of that same file trusts the earlier verdict. A file that

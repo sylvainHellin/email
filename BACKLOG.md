@@ -6,7 +6,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055 and #0056 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0068; #0065 has shipped.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056 and #0057 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0068; #0065 has shipped.
 
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
 - [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
@@ -17,7 +17,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 - [#0066 A drop-and-rebuild discards outbox rows and orphans blob files](docs/tickets/0066-store-rebuild-loses-outbox-and-blobs.md) -- bug
 - [#0068 Investigate why the perso account's store holds no message rows](docs/tickets/0068-perso-store-holds-no-messages.md) -- bug
-- [#0057 Delete the dead file-era code](docs/tickets/0057-dead-file-era-code-deletion.md) -- chore
 - [#0058 One send implementation for the CLI and the TUI](docs/tickets/0058-send-path-unification.md) -- refactor
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature

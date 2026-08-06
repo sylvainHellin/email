@@ -13,7 +13,7 @@ use crate::contacts::filter::is_usable_address;
 use crate::contacts::rank::{update_from_observation, Observation, ObservationField};
 use crate::contacts::types::{Contact, ContactIndex};
 use crate::store::read::{self, MessageRow};
-use crate::store::Store;
+use crate::store::{open_store, Store};
 use anyhow::Result;
 use chrono::Utc;
 use mailparse::addrparse;
@@ -37,7 +37,7 @@ pub enum ObservedIn {
 /// `cache::save_rebuilt_cache`, which refuses to persist an empty rebuild over
 /// a populated cache).
 pub fn build_index_for_account(account: &AccountConfig) -> Result<ContactIndex> {
-    match crate::tui::app::open_store(&account.name) {
+    match open_store(&account.name) {
         Some(store) => build_index_from_store(&store, account),
         None => Ok(empty_index(account)),
     }

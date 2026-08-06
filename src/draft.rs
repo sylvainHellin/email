@@ -11,7 +11,7 @@ use crate::config::{EmailSettings, SmtpConfig};
 use crate::parse::{
     extract_email_address, slugify_sender, slugify_subject, stable_attachments_dir,
 };
-use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus, InboxFrontmatter};
+use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus};
 
 /// Frontmatter skeleton for a brand-new empty draft (CLI `mp new` and TUI `n`).
 /// `attachments:` is intentionally a bare key: it deserializes to `None` via the
@@ -46,66 +46,6 @@ pub fn new_draft_skeleton_with_id(from: &str, date: &str, id: &str) -> String {
 /// selector it is listed under is the selector the file itself carries.
 pub fn set_draft_id(path: &Path, id: &str) -> Result<()> {
     rewrite_frontmatter_scalars_at(path, &[("id", FieldWrite::Set(id.to_string()))])
-}
-
-pub fn select_inbox_email(inbox_dir: &Path, prompt: &str) -> Result<PathBuf> {
-    let mut entries: Vec<(PathBuf, InboxFrontmatter)> = Vec::new();
-
-    for entry in WalkDir::new(inbox_dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let matter = Matter::<YAML>::new();
-            let parsed = matter.parse(&content);
-            if let Some(data) = parsed.data {
-                if let Ok(fm) = data.deserialize::<InboxFrontmatter>() {
-                    entries.push((path.to_path_buf(), fm));
-                }
-            }
-        }
-    }
-
-    if entries.is_empty() {
-        return Err(anyhow!("No inbox emails found in {}", inbox_dir.display()));
-    }
-
-    // Sort by date descending (most recent first)
-    entries.sort_by(|a, b| {
-        let da = a.1.date.as_deref().unwrap_or("");
-        let db = b.1.date.as_deref().unwrap_or("");
-        db.cmp(da)
-    });
-
-    // Build display strings for the fuzzy selector
-    let display_items: Vec<String> = entries
-        .iter()
-        .map(|(_, fm)| {
-            let date_short = fm
-                .date
-                .as_deref()
-                .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let from_short = extract_email_address(&fm.from);
-            format!("{} | {} | {}", date_short, from_short, fm.subject)
-        })
-        .collect();
-
-    let selection = dialoguer::FuzzySelect::new()
-        .with_prompt(prompt)
-        .items(&display_items)
-        .default(0)
-        .interact()
-        .context("Selection cancelled")?;
-
-    Ok(entries[selection].0.clone())
 }
 
 /// The message a reply or a forward is built from, independent of where it

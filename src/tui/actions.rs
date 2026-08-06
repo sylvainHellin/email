@@ -7,12 +7,13 @@ use anyhow::{Context, Result};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
-    mailbox_key, open_store, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard,
-    Focus, MailboxKind, MessageRef, Overlay, StatusLevel,
+    mailbox_key, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus,
+    MailboxKind, MessageRef, Overlay, StatusLevel,
 };
 use super::helpers::{
     edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
 };
+use crate::store::open_store;
 use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
@@ -390,7 +391,7 @@ fn edit_new_draft(
 /// The list entry is not the source here: it substitutes "(no subject)" for an
 /// empty subject, and that placeholder must not end up in a sent header.
 fn forward_subject(app: &App, msg: MessageRef) -> String {
-    let subject = crate::tui::app::open_store(&app.account_config.name)
+    let subject = open_store(&app.account_config.name)
         .and_then(|store| crate::store::read::find_by_id(&store, msg.row_id()).ok().flatten())
         .and_then(|row| row.subject)
         .unwrap_or_default();

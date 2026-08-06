@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 
 use crate::parse::FetchedEmail;
 use crate::store::read::{self, MessageRow};
-use crate::store::{drafts, Store};
+use crate::store::{drafts, open_store, Store};
 
 // ---------------------------------------------------------------------------
 // MessageRef
@@ -306,29 +306,6 @@ pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> 
             }
         })
         .collect()
-}
-
-/// Open the account's store, or `None` when there is not one yet.
-///
-/// A missing file is the normal state of an account that has never synced, so
-/// it is not logged; anything else is, because [`Store::open`] already rebuilds
-/// every recoverable case and only reports genuine filesystem failures.
-///
-/// Stores are opened per call rather than parked on `AccountState`, because
-/// `rusqlite::Connection` is not `Sync` and the TUI clones account state
-/// across threads. This follows `crate::outbox::counts_for_account`.
-pub fn open_store(account: &str) -> Option<Store> {
-    let path = crate::config::store_path(account);
-    if !path.exists() {
-        return None;
-    }
-    match Store::open(&path) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            log::warn!("[store] could not open the store for {account}: {e:#}");
-            None
-        }
-    }
 }
 
 /// The `messages.mailbox` value for a sidebar mailbox: the leaf of its
@@ -659,11 +636,8 @@ pub struct AccountState {
     pub smtp_config: Option<crate::config::SmtpConfig>,
     pub graph_config: Option<crate::config::GraphConfig>,
     pub signature_content: Option<String>,
-    pub sent_dir: Option<PathBuf>,
-    pub archive_dir: Option<PathBuf>,
     pub archive_server_name: String,
     pub drafts_dir: Option<PathBuf>,
-    pub inbox_dir: Option<PathBuf>,
     pub mailboxes: Vec<MailboxInfo>,
     pub mailbox_counts: Vec<usize>,
     /// Per-mailbox cache of parsed entries. `Arc` so switching mailboxes
@@ -710,16 +684,6 @@ impl AccountState {
             None
         };
 
-        let sent_dir = account_config
-            .mailboxes
-            .sent
-            .as_ref()
-            .map(|_| crate::config::mailbox_dir(&account_config.name, "sent"));
-        let archive_dir = account_config
-            .mailboxes
-            .archive
-            .as_ref()
-            .map(|_| crate::config::mailbox_dir(&account_config.name, "archive"));
         let archive_server_name = account_config
             .mailboxes
             .archive
@@ -731,11 +695,6 @@ impl AccountState {
         // Read once at startup so a message left mid-send by the last run is
         // visible in the badge before any sync runs (#0037 item 5).
         let outbox = crate::outbox::counts_for_account(&account_config.name);
-        let inbox_dir = account_config
-            .mailboxes
-            .inbox
-            .as_ref()
-            .map(|_| crate::config::mailbox_dir(&account_config.name, "inbox"));
 
         let mut span = crate::timing::TimingSpan::with_context(
             "AccountState::new",
@@ -756,11 +715,8 @@ impl AccountState {
             smtp_config,
             graph_config,
             signature_content,
-            sent_dir,
-            archive_dir,
             archive_server_name,
             drafts_dir,
-            inbox_dir,
             mailboxes,
             mailbox_counts: counts,
             email_cache: vec![None; n],

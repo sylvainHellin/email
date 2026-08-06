@@ -126,6 +126,27 @@ All notable changes to this project are documented in this file.
   inheriting the dead one's verdict, and a file that fails is walked again
   rather than remembered as checked.
 
+### Removed
+- **The dead code the store cutover orphaned, and the last three strings that
+  still described the file era (#0057).** Nine items whose callers went with
+  the `.md` tree: the `select_inbox_email` draft picker that walked an inbox
+  directory, the four `.md`-path helpers in `parse.rs`
+  (`attachments_dir_for`, `account_dir_for_email`, `list_attachments`,
+  `parse_email_date_prefix`), the `SaveFrontmatter` struct that described how a
+  fetched email was written to disk, `config::resolve_mailbox_dir`, and the
+  write-only `sent_dir` / `archive_dir` / `inbox_dir` fields carried on every
+  account's TUI state. The fourteen tests that existed only to exercise them
+  went too, which is the whole of the 820 to 806 suite delta. `open_store`, the
+  opener that returns `None` rather than creating a store for an account that
+  has never synced, moved from `tui::app` to `store` beside `Store::open`, so
+  the contacts extractor and the dump path no longer reach into the TUI module
+  for it. **`mp config show` stops printing mailbox directories that do not
+  exist**: `[local paths]` now names the store, the blob directory and the
+  drafts directory, and `[mailboxes]` maps each role to its server folder and
+  nothing else. The `src/graph.rs` module comment no longer claims the client
+  integrates with a local `.md` + `.html` + `_attachments/` layer, and `mp
+  --help` now describes the whole product rather than the drafts half of it.
+
 ### Changed
 - **The documentation and the two outputs that still described the file era
   (#0056).** `docs/architecture.md` is the file every session is told to read

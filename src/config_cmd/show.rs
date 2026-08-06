@@ -2,8 +2,8 @@ use anyhow::Result;
 use colored::*;
 
 use crate::config::{
-    all_configured_mailboxes, config_path, drafts_dir, get_secret, load_global_config,
-    mailbox_dir, mailypoppins_data_dir, AuthMethod,
+    all_configured_mailboxes, blobs_dir, config_path, drafts_dir, get_secret, load_global_config,
+    mailypoppins_data_dir, store_path, AuthMethod,
 };
 
 /// Print the config file path.
@@ -136,21 +136,21 @@ pub fn cmd_config_show() -> Result<()> {
         }
 
         println!("\n  {}", "[local paths]".bold());
+        println!("    store  = {}", store_path(&account.name).display());
+        println!("    blobs  = {}", blobs_dir(&account.name).display());
         println!("    drafts = {}", drafts_dir(&account.name).display());
 
+        // Role to server folder, and nothing else: a mailbox has no local
+        // directory since received mail moved into the store above. This block
+        // used to print `<account_dir>/inbox` per mailbox, a path nothing has
+        // created since the cutover (#0057).
         println!("\n  {}", "[mailboxes]".bold());
         let all = all_configured_mailboxes(account);
         if all.is_empty() {
             println!("    (none configured)");
         } else {
             for (role, mapping) in &all {
-                let resolved = mailbox_dir(&account.name, role);
-                println!(
-                    "    {} {} -> {}",
-                    format!("[{}]", role).bold(),
-                    mapping.server,
-                    resolved.display()
-                );
+                println!("    {} -> {}", format!("[{}]", role).bold(), mapping.server);
             }
         }
 

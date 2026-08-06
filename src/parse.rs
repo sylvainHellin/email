@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use colored::*;
 use mailparse::{parse_mail, MailHeaderMap};
 use std::fs;
@@ -325,14 +324,6 @@ pub(crate) fn sanitize_attachment_filename(name: &str) -> String {
     }
 }
 
-/// Return the attachments directory path for a given .md email file.
-/// Convention: `{parent}/{stem}_attachments/`
-pub fn attachments_dir_for(md_path: &Path) -> PathBuf {
-    let parent = md_path.parent().unwrap_or(Path::new("."));
-    let stem = md_path.file_stem().unwrap_or_default().to_string_lossy();
-    parent.join(format!("{}_attachments", stem))
-}
-
 /// Sanitize a Message-ID for use as a directory name.
 /// Strips angle brackets, replaces path-unsafe characters with `_`, drops control
 /// chars, trims, and truncates to 200 bytes (UTF-8-safe). If the result is empty,
@@ -372,29 +363,6 @@ pub fn stable_attachments_dir(account_dir: &Path, message_id: &str) -> PathBuf {
     account_dir
         .join("attachments")
         .join(sanitize_message_id_for_path(message_id))
-}
-
-/// Given a path to an email `.md` file at `<account>/<mailbox>/<file>.md`,
-/// return `<account>` (i.e. `parent().parent()`).
-/// Returns `None` if the path doesn't have at least two ancestors.
-pub fn account_dir_for_email(md_path: &Path) -> Option<PathBuf> {
-    md_path.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())
-}
-
-/// List all attachment files for a given email .md file.
-/// Returns an empty Vec if the attachments directory doesn't exist or is empty.
-pub fn list_attachments(email_path: &Path) -> Result<Vec<PathBuf>> {
-    let dir = attachments_dir_for(email_path);
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-    let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_file())
-        .collect();
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    Ok(files)
 }
 
 /// The temp directory a message's files are materialised into, created
@@ -645,15 +613,6 @@ pub fn extract_email_address(raw: &str) -> String {
     raw.trim().to_string()
 }
 
-pub fn parse_email_date_prefix(date_str: &str) -> String {
-    // Try parsing common email date formats to extract YYYY-MM-DD-HHMM
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_str) {
-        return dt.format("%Y-%m-%d-%H%M").to_string();
-    }
-    // Fallback: use current datetime
-    Utc::now().format("%Y-%m-%d-%H%M").to_string()
-}
-
 pub fn display_fetched_emails(emails: &[FetchedEmail], full_body: bool) {
     if emails.is_empty() {
         println!("No emails found matching the criteria.");
@@ -817,24 +776,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_email_date_prefix
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_email_date_prefix_valid_rfc2822() {
-        let result = parse_email_date_prefix("Mon, 01 Jan 2024 12:00:00 +0000");
-        assert_eq!(result, "2024-01-01-1200");
-    }
-
-    #[test]
-    fn test_parse_email_date_prefix_invalid_fallback() {
-        let result = parse_email_date_prefix("not a date");
-        // Should fall back to current date - just verify it has the right format
-        assert!(result.len() >= 15); // YYYY-MM-DD-HHMM
-        assert_eq!(&result[4..5], "-");
-    }
-
-    // -----------------------------------------------------------------------
     // sanitize_attachment_filename
     // -----------------------------------------------------------------------
 
@@ -941,41 +882,6 @@ mod tests {
             stable_attachments_dir(acct, "<m@x.com>"),
             PathBuf::from("/data/accounts/tum/attachments/m@x.com")
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // account_dir_for_email
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_account_dir_for_email_basic() {
-        let p = Path::new("/data/accounts/tum/inbox/2024-01-01_x.md");
-        assert_eq!(
-            account_dir_for_email(p),
-            Some(PathBuf::from("/data/accounts/tum"))
-        );
-    }
-
-    #[test]
-    fn test_account_dir_for_email_too_shallow() {
-        // Single component path has no grandparent.
-        assert_eq!(account_dir_for_email(Path::new("foo.md")), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // attachments_dir_for
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_attachments_dir_for_basic() {
-        let path = Path::new("/mail/inbox/email.md");
-        assert_eq!(attachments_dir_for(path), PathBuf::from("/mail/inbox/email_attachments"));
-    }
-
-    #[test]
-    fn test_attachments_dir_for_nested() {
-        let path = Path::new("a/b/c/test.md");
-        assert_eq!(attachments_dir_for(path), PathBuf::from("a/b/c/test_attachments"));
     }
 
     // -----------------------------------------------------------------------
@@ -1210,34 +1116,6 @@ mod tests {
         let raw = b"From: a@x.com\r\nTo: b@x.com\r\nSubject: Empty\r\nDate: Mon, 01 Jan 2024 12:00:00 +0000\r\n\r\n";
         let email = parse_rfc822_to_fetched_email(raw).expect("should parse");
         assert!(email.body_text.is_empty() || email.body_text.trim().is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // list_attachments (filesystem)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_list_attachments_no_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let md_path = dir.path().join("email.md");
-        let files = list_attachments(&md_path).unwrap();
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_list_attachments_with_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let md_path = dir.path().join("email.md");
-        let att_dir = dir.path().join("email_attachments");
-        std::fs::create_dir(&att_dir).unwrap();
-        std::fs::write(att_dir.join("doc.pdf"), b"pdf data").unwrap();
-        std::fs::write(att_dir.join("img.png"), b"png data").unwrap();
-
-        let files = list_attachments(&md_path).unwrap();
-        assert_eq!(files.len(), 2);
-        // Should be sorted by filename
-        assert!(files[0].file_name().unwrap().to_str().unwrap() == "doc.pdf");
-        assert!(files[1].file_name().unwrap().to_str().unwrap() == "img.png");
     }
 
     // -----------------------------------------------------------------------

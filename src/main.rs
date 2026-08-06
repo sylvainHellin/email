@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "mailypoppins")]
-#[command(about = "A CLI tool for sending emails from Markdown drafts with YAML frontmatter")]
+#[command(about = "A terminal email client: Markdown drafts on disk, received mail in a local store")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]

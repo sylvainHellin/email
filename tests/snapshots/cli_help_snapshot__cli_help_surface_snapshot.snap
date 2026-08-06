@@ -3,7 +3,7 @@ source: tests/cli_help_snapshot.rs
 expression: out
 ---
 $ mp --help
-A CLI tool for sending emails from Markdown drafts with YAML frontmatter
+A terminal email client: Markdown drafts on disk, received mail in a local store
 
 Usage: mp [OPTIONS] [SELECTOR] [COMMAND]
 

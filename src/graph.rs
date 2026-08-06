@@ -2,8 +2,9 @@
 //
 // Provides a stateless HTTP client that wraps `reqwest::Client` + OAuth2 access token.
 // Each function corresponds to a Graph API endpoint and returns domain types
-// (`FetchedEmail`, folder lists, etc.) that integrate with the existing local
-// storage layer (`.md` + `.html` + `_attachments/`).
+// (`FetchedEmail`, folder lists, etc.). Those are what `src/ingest.rs` writes
+// into the per-account store and blob store, the same landing point the IMAP
+// backend uses; this module never touches the filesystem itself.
 
 use std::collections::{HashMap, HashSet};
 
