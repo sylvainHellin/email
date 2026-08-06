@@ -26,6 +26,18 @@ The replacement mitigation is narrower and honest: these ops change server-side 
 5. Kill the "Quick sync queued (N ops pending...)" pattern, owner directive 2026-08-05 from first live use of the branch build: a quick sync requested while a background job runs is queued and each request logs its own Activity line, stacking duplicates.
    With ops in a durable queue drained by the engine there is nothing for the user-visible sync to wait behind: mutations enqueue silently, the drain reports per-op state transitions, and the Activity log gets one consolidated line per state change instead of one per keypress.
 
+## Amendment 2026-08-06 (architecture review)
+
+From [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06_architecture-review-synthesis.md), Tier 2 item 2 and Tier 3.
+
+- Mutation-path unification belongs in this scope: the TUI writes locally first and rolls back (`src/tui/mutations.rs`, the right seam in the wrong module), the CLI writes server-first with an inline store write and no rollback (`src/main.rs:1946+`).
+  Move `mutations.rs` to `src/ops.rs`, make the ordering a parameter, and have both consumers call it; this ticket has to unify them anyway to enqueue ops.
+- `pending_ops` schema decisions to take here: keep `target_message_id` as the `messages` row id for correlation and carry the full addressing in the JSON payload, rather than storing the String Message-ID in an INTEGER column.
+  The `updated` column and the account-column convention are handled by [#0054](0054-schema-bump-bundle.md).
+- Ops are addressed by Message-ID through a full-mailbox `UID SEARCH HEADER` although the store row already knows the exact `(mailbox, uid)`.
+  Carry the uid on `ServerOp` and keep the search as a fallback for sentinel UIDs only.
+- The engine advisory lock ([#0061](0061-engine-advisory-lock.md)) is a fold-in candidate: two drains racing on this queue is the point where the missing lock turns destructive.
+
 ## Acceptance criteria
 
 - A mutation reflects instantly in the UI and is confirmed or retried in the background with visible feedback.

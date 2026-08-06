@@ -23,6 +23,11 @@ async-imap 0.11.2 surface is confirmed (see plan "Resolved unknowns"): typed `se
 4. QRESYNC where advertised: `SELECT ... (QRESYNC (uidvalidity modseq))` folds vanished + changed into SELECT. Gate strictly on CAPABILITY; fall back to CONDSTORE, then to the current heuristic.
 5. UIDPLUS for own writes (APPEND/COPY): capture the returned UID to update the store without a follow-up search.
 
+## Prerequisite (added 2026-08-06)
+
+[#0054](0054-schema-bump-bundle.md) must land first.
+`sync_cursors.highest_modseq` currently holds a UID, not a modseq (`src/ingest.rs:606-614`), so scope item 3 above would issue `CHANGEDSINCE` with a UID-sized number, get an empty response and no error, and silently reproduce the [#0004](0004-fix-read-unread-sync.md) failure mode.
+
 ## Acceptance criteria
 
 - Quick-sync `[TIMING]` drops sharply; no fresh LOGIN per op.
