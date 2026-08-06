@@ -212,8 +212,12 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             }
         }
 
-        // Auto-execute queued action when all mutations complete
-        if app.bg_mutations == 0 && app.pending_actions.is_empty() {
+        // Auto-execute the parked action once the condition it parked on has
+        // cleared. It must be the same condition the action re-enters (see
+        // `actions::sync_is_blocked`): releasing on `bg_mutations == 0` while
+        // the gate reads `bg_count` meant a running sync released the parked
+        // fetch straight back into its own refusal, four times a second.
+        if actions::queued_action_is_releasable(app.bg_count, app.pending_actions.is_empty()) {
             if let Some(action) = app.queued_action.take() {
                 app.pending_actions.push_back(action);
             }

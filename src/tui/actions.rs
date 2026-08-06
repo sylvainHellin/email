@@ -24,6 +24,44 @@ use crate::store::BlobStore;
 use crate::types::EmailStatus;
 
 // ---------------------------------------------------------------------------
+// Parking a sync behind the background work it cannot run alongside
+// ---------------------------------------------------------------------------
+
+/// Whether a fetch or a sync must wait. One gate, named once, because the
+/// release condition in the event loop has to be the *same* condition: they
+/// drifted apart (`bg_count` here, `bg_mutations` there), and the 250 ms tick
+/// then released the parked action into this refusal about four times a
+/// second.
+pub(super) fn sync_is_blocked(app: &App) -> bool {
+    app.bg_count > 0
+}
+
+/// Whether the event loop may hand a parked action back to the dispatcher.
+///
+/// Deliberately the negation of [`sync_is_blocked`], plus "nothing else is
+/// already queued". `bg_mutations` is always raised together with `bg_count`,
+/// so this is strictly stricter than the condition it replaces.
+pub(super) fn queued_action_is_releasable(bg_count: usize, pending_is_empty: bool) -> bool {
+    bg_count == 0 && pending_is_empty
+}
+
+/// Park `action` until the background work clears, announcing it once.
+///
+/// Re-parking the same action is silent: the user asked for one sync and one
+/// activity-log line is the honest record of that. A different action taking
+/// the slot announces itself, because it is a different answer to the user.
+fn park_until_idle(app: &mut App, action: Action, label: &str) {
+    let already_parked = app
+        .queued_action
+        .as_ref()
+        .is_some_and(|parked| std::mem::discriminant(parked) == std::mem::discriminant(&action));
+    if !already_parked {
+        app.set_status(format!("{label} queued ({} ops pending...)", app.bg_count));
+    }
+    app.queued_action = Some(action);
+}
+
+// ---------------------------------------------------------------------------
 // Files materialised out of the store (#0052 scope items 8, 9 and 10)
 // ---------------------------------------------------------------------------
 
@@ -1543,12 +1581,8 @@ pub(super) fn handle_action(
         },
 
         Action::Fetch => {
-            if app.bg_count > 0 {
-                app.queued_action = Some(Action::Fetch);
-                app.set_status(format!(
-                    "Quick sync queued ({} ops pending...)",
-                    app.bg_count
-                ));
+            if sync_is_blocked(app) {
+                park_until_idle(app, Action::Fetch, "Quick sync");
                 return Ok(());
             }
             let account_config = app.account_config.clone();
@@ -1768,12 +1802,8 @@ pub(super) fn handle_action(
         }
 
         Action::Sync => {
-            if app.bg_count > 0 {
-                app.queued_action = Some(Action::Sync);
-                app.set_status(format!(
-                    "Full sync queued ({} ops pending...)",
-                    app.bg_count
-                ));
+            if sync_is_blocked(app) {
+                park_until_idle(app, Action::Sync, "Full sync");
                 return Ok(());
             }
             let account_config = app.account_config.clone();
@@ -2747,6 +2777,69 @@ mod tests {
         assert!(any_invite(&app, &[MessageRef::new(2), MessageRef::new(1)]));
         assert!(!any_invite(&app, &[MessageRef::new(2)]));
         assert!(!any_invite(&app, &[MessageRef::new(404)]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Parking a sync: one announcement, and a release that matches the gate
+    // -----------------------------------------------------------------------
+
+    /// A parked action is announced when it is parked, and never again. The
+    /// event loop re-offers it on every tick until the background work clears,
+    /// and each re-offer used to push another activity line: ~4 per second for
+    /// as long as the sync ran.
+    #[test]
+    fn re_parking_the_same_action_does_not_announce_it_again() {
+        let mut app = App::default_for_tests();
+        app.bg_count = 2;
+
+        park_until_idle(&mut app, Action::Fetch, "Quick sync");
+        for _ in 0..40 {
+            park_until_idle(&mut app, Action::Fetch, "Quick sync");
+        }
+
+        assert_eq!(app.status_log.len(), 1, "one keypress, one activity line");
+        assert_eq!(app.status_log[0].message, "Quick sync queued (2 ops pending...)");
+        assert!(matches!(app.queued_action, Some(Action::Fetch)));
+    }
+
+    /// A different action taking the slot is a different answer to the user,
+    /// so it says so.
+    #[test]
+    fn parking_a_different_action_announces_it() {
+        let mut app = App::default_for_tests();
+        app.bg_count = 1;
+
+        park_until_idle(&mut app, Action::Fetch, "Quick sync");
+        park_until_idle(&mut app, Action::Sync, "Full sync");
+        park_until_idle(&mut app, Action::Sync, "Full sync");
+
+        assert_eq!(app.status_log.len(), 2);
+        assert_eq!(app.status_log[1].message, "Full sync queued (1 ops pending...)");
+        assert!(matches!(app.queued_action, Some(Action::Sync)));
+    }
+
+    /// The release condition and the gate the released action re-enters are
+    /// the same condition. A background sync raises `bg_count` without
+    /// raising `bg_mutations`, which is exactly the case the old
+    /// `bg_mutations == 0` release got wrong.
+    #[test]
+    fn a_parked_action_is_released_only_once_the_gate_it_re_enters_has_cleared() {
+        let mut app = App::default_for_tests();
+        app.bg_count = 1;
+        app.bg_mutations = 0;
+        assert!(sync_is_blocked(&app));
+        assert!(
+            !queued_action_is_releasable(app.bg_count, app.pending_actions.is_empty()),
+            "releasing here hands the action straight back into its own refusal"
+        );
+
+        app.bg_count = 0;
+        assert!(!sync_is_blocked(&app));
+        assert!(queued_action_is_releasable(app.bg_count, true));
+        assert!(
+            !queued_action_is_releasable(0, false),
+            "a queue that already holds work waits its turn"
+        );
     }
 
     #[test]
