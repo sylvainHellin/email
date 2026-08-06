@@ -303,7 +303,15 @@ pub(super) async fn lib_do_sync(
     // not be appended when the message was sent lands here (#0037 item 5).
     crate::send::resume_outbox(account_config).await;
 
-    let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false).await?;
+    // An account-level failure (a refused login above all) has to reach the
+    // log: the status line it otherwise becomes loses every race against a
+    // concurrent account that succeeded, which is how #0068 stayed invisible
+    // for seven weeks. The per-mailbox path already warns
+    // (`imap_client::store_sync`); this is its account-level equivalent.
+    // A persistent per-account health surface is #0071.
+    let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false)
+        .await
+        .inspect_err(|e| log::error!("[sync] account '{}' failed: {e:#}", account_config.name))?;
     Ok((finish_sync(account_config, &result), SyncResultMeta {
         new_inbox_mail: result.new_inbox_mail.clone(),
     }))
@@ -429,6 +437,9 @@ pub(super) async fn lib_do_sync_graph(
         })
         .collect();
 
+    // Same reason as the IMAP path above: an account-level failure has to be
+    // in the log, not only in a status line another account will overwrite
+    // (#0068, #0071).
     let result = crate::graph::sync_mailboxes_graph(
         graph_config,
         &account_config.name,
@@ -436,7 +447,8 @@ pub(super) async fn lib_do_sync_graph(
         limit,
         false,
     )
-    .await?;
+    .await
+    .inspect_err(|e| log::error!("[sync] account '{}' failed: {e:#}", account_config.name))?;
 
     Ok((finish_sync(account_config, &result), SyncResultMeta {
         new_inbox_mail: result.new_inbox_mail.clone(),
@@ -567,6 +579,37 @@ fn resolve_fetched_hit(account: &str, fetched: &FetchedEmail) -> Option<MessageR
 // Account resolution for Send
 // ---------------------------------------------------------------------------
 
+/// Which transport a send actually uses, keyed off the account's
+/// `auth_method` alone.
+///
+/// A Graph account sends over Graph or not at all: an SMTP config that happens
+/// to be loaded is not a fallback for a `GraphConfig` that is not.
+/// `AccountState::new` loads the Graph config with `GraphConfig::load(..).ok()`,
+/// so a Graph account whose config fails to load carries `graph_config: None`;
+/// a guard that asks "is there a Graph config?" therefore sends such an account
+/// over SMTP behind the user's back, under an identity Graph would have
+/// stamped. Asking the account what it is instead makes that case an error the
+/// user sees.
+///
+/// `Err` carries the status-line wording for the missing transport.
+pub(super) fn resolve_send_transport(
+    account_config: &AccountConfig,
+    graph: Option<crate::config::GraphConfig>,
+    smtp: Option<crate::config::SmtpConfig>,
+) -> Result<(Option<crate::config::GraphConfig>, Option<crate::config::SmtpConfig>), &'static str> {
+    if account_config.auth_method == crate::config::AuthMethod::Graph {
+        match graph {
+            Some(g) => Ok((Some(g), None)),
+            None => Err("Graph not configured"),
+        }
+    } else {
+        match smtp {
+            Some(s) => Ok((None, Some(s))),
+            None => Err("SMTP not configured"),
+        }
+    }
+}
+
 /// Which account sends this draft: the one whose address its `from:` names,
 /// falling back to the active one.
 ///
@@ -686,6 +729,84 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    fn smtp() -> crate::config::SmtpConfig {
+        crate::config::SmtpConfig {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: "me@example.com".to_string(),
+            password: "secret".to_string(),
+            default_from: "me@example.com".to_string(),
+            accept_invalid_certs: false,
+            auth_method: crate::config::AuthMethod::Password,
+        }
+    }
+
+    fn graph() -> crate::config::GraphConfig {
+        crate::config::GraphConfig {
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            username: "me@example.com".to_string(),
+            account_name: "work".to_string(),
+        }
+    }
+
+    fn account_config(auth_method: crate::config::AuthMethod) -> AccountConfig {
+        AccountConfig {
+            name: "work".to_string(),
+            default_from: "me@example.com".to_string(),
+            auth_method,
+            ..Default::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_send_transport (#0058 review)
+    // -----------------------------------------------------------------------
+
+    /// A Graph account sends over Graph, and the SMTP config it also carries
+    /// is dropped rather than kept as a fallback.
+    #[test]
+    fn resolve_send_transport_sends_a_graph_account_over_graph_only() {
+        let cfg = account_config(crate::config::AuthMethod::Graph);
+        // `SmtpConfig` holds a password and deliberately has no `Debug`, so
+        // these unwrap by hand rather than through `Result::unwrap`.
+        let Ok((g, s)) = resolve_send_transport(&cfg, Some(graph()), Some(smtp())) else {
+            panic!("a Graph account with a Graph config has a transport");
+        };
+        assert!(g.is_some());
+        assert!(s.is_none(), "the loaded SMTP config is not a Graph fallback");
+    }
+
+    /// The regression this guard exists for: `AccountState::new` loads the
+    /// Graph config with `.ok()`, so a Graph account whose config fails to
+    /// load reaches the send path with `graph: None`. It must be refused, not
+    /// quietly sent over the SMTP config that did load.
+    #[test]
+    fn resolve_send_transport_refuses_a_graph_account_with_no_graph_config() {
+        let cfg = account_config(crate::config::AuthMethod::Graph);
+        let Err(missing) = resolve_send_transport(&cfg, None, Some(smtp())) else {
+            panic!("a Graph account with no Graph config fell back to SMTP");
+        };
+        assert_eq!(missing, "Graph not configured");
+    }
+
+    /// A password account sends over SMTP, and a Graph config that somehow
+    /// loaded is not consulted.
+    #[test]
+    fn resolve_send_transport_sends_a_password_account_over_smtp_only() {
+        let cfg = account_config(crate::config::AuthMethod::Password);
+        let Ok((g, s)) = resolve_send_transport(&cfg, Some(graph()), Some(smtp())) else {
+            panic!("a password account with an SMTP config has a transport");
+        };
+        assert!(g.is_none());
+        assert!(s.is_some());
+
+        let Err(missing) = resolve_send_transport(&cfg, Some(graph()), None) else {
+            panic!("a password account with no SMTP config has no transport");
+        };
+        assert_eq!(missing, "SMTP not configured");
     }
 
     fn fetched(date: &str) -> FetchedEmail {

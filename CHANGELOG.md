@@ -25,10 +25,43 @@ All notable changes to this project are documented in this file.
   path: an attachment that cannot be read fails the send everywhere rather than
   being dropped in silence, and the contacts index is bumped on every send that
   reached a recipient, including one whose draft file could not be retired
-  afterwards. `mp send-approved` now also names the reason on the line that
-  says every recipient failed.
+  afterwards. That second one changes `mp send-approved` over both transports
+  and the TUI's single-draft send key; `mp send` and the TUI's send-approved
+  already bumped unconditionally. `mp send-approved` now also names the reason
+  on the line that says every recipient failed.
+
+  Four smaller changes ride along, each one narrowing a place where the outcome
+  of a send was reported wrongly. A draft file that cannot be retired after the
+  message has gone out no longer turns the TUI's send key into `Send failed`:
+  the failure is a logged warning and the status line reports the send that
+  actually happened. `mp send-approved` over Graph now finishes the batch and
+  exits 0 with a sent/failed tally, where a transport error used to abort the
+  remaining drafts and exit 1, which is what the SMTP loop always did.
+  `mp reply` and `mp forward` now exit 1 without printing a selector when the
+  drafts-index refresh fails after the draft file is written, instead of warning
+  and printing a selector nothing can resolve yet; the id-collision notices on
+  that path moved from stderr to the log, where the rest of that scan's warnings
+  already were. And the TUI's attachment-read failure is worded
+  `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **An account whose sync fails now says so in the log (#0068).** A sync that
+  died at the account level, a refused IMAP login above all, produced one
+  transient TUI status line and nothing else: in a multi-account sync the
+  accounts that succeeded overwrote that line seconds later, so a Proton Bridge
+  that had been signed out since June went unnoticed for seven weeks while
+  roughly 2900 logins were refused. The per-mailbox failure right below it had
+  warned all along; the account-level one now logs at error level too. The
+  persistent surface this also wants, a per-account health mark in the TUI and
+  an `mp sync` that exits non-zero naming the failed accounts, is #0071.
+- **A Graph account with an unloadable Graph config no longer sends over SMTP
+  (#0058 follow-up).** Both TUI send keys chose their transport by asking
+  whether a `GraphConfig` had loaded, but `AccountState` loads that config
+  best-effort, so a Graph account whose config failed to load fell through to
+  whatever SMTP config happened to be configured and sent the mail from there,
+  under an identity Graph would have stamped. The choice is now the account's
+  `auth_method` alone, which makes that case the `Graph not configured` error it
+  was always meant to be, and makes the status reachable.
 - **The Graph prune no longer deletes the copy of a message you just sent
   (#0065).** Sending through Graph files the local copy under a uid derived
   from our own `Message-ID`, but `sendMail` transmits JSON and Exchange stamps

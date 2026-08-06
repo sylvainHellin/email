@@ -818,12 +818,17 @@ pub(super) fn handle_action(
             // not something this path does after the fact.
             let (acct_idx, smtp, _imap, graph, account_config, signature) =
                 super::helpers::resolve_send_account(app, &path);
-            let graph =
-                graph.filter(|_| account_config.auth_method == crate::config::AuthMethod::Graph);
-            if graph.is_none() && smtp.is_none() {
-                app.set_status_level("SMTP not configured".to_string(), StatusLevel::Error);
-                return Ok(());
-            }
+            // The account's `auth_method` decides the transport, not which
+            // config happened to load: a Graph account sends over Graph or not
+            // at all (see `resolve_send_transport`).
+            let (graph, smtp) =
+                match super::helpers::resolve_send_transport(&account_config, graph, smtp) {
+                    Ok(pair) => pair,
+                    Err(missing) => {
+                        app.set_status_level(missing.to_string(), StatusLevel::Error);
+                        return Ok(());
+                    }
+                };
             let ctx = crate::send::SendContext {
                 graph,
                 smtp,
@@ -924,23 +929,20 @@ pub(super) fn handle_action(
                 return Ok(());
             };
             // A Graph account sends over Graph or not at all: an SMTP config
-            // that happens to be loaded is not a fallback for a token that is
-            // not.
-            let is_graph = app.is_graph();
-            let (graph, smtp) = if is_graph {
-                (app.graph_config.clone(), None)
-            } else {
-                (None, app.smtp_config.clone())
+            // that happens to be loaded is not a fallback for a Graph config
+            // that is not (see `resolve_send_transport`).
+            let (graph, smtp) = match super::helpers::resolve_send_transport(
+                &app.account_config,
+                app.graph_config.clone(),
+                app.smtp_config.clone(),
+            ) {
+                Ok(pair) => pair,
+                Err(missing) => {
+                    app.set_status_level(missing.to_string(), StatusLevel::Error);
+                    return Ok(());
+                }
             };
-            if graph.is_none() && smtp.is_none() {
-                let missing = if is_graph {
-                    "Graph not configured"
-                } else {
-                    "SMTP not configured"
-                };
-                app.set_status_level(missing.to_string(), StatusLevel::Error);
-                return Ok(());
-            }
+            let is_graph = graph.is_some();
             let ctx = crate::send::SendContext {
                 graph,
                 smtp,

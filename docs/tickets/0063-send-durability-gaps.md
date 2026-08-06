@@ -20,6 +20,12 @@ Both lose a delivery quietly, which is the failure mode the outbox exists to pre
 - Graph submissions stuck in `pending_send` can never be resumed: `src/send.rs:1262-1274` returns early for `AuthMethod::Graph` because the row holds RFC822 bytes while the Graph transport sends structured JSON.
   The row stays visible in `mp outbox list` and is only recoverable by a human re-sending from the draft.
 - The stranded-submission path (`src/outbox.rs:672-702` `sweep_pending_sends`) parks ambiguous rows as failed, which is correct, but it is the only automated handling either case gets.
+- Nothing stops one draft being submitted twice concurrently, so the TUI can send it twice: `Action::Send` on the cursor draft and an `Action::SendApproved` batch already in flight both reach `send::send_draft` on their own background thread, and an approved draft under the cursor is by definition also in the batch.
+  There is no dedup on the way in.
+  `build_draft_message` mints a fresh `Message-ID` per build (`message_id(None)`, `src/send.rs`), and `DurableSend::begin` enqueues on that id with no key on the draft itself, so the second run looks like an unrelated message to the outbox and to the Sent-copy search that a retry uses to avoid duplicating.
+  Whichever settle runs second retires a file the other one already moved.
+  Pre-existing and unchanged by [#0058](0058-send-path-unification.md), which unified the four copies of this orchestration without adding an admission gate; noted here because the fix belongs with the outbox, not with the callers.
+  The cheap half is an in-process guard on the set of drafts a send is running for; the durable half is keying the outbox row on the draft so a resume cannot double-submit either.
 
 ## Scope
 

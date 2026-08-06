@@ -495,3 +495,11 @@ Diffing them before merging turned up three divergences that no test and no read
 None of the three is a copy-paste slip; each is a place where one copy was edited and the others were not, and the weaker handling is the one that survives because it never fails a test.
 Unification is therefore not a mechanical merge: every divergence found is a decision to take deliberately and to write down, because whichever copy you started from silently becomes the contract for all four call sites.
 When collapsing duplicated orchestrations, diff them first and treat the differences as the findings, not as noise.
+
+## A capability guard that asks "did the config load?" turns a load failure into a silent fallback
+
+`App::is_graph()` is `graph_config.is_some() && auth_method == Graph`, and both TUI send keys chose their transport with it (#0058).
+`AccountState::new` loads the Graph config with `GraphConfig::load(..).ok()`, so an account that *is* a Graph account but whose config failed to load answers `false`, drops into the SMTP branch and sends the mail over whatever SMTP config the account happens to carry, from an identity Graph would have stamped differently.
+The `Graph not configured` status written for exactly that case was unreachable, because the only way to reach it was for the account to be Graph with no Graph config, which is the condition the guard had just answered `false` to.
+The guard now keys off `auth_method` alone and the missing config is the error (`tui::helpers::resolve_send_transport`).
+A guard over "what is this thing" must not be conjoined with "did its optional setup succeed": the second question belongs to the branch, where its failure has somewhere to be reported.
