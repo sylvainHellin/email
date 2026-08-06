@@ -180,10 +180,14 @@ fn open_validated(path: &Path) -> Result<Connection> {
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .context("running integrity_check")?;
-        note_integrity_check(path);
         if !integrity.eq_ignore_ascii_case("ok") {
             return Err(anyhow!("integrity_check returned {integrity}"));
         }
+        // Only a passing check is worth remembering: noting a failed one would
+        // mark the file as checked for the rest of the process, and a caller
+        // that recovers without going through `forget_integrity_check` would
+        // then skip the check on the very file that failed it.
+        note_integrity_check(path);
     }
 
     match schema::stamped_version(&conn)? {
@@ -349,35 +353,36 @@ mod tests {
     /// as a database) still costs the file its contents on the first open of
     /// the process, and the rebuilt file is validated on its own next open
     /// rather than inheriting the dead one's verdict.
-    #[test]
-    fn a_corrupted_page_is_still_caught_on_the_first_open() {
+    /// A store whose middle pages are scribbled over: page 1 (the header and
+    /// the schema) stays readable, so the file still opens and only a full
+    /// `integrity_check` walk notices.
+    fn store_with_a_corrupted_page(path: &Path) {
         use std::io::{Seek, SeekFrom, Write as _};
 
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("store.sqlite3");
         {
-            let store = Store::open(&path).unwrap();
+            let store = Store::open(path).unwrap();
             for uid in 0..400 {
                 insert_message(&store, "alice", "inbox", uid, &format!("<m{uid}@example.com>"))
                     .unwrap();
             }
         }
         let page_size: i64 = {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(path).unwrap();
             conn.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap()
         };
+        let mut f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let offset = (len / 2).max(page_size as u64);
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&vec![0x5a; page_size as usize]).unwrap();
+        f.sync_all().unwrap();
+    }
 
-        // Scribble over the middle of the file, leaving page 1 (the header and
-        // the schema) readable: the file still opens, and only a full walk
-        // notices.
-        {
-            let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
-            let len = f.metadata().unwrap().len();
-            let offset = (len / 2).max(page_size as u64);
-            f.seek(SeekFrom::Start(offset)).unwrap();
-            f.write_all(&vec![0x5a; page_size as usize]).unwrap();
-            f.sync_all().unwrap();
-        }
+    #[test]
+    fn a_corrupted_page_is_still_caught_on_the_first_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        store_with_a_corrupted_page(&path);
         assert_eq!(
             integrity_check_count(&path),
             0,
@@ -400,6 +405,27 @@ mod tests {
         );
         drop(Store::open(&path).unwrap());
         assert_eq!(integrity_check_count(&path), 1);
+    }
+
+    /// A failed check is not a check. The note is recorded on the passing
+    /// verdict only, so a file that fails is walked again on its next open
+    /// rather than trusted; `Store::open`'s own `forget_integrity_check` covers
+    /// the file it deletes, not a caller that recovers some other way.
+    #[test]
+    fn a_failed_integrity_check_is_not_recorded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        store_with_a_corrupted_page(&path);
+
+        assert!(open_validated(&path).is_err(), "a corrupted file must not validate");
+        assert_eq!(
+            integrity_check_count(&path),
+            0,
+            "a file that failed the walk must be walked again"
+        );
+
+        assert!(open_validated(&path).is_err());
+        assert_eq!(integrity_check_count(&path), 0);
     }
 
     #[test]

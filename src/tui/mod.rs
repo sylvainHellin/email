@@ -217,7 +217,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
         // `actions::sync_is_blocked`): releasing on `bg_mutations == 0` while
         // the gate reads `bg_count` meant a running sync released the parked
         // fetch straight back into its own refusal, four times a second.
-        if actions::queued_action_is_releasable(app.bg_count, app.pending_actions.is_empty()) {
+        if actions::queued_action_is_releasable(&app) {
             if let Some(action) = app.queued_action.take() {
                 app.pending_actions.push_back(action);
             }

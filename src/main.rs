@@ -1897,7 +1897,7 @@ async fn main() -> Result<()> {
             }
             if result.pruned > 0 {
                 println!(
-                    "{} {}Dropped {} message(s) the server no longer lists",
+                    "{} {}{} message(s) left their mailbox on the server",
                     "ℹ".blue(),
                     prefix,
                     result.pruned,

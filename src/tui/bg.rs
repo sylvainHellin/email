@@ -554,6 +554,43 @@ mod tests {
         app
     }
 
+    /// A minimal `AccountState` with one warm mailbox cache, for the account
+    /// that is not on screen. Built as a struct literal rather than through
+    /// `AccountState::new`, which reads the user's config and keyring.
+    fn background_account(name: &str) -> crate::tui::app::AccountState {
+        crate::tui::app::AccountState {
+            account_config: crate::config::AccountConfig {
+                name: name.to_string(),
+                ..Default::default()
+            },
+            imap_config: None,
+            smtp_config: None,
+            graph_config: None,
+            signature_content: None,
+            sent_dir: None,
+            archive_dir: None,
+            archive_server_name: "Archive".to_string(),
+            drafts_dir: None,
+            inbox_dir: None,
+            mailboxes: Vec::new(),
+            mailbox_counts: vec![7],
+            email_cache: vec![Some(std::sync::Arc::new(Vec::new()))],
+            sidebar_index: 0,
+            active_mailbox: 0,
+            list_index: 0,
+            cursor_ref: None,
+            headers_scroll: 0,
+            preview_scroll: 0,
+            selection: std::collections::HashSet::new(),
+            search_query: String::new(),
+            search_includes_body: false,
+            bg_mutations: 0,
+            watcher_active: false,
+            outbox: crate::outbox::OutboxCounts::default(),
+            has_unseen: false,
+        }
+    }
+
     /// A completed sync rewrote rows in every target mailbox, so every cache
     /// of that account goes, the open mailbox is queued for a background
     /// reload, and the sidebar counts are recomputed. Before this the handler
@@ -592,14 +629,29 @@ mod tests {
 
     /// A sync on a background account has no list on screen and no counts to
     /// redraw: it drops that account's caches and leaves the active account
-    /// alone.
+    /// alone. Account 1 carries a warm cache of its own, so the drop is
+    /// observable rather than a no-op on an empty `accounts` vector.
     #[test]
     fn a_finished_sync_on_another_account_leaves_the_open_list_alone() {
         let _data = DataDir::new();
         let mut app = app_with_warm_caches();
+        app.accounts = vec![background_account("alice"), background_account("bob")];
 
         refresh_after_server_sync(&mut app, 1);
 
+        assert!(
+            app.accounts[1].email_cache.iter().all(|slot| slot.is_none()),
+            "the synced account's rows changed under its cache"
+        );
+        assert_eq!(
+            app.accounts[1].mailbox_counts,
+            vec![7],
+            "an off-screen account keeps its counts until it is switched to"
+        );
+        assert!(
+            app.accounts[0].email_cache.iter().all(|slot| slot.is_some()),
+            "the other background account is untouched"
+        );
         assert!(
             app.email_cache.iter().all(|slot| slot.is_some()),
             "the active account's caches are not stale"

@@ -273,7 +273,7 @@ fn finish_sync(
         msg.push_str(&format!(", {} renumbered", result.uid_rebound));
     }
     if result.pruned > 0 {
-        msg.push_str(&format!(", {} gone from the server", result.pruned));
+        msg.push_str(&format!(", {} no longer in this mailbox", result.pruned));
     }
     msg
 }

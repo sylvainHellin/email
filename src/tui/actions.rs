@@ -38,11 +38,12 @@ pub(super) fn sync_is_blocked(app: &App) -> bool {
 
 /// Whether the event loop may hand a parked action back to the dispatcher.
 ///
-/// Deliberately the negation of [`sync_is_blocked`], plus "nothing else is
-/// already queued". `bg_mutations` is always raised together with `bg_count`,
-/// so this is strictly stricter than the condition it replaces.
-pub(super) fn queued_action_is_releasable(bg_count: usize, pending_is_empty: bool) -> bool {
-    bg_count == 0 && pending_is_empty
+/// Literally the negation of [`sync_is_blocked`], plus "nothing else is
+/// already queued". Taking the same `&App` rather than the scalars it reads is
+/// the point: restating the gate as `bg_count == 0` is how the two drifted
+/// apart in the first place, and a call through [`sync_is_blocked`] cannot.
+pub(super) fn queued_action_is_releasable(app: &App) -> bool {
+    !sync_is_blocked(app) && app.pending_actions.is_empty()
 }
 
 /// Park `action` until the background work clears, announcing it once.
@@ -2829,15 +2830,17 @@ mod tests {
         app.bg_mutations = 0;
         assert!(sync_is_blocked(&app));
         assert!(
-            !queued_action_is_releasable(app.bg_count, app.pending_actions.is_empty()),
+            !queued_action_is_releasable(&app),
             "releasing here hands the action straight back into its own refusal"
         );
 
         app.bg_count = 0;
         assert!(!sync_is_blocked(&app));
-        assert!(queued_action_is_releasable(app.bg_count, true));
+        assert!(queued_action_is_releasable(&app));
+
+        app.pending_actions.push_back(Action::Fetch);
         assert!(
-            !queued_action_is_releasable(0, false),
+            !queued_action_is_releasable(&app),
             "a queue that already holds work waits its turn"
         );
     }
