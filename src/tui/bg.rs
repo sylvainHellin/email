@@ -42,6 +42,28 @@ fn move_failure_invalidation(
     (indices, reload_current)
 }
 
+/// Bring the list back in step with the store after a fetch or sync wrote to
+/// it (#0038 follow-up).
+///
+/// Ingest inserts rows, the flag pass rewrites `\Seen` and the prune deletes
+/// rows the server no longer lists, in every target mailbox of the account. The
+/// list reads those same rows, so all of that account's per-mailbox caches are
+/// dropped. The mailbox the user is looking at is then reloaded off the UI
+/// thread through the same `request_mailbox_load` path a mailbox switch takes,
+/// and the sidebar counts are recomputed with one grouped query.
+///
+/// An inactive account keeps only the cache drop: it has no list on screen and
+/// no counts to redraw, and switching to it reloads from the store anyway.
+fn refresh_after_server_sync(app: &mut App, account_index: usize) {
+    if account_index == app.active_account {
+        app.invalidate_all_caches();
+        app.reload_current_mailbox();
+        app.recount_all_mailboxes();
+    } else {
+        app.invalidate_all_caches_on(account_index);
+    }
+}
+
 /// Decrement bg_mutations on the correct account.
 fn decrement_mutations(app: &mut App, account_index: usize) {
     if account_index == app.active_account {
@@ -267,20 +289,18 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                             .unwrap_or("");
                         crate::notify::notify_new_mail(account_name, &new_inbox_mail);
                     }
-                    // Ingest writes no `.md`, so a sync never changes what the
-                    // list is reading and there is nothing to invalidate. The
-                    // tree goes stale until the read path moves onto the store
-                    // in #0038.
+                    refresh_after_server_sync(app, account_index);
                 }
                 Err(e) => app.set_status_level(format!("Fetch failed: {e}"), StatusLevel::Error),
             }
         }
 
-        BgResult::Sync { account_index: _, result } => {
+        BgResult::Sync { account_index, result } => {
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Sync complete".into() } else { msg };
                     app.set_status_level(text, StatusLevel::Success);
+                    refresh_after_server_sync(app, account_index);
                 }
                 Err(e) => app.set_status_level(format!("Sync failed: {e}"), StatusLevel::Error),
             }
@@ -471,5 +491,120 @@ mod tests {
     #[test]
     fn move_failure_same_source_and_dest_dedupes() {
         assert_eq!(move_failure_invalidation(3, 3, 3), (vec![3], true));
+    }
+
+    // -----------------------------------------------------------------------
+    // refresh_after_server_sync (#0038 follow-up: a refresh that refreshes)
+    // -----------------------------------------------------------------------
+
+    /// Point the data directory at a temp dir so `recount_all_mailboxes`
+    /// resolves its store inside the fixture. Serialised against the other
+    /// data-dir tests by `config::data_dir_lock`.
+    struct DataDir {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl DataDir {
+        fn new() -> Self {
+            let guard = crate::config::data_dir_lock();
+            let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+            Self { _dir: dir, _guard: guard, previous }
+        }
+    }
+
+    impl Drop for DataDir {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+            }
+        }
+    }
+
+    /// An app parked on mailbox 1 of a two-mailbox account, both caches warm.
+    fn app_with_warm_caches() -> App {
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.mailboxes = vec![
+            crate::tui::app::MailboxInfo {
+                label: "Inbox".into(),
+                icon: "",
+                dir: crate::config::mailbox_dir("alice", "inbox"),
+                kind: MailboxKind::Inbox,
+                server_name: None,
+            },
+            crate::tui::app::MailboxInfo {
+                label: "Archive".into(),
+                icon: "",
+                dir: crate::config::mailbox_dir("alice", "archive"),
+                kind: MailboxKind::Archive,
+                server_name: None,
+            },
+        ];
+        app.mailbox_counts = vec![3, 4];
+        app.email_cache = vec![
+            Some(std::sync::Arc::new(Vec::new())),
+            Some(std::sync::Arc::new(Vec::new())),
+        ];
+        app.active_mailbox = 1;
+        app
+    }
+
+    /// A completed sync rewrote rows in every target mailbox, so every cache
+    /// of that account goes, the open mailbox is queued for a background
+    /// reload, and the sidebar counts are recomputed. Before this the handler
+    /// only set a status line, so a message archived in another client stayed
+    /// in the local inbox until a mailbox switch.
+    #[test]
+    fn a_finished_sync_drops_every_cache_and_reloads_the_open_mailbox() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+
+        refresh_after_server_sync(&mut app, 0);
+
+        assert!(
+            app.email_cache.iter().all(|slot| slot.is_none()),
+            "a sync writes to every target mailbox, so every cache is stale"
+        );
+        let queued: Vec<usize> = app
+            .pending_actions
+            .iter()
+            .filter_map(|a| match a {
+                crate::tui::app::Action::LoadMailbox { mailbox_idx, .. } => Some(*mailbox_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec![1],
+            "the open mailbox reloads off the UI thread, like a mailbox switch"
+        );
+        assert_eq!(
+            app.mailbox_counts,
+            vec![0, 0],
+            "the sidebar counts come back from the store, not from the stale cache"
+        );
+    }
+
+    /// A sync on a background account has no list on screen and no counts to
+    /// redraw: it drops that account's caches and leaves the active account
+    /// alone.
+    #[test]
+    fn a_finished_sync_on_another_account_leaves_the_open_list_alone() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+
+        refresh_after_server_sync(&mut app, 1);
+
+        assert!(
+            app.email_cache.iter().all(|slot| slot.is_some()),
+            "the active account's caches are not stale"
+        );
+        assert!(app.pending_actions.is_empty(), "nothing to reload");
+        assert_eq!(app.mailbox_counts, vec![3, 4]);
     }
 }
