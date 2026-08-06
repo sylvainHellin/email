@@ -680,6 +680,42 @@ pub fn apply_seen_flag(
     Ok(changed > 0)
 }
 
+/// Drop the rows of `mailbox` whose UIDs the server no longer lists, returning
+/// how many went.
+///
+/// The set comes from [`crate::imap_client::vanished_uids`], which
+/// clamps it to the numeric range the fetch window actually covered, so a short
+/// window can only ever prune inside what the server proved.
+///
+/// Delete is the whole of it: there is no tombstone and no attempt to guess
+/// where the message went. The store is a droppable cache in front of the
+/// server (see [`crate::store::write`]), and a message archived in another
+/// client is re-ingested under the destination mailbox by the same sync, so
+/// deleting the source row leaves exactly the one row the server has. A row the
+/// user is previewing can go out from under them, which is the row-id reuse
+/// hazard the write path already documents; the list is rebuilt from the store
+/// after every sync, which is where a stale reference is dropped.
+pub fn prune_vanished(
+    store: &Store,
+    blobs: &BlobStore,
+    account: &str,
+    mailbox: &str,
+    vanished: &[u32],
+) -> Result<usize> {
+    let mut pruned = 0;
+    for uid in vanished {
+        match crate::store::write::delete_by_uid(store, blobs, account, mailbox, *uid as i64) {
+            Ok(Some(_)) => pruned += 1,
+            Ok(None) => {}
+            Err(e) => warn!("Failed to prune UID {uid} from '{mailbox}': {e:#}"),
+        }
+    }
+    if pruned > 0 {
+        warn!("Pruned {pruned} row(s) from '{mailbox}': gone from the server");
+    }
+    Ok(pruned)
+}
+
 /// What the store already holds for a mailbox, and the UIDVALIDITY it holds it
 /// under.
 ///

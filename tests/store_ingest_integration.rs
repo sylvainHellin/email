@@ -891,3 +891,151 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
     assert!(kinds.contains(&"raw".to_string()));
     assert!(!kinds.contains(&"html".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// 7. The prune: rows the server no longer lists
+// ---------------------------------------------------------------------------
+
+/// `vanished_uids` is the diff a fetch computes; `prune_vanished` is what the
+/// sync does with it. Both halves run here so the tests read like one sync
+/// pass without needing a server.
+fn sync_prune(f: &Fixture, mailbox: &str, window: &[u32]) -> usize {
+    let known = email::ingest::known_uids(&f.store, "acct", mailbox).unwrap();
+    let vanished = email::imap_client::vanished_uids(&known, window);
+    email::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished).unwrap()
+}
+
+fn plain(name: &str) -> Vec<u8> {
+    message(
+        &format!("From: a@example.com\r\nSubject: {name}\r\nMessage-ID: <{name}@example.com>\r\n"),
+        format!("{name} body\r\n").as_bytes(),
+    )
+}
+
+/// A UID inside the window's range that the server did not list is gone from
+/// the mailbox: the row goes, and the blobs it was holding lose their
+/// reference. Before this the row was immortal, because no sync path ever
+/// computed "store UID not in the server window".
+#[test]
+fn a_uid_missing_from_the_window_loses_its_row_and_its_blob_refs() {
+    let f = Fixture::new();
+    let gone = f.ingest_raw("inbox", 2, &plain("gone"));
+    let stays = f.ingest_raw("inbox", 3, &plain("stays"));
+    let gone_hash = f.text(gone.row_id, "body_blob");
+    assert_eq!(f.refcount(&gone_hash), 1);
+
+    // The server lists 1..=3 minus 2.
+    f.ingest_raw("inbox", 1, &plain("first"));
+    assert_eq!(sync_prune(&f, "inbox", &[1, 3]), 1);
+
+    assert_eq!(f.message_rows(), 2);
+    assert!(email::store::read::find_by_id(&f.store, gone.row_id).unwrap().is_none());
+    assert!(email::store::read::find_by_id(&f.store, stays.row_id).unwrap().is_some());
+    assert!(f.blob_refs(gone.row_id).is_empty(), "the reference list outlived its row");
+    assert_eq!(f.refcount(&gone_hash), 0, "the pruned row kept its blob alive");
+    let fts: i64 = f
+        .store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM messages_fts WHERE rowid = ?1", [gone.row_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fts, 0);
+}
+
+/// The clamp, which is the difference between a prune and a catastrophe: with
+/// `-n 50` on a 12k mailbox the window is the tail, and everything older than
+/// it is simply outside what the server said anything about.
+#[test]
+fn a_uid_outside_the_window_range_survives() {
+    let f = Fixture::new();
+    for uid in 1..=6 {
+        f.ingest_raw("inbox", uid, &plain(&format!("m{uid}")));
+    }
+
+    // A short window: the server listed only the last three UIDs.
+    assert_eq!(sync_prune(&f, "inbox", &[4, 5, 6]), 0);
+    assert_eq!(f.message_rows(), 6, "older rows are not in the window's range");
+
+    // Widen it, and the hole inside the new range is prunable.
+    assert_eq!(sync_prune(&f, "inbox", &[1, 2, 4, 5, 6]), 1);
+    assert_eq!(f.message_rows(), 5);
+    assert_eq!(
+        email::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
+        HashSet::from([1, 2, 4, 5, 6])
+    );
+}
+
+/// A UIDVALIDITY reset empties the known set, so there is nothing to prune: a
+/// renumbering says nothing about which messages are gone, and the rows are
+/// about to be rebound through their Message-IDs.
+#[test]
+fn a_uidvalidity_reset_prunes_nothing() {
+    let f = Fixture::new();
+    for uid in 1..=3 {
+        f.ingest_raw("inbox", uid, &plain(&format!("m{uid}")));
+    }
+    email::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(1),
+            last_uid: Some(3),
+            uidnext: Some(4),
+            exists: Some(3),
+            deltalink: None,
+        },
+    )
+    .unwrap();
+
+    // The server renumbered: UIDs 90..=92 now hold the same three messages.
+    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    let (resolved, reset) = known.resolve(Some(2));
+    assert!(reset);
+    let vanished = email::imap_client::vanished_uids(&resolved, &[90, 91, 92]);
+    assert!(vanished.is_empty(), "a reset must never prune");
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished).unwrap(),
+        0
+    );
+    assert_eq!(f.message_rows(), 3);
+}
+
+/// The reported defect, end to end: a message archived in another client leaves
+/// the inbox window and reappears in the archive. Ingest inserts the archive
+/// copy (identity is per mailbox), the prune drops the inbox row, and the user
+/// sees the message exactly once, in the archive.
+#[test]
+fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
+    let f = Fixture::new();
+    let raw = plain("archived-elsewhere");
+    let inbox = f.ingest_raw("inbox", 7, &raw);
+    f.ingest_raw("inbox", 8, &plain("other"));
+    let hash = f.text(inbox.row_id, "body_blob");
+    assert_eq!(f.refcount(&hash), 1);
+
+    // The same sync ingests the archive copy at its new UID ...
+    let archived = f.ingest_raw("archive", 31, &raw);
+    assert!(archived.inserted);
+    assert_eq!(f.refcount(&hash), 2, "both rows reference the deduped body blob");
+
+    // ... and prunes the inbox row, whose UID the server stopped listing.
+    assert_eq!(sync_prune(&f, "inbox", &[6, 8]), 1);
+    assert_eq!(sync_prune(&f, "archive", &[31]), 0);
+
+    assert_eq!(f.message_rows(), 2, "the archived message plus the untouched one");
+    let mailboxes: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+        .unwrap()
+        .iter()
+        .map(|e| e.message_id.clone())
+        .collect();
+    assert_eq!(mailboxes, vec!["<other@example.com>".to_string()]);
+    let archive: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "archive")
+        .unwrap()
+        .iter()
+        .map(|e| e.message_id.clone())
+        .collect();
+    assert_eq!(archive, vec!["<archived-elsewhere@example.com>".to_string()]);
+    assert_eq!(f.refcount(&hash), 1, "the inbox row released its reference");
+}

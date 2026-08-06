@@ -8,7 +8,8 @@ mod watch;
 
 pub use batch::{batch_delete_on_server, batch_move_on_server};
 pub use fetch::{
-    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, FetchedRaw, MailboxState,
+    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, vanished_uids, FetchedRaw,
+    MailboxState,
 };
 pub use ops::{
     delete_email_on_server, mark_read_on_server, mark_unread_on_server, move_email_on_server,

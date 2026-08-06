@@ -1895,6 +1895,14 @@ async fn main() -> Result<()> {
                     result.uid_rebound,
                 );
             }
+            if result.pruned > 0 {
+                println!(
+                    "{} {}Dropped {} message(s) the server no longer lists",
+                    "ℹ".blue(),
+                    prefix,
+                    result.pruned,
+                );
+            }
         }
 
         Some(Commands::Watch { mailbox, timeout }) => {

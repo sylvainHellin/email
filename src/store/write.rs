@@ -132,6 +132,34 @@ pub fn delete_row(store: &Store, blobs: &BlobStore, id: i64) -> Result<Option<Mu
     Ok(Some(previous))
 }
 
+/// Delete the row a `(account, mailbox, uid)` triple names, if it is there.
+///
+/// Same delete as [`delete_row`], reached from the identity the *server* uses
+/// rather than from a row id: the sync prune knows that a UID has left a
+/// mailbox, never which local row held it. `Ok(None)` means the store does not
+/// hold that UID, which is a no-op rather than an error.
+pub fn delete_by_uid(
+    store: &Store,
+    blobs: &BlobStore,
+    account: &str,
+    mailbox: &str,
+    uid: i64,
+) -> Result<Option<MutatedRow>> {
+    let id: Option<i64> = store
+        .conn()
+        .query_row(
+            "SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            rusqlite::params![account, mailbox, uid],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("looking up a message row by uid")?;
+    match id {
+        Some(id) => delete_row(store, blobs, id),
+        None => Ok(None),
+    }
+}
+
 /// Set (or clear) `\Seen` on a row. Returns true when the flags changed.
 pub fn set_read(store: &Store, id: i64, read: bool) -> Result<bool> {
     let flags = if read { "\\Seen" } else { "" };
@@ -297,6 +325,30 @@ mod tests {
         let fx = fixture();
         assert!(move_row(&fx.store, 404, "archive").unwrap().is_none());
         assert!(delete_row(&fx.store, &fx.blobs, 404).unwrap().is_none());
+        assert!(delete_by_uid(&fx.store, &fx.blobs, "alice", "inbox", 404)
+            .unwrap()
+            .is_none());
         assert!(!set_read(&fx.store, 404, true).unwrap());
+    }
+
+    /// The server's identity for a message is `(account, mailbox, uid)`, and
+    /// the same UID in another mailbox is a different message: a delete
+    /// reached from a UID must not cross the mailbox boundary.
+    #[test]
+    fn deleting_by_uid_takes_only_the_row_in_that_mailbox() {
+        let fx = fixture();
+        let inbox = fx.ingest_plain("inbox", 7, "Gone from the inbox");
+        let archive = fx.ingest_plain("archive", 7, "Still in the archive");
+
+        let previous = delete_by_uid(&fx.store, &fx.blobs, "alice", "inbox", 7)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            (previous.id, previous.mailbox.as_str(), previous.uid),
+            (inbox, "inbox", 7)
+        );
+        assert!(row_coordinates(&fx.store, inbox).unwrap().is_none());
+        assert!(row_coordinates(&fx.store, archive).unwrap().is_some());
     }
 }

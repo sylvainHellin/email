@@ -110,9 +110,41 @@ pub struct StoreFetch {
     pub known_flags: Vec<(u32, bool)>,
     /// What SELECT said about the mailbox.
     pub state: MailboxState,
+    /// UIDs the store holds for this mailbox that the server no longer lists,
+    /// restricted to the numeric range the window covers. See
+    /// [`vanished_uids`].
+    pub vanished: Vec<u32>,
     /// True when the server's UIDVALIDITY no longer matches the stored one, so
     /// this fetch deliberately skipped nothing and redownloaded the window.
     pub uidvalidity_reset: bool,
+}
+
+/// The UIDs the store holds that the server did not list, clamped to the
+/// window's own numeric range.
+///
+/// The clamp is the whole safety argument. `UID SEARCH ALL` returns the entire
+/// mailbox, but the window is only its last `limit` UIDs, so `known − window`
+/// on a 12k mailbox with `-n 50` is 12k UIDs that are merely *older* than the
+/// window, not gone. Only a known UID that falls between the window's lowest
+/// and highest UID is provably absent from the server: the server listed every
+/// UID in that range and this one was not among them.
+///
+/// Negative UIDs are skipped: they are the `-id` sentinel a local move parks a
+/// row on (see [`crate::store::write`]), a row waiting for the destination's
+/// next sync to give it a real UID, not something the server ever knew about.
+pub fn vanished_uids(known: &std::collections::HashSet<i64>, window: &[u32]) -> Vec<u32> {
+    let (Some(&lo), Some(&hi)) = (window.iter().min(), window.iter().max()) else {
+        return Vec::new();
+    };
+    let listed: std::collections::HashSet<u32> = window.iter().copied().collect();
+    let mut out: Vec<u32> = known
+        .iter()
+        .filter(|&&uid| uid >= lo as i64 && uid <= hi as i64)
+        .map(|&uid| uid as u32)
+        .filter(|uid| !listed.contains(uid))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// Two-pass fetch for the store ingest path.
@@ -164,6 +196,7 @@ pub async fn fetch_new_raw_on_session(
         skipped: 0,
         known_flags: Vec::new(),
         state,
+        vanished: Vec::new(),
         uidvalidity_reset,
     };
 
@@ -210,6 +243,17 @@ pub async fn fetch_new_raw_on_session(
         }
     }
     let skipped = known_flags.len();
+    // A UIDVALIDITY reset empties `known_uids`, so this is empty too: the
+    // server renumbering says nothing about which messages are gone, and the
+    // rows are about to be rebound through their Message-IDs.
+    let vanished = vanished_uids(&known_uids, &window);
+    if !vanished.is_empty() {
+        info!(
+            "Store fetch for '{}': {} row(s) inside the window range are no longer on the server",
+            mailbox,
+            vanished.len()
+        );
+    }
 
     if new_uids.is_empty() {
         return Ok(StoreFetch {
@@ -217,6 +261,7 @@ pub async fn fetch_new_raw_on_session(
             skipped,
             known_flags,
             state,
+            vanished,
             uidvalidity_reset,
         });
     }
@@ -254,6 +299,62 @@ pub async fn fetch_new_raw_on_session(
         skipped,
         known_flags,
         state,
+        vanished,
         uidvalidity_reset,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A UID inside the window's range that the server did not list is gone.
+    #[test]
+    fn a_uid_missing_from_the_middle_of_the_window_is_vanished() {
+        let known = HashSet::from([10, 11, 12, 13]);
+        assert_eq!(vanished_uids(&known, &[10, 12, 13]), vec![11]);
+    }
+
+    /// The clamp: with a small `-n` the window is the tail of the mailbox, and
+    /// everything older than it is outside the range the server proved
+    /// anything about. Without this the first quick sync would delete the
+    /// whole archive.
+    #[test]
+    fn uids_below_the_window_survive() {
+        let known: HashSet<i64> = (1..=100).collect();
+        assert_eq!(vanished_uids(&known, &[98, 99, 100]), Vec::<u32>::new());
+    }
+
+    /// Symmetrically, a UID above the window's highest is not covered either:
+    /// only a row that was optimistically written ahead of the server can be
+    /// there, and the next fetch will list it.
+    #[test]
+    fn uids_above_the_window_survive() {
+        let known = HashSet::from([5, 6, 7, 42]);
+        assert_eq!(vanished_uids(&known, &[5, 7]), vec![6]);
+    }
+
+    /// A UIDVALIDITY reset hands `resolve` an empty known set, which must
+    /// produce an empty prune: a renumbering says nothing about what is gone.
+    #[test]
+    fn an_empty_known_set_prunes_nothing() {
+        assert_eq!(vanished_uids(&HashSet::new(), &[1, 2, 3]), Vec::<u32>::new());
+    }
+
+    /// An empty window is "the server told us nothing", not "the mailbox is
+    /// gone".
+    #[test]
+    fn an_empty_window_prunes_nothing() {
+        let known = HashSet::from([1, 2, 3]);
+        assert_eq!(vanished_uids(&known, &[]), Vec::<u32>::new());
+    }
+
+    /// The negative sentinel of a locally moved row is not a server UID and
+    /// must never be pruned, whatever the window covers.
+    #[test]
+    fn a_locally_moved_rows_sentinel_uid_is_never_pruned() {
+        let known = HashSet::from([-7, 4, 5]);
+        assert_eq!(vanished_uids(&known, &[4, 5]), Vec::<u32>::new());
+    }
 }

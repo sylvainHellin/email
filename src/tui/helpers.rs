@@ -250,8 +250,10 @@ pub(super) async fn lib_do_sync(
 /// Post-sync hooks shared by both backends, and the one-line status message.
 ///
 /// The `.md` era also returned the directories a sync had touched so the TUI
-/// could invalidate its caches; ingest writes no files, so there is nothing to
-/// invalidate until the read path moves onto the store (#0038).
+/// could invalidate its caches. The store made that list unnecessary rather
+/// than unnecessary to act on: a sync writes rows the list reads, so the TUI
+/// drops every cache of the account when the result lands (see
+/// `tui::bg::refresh_after_server_sync`).
 fn finish_sync(
     account_config: &AccountConfig,
     result: &crate::imap_client::SyncResult,
@@ -269,6 +271,9 @@ fn finish_sync(
     }
     if result.uid_rebound > 0 {
         msg.push_str(&format!(", {} renumbered", result.uid_rebound));
+    }
+    if result.pruned > 0 {
+        msg.push_str(&format!(", {} gone from the server", result.pruned));
     }
     msg
 }

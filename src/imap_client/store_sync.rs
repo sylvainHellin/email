@@ -13,8 +13,9 @@
 //! - the dedup pass over the mailbox directory (the unique constraint on
 //!   `(account, mailbox, uid)` makes a duplicate impossible);
 //! - the EXISTS/UIDNEXT reconciliation heuristic and its `mailbox-states.json`
-//!   cache (superseded by `sync_cursors`; server-side moves and deletes land
-//!   with the reconcile work in #0038).
+//!   cache (superseded by `sync_cursors`; a row the server no longer lists is
+//!   now pruned from the fetch's own window, see
+//!   [`crate::imap_client::vanished_uids`]).
 
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -59,6 +60,10 @@ pub struct SyncResult {
     pub skipped: usize,
     /// Rows whose `\Seen` flag was updated from the server.
     pub read_updated: usize,
+    /// Rows deleted because the server no longer lists their UID inside the
+    /// window the fetch covered (a message archived, moved or deleted in
+    /// another client).
+    pub pruned: usize,
     /// Rows rebound to a new UID after a UIDVALIDITY reset.
     pub uid_rebound: usize,
     /// Mailboxes whose server-side UIDVALIDITY no longer matched the stored
@@ -186,6 +191,21 @@ pub async fn sync_mailboxes(
                 Ok(false) => {}
                 Err(e) => warn!("Failed to apply the read flag for UID {uid}: {e:#}"),
             }
+        }
+
+        // The other half of the same diff: the UIDs the store holds inside the
+        // window's range that the server did not list. Applied after the
+        // ingest of `new_messages`, so a message that merely moved mailboxes
+        // is already present at its destination before its source row goes.
+        match ingest::prune_vanished(
+            &store,
+            &blobs,
+            account_name,
+            &target.role,
+            &fetched.vanished,
+        ) {
+            Ok(n) => result.pruned += n,
+            Err(e) => warn!("Failed to prune '{}': {e:#}", target.server_name),
         }
 
         let highest_uid = new_messages.iter().map(|m| m.uid as i64).max();
