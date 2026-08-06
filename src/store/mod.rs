@@ -5,7 +5,9 @@
 //! IMAP, never a system of record, so there is no migrator: a version
 //! mismatch, a failed `integrity_check` or a file that cannot be opened as a
 //! database is dropped and rebuilt empty, with a log line and no user-visible
-//! error. The next sync refills it.
+//! error. The next sync refills it. The `integrity_check` behind that contract
+//! is a full walk of the file, so it runs once per file per process (see
+//! [`INTEGRITY_CHECKED`]) rather than on every open.
 //!
 //! This module knows nothing about IMAP, MIME or Markdown. It owns the file,
 //! the pragmas and the schema; everything above it speaks SQL.
@@ -21,8 +23,10 @@ pub mod read;
 pub mod schema;
 pub mod write;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -71,6 +75,10 @@ impl Store {
                         "[store] {} is unusable ({err:#}); dropping and rebuilding empty",
                         path.display()
                     );
+                    // The file about to be created is a different file, so the
+                    // "already checked this incarnation" note must go with the
+                    // one being deleted.
+                    forget_integrity_check(&path);
                     remove_store_files(&path)?;
                     span.mark("dropped");
                 }
@@ -109,19 +117,73 @@ impl Store {
     }
 }
 
+/// Files whose `integrity_check` this process has already run and passed,
+/// keyed by canonical path, with the number of checks run against each.
+///
+/// `PRAGMA integrity_check` walks every page of the database file: 240 ms on a
+/// 44 MB store. The TUI opens a store per call rather than parking one (see
+/// `tui::app::types::open_store`), so an unconditional check ran once per
+/// keypress and ten times before the first paint. The check stays load-bearing
+/// for the drop-and-rebuild contract in the module docs, so it is amortised
+/// rather than removed: the first open of a given file in a given process
+/// still validates it in full and still triggers the rebuild on failure, and
+/// every later open of that same file trusts the earlier verdict. A file that
+/// rots underneath a long-lived process is caught by the next process, which
+/// is the same guarantee the pre-store build gave.
+static INTEGRITY_CHECKED: OnceLock<Mutex<HashMap<PathBuf, u32>>> = OnceLock::new();
+
+fn integrity_registry() -> &'static Mutex<HashMap<PathBuf, u32>> {
+    INTEGRITY_CHECKED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Canonical identity of a store file. Canonicalisation needs the file to
+/// exist, which it does on every path that reaches here; the raw path is a
+/// safe fallback because a miss only means one extra check.
+fn integrity_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn integrity_check_count(path: &Path) -> u32 {
+    let registry = integrity_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.get(&integrity_key(path)).copied().unwrap_or(0)
+}
+
+fn note_integrity_check(path: &Path) {
+    let mut registry = integrity_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *registry.entry(integrity_key(path)).or_insert(0) += 1;
+}
+
+/// Drop the note for a file that is about to be deleted, so the replacement
+/// created at the same path is validated on its own first open.
+fn forget_integrity_check(path: &Path) {
+    let key = integrity_key(path);
+    let mut registry = integrity_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.remove(&key);
+}
+
 /// Open an existing file and prove it is a usable store of the current schema
 /// version: readable as a
-/// database, passing `integrity_check`, stamped with the current version and
-/// structurally complete.
+/// database, passing `integrity_check` (once per file per process, see
+/// [`INTEGRITY_CHECKED`]), stamped with the current version and structurally
+/// complete.
 fn open_validated(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     apply_pragmas(&conn)?;
 
-    let integrity: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .context("running integrity_check")?;
-    if !integrity.eq_ignore_ascii_case("ok") {
-        return Err(anyhow!("integrity_check returned {integrity}"));
+    if integrity_check_count(path) == 0 {
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .context("running integrity_check")?;
+        note_integrity_check(path);
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(anyhow!("integrity_check returned {integrity}"));
+        }
     }
 
     match schema::stamped_version(&conn)? {
@@ -252,6 +314,92 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "rebuilt store must be empty");
+    }
+
+    /// The check is what makes the drop-and-rebuild contract real, so it is
+    /// amortised rather than dropped: the first open of a file validates it,
+    /// every later open in the same process trusts that verdict. A freshly
+    /// created file is intact by construction and is not checked at all.
+    #[test]
+    fn the_integrity_check_runs_once_per_file_per_process() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+
+        drop(Store::open(&path).unwrap());
+        assert_eq!(
+            integrity_check_count(&path),
+            0,
+            "a file this process just created needs no integrity check"
+        );
+
+        drop(Store::open(&path).unwrap());
+        assert_eq!(integrity_check_count(&path), 1, "the first reopen validates");
+
+        for _ in 0..5 {
+            drop(Store::open(&path).unwrap());
+        }
+        assert_eq!(
+            integrity_check_count(&path),
+            1,
+            "later opens must skip the full-file walk"
+        );
+    }
+
+    /// Corruption that only `integrity_check` can see (the header still reads
+    /// as a database) still costs the file its contents on the first open of
+    /// the process, and the rebuilt file is validated on its own next open
+    /// rather than inheriting the dead one's verdict.
+    #[test]
+    fn a_corrupted_page_is_still_caught_on_the_first_open() {
+        use std::io::{Seek, SeekFrom, Write as _};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        {
+            let store = Store::open(&path).unwrap();
+            for uid in 0..400 {
+                insert_message(&store, "alice", "inbox", uid, &format!("<m{uid}@example.com>"))
+                    .unwrap();
+            }
+        }
+        let page_size: i64 = {
+            let conn = Connection::open(&path).unwrap();
+            conn.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap()
+        };
+
+        // Scribble over the middle of the file, leaving page 1 (the header and
+        // the schema) readable: the file still opens, and only a full walk
+        // notices.
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let len = f.metadata().unwrap().len();
+            let offset = (len / 2).max(page_size as u64);
+            f.seek(SeekFrom::Start(offset)).unwrap();
+            f.write_all(&vec![0x5a; page_size as usize]).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert_eq!(
+            integrity_check_count(&path),
+            0,
+            "nothing in this process has validated this file yet"
+        );
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a corrupted store must be dropped and rebuilt");
+        drop(store);
+
+        assert_eq!(
+            integrity_check_count(&path),
+            0,
+            "the rebuilt file must not inherit the dead one's verdict"
+        );
+        drop(Store::open(&path).unwrap());
+        assert_eq!(integrity_check_count(&path), 1);
     }
 
     #[test]
