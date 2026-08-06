@@ -36,6 +36,16 @@ The abstraction already exists implicitly, which is why [#0055](0055-graph-sync-
 - The sync engine has tests that run offline against a fake backend, covering at least prune, uid rebinding and cursor advance.
 - No behaviour change for either transport, verified against the `dump-mailbox` parity oracle.
 
+## Notes carried in from #0065
+
+Two things the [#0065](0065-graph-prune-batch-hardening.md) hardening could only do per pass belong to this seam, because both need a place to keep state between passes.
+
+- A batch sub-request that fails permanently is retried on every sync forever.
+  `BATCH_FAILURE_BUDGET` bounds the cost of one pass, but there is no per-message failure count, and adding one to `messages` is a schema change with no home until the backend seam owns the fetch.
+- A suspended prune is invisible.
+  When a pass cannot download everything it found, it defers every prune and logs one `info!` line; nothing in `SyncResult` or the TUI says the local view is knowingly stale.
+  The signal wants a field on the shared `SyncResult` this ticket moves out of `imap_client`, and a status-line consumer, which is why it was not bolted onto `sync_mailboxes_graph` alone (#0065 follow-up).
+
 ## Sequencing
 
 Extract this before [#0041](0041-persistent-conn-condstore.md) and [#0042](0042-graph-delta-sync.md), not as a competing refactor: both tickets assume this seam, and both would otherwise widen the duplication they are meant to remove.

@@ -34,6 +34,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0063 Send durability gaps (partial recipients, Graph resume)](docs/tickets/0063-send-durability-gaps.md) -- bug
 - [#0064 Retire path-shaped identity (MailboxRole, MailboxInfo.id, EmailStatus)](docs/tickets/0064-identity-type-cleanup.md) -- refactor _(before #TKT-0051; concrete half of #0022)_
 - [#0067 Contacts guard refinements (observed_at, corrupt cache, partial erosion)](docs/tickets/0067-contacts-guard-refinements.md) -- bug
+- [#0069 Delete the file-era invite rewriters (set_event_rsvp, InboxFrontmatter)](docs/tickets/0069-drop-file-era-invite-rewriters.md) -- chore _(from the #0057 review)_
+- [#0070 Audit the website for file-era claims](docs/tickets/0070-website-file-era-claims.md) -- chore _(website; from the #0057 review)_
 - [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037; absorbs mutation unification and the engine lock)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_
