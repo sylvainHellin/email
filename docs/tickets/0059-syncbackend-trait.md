@@ -9,6 +9,8 @@ created: 2026-08-06
 
 From the architecture review synthesis, Tier 2 item 1: [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06_architecture-review-synthesis.md).
 Effort: L, the largest structural item in the review.
+Partly parked 2026-08-06: the Graph backend is parked, so the parity half of the motivation waits with it; what still stands is the fake-backend seam that gives the sync engine its first offline tests.
+See [BACKLOG](../../BACKLOG.md).
 
 Six paired IMAP and Graph implementations differ only in transport.
 The abstraction already exists implicitly, which is why [#0055](0055-graph-sync-parity.md) exists at all: every fix applied to one path has to be re-applied by hand to the other, and the review found six places where that did not happen.

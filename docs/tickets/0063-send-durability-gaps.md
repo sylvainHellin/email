@@ -9,6 +9,8 @@ created: 2026-08-06
 
 From the architecture review synthesis, Tier 3: [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06_architecture-review-synthesis.md).
 Effort: M each.
+Partly parked 2026-08-06: the Graph backend is parked, so scope item 3 (resumable Graph `pending_send` rows) waits with it; the partial-recipient and double-submit halves are SMTP-side and stay active.
+See [BACKLOG](../../BACKLOG.md).
 
 Two holes the durable outbox of [#0037](0037-sqlite-store-engine-skeleton.md) left open.
 Both lose a delivery quietly, which is the failure mode the outbox exists to prevent.

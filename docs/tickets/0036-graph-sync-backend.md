@@ -7,6 +7,8 @@ status: blocked
 created: 2026-07-11
 ---
 
+Parked 2026-08-06: the Graph backend is parked until it is picked up deliberately, first live target the EVOQS Exchange account; see [BACKLOG](../../BACKLOG.md).
+
 Future Graph-based sync backend that closes the gaps v1 leaves open. Design: [calendar-invites](../plans/calendar-invites.md) (D1, D4, risks), [tui-restructure-views](../plans/tui-restructure-views.md) (D12). **Blocked by [#0035](0035-graph-admin-approval.md)** (admin approval unobtainable today).
 
 v1 is iMIP-only and never touches the server-side Exchange calendar. This ticket adds Graph as an additional sync backend for Graph accounts.

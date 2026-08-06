@@ -7,6 +7,8 @@ status: open
 created: 2026-07-14
 ---
 
+Parked 2026-08-06: the Graph backend is parked until it is picked up deliberately, first live target the EVOQS Exchange account; see [BACKLOG](../../BACKLOG.md).
+
 Stage 5 (Graph) of the data-access-layer redesign. Plan: [data-access-layer](../plans/data-access-layer.md).
 
 The single biggest Graph-account win: today Graph accounts disk-scan on every sync.
