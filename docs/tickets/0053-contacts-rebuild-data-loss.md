@@ -3,7 +3,7 @@ id: 0053
 title: Contacts rebuild wipes the frecency index (extractor still walks the deleted .md tree)
 type: bug
 priority: now
-status: open
+status: done
 created: 2026-08-06
 ---
 
@@ -34,3 +34,14 @@ The contacts extractor was never ported off the file layer, so it walks a direct
 - An extractor that returns zero contacts never overwrites a non-empty cache, and says so in the log.
 - The contacts module no longer references `account_dir`, `mailbox_dir` or `gray_matter`.
 - A test builds an index from a fixture store and asserts the observed roles and counts, with no filesystem mailbox tree present.
+
+## Resolution
+
+`build_index_for_account` opens the account store and folds `read::list_account` rows into the ranker; `process_header`, `flatten_addr` and the whole ranking side ported unchanged, and the role now comes from the row's `mailbox` column (`sent`/`inbox`/`archive` verbatim, anything else `extra`, as the per-directory walk did).
+`walk_mailbox_dir`, `account_mailboxes` and the `InboxFrontmatter` + `gray_matter` usage are gone; `account_dir` survives inside `contacts/` only as the cache location, never as a mailbox tree.
+
+The guard is `cache::save_rebuilt_cache`, which the three rebuild paths (`mp contacts rebuild`, the cold-cache `load_or_build`, the TUI refresh key) call instead of `save_cache`: an empty rebuild over a populated cache is refused, logged, and reported to the user, and the TUI keeps the loaded index too.
+The incremental hooks still call `save_cache` directly, because they can only ever add.
+
+Measured on the live `tum` account: the rebuild produced 1733 contacts against the 1735 the pre-rebuild corpus held, with an identical top ten and counts within a few percent (the store holds marginally fewer messages than the retired `.md` tree did).
+The guard fired for `perso`, whose store carries no message rows, and kept its 61 hook-accumulated contacts.

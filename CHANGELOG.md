@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **A contacts rebuild no longer wipes the frecency index (#0053).** The
+  extractor was the last thing still walking the `.md` tree the store cutover
+  deleted: it found zero messages, and `mp contacts rebuild`, the cold-cache
+  build and the TUI refresh key each cached that nothing over a corpus months
+  of use had accumulated. The rebuild now reads the same `messages` rows the
+  TUI and `mp dump-mailbox` read, taking the from/to/cc headers and the
+  observation role straight off the row (its `mailbox` column), so it produces
+  the index the mail actually supports: 1733 contacts on the largest live
+  account, top ten unchanged against the pre-rebuild corpus. Two guards sit
+  behind it: **an empty rebuild never replaces a populated cache**, it says so
+  on the console and in the log and leaves both the file and the TUI's loaded
+  index alone. That is what an account whose store holds no rows yet now does
+  instead of losing what the send/sync hooks had collected for it.
 - **The Body pane fills for a draft row.** Selecting a draft in the TUI showed
   its headers and an empty body: the preview's memo was keyed on the store row
   a draft does not have, so the key never built and the pane was never filled.

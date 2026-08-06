@@ -168,6 +168,9 @@ mod tests {
     use super::*;
     use crate::config::{account_dir, MailboxMapping, MailboxesConfig};
     use crate::contacts::{build_index_for_account, cache_path};
+    use crate::ingest::{ingest_message, IngestInput};
+    use crate::parse::FetchedEmail;
+    use crate::store::{BlobStore, Store};
     use crate::types::{EmailFrontmatter, EmailStatus};
     use std::path::PathBuf;
 
@@ -221,6 +224,45 @@ mod tests {
         }
     }
 
+    /// Seed the fixture account's store with one received message, then build
+    /// and persist the index from it, exactly as `mp contacts rebuild` does.
+    /// The hooks merge into a real rebuilt cache, not into an empty one.
+    fn seed_cache_from_store(account: &AccountConfig, root: &std::path::Path, from: &str) {
+        let store = Store::open(crate::config::store_path(&account.name)).unwrap();
+        let blobs = BlobStore::new(crate::config::blobs_dir(&account.name));
+        let email = FetchedEmail {
+            from: from.into(),
+            to: account.default_from.clone(),
+            cc: None,
+            subject: "Seed".into(),
+            date: "Fri, 02 Jan 2026 09:00:00 +0000".into(),
+            body_text: "body".into(),
+            html_body: None,
+            has_attachments: false,
+            message_id: Some("<seed@example.com>".into()),
+            attachments: Vec::new(),
+            is_read: false,
+            calendar_ics: None,
+            event: None,
+        };
+        ingest_message(
+            &store,
+            &blobs,
+            &IngestInput {
+                account: &account.name,
+                mailbox: "inbox",
+                uid: 1,
+                email: &email,
+                raw: None,
+            },
+        )
+        .unwrap();
+        drop(store);
+
+        let index = build_index_for_account(account).unwrap();
+        save_cache(root, &index).unwrap();
+    }
+
     fn mk_draft(to: &str, cc: Option<&str>) -> EmailDraft {
         let to_opt = if to.is_empty() { None } else { Some(to.to_string()) };
         EmailDraft {
@@ -261,10 +303,11 @@ mod tests {
         let f = fixture("testaccount");
         let account = mk_account();
 
-        // Seed an empty cache via build_index_for_account (empty mailboxes).
-        let index = build_index_for_account(&account).unwrap();
-        save_cache(&f.account_root, &index).unwrap();
+        seed_cache_from_store(&account, &f.account_root, "Zoe <zoe@example.com>");
         assert!(cache_path(&f.account_root).exists());
+        // The rebuild really read the store, so the seed contact is there.
+        let seeded = load_cache(&f.account_root).unwrap().unwrap();
+        assert_eq!(seeded.contacts.get("zoe@example.com").unwrap().received, 1);
 
         let draft = mk_draft("Alice <alice@example.com>", Some("bob@example.com"));
         bump_after_send(&account, &draft);
@@ -281,8 +324,7 @@ mod tests {
     fn bump_after_sync_merges_fresh_observations() {
         let f = fixture("testaccount");
         let account = mk_account();
-        let index = build_index_for_account(&account).unwrap();
-        save_cache(&f.account_root, &index).unwrap();
+        seed_cache_from_store(&account, &f.account_root, "Zoe <zoe@example.com>");
 
         let observations = vec![
             FreshObservation {

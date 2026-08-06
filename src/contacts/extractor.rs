@@ -1,21 +1,23 @@
-//! Walks account mailboxes and builds or updates a `ContactIndex`.
+//! Reads the account's message rows and builds or updates a `ContactIndex`.
 //!
-//! Reuses the existing walkdir + gray_matter pattern from `parse.rs`.
+//! The full rebuild reads `messages` through `store::read`, the same listing
+//! shape the TUI and `mp dump-mailbox` use: every row already carries `from`,
+//! `to`, `cc`, `mailbox` and the `Date:` header, which is exactly what the
+//! ranker needs. Before [#0053](../../docs/tickets/0053-contacts-rebuild-data-loss.md)
+//! this walked a `.md` tree that the store cutover deleted, so a rebuild found
+//! nothing and the caller cached the nothing over months of accumulated
+//! frecency.
 
-use crate::config::{account_dir, mailbox_dir, AccountConfig};
+use crate::config::AccountConfig;
 use crate::contacts::filter::is_usable_address;
 use crate::contacts::rank::{update_from_observation, Observation, ObservationField};
-use crate::contacts::types::ContactIndex;
-use crate::types::InboxFrontmatter;
+use crate::contacts::types::{Contact, ContactIndex};
+use crate::store::read::{self, MessageRow};
+use crate::store::Store;
 use anyhow::Result;
 use chrono::Utc;
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
 use mailparse::addrparse;
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// Public observation kind used by incremental-update hooks (send/sync).
 #[derive(Debug, Clone, Copy)]
@@ -28,78 +30,88 @@ pub enum ObservedIn {
     Inbox,
 }
 
-/// Walk the given account's mailboxes and build a full `ContactIndex`.
-/// Returns even if some mailboxes are missing — best-effort across directories.
+/// Build a full `ContactIndex` from the account's message store.
+///
+/// An account that has never synced has no store, and that is not an error:
+/// the index comes back empty and the caller decides what to do with it (see
+/// `cache::save_rebuilt_cache`, which refuses to persist an empty rebuild over
+/// a populated cache).
 pub fn build_index_for_account(account: &AccountConfig) -> Result<ContactIndex> {
-    let _root = account_dir(&account.name);
+    match crate::tui::app::open_store(&account.name) {
+        Some(store) => build_index_from_store(&store, account),
+        None => Ok(empty_index(account)),
+    }
+}
 
-    let mut index = ContactIndex {
-        account: account.name.clone(),
-        contacts: HashMap::new(),
-        built_at: Utc::now().to_rfc3339(),
-    };
+/// Build a full `ContactIndex` from an already-open store.
+pub(crate) fn build_index_from_store(
+    store: &Store,
+    account: &AccountConfig,
+) -> Result<ContactIndex> {
+    let mut index = empty_index(account);
     let self_addr = account.default_from.to_ascii_lowercase();
 
-    // For each configured mailbox (inbox/archive/sent/extra), walk its files.
-    for (role, dir) in account_mailboxes(account) {
-        if !dir.exists() {
-            continue;
+    for row in read::list_account(store, &account.name)? {
+        let role = mailbox_role(&row.mailbox);
+        let observed_at = row
+            .date_display
+            .as_deref()
+            .and_then(parse_date_to_rfc3339)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        for (field, raw) in header_fields(&row) {
+            let Some(raw) = raw else { continue };
+            if raw.trim().is_empty() {
+                continue;
+            }
+            process_header(
+                &mut index.contacts,
+                raw,
+                field,
+                role,
+                &observed_at,
+                &self_addr,
+            );
         }
-        walk_mailbox_dir(&mut index.contacts, &dir, role, &self_addr);
     }
 
     Ok(index)
 }
 
-fn walk_mailbox_dir(
-    contacts: &mut HashMap<String, crate::contacts::types::Contact>,
-    dir: &Path,
-    role: &'static str,
-    self_addr: &str,
-) {
-    for entry in WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() || path.extension().map(|e| e != "md").unwrap_or(true) {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        let matter = Matter::<YAML>::new();
-        let parsed = matter.parse(&content);
-        let Some(data) = parsed.data else { continue };
-        let Ok(fm) = data.deserialize::<InboxFrontmatter>() else {
-            continue;
-        };
+fn empty_index(account: &AccountConfig) -> ContactIndex {
+    ContactIndex {
+        account: account.name.clone(),
+        contacts: HashMap::new(),
+        built_at: Utc::now().to_rfc3339(),
+    }
+}
 
-        let observed_at = fm
-            .date
-            .clone()
-            .and_then(|d| parse_date_to_rfc3339(&d))
-            .unwrap_or_else(|| file_mtime_rfc3339(path));
+/// The from/to/cc headers of one row, in the order the ranker sees them.
+fn header_fields(row: &MessageRow) -> [(ObservationField, Option<&str>); 3] {
+    [
+        (ObservationField::From, row.from.as_deref()),
+        (ObservationField::To, row.to.as_deref()),
+        (ObservationField::Cc, row.cc.as_deref()),
+    ]
+}
 
-        // Extract all addresses from from/to/cc fields.
-        let fields: [(ObservationField, Option<String>); 3] = [
-            (ObservationField::From, Some(fm.from.clone())),
-            (ObservationField::To, Some(fm.to.clone())),
-            (ObservationField::Cc, fm.cc.clone()),
-        ];
-        for (field, raw) in fields {
-            let Some(raw) = raw else { continue };
-            if raw.trim().is_empty() {
-                continue;
-            }
-            process_header(contacts, &raw, field, role, &observed_at, self_addr);
-        }
+/// The ranking role of a `messages.mailbox` value.
+///
+/// The column holds the role name for the four mapped mailboxes and a
+/// slugified server name for anything else, so every unmapped mailbox folds
+/// into `extra` exactly as the per-directory walk did. Only `sent` changes the
+/// ranking (see `rank::update_from_observation`); the rest all count as
+/// received.
+fn mailbox_role(mailbox: &str) -> &'static str {
+    match mailbox {
+        "sent" => "sent",
+        "inbox" => "inbox",
+        "archive" => "archive",
+        _ => "extra",
     }
 }
 
 fn process_header(
-    contacts: &mut HashMap<String, crate::contacts::types::Contact>,
+    contacts: &mut HashMap<String, Contact>,
     raw: &str,
     field: ObservationField,
     role: &'static str,
@@ -130,26 +142,6 @@ fn process_header(
     }
 }
 
-/// Returns `(role_label, absolute_path)` pairs for every configured mailbox.
-fn account_mailboxes(account: &AccountConfig) -> Vec<(&'static str, PathBuf)> {
-    let mut out = Vec::new();
-    if account.mailboxes.inbox.is_some() {
-        out.push(("inbox", mailbox_dir(&account.name, "inbox")));
-    }
-    if account.mailboxes.archive.is_some() {
-        out.push(("archive", mailbox_dir(&account.name, "archive")));
-    }
-    if account.mailboxes.sent.is_some() {
-        out.push(("sent", mailbox_dir(&account.name, "sent")));
-    }
-    if let Some(extras) = &account.mailboxes.extra {
-        for m in extras {
-            out.push(("extra", mailbox_dir(&account.name, &m.server)));
-        }
-    }
-    out
-}
-
 fn flatten_addr(info: &mailparse::MailAddr) -> Vec<(String, String)> {
     match info {
         mailparse::MailAddr::Single(s) => {
@@ -161,17 +153,6 @@ fn flatten_addr(info: &mailparse::MailAddr) -> Vec<(String, String)> {
             .map(|s| (s.addr.clone(), s.display_name.clone().unwrap_or_default()))
             .collect(),
     }
-}
-
-fn file_mtime_rfc3339(path: &Path) -> String {
-    use chrono::DateTime;
-    if let Ok(meta) = fs::metadata(path) {
-        if let Ok(mtime) = meta.modified() {
-            let dt: DateTime<Utc> = mtime.into();
-            return dt.to_rfc3339();
-        }
-    }
-    Utc::now().to_rfc3339()
 }
 
 /// Convert common email date formats to RFC-3339. Returns `None` if parsing fails.
@@ -232,7 +213,10 @@ pub fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contacts::types::Contact;
+    use crate::ingest::{ingest_message, IngestInput};
+    use crate::parse::FetchedEmail;
+    use crate::store::BlobStore;
+    use tempfile::TempDir;
 
     fn empty_index() -> ContactIndex {
         ContactIndex {
@@ -240,6 +224,165 @@ mod tests {
             contacts: HashMap::new(),
             built_at: Utc::now().to_rfc3339(),
         }
+    }
+
+    /// A store plus its blob store, both under one temp directory. No mailbox
+    /// tree exists anywhere near it: the rebuild reads rows only.
+    struct Fixture {
+        _dir: TempDir,
+        store: Store,
+        blobs: BlobStore,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
+        Fixture {
+            _dir: dir,
+            store,
+            blobs,
+        }
+    }
+
+    fn account() -> AccountConfig {
+        AccountConfig {
+            name: "alice".into(),
+            default_from: "me@example.com".into(),
+            ..Default::default()
+        }
+    }
+
+    fn email(from: &str, to: &str, cc: Option<&str>, date: &str) -> FetchedEmail {
+        FetchedEmail {
+            from: from.into(),
+            to: to.into(),
+            cc: cc.map(|s| s.into()),
+            subject: "Subject".into(),
+            date: date.into(),
+            body_text: "body".into(),
+            html_body: None,
+            has_attachments: false,
+            message_id: Some(format!("<{from}-{date}@example.com>")),
+            attachments: Vec::new(),
+            is_read: false,
+            calendar_ics: None,
+            event: None,
+        }
+    }
+
+    /// Ingest through the real ingest API, so the fixture rows are exactly the
+    /// rows the sync path writes.
+    fn ingest(fx: &Fixture, mailbox: &str, uid: i64, email: &FetchedEmail) {
+        ingest_message(
+            &fx.store,
+            &fx.blobs,
+            &IngestInput {
+                account: "alice",
+                mailbox,
+                uid,
+                email,
+                raw: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// #0053: the rebuild reads the store, so two ingested messages produce
+    /// two contacts with no mailbox tree present.
+    #[test]
+    fn rebuild_finds_both_senders_of_a_two_message_store() {
+        let fx = fixture();
+        ingest(
+            &fx,
+            "inbox",
+            1,
+            &email(
+                "Alice <alice@example.com>",
+                "me@example.com",
+                None,
+                "Mon, 05 Jan 2026 12:00:00 +0000",
+            ),
+        );
+        ingest(
+            &fx,
+            "inbox",
+            2,
+            &email(
+                "Bob <bob@example.com>",
+                "me@example.com",
+                None,
+                "Tue, 06 Jan 2026 12:00:00 +0000",
+            ),
+        );
+
+        let index = build_index_from_store(&fx.store, &account()).unwrap();
+
+        assert_eq!(index.contacts.len(), 2);
+        let alice = index.contacts.get("alice@example.com").expect("alice");
+        assert_eq!(alice.display_name, "Alice");
+        assert_eq!(alice.received, 1);
+        assert_eq!(alice.sent_to, 0);
+        assert_eq!(alice.last_seen, "2026-01-05T12:00:00+00:00");
+        let bob = index.contacts.get("bob@example.com").expect("bob");
+        assert_eq!(bob.received, 1);
+        // The self address is filtered out of every field.
+        assert!(!index.contacts.contains_key("me@example.com"));
+    }
+
+    /// The role comes from the row's `mailbox` column: a `sent` row bumps
+    /// sent_to/sent_cc, an archive row counts as received.
+    #[test]
+    fn the_row_mailbox_decides_the_observation_role() {
+        let fx = fixture();
+        ingest(
+            &fx,
+            "sent",
+            1,
+            &email(
+                "me@example.com",
+                "Carol <carol@example.com>",
+                Some("Dave <dave@example.com>"),
+                "Wed, 07 Jan 2026 12:00:00 +0000",
+            ),
+        );
+        ingest(
+            &fx,
+            "archive",
+            1,
+            &email(
+                "Erin <erin@example.com>",
+                "me@example.com",
+                None,
+                "Thu, 08 Jan 2026 12:00:00 +0000",
+            ),
+        );
+
+        let index = build_index_from_store(&fx.store, &account()).unwrap();
+
+        assert_eq!(index.contacts.get("carol@example.com").unwrap().sent_to, 1);
+        assert_eq!(index.contacts.get("dave@example.com").unwrap().sent_cc, 1);
+        assert_eq!(index.contacts.get("erin@example.com").unwrap().received, 1);
+    }
+
+    /// A store with no rows for this account builds an empty index rather than
+    /// failing; the caller's guard decides what that means.
+    #[test]
+    fn an_empty_store_builds_an_empty_index() {
+        let fx = fixture();
+        let index = build_index_from_store(&fx.store, &account()).unwrap();
+        assert!(index.contacts.is_empty());
+        assert_eq!(index.account, "alice");
+    }
+
+    /// Roles map verbatim for the three ranked mailboxes; a slugified server
+    /// name folds into `extra`, as the per-directory walk did.
+    #[test]
+    fn mailbox_role_folds_unmapped_mailboxes_into_extra() {
+        assert_eq!(mailbox_role("sent"), "sent");
+        assert_eq!(mailbox_role("inbox"), "inbox");
+        assert_eq!(mailbox_role("archive"), "archive");
+        assert_eq!(mailbox_role("some-folder"), "extra");
     }
 
     #[test]

@@ -448,20 +448,33 @@ impl App {
         self.contacts_view = ContactsView::default();
     }
 
-    /// Rebuild the active account's contact index from its mailboxes and
-    /// persist the cache (manual refresh key). The index build is a fast
-    /// bounded walk (~100 ms even on the largest local account), so it runs
+    /// Rebuild the active account's contact index from its message rows and
+    /// persist the cache (manual refresh key). The index build is one store
+    /// query (~100 ms even on the largest local account), so it runs
     /// synchronously; failures surface as a status message and leave the
     /// previously-loaded index intact.
+    ///
+    /// A rebuild that comes back empty over a populated cache is refused by
+    /// `save_rebuilt_cache`, and the view keeps the loaded index too: the
+    /// refusal means the rebuild read nothing, not that the account has no
+    /// correspondents (#0053).
     pub fn refresh_contacts(&mut self) {
         match crate::contacts::build_index_for_account(&self.account_config) {
             Ok(index) => {
                 let root = crate::config::account_dir(&self.account_config.name);
-                if let Err(e) = crate::contacts::save_cache(&root, &index) {
-                    self.set_status_level(
+                match crate::contacts::save_rebuilt_cache(&root, &index) {
+                    Ok(crate::contacts::CacheSave::RefusedEmpty { kept }) => {
+                        self.set_status_level(
+                            format!("Contacts rebuild found none, kept {kept} cached"),
+                            StatusLevel::Warning,
+                        );
+                        return;
+                    }
+                    Ok(crate::contacts::CacheSave::Written) => {}
+                    Err(e) => self.set_status_level(
                         format!("Contacts cache save failed: {e}"),
                         StatusLevel::Error,
-                    );
+                    ),
                 }
                 let count = index.contacts.len();
                 self.contacts_view.index = Some(index);

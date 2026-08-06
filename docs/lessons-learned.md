@@ -426,3 +426,10 @@ The argument holds only when there is an outbox row, and `send_durably` delibera
 That branch is rare enough to be invisible in testing and is exactly the one where the deletion is unrecoverable: no APPEND, no ingest, and the recipients hold the only copy of the message.
 A retirement now requires the report to be both complete and durable, which is a precondition on the *replacement* rather than on the send ([src/draft.rs](../src/draft.rs), `settle_sent_draft`).
 When a fallback is written that trades a guarantee for availability, every later step that assumed the guarantee has to name it in its own condition; the fallback's own comment will not find them.
+
+## A full rebuild is a deletion, so it needs the same precondition as one
+
+`mp contacts rebuild` regenerates a derived index, which reads like a refresh and is not one: it replaces a corpus the send/sync hooks accumulate incrementally, and the only thing it can offer in exchange is what its source currently holds.
+When the source was the deleted `.md` tree the exchange was a populated cache for nothing at all, and three call sites persisted it without looking (#0053).
+The source being right again does not retire the guard, because the sources are not equivalent: an account whose store carries no rows yet still has months of hook observations, and a rebuild would still trade them for zero.
+An empty result from a full rebuild is now read as a failure to read rather than as an empty world, and refused ([src/contacts/cache.rs](../src/contacts/cache.rs), `save_rebuilt_cache`).

@@ -2,7 +2,8 @@
 
 use crate::config::{account_dir, AccountConfig, GlobalConfig};
 use crate::contacts::{
-    build_index_for_account, cache_path, load_cache, save_cache, search, Contact, ContactIndex,
+    build_index_for_account, cache_path, load_cache, save_rebuilt_cache, search, CacheSave,
+    Contact, ContactIndex,
 };
 use anyhow::{anyhow, Result};
 use colored::*;
@@ -70,13 +71,20 @@ pub fn handle_rebuild(config: &GlobalConfig, account_name: Option<String>) -> Re
         );
         let index = build_index_for_account(account)?;
         let count = index.contacts.len();
-        save_cache(&root, &index)?;
-        println!(
-            "{} {} contacts cached at {}",
-            "✓".green(),
-            count.to_string().bold(),
-            cache_path(&root).display()
-        );
+        match save_rebuilt_cache(&root, &index)? {
+            CacheSave::Written => println!(
+                "{} {} contacts cached at {}",
+                "✓".green(),
+                count.to_string().bold(),
+                cache_path(&root).display()
+            ),
+            CacheSave::RefusedEmpty { kept } => println!(
+                "{} Rebuild found no contacts; kept the {} already cached at {}",
+                "⚠".yellow(),
+                kept.to_string().bold(),
+                cache_path(&root).display()
+            ),
+        }
     }
     Ok(())
 }
@@ -146,7 +154,7 @@ fn load_or_build(account: &AccountConfig, root: &Path) -> Result<ContactIndex> {
     }
     // No cache yet — build on demand.
     let idx = build_index_for_account(account)?;
-    save_cache(root, &idx)?;
+    save_rebuilt_cache(root, &idx)?;
     Ok(idx)
 }
 

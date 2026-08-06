@@ -6,9 +6,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053 has shipped.
 
-- [#0053 Contacts rebuild wipes the frecency index](docs/tickets/0053-contacts-rebuild-data-loss.md) -- bug _(live data loss)_
 - [#0054 Schema bump bundle (modseq/UID split, pending_ops.updated, dead columns)](docs/tickets/0054-schema-bump-bundle.md) -- refactor _(prerequisite for #0041)_
 - [#0055 Graph backend sync parity (prune, converge, watcher, timing)](docs/tickets/0055-graph-sync-parity.md) -- bug
 - [#0056 Rewrite docs/architecture.md, fix the wizard and dump-mailbox help](docs/tickets/0056-architecture-docs-rewrite.md) -- chore
