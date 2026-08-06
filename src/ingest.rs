@@ -687,12 +687,55 @@ pub fn apply_seen_flag(
     Ok(changed > 0)
 }
 
+/// Apply a whole mailbox's worth of server `\Seen` states in one transaction,
+/// returning how many rows actually changed.
+///
+/// Every sync pass hands over the flags of every message the server listed, so
+/// this is O(mailbox) `UPDATE`s per pass. In autocommit each one is its own
+/// fsync; one transaction makes the pass a single commit. Both backends go
+/// through here.
+///
+/// Best-effort in the same sense as [`prune_vanished`]: a row that refuses to
+/// update is logged and the rest still go. A commit that fails loses the whole
+/// pass's flag updates, which the next sync recomputes from the server, so it
+/// is logged and reported as zero rather than returned as an error.
+pub fn apply_seen_flags(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    flags: impl IntoIterator<Item = (i64, bool)>,
+) -> usize {
+    let tx = match store.conn().unchecked_transaction() {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!("Failed to open the read-flag transaction for '{mailbox}': {e:#}");
+            return 0;
+        }
+    };
+    let mut updated = 0;
+    for (uid, is_read) in flags {
+        match apply_seen_flag(store, account, mailbox, uid, is_read) {
+            Ok(true) => updated += 1,
+            Ok(false) => {}
+            Err(e) => warn!("Failed to apply the read flag for UID {uid}: {e:#}"),
+        }
+    }
+    if let Err(e) = tx.commit() {
+        warn!("Failed to commit the read flags for '{mailbox}': {e:#}");
+        return 0;
+    }
+    updated
+}
+
 /// Drop the rows of `mailbox` whose UIDs the server no longer lists, returning
 /// how many went.
 ///
-/// The set comes from [`crate::imap_client::vanished_uids`], which
-/// clamps it to the numeric range the fetch window actually covered, so a short
-/// window can only ever prune inside what the server proved.
+/// On the IMAP side the set comes from [`crate::imap_client::vanished_uids`],
+/// which clamps it to the numeric range the fetch window actually covered, so a
+/// short window can only ever prune inside what the server proved. The Graph
+/// side enumerates the whole folder every pass and needs no clamp, and its UIDs
+/// are the 63-bit [`graph_uid`] hashes rather than IMAP's `u32`: hence the
+/// generic width.
 ///
 /// Delete is the whole of it: there is no tombstone and no attempt to guess
 /// where the message went. The store is a droppable cache in front of the
@@ -709,16 +752,19 @@ pub fn apply_seen_flag(
 ///
 /// Best-effort by construction: a row that refuses to delete is logged and the
 /// rest still go, so there is no error to return.
-pub fn prune_vanished(
+pub fn prune_vanished<U>(
     store: &Store,
     blobs: &BlobStore,
     account: &str,
     mailbox: &str,
-    vanished: &[u32],
-) -> usize {
+    vanished: &[U],
+) -> usize
+where
+    U: Copy + Into<i64> + std::fmt::Display,
+{
     let mut pruned = 0;
     for uid in vanished {
-        match crate::store::write::delete_by_uid(store, blobs, account, mailbox, *uid as i64) {
+        match crate::store::write::delete_by_uid(store, blobs, account, mailbox, (*uid).into()) {
             Ok(Some(_)) => pruned += 1,
             Ok(None) => {}
             Err(e) => warn!("Failed to prune UID {uid} from '{mailbox}': {e:#}"),

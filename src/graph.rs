@@ -14,8 +14,17 @@ use serde::Deserialize;
 use crate::config::GraphConfig;
 use crate::imap_client::{FreshObservation, SyncResult, SyncTarget};
 use crate::parse::{sanitize_attachment_filename, AttachmentData, FetchedEmail};
+use crate::timing::TimingSpan;
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+
+/// The `$select` a full message fetch needs, shared by every endpoint that
+/// returns whole messages so they all hydrate the same [`FetchedEmail`].
+const MESSAGE_SELECT: &str =
+    "id,internetMessageId,subject,from,toRecipients,ccRecipients,body,receivedDateTime,hasAttachments,isRead";
+
+/// Graph's hard ceiling on the number of requests in one `/$batch` call.
+const BATCH_MAX_REQUESTS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // GraphClient
@@ -64,6 +73,25 @@ impl GraphClient {
 
     fn bearer(&self) -> String {
         self.access_token.clone()
+    }
+
+    /// Refresh the access token in place, keeping the reqwest client and its
+    /// connection pool.
+    ///
+    /// For the long-lived callers (the TUI watcher): an access token expires
+    /// after about an hour, so a client built once and never touched starts
+    /// returning 401 mid-session, but rebuilding the whole client per poll
+    /// throws away the connection pool as well. `load_or_refresh_token` hits
+    /// the network only when the cached token has actually expired.
+    pub async fn refresh_token(&mut self, config: &GraphConfig) -> Result<()> {
+        self.access_token = crate::oauth2::load_or_refresh_token(
+            &config.account_name,
+            &config.client_id,
+            &config.tenant_id,
+            crate::oauth2::GRAPH_SCOPES,
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -162,14 +190,18 @@ struct GraphAttachmentList {
     value: Vec<GraphAttachment>,
 }
 
-/// Lightweight response for fetching just Message-IDs and read status.
+/// Lightweight response for enumerating a folder: everything the sync needs
+/// about a message without downloading it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphMessageIdEntry {
+    id: String,
     #[serde(default)]
     internet_message_id: Option<String>,
     #[serde(default)]
     is_read: bool,
+    #[serde(default)]
+    received_date_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +209,38 @@ struct GraphMessageIdList {
     value: Vec<GraphMessageIdEntry>,
     #[serde(rename = "@odata.nextLink")]
     next_link: Option<String>,
+}
+
+/// What a folder enumeration knows about one message it listed.
+///
+/// Keyed by `internetMessageId` (the identity the store uses, see
+/// [`crate::ingest::graph_uid`]); this is the rest of the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderEntry {
+    /// Graph's own message id: the only handle that fetches *this* message,
+    /// rather than whatever currently sits in the folder's recency window.
+    pub graph_id: String,
+    /// The server's `\Seen` equivalent.
+    pub is_read: bool,
+    /// `receivedDateTime` verbatim (ISO 8601, always UTC from Graph), used to
+    /// order a capped download newest-first. Sorts as a string, which is why
+    /// the UTC form matters; `None` sorts oldest.
+    pub received: Option<String>,
+}
+
+/// One entry of a `/$batch` response.
+#[derive(Debug, Deserialize)]
+struct GraphBatchEntry {
+    id: String,
+    status: u16,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphBatchResponse {
+    #[serde(default)]
+    responses: Vec<GraphBatchEntry>,
 }
 
 /// Lightweight response for finding a message by internet message ID.
@@ -208,6 +272,25 @@ fn format_recipients(recipients: &[GraphRecipient]) -> String {
         .map(format_recipient)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The JSON body of a `/$batch` call fetching one message per id.
+///
+/// The request id is the index into `ids`, which is how the caller matches a
+/// response back to the message it asked for.
+fn batch_request_body(ids: &[&str]) -> serde_json::Value {
+    let requests: Vec<serde_json::Value> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            serde_json::json!({
+                "id": i.to_string(),
+                "method": "GET",
+                "url": format!("/me/messages/{}?$select={}", id, MESSAGE_SELECT),
+            })
+        })
+        .collect();
+    serde_json::json!({ "requests": requests })
 }
 
 /// Convert an ISO 8601 datetime (e.g. "2024-01-15T10:30:00Z") to RFC 2822 format.
@@ -278,8 +361,8 @@ impl GraphClient {
             "{}/me/mailFolders/{}/messages?\
              $top={}&\
              $orderby=receivedDateTime desc&\
-             $select=id,internetMessageId,subject,from,toRecipients,ccRecipients,body,receivedDateTime,hasAttachments,isRead",
-            GRAPH_BASE, folder_path, limit
+             $select={}",
+            GRAPH_BASE, folder_path, limit, MESSAGE_SELECT
         );
 
         let resp = self
@@ -306,21 +389,98 @@ impl GraphClient {
 
         let mut emails = Vec::with_capacity(msg_list.value.len());
         for msg in &msg_list.value {
-            let mut email = graph_message_to_fetched_email(msg);
-
-            // Fetch attachments if the message has them
-            if msg.has_attachments {
-                match self.fetch_attachments(&msg.id).await {
-                    Ok(attachments) => email.attachments = attachments,
-                    Err(e) => warn!("Failed to fetch attachments for {}: {}", msg.id, e),
-                }
-                populate_calendar_from_attachments(&mut email);
-            }
-
-            emails.push(email);
+            emails.push(self.hydrate(msg).await);
         }
 
         Ok(emails)
+    }
+
+    /// Fetch messages by their Graph ids, in batches of
+    /// [`BATCH_MAX_REQUESTS`].
+    ///
+    /// This is what makes a Graph sync converge. Asking a folder for its `$top`
+    /// most recent messages can never return a message that is new to the store
+    /// but old on the server (one moved into Archive, say), so detection kept
+    /// reporting it and the download kept missing it; naming each message by id
+    /// downloads exactly what detection found.
+    ///
+    /// A message that fails inside the batch is logged and skipped: the rest of
+    /// the pass still lands, and a message that was not ingested is simply new
+    /// again next sync.
+    pub async fn fetch_messages_by_ids(&self, ids: &[&str]) -> Result<Vec<FetchedEmail>> {
+        let url = format!("{}/$batch", GRAPH_BASE);
+        let mut emails = Vec::with_capacity(ids.len());
+
+        for chunk in ids.chunks(BATCH_MAX_REQUESTS) {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(self.bearer())
+                .json(&batch_request_body(chunk))
+                .send()
+                .await
+                .context("Failed to fetch messages by id")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "Batch message fetch failed (HTTP {}): {}",
+                    status,
+                    body
+                ));
+            }
+
+            let batch: GraphBatchResponse = resp
+                .json()
+                .await
+                .context("Failed to parse the batch response")?;
+
+            for entry in batch.responses {
+                // Graph is free to reorder the responses, so the request id
+                // (the index into `chunk`) is the only correlation.
+                let requested = entry
+                    .id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| chunk.get(i).copied())
+                    .unwrap_or("<unknown>");
+                if entry.status != 200 {
+                    warn!(
+                        "Batch fetch of message {} failed (HTTP {}): {}",
+                        requested,
+                        entry.status,
+                        entry.body.map(|b| b.to_string()).unwrap_or_default(),
+                    );
+                    continue;
+                }
+                let Some(body) = entry.body else {
+                    warn!("Batch fetch of message {requested} returned no body");
+                    continue;
+                };
+                match serde_json::from_value::<GraphMessage>(body) {
+                    Ok(msg) => emails.push(self.hydrate(&msg).await),
+                    Err(e) => warn!("Batch fetch of message {requested} did not parse: {e}"),
+                }
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Turn one Graph message into a [`FetchedEmail`], pulling its attachments
+    /// and lifting an iMIP invite out of them. Attachment failures are logged
+    /// and leave the email otherwise intact.
+    async fn hydrate(&self, msg: &GraphMessage) -> FetchedEmail {
+        let mut email = graph_message_to_fetched_email(msg);
+        if msg.has_attachments {
+            match self.fetch_attachments(&msg.id).await {
+                Ok(attachments) => email.attachments = attachments,
+                Err(e) => warn!("Failed to fetch attachments for {}: {}", msg.id, e),
+            }
+            populate_calendar_from_attachments(&mut email);
+        }
+        email
     }
 
     /// Fetch attachments for a specific message.
@@ -471,16 +631,23 @@ fn populate_calendar_from_attachments(email: &mut FetchedEmail) {
 // ---------------------------------------------------------------------------
 
 impl GraphClient {
-    /// Fetch all internet message IDs from a folder (for dedup).
-    /// Also returns the read status for each message.
-    pub async fn fetch_message_ids(
-        &self,
-        folder: &str,
-    ) -> Result<HashMap<String, bool>> {
+    /// Enumerate a folder: every message it holds, keyed by
+    /// `internetMessageId`, with the handle and the metadata the sync needs to
+    /// decide what to download, what to re-flag and what has gone.
+    ///
+    /// Messages without an `internetMessageId` are dropped, because the store
+    /// identifies a Graph message by exactly that header (see
+    /// [`crate::ingest::graph_uid`]) and an entry that cannot be matched to a
+    /// row would look like a permanent new message. Since #0055 the sync also
+    /// prunes from this enumeration, so such a message is not merely never
+    /// downloaded but dropped locally if an older sync did download it;
+    /// Exchange stamps the header on everything that goes through transport,
+    /// which is what makes that acceptable.
+    pub async fn enumerate_folder(&self, folder: &str) -> Result<HashMap<String, FolderEntry>> {
         let folder_path = resolve_folder_path(folder);
         let mut result = HashMap::new();
         let mut url = format!(
-            "{}/me/mailFolders/{}/messages?$select=internetMessageId,isRead&$top=200",
+            "{}/me/mailFolders/{}/messages?$select=id,internetMessageId,isRead,receivedDateTime&$top=200",
             GRAPH_BASE, folder_path
         );
 
@@ -510,7 +677,14 @@ impl GraphClient {
             for entry in page.value {
                 if let Some(mid) = entry.internet_message_id {
                     if !mid.is_empty() {
-                        result.insert(mid, entry.is_read);
+                        result.insert(
+                            mid,
+                            FolderEntry {
+                                graph_id: entry.id,
+                                is_read: entry.is_read,
+                                received: entry.received_date_time,
+                            },
+                        );
                     }
                 }
             }
@@ -524,48 +698,77 @@ impl GraphClient {
         Ok(result)
     }
 
-    /// Two-pass fetch: first get IDs, then full messages for new ones only.
-    /// Returns (new_emails, skipped_count, server_read_flags), where the flag
-    /// map covers *every* message in the folder so the ingest path can apply
-    /// read-status changes to rows it already holds.
+    /// Two-pass fetch: enumerate the folder, then download by id the messages
+    /// the store does not hold.
+    ///
+    /// Returns (new_emails, skipped_count, folder_enumeration). The enumeration
+    /// covers *every* message in the folder, so the caller can both apply
+    /// read-status changes to rows it already holds and see what has gone.
     pub async fn fetch_new_messages(
         &self,
         folder: &str,
         limit: usize,
         known_ids: &HashSet<String>,
-    ) -> Result<(Vec<FetchedEmail>, usize, HashMap<String, bool>)> {
-        let server_ids = self.fetch_message_ids(folder).await?;
-        let new_ids: Vec<&String> = server_ids
-            .keys()
-            .filter(|id| !known_ids.contains(id.as_str()))
-            .collect();
+    ) -> Result<(Vec<FetchedEmail>, usize, HashMap<String, FolderEntry>)> {
+        let server = self.enumerate_folder(folder).await?;
+        let mut new = new_ids_newest_first(&server, known_ids);
+        let skipped = server.len() - new.len();
+        new.truncate(limit);
 
-        let skipped = server_ids.len() - new_ids.len();
-        let to_fetch = new_ids.len().min(limit);
-
-        if to_fetch == 0 {
-            return Ok((Vec::new(), skipped, server_ids));
+        if new.is_empty() {
+            return Ok((Vec::new(), skipped, server));
         }
 
-        // Fetch the full messages. We use the folder endpoint with a limit,
-        // then filter to only the new ones.
-        let fetch_limit = to_fetch + skipped.min(20); // over-fetch slightly for robustness
-        let all = self.fetch_messages(folder, fetch_limit).await?;
+        let graph_ids: Vec<&str> = new.iter().map(|entry| entry.graph_id.as_str()).collect();
+        let emails = self.fetch_messages_by_ids(&graph_ids).await?;
 
-        let new_set: HashSet<&str> = new_ids.iter().map(|s| s.as_str()).collect();
-        let filtered: Vec<FetchedEmail> = all
-            .into_iter()
-            .filter(|e| {
-                e.message_id
-                    .as_deref()
-                    .map(|mid| new_set.contains(mid))
-                    .unwrap_or(true) // keep messages without message-id (unlikely)
-            })
-            .take(to_fetch)
-            .collect();
-
-        Ok((filtered, skipped, server_ids))
+        Ok((emails, skipped, server))
     }
+}
+
+/// The folder's messages the store does not hold, newest first.
+///
+/// Newest first is what makes a capped sync useful (the quick sync passes
+/// `limit = 100`): the pass downloads the most recent arrivals, and because it
+/// downloads them *by id* the leftovers are known next pass, so a backlog
+/// drains one window at a time instead of the same window repeating. Ties and
+/// missing dates fall back to the message id so the order is total and a
+/// truncated pass is reproducible.
+fn new_ids_newest_first<'a>(
+    server: &'a HashMap<String, FolderEntry>,
+    known_ids: &HashSet<String>,
+) -> Vec<&'a FolderEntry> {
+    let mut new: Vec<(&str, &FolderEntry)> = server
+        .iter()
+        .filter(|(mid, _)| !known_ids.contains(mid.as_str()))
+        .map(|(mid, entry)| (mid.as_str(), entry))
+        .collect();
+    new.sort_by(|(a_mid, a), (b_mid, b)| {
+        b.received
+            .cmp(&a.received)
+            .then_with(|| a_mid.cmp(b_mid))
+    });
+    new.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// The rows the store holds for a mailbox that the folder no longer lists, as
+/// the synthetic UIDs [`crate::ingest::graph_uid`] gives them.
+///
+/// The Graph counterpart of [`crate::imap_client::vanished_uids`], and simpler:
+/// the enumeration covers the whole folder rather than a recency window, so
+/// there is no range to clamp the diff to. An enumeration that came back short
+/// is not a case to defend against here, because a failed page is an error the
+/// caller skips the whole target on; an enumeration that came back empty means
+/// an empty folder, and emptying a folder on the server does empty it locally.
+fn vanished_graph_uids(
+    known_ids: &HashSet<String>,
+    server: &HashMap<String, FolderEntry>,
+) -> Vec<i64> {
+    known_ids
+        .iter()
+        .filter(|mid| !server.contains_key(mid.as_str()))
+        .map(|mid| crate::ingest::graph_uid(mid))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -581,9 +784,15 @@ impl GraphClient {
 ///   the message's `Message-ID`, which is stable per message and keeps the
 ///   `UNIQUE (account, mailbox, uid)` identity meaningful.
 ///
-/// TODO(#0037-4b-or-0038): this still enumerates `internetMessageId` for the
-/// whole folder on every pass. The `sync_cursors.deltalink` column is written
-/// as NULL until the `/messages/delta` fetch replaces that enumeration.
+/// The orchestration mirrors [`crate::imap_client::sync_mailboxes`] line for
+/// line, prune second pass included: the prunes are held back until every
+/// target has been ingested, so a message archived in Outlook web has its
+/// archive row before its inbox row goes and never spends a window with no row
+/// anywhere (#0055).
+///
+/// TODO(#0042): this still enumerates `internetMessageId` for the whole folder
+/// on every pass. The `sync_cursors.deltalink` column is written as NULL until
+/// the `/messages/delta` fetch replaces that enumeration.
 pub async fn sync_mailboxes_graph(
     config: &GraphConfig,
     account_name: &str,
@@ -595,16 +804,28 @@ pub async fn sync_mailboxes_graph(
         "sync_mailboxes_graph: account={account_name}, {} targets, limit={limit}, dry_run={dry_run}",
         targets.len(),
     );
+    let span_label = if limit < usize::MAX {
+        "sync_mailboxes_graph:quick"
+    } else {
+        "sync_mailboxes_graph:full"
+    };
+    let mut span =
+        TimingSpan::with_context(span_label, format!("{} targets", targets.len()));
 
     let client = GraphClient::new_async(config).await?;
     let store = crate::store::Store::open_account(account_name)?;
     let blobs = crate::store::BlobStore::for_account(account_name);
     let mut result = SyncResult::default();
+    span.mark("client_open");
+
+    // Every prune this run will apply, collected here and applied after the
+    // loop: see the second pass below for why it cannot run per target.
+    let mut prunes: Vec<(String, Vec<i64>)> = Vec::new();
 
     for target in targets {
         let known = crate::ingest::known_message_ids(&store, account_name, &target.role)?;
 
-        let (new_emails, skipped, server_flags) = match client
+        let (new_emails, skipped, server) = match client
             .fetch_new_messages(&target.server_name, limit, &known)
             .await
         {
@@ -615,6 +836,7 @@ pub async fn sync_mailboxes_graph(
             }
         };
         result.skipped += skipped;
+        span.mark(&format!("fetch:{}", target.role));
 
         if dry_run {
             result.saved += new_emails.len();
@@ -658,16 +880,26 @@ pub async fn sync_mailboxes_graph(
                 Err(e) => warn!("Failed to ingest {} from {}: {:#}", message_id, target.role, e),
             }
         }
+        span.mark(&format!("ingest:{}", target.role));
 
-        // Read status for messages the store already holds.
-        for (mid, is_read) in &server_flags {
-            let uid = crate::ingest::graph_uid(mid);
-            match crate::ingest::apply_seen_flag(&store, account_name, &target.role, uid, *is_read)
-            {
-                Ok(true) => result.read_updated += 1,
-                Ok(false) => {}
-                Err(e) => warn!("Failed to apply the read flag for {mid}: {e:#}"),
-            }
+        // Read status for messages the store already holds, one transaction
+        // for the whole folder.
+        result.read_updated += crate::ingest::apply_seen_flags(
+            &store,
+            account_name,
+            &target.role,
+            server
+                .iter()
+                .map(|(mid, entry)| (crate::ingest::graph_uid(mid), entry.is_read)),
+        );
+        span.mark(&format!("flags:{}", target.role));
+
+        // The other half of the same diff: what the store holds here and the
+        // server does not. Held back until every target has been ingested (see
+        // the second pass below).
+        let vanished = vanished_graph_uids(&known, &server);
+        if !vanished.is_empty() {
+            prunes.push((target.role.clone(), vanished));
         }
 
         crate::ingest::record_mailbox_cursor(
@@ -678,12 +910,22 @@ pub async fn sync_mailboxes_graph(
                 uidvalidity: None,
                 last_uid: None,
                 uidnext: None,
-                exists: Some(server_flags.len() as i64),
+                exists: Some(server.len() as i64),
                 highest_modseq: None,
                 deltalink: None,
             },
         )?;
     }
+
+    // Second pass: every prune, after every target has been ingested. The
+    // ordering argument is [`crate::imap_client::sync_mailboxes`]'s, and holds
+    // here for the same reason: targets are synced inbox, archive, sent, so
+    // pruning inside the loop would delete the inbox row of a message archived
+    // in Outlook web before the archive pass ingests it.
+    for (role, vanished) in &prunes {
+        result.pruned += crate::ingest::prune_vanished(&store, &blobs, account_name, role, vanished);
+    }
+    span.mark("prune");
 
     Ok(result)
 }
@@ -1299,6 +1541,108 @@ mod tests {
         assert!(email.event.is_none());
         assert_eq!(email.attachments.len(), 1);
         assert_eq!(email.attachments[0].filename, "schedule.ics");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sync diff: what a folder enumeration says to download and to prune
+    // -----------------------------------------------------------------------
+
+    fn entry(graph_id: &str, received: Option<&str>) -> FolderEntry {
+        FolderEntry {
+            graph_id: graph_id.to_string(),
+            is_read: false,
+            received: received.map(|s| s.to_string()),
+        }
+    }
+
+    /// A folder as the server enumerates it: `(internetMessageId, graph id,
+    /// receivedDateTime)`.
+    fn folder(rows: &[(&str, &str, Option<&str>)]) -> HashMap<String, FolderEntry> {
+        rows.iter()
+            .map(|(mid, gid, received)| (mid.to_string(), entry(gid, *received)))
+            .collect()
+    }
+
+    fn known(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The defect that made a Graph sync never converge: a message that is new
+    /// to the store but old on the server. Detection always found it; the
+    /// download asked the folder for its most recent messages and never got it
+    /// back. Selection now hands the caller that message's own Graph id.
+    #[test]
+    fn an_old_message_new_to_the_store_is_selected_for_download() {
+        let server = folder(&[
+            ("<recent@x>", "AAA", Some("2026-08-06T10:00:00Z")),
+            ("<moved-in@x>", "BBB", Some("2024-01-01T09:00:00Z")),
+        ]);
+        let selected = new_ids_newest_first(&server, &known(&["<recent@x>"]));
+        assert_eq!(
+            selected.iter().map(|e| e.graph_id.as_str()).collect::<Vec<_>>(),
+            vec!["BBB"],
+        );
+    }
+
+    /// Newest first, so a capped pass takes the arrivals a user is waiting for;
+    /// no `received` sorts last rather than dropping out.
+    #[test]
+    fn new_ids_come_back_newest_first() {
+        let server = folder(&[
+            ("<old@x>", "OLD", Some("2026-01-01T00:00:00Z")),
+            ("<new@x>", "NEW", Some("2026-08-06T00:00:00Z")),
+            ("<undated@x>", "UND", None),
+        ]);
+        let selected = new_ids_newest_first(&server, &HashSet::new());
+        assert_eq!(
+            selected.iter().map(|e| e.graph_id.as_str()).collect::<Vec<_>>(),
+            vec!["NEW", "OLD", "UND"],
+        );
+    }
+
+    /// Same timestamp on two messages must still give one order, or a truncated
+    /// pass would pick a different pair each time and neither would land.
+    #[test]
+    fn ties_break_on_the_message_id_so_a_capped_pass_is_reproducible() {
+        let server = folder(&[
+            ("<b@x>", "B", Some("2026-08-06T00:00:00Z")),
+            ("<a@x>", "A", Some("2026-08-06T00:00:00Z")),
+        ]);
+        let first = new_ids_newest_first(&server, &HashSet::new());
+        let second = new_ids_newest_first(&server, &HashSet::new());
+        assert_eq!(
+            first.iter().map(|e| e.graph_id.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B"],
+        );
+        assert_eq!(first, second);
+    }
+
+    /// The prune set: what the store holds for this mailbox and the server did
+    /// not list, as the UIDs the rows carry.
+    #[test]
+    fn a_message_gone_from_the_folder_is_a_vanished_uid() {
+        let server = folder(&[("<stays@x>", "AAA", None)]);
+        let vanished = vanished_graph_uids(&known(&["<stays@x>", "<archived@x>"]), &server);
+        assert_eq!(vanished, vec![crate::ingest::graph_uid("<archived@x>")]);
+    }
+
+    #[test]
+    fn a_folder_the_store_matches_prunes_nothing() {
+        let server = folder(&[("<a@x>", "AAA", None), ("<b@x>", "BBB", None)]);
+        assert!(vanished_graph_uids(&known(&["<a@x>", "<b@x>"]), &server).is_empty());
+    }
+
+    #[test]
+    fn batch_body_names_one_get_per_id() {
+        let body = batch_request_body(&["AAA", "BBB"]);
+        let requests = body["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["id"], "0");
+        assert_eq!(requests[1]["id"], "1");
+        assert_eq!(requests[0]["method"], "GET");
+        let url = requests[1]["url"].as_str().unwrap();
+        assert!(url.starts_with("/me/messages/BBB?$select="), "got {url}");
+        assert!(url.contains("internetMessageId"));
     }
 
     #[test]

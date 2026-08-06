@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **A Graph sync now converges, prunes, and says so in the timing log
+  (#0055).** The sync fixes the IMAP path got over the last months had never
+  reached the Graph backend, which still behaved like the file era. Six defects
+  went together. **Mail archived or deleted in Outlook web now disappears
+  locally**: the folder enumeration already covered every message, so the ids
+  the store holds and the server no longer lists are the vanished set, pruned
+  after every mailbox has been ingested, the same ordering the IMAP side uses so
+  an archived message always has its archive row before its inbox row goes. **A
+  message that is new to the store but old on the server is downloaded once**
+  instead of being re-detected on every sync forever: detection looked at the
+  whole folder while the download asked for the most recent `$top` messages, a
+  mismatch a `skipped.min(20)` fudge admitted to; messages are now fetched by
+  their own id, twenty per Graph `/$batch` call, newest first so a capped pass
+  still takes the arrivals a user is waiting for. **The TUI watcher compares the
+  set of inbox ids rather than how many there are**, so one arrival plus one
+  archive inside the same minute is no longer invisible, and it keeps one client
+  (refreshing only the token) instead of paying a keyring read and a fresh
+  connection pool every poll. **A revoked Graph token now reaches the user**: it
+  used to be one silent failed request per minute forever, and is now a widening
+  poll interval sharing the outbox's backoff curve, up to 15 minutes, plus a
+  visible watch error after three consecutive failures. A sync's per-message
+  read-flag updates land in **one transaction per mailbox** on both backends
+  rather than one commit per message, and the Graph sync path carries the same
+  `[TIMING]` marks as the IMAP one.
 - **A contacts rebuild no longer wipes the frecency index (#0053).** The
   extractor was the last thing still walking the `.md` tree the store cutover
   deleted: it found zero messages, and `mp contacts rebuild`, the cold-cache

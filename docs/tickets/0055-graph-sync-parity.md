@@ -3,7 +3,7 @@ id: 0055
 title: Graph backend sync parity (prune, converge, watcher, transactions, timing, backoff)
 type: bug
 priority: now
-status: open
+status: done
 created: 2026-08-06
 ---
 

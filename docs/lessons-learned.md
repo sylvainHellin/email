@@ -433,3 +433,18 @@ When a fallback is written that trades a guarantee for availability, every later
 When the source was the deleted `.md` tree the exchange was a populated cache for nothing at all, and three call sites persisted it without looking (#0053).
 The source being right again does not retire the guard, because the sources are not equivalent: an account whose store carries no rows yet still has months of hook observations, and a rebuild would still trade them for zero.
 An empty result from a full rebuild is now read as a failure to read rather than as an empty world, and refused ([src/contacts/cache.rs](../src/contacts/cache.rs), `save_rebuilt_cache`).
+
+## A detection window and a download window that are not the same window never converge
+
+The Graph sync decided what was new by enumerating the whole folder and then downloaded it by asking the folder for its `$top` most recent messages.
+For a message that is new to the store but old on the server, one message moved into Archive in Outlook web, the two windows never intersected: it was reported new on every sync and downloaded on none, and the `skipped.min(20)` over-fetch in the code was an admission that the numbers were not expected to line up.
+No error surfaced, because both halves were doing exactly what they were written to do.
+The fix is to make the download name what detection found rather than approximate it: fetch each detected id by id, twenty per Graph `/$batch` call ([src/graph.rs](../src/graph.rs), `fetch_messages_by_ids`).
+When a diff is computed over one set and applied to another, the sync's progress depends on an overlap nothing in the code enforces; make the second set the output of the first.
+
+## Reusing a client across a poll loop means owning its token's expiry
+
+Rebuilding the Graph client on every watcher pass cost a keyring read and a fresh connection pool per minute, but it also hid a dependency: it refreshed the OAuth2 access token as a side effect.
+Keeping one client for the life of the watcher removes the cost and the refresh together, and an access token expires after about an hour, so the loop would have started 401-ing mid-session with nothing in the code saying why.
+`GraphClient::refresh_token` now updates the token in place and the watcher calls it once per pass, which keeps the pool and re-reads the cached token only ([src/graph.rs](../src/graph.rs), [src/tui/helpers.rs](../src/tui/helpers.rs)).
+Before hoisting a construction out of a loop, list what the constructor did besides construct.

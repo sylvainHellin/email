@@ -188,13 +188,15 @@ pub async fn sync_mailboxes(
             }
         }
 
-        for (uid, is_read) in fetched.known_flags {
-            match ingest::apply_seen_flag(&store, account_name, &target.role, uid as i64, is_read) {
-                Ok(true) => result.read_updated += 1,
-                Ok(false) => {}
-                Err(e) => warn!("Failed to apply the read flag for UID {uid}: {e:#}"),
-            }
-        }
+        result.read_updated += ingest::apply_seen_flags(
+            &store,
+            account_name,
+            &target.role,
+            fetched
+                .known_flags
+                .into_iter()
+                .map(|(uid, is_read)| (uid as i64, is_read)),
+        );
 
         // The other half of the same diff: the UIDs the store holds inside
         // the window's range that the server did not list. Held back until

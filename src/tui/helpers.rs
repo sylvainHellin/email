@@ -96,11 +96,42 @@ pub(super) fn watcher_loop(
     }
 }
 
+/// How long the Graph watcher waits between polls, and how that widens after
+/// consecutive failures.
+const GRAPH_POLL_SECS: u64 = 60;
+
+/// Consecutive failed polls before the user is told. One failure is a hiccup
+/// (a dropped connection, a throttled request); three in a row is an account
+/// that needs attention, typically a refresh token the tenant revoked.
+const GRAPH_FAILURES_BEFORE_ALERT: u32 = 3;
+
+/// The delay before the next Graph poll after `failures` consecutive failures.
+///
+/// Shares [`crate::outbox::backoff_secs`] rather than hand-rolling a second
+/// curve, floored at the normal poll interval (backing *off* must never poll
+/// more often) and capped by that function at 15 minutes.
+fn graph_poll_delay(failures: u32) -> std::time::Duration {
+    let backoff = crate::outbox::backoff_secs(failures as i64).max(0) as u64;
+    std::time::Duration::from_secs(backoff.max(GRAPH_POLL_SECS))
+}
+
+/// Poll the Graph inbox for change.
+///
+/// Compares the *set* of message ids, not its cardinality: one arrival plus one
+/// archive inside the same interval leaves the count untouched and used to pass
+/// unnoticed. One [`crate::graph::GraphClient`] serves the whole loop, its
+/// token refreshed in place per pass, so a poll costs one enumeration rather
+/// than a keyring read and a fresh connection pool as well.
+///
+/// Still an enumeration of the whole folder every minute; the delta query that
+/// removes it is #0042.
 pub(super) fn graph_watcher_loop(
     tx: mpsc::Sender<WatchEvent>,
     graph_config: crate::config::GraphConfig,
     account_index: usize,
 ) {
+    use std::collections::HashSet;
+
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(_) => {
@@ -112,34 +143,64 @@ pub(super) fn graph_watcher_loop(
         }
     };
 
-    let mut last_count: Option<usize> = None;
-    let poll_interval = std::time::Duration::from_secs(60);
+    let mut client: Option<crate::graph::GraphClient> = None;
+    let mut known: Option<HashSet<String>> = None;
+    let mut consecutive_failures: u32 = 0;
+    // Whether the UI has been told about the current failure run, so the
+    // "reconnected" that clears it is only sent when there is something to
+    // clear.
+    let mut alerted = false;
 
     loop {
-        match rt.block_on(async {
-            let client = crate::graph::GraphClient::new_async(&graph_config).await?;
-            let ids = client.fetch_message_ids("inbox").await?;
-            Ok::<usize, anyhow::Error>(ids.len())
-        }) {
-            Ok(count) => {
-                if let Some(prev) = last_count {
-                    if count != prev {
-                        if tx.send(WatchEvent::Changed { account_index }).is_err() {
-                            break;
-                        }
-                    }
+        let poll = rt.block_on(async {
+            match client.as_mut() {
+                Some(existing) => existing.refresh_token(&graph_config).await?,
+                None => {
+                    client = Some(crate::graph::GraphClient::new_async(&graph_config).await?);
                 }
-                last_count = Some(count);
+            }
+            let client = client.as_ref().expect("client built above");
+            let folder = client.enumerate_folder("inbox").await?;
+            Ok::<HashSet<String>, anyhow::Error>(folder.into_keys().collect())
+        });
+
+        match poll {
+            Ok(ids) => {
+                consecutive_failures = 0;
+                if alerted {
+                    alerted = false;
+                    let _ = tx.send(WatchEvent::Reconnected { account_index });
+                }
+                let changed = known.as_ref().is_some_and(|prev| *prev != ids);
+                known = Some(ids);
+                if changed && tx.send(WatchEvent::Changed { account_index }).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(GRAPH_POLL_SECS));
             }
             Err(e) => {
+                // The token is the likeliest thing to have gone stale, and it
+                // lives in the client, so the next pass builds a new one.
+                client = None;
+                consecutive_failures = consecutive_failures.saturating_add(1);
                 log::warn!(
-                    "Graph watcher poll failed for account {}: {}",
+                    "Graph watcher poll failed for account {} ({} in a row): {:#}",
                     account_index,
+                    consecutive_failures,
                     e
                 );
+                if consecutive_failures == GRAPH_FAILURES_BEFORE_ALERT {
+                    alerted = true;
+                    let _ = tx.send(WatchEvent::Error {
+                        account_index,
+                        message: format!(
+                            "{consecutive_failures} failed polls, backing off: {e}"
+                        ),
+                    });
+                }
+                std::thread::sleep(graph_poll_delay(consecutive_failures));
             }
         }
-        std::thread::sleep(poll_interval);
     }
 }
 
@@ -352,6 +413,13 @@ pub(super) async fn lib_do_sync_graph(
     graph_config: &crate::config::GraphConfig,
     limit: usize,
 ) -> anyhow::Result<(String, SyncResultMeta)> {
+    let span_label = if limit < usize::MAX {
+        "lib_do_sync_graph:quick"
+    } else {
+        "lib_do_sync_graph:full"
+    };
+    let _span = crate::timing::TimingSpan::with_context(span_label, account_config.name.clone());
+
     let targets: Vec<SyncTarget> = all_configured_mailboxes(account_config)
         .iter()
         .map(|(role, mapping)| SyncTarget {
@@ -638,6 +706,29 @@ mod tests {
             calendar_ics: None,
             event: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Graph watcher
+    // -----------------------------------------------------------------------
+
+    /// The Graph watcher widens its poll interval as failures pile up instead
+    /// of retrying a revoked token once a minute forever, and never polls
+    /// *faster* than the healthy interval.
+    #[test]
+    fn the_graph_poll_delay_widens_and_never_dips_below_the_poll_interval() {
+        assert_eq!(graph_poll_delay(0).as_secs(), GRAPH_POLL_SECS);
+        assert_eq!(graph_poll_delay(1).as_secs(), GRAPH_POLL_SECS);
+        let widening: Vec<u64> = (1..=8).map(|n| graph_poll_delay(n).as_secs()).collect();
+        assert!(
+            widening.windows(2).all(|w| w[1] >= w[0]),
+            "delays must be monotonic: {widening:?}"
+        );
+        assert_eq!(
+            *widening.last().unwrap(),
+            crate::outbox::BACKOFF_MAX_SECS as u64,
+            "and settle at the shared ceiling"
+        );
     }
 
     // -----------------------------------------------------------------------

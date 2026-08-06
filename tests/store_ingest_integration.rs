@@ -1121,3 +1121,94 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
         .collect();
     assert_eq!(archive, vec!["<archived-elsewhere@example.com>".to_string()]);
 }
+
+/// A Graph message, whose identity is its `Message-ID` and whose UID is the
+/// hash of it.
+fn graph_email(message_id: &str, is_read: bool) -> FetchedEmail {
+    FetchedEmail {
+        from: "a@example.com".into(),
+        to: "b@example.com".into(),
+        cc: None,
+        subject: message_id.to_string(),
+        date: "Mon, 01 Jan 2024 12:00:00 +0000".into(),
+        body_text: format!("{message_id} body"),
+        html_body: None,
+        has_attachments: false,
+        message_id: Some(message_id.to_string()),
+        attachments: Vec::new(),
+        is_read,
+        calendar_ics: None,
+        event: None,
+    }
+}
+
+/// The Graph half of `a_message_archived_elsewhere_ends_up_in_the_archive_only`
+/// (#0055): a message archived in Outlook web leaves the inbox enumeration and
+/// appears in the archive one, and the same prune-after-every-ingest ordering
+/// leaves exactly the archive row. Graph UIDs are 63-bit hashes rather than
+/// IMAP's `u32`, which is the width the prune has to take.
+#[test]
+fn a_graph_message_archived_on_the_server_is_pruned_from_the_inbox() {
+    let f = Fixture::new();
+    let moved = "<moved@example.com>";
+    let stays = "<stays@example.com>";
+    let moved_uid = email::ingest::graph_uid(moved);
+    let stays_uid = email::ingest::graph_uid(stays);
+    f.ingest("inbox", moved_uid, &graph_email(moved, false), None);
+    f.ingest("inbox", stays_uid, &graph_email(stays, false), None);
+
+    // Archive pass ingests the moved copy first, exactly as the sync does.
+    assert!(f.ingest("archive", moved_uid, &graph_email(moved, false), None).inserted);
+    assert_eq!(f.message_rows(), 3);
+
+    // Inbox prune: the server enumeration no longer lists the moved message.
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &[moved_uid]),
+        1
+    );
+    assert_eq!(f.message_rows(), 2);
+
+    let inbox: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+        .unwrap()
+        .iter()
+        .map(|e| e.message_id.clone())
+        .collect();
+    assert_eq!(inbox, vec![stays.to_string()]);
+    let archive: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "archive")
+        .unwrap()
+        .iter()
+        .map(|e| e.message_id.clone())
+        .collect();
+    assert_eq!(archive, vec![moved.to_string()]);
+}
+
+/// The whole folder's read flags in one transaction: every changed row lands,
+/// a UID the store does not hold is a no-op rather than an error, and the
+/// return value counts only the rows that actually changed.
+#[test]
+fn a_pass_of_server_read_flags_applies_in_one_transaction() {
+    let f = Fixture::new();
+    let read_already = "<read@example.com>";
+    let unread = "<unread@example.com>";
+    f.ingest("inbox", email::ingest::graph_uid(read_already), &graph_email(read_already, true), None);
+    f.ingest("inbox", email::ingest::graph_uid(unread), &graph_email(unread, false), None);
+
+    let updated = email::ingest::apply_seen_flags(
+        &f.store,
+        "acct",
+        "inbox",
+        [
+            (email::ingest::graph_uid(read_already), true),
+            (email::ingest::graph_uid(unread), true),
+            (email::ingest::graph_uid("<never-ingested@example.com>"), true),
+        ],
+    );
+    assert_eq!(updated, 1, "only the row whose flags changed");
+
+    let flags: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+        .unwrap()
+        .iter()
+        .map(|e| e.flags.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(flags, vec!["\\Seen".to_string(), "\\Seen".to_string()]);
+}
