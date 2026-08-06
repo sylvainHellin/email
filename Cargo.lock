@@ -944,6 +944,7 @@ dependencies = [
  "mime_guess",
  "nucleo-matcher",
  "openssl",
+ "percent-encoding",
  "pulldown-cmark",
  "rand 0.8.5",
  "ratatui",

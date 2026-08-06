@@ -3,7 +3,7 @@ id: 0065
 title: Graph prune and batch hardening (Sent-copy deletion, trim asymmetry, paging, batch ids)
 type: bug
 priority: now
-status: open
+status: done
 created: 2026-08-06
 ---
 
@@ -77,3 +77,37 @@ Not silent (one `warn!` per pass) and it does not block the other 19 in the chun
 - A padded `internetMessageId` does not produce a delete-and-re-download loop; a test pins the trim on both sides.
 - A capped quick sync never leaves a message without a row in any mailbox.
 - A sub-request that fails permanently stops being retried and is visible as failed.
+
+## Resolution
+
+### 1. The age guard, not a `sent` exemption
+
+`crate::ingest::prunable_uids` drops any vanished uid whose row is dated within `PRUNE_MIN_AGE_SECS` (900 s, the watcher's longest poll delay) of now, in either direction, and the Graph prune runs on what it returns.
+
+Exempting the `sent` role was the cheaper edit and the worse trade.
+The locally-ingested copy is a *duplicate* of the server's copy from the moment Exchange files the item: exempting the role would have traded a rare permanent data loss for one permanent duplicate row per message ever sent through a Graph account, which is the accumulation #0055's prune was written to clear.
+The guard keeps both properties, because the danger is a window (the server has not filed the item yet) and not a state: the copy survives the window, and the pass after it expires still tidies the duplicate up.
+
+The age is the row's `date_sort`, its own `Date:` header, because the store has no ingest timestamp and adding one is a schema migration this ticket does not need; for a message this client has just composed the two are the same instant.
+The window is symmetric so that a sender's fast clock is covered and a message dated 2099 is still prunable rather than immortal.
+The cost is that a message *received* in the last quarter hour and deleted on the server keeps its row for one more pass.
+
+### 2 to 6
+
+2. `absorb_page` keys the enumeration on `mid.trim()`, matching `resolve_message_id`.
+3. The enumeration walks `$orderby=receivedDateTime desc` (the same `$orderby` `fetch_messages` already uses on this endpoint, and there is no `$filter` to conflict with), so a concurrent arrival lands on a page the walk has passed rather than shifting a message out of the window. `MAX_ENUMERATION_PAGES` (250, i.e. 50 000 messages) bounds the `next_link` loop, and hitting it marks the enumeration incomplete rather than letting a short walk read as a mass deletion.
+4. The prune is gated on the whole pass, not the target: `pass_may_prune` requires every target to have enumerated in full and downloaded its whole backlog, and a target whose fetch failed outright counts as neither. Per-target gating would not have worked, because the danger is cross-target -- the inbox prune of a message archived elsewhere is only safe because the *archive* pass ingested the copy, and the archive pass is the one a `limit = 100` quick sync truncates. A full sync never truncates, so a deferred prune is postponed, not lost.
+5. `batch_request_body` percent-encodes the id (`percent-encoding`, already in the lockfile via `reqwest` -> `url`).
+6. A 429 sub-response's `Retry-After` (capped at 120 s) pauses the pass before the next chunk goes out, and `BATCH_FAILURE_BUDGET` (50) stops a pass that is failing systematically. Visibility keeps the first five failures as individual `warn!` lines plus one summary line, instead of one per message on a 5 000-message first sync.
+
+### Deviations
+
+Item 6's "terminal state" is per pass, not persistent.
+A failing id that stops being retried *across* syncs needs somewhere to record it, which is a schema change; the give-up implemented here bounds the cost of one pass and leaves the retry to the next one.
+Filed as a note for #0059, where the backend seam is the natural home for a per-message failure count.
+
+### Verification
+
+No Graph account exists on this machine (confirmed during #0055), so none of this has met a live server; the enumeration, batch and prune paths have no HTTP mock in the test harness either.
+What is pinned by tests is the logic underneath: the age guard end to end through `outbox::ingest_sent_copy` (the row and its raw blob survive the pass that never listed them, and the duplicate goes one cycle later), the trim on both sides of the diff, the truncation report and the prune gate, the percent-encoding, and the `Retry-After` parse.
+Still needing first live contact: that Graph accepts `$orderby=receivedDateTime desc` on `/me/mailFolders/{id}/messages` alongside `$select` and paging, that a throttled batch really does carry `Retry-After` in the sub-response headers, and that the sent-copy window is as short in practice as it is assumed to be here.

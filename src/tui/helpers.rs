@@ -161,7 +161,7 @@ pub(super) fn graph_watcher_loop(
             }
             let client = client.as_ref().expect("client built above");
             let folder = client.enumerate_folder("inbox").await?;
-            Ok::<HashSet<String>, anyhow::Error>(folder.into_keys().collect())
+            Ok::<HashSet<String>, anyhow::Error>(folder.entries.into_keys().collect())
         });
 
         match poll {

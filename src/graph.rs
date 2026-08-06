@@ -26,6 +26,56 @@ const MESSAGE_SELECT: &str =
 /// Graph's hard ceiling on the number of requests in one `/$batch` call.
 const BATCH_MAX_REQUESTS: usize = 20;
 
+/// How many sub-request failures one `/$batch` pass tolerates before it stops
+/// asking for the rest.
+///
+/// A failing sub-request is skipped, so the message stays new and is retried
+/// next pass; without a budget a systematically failing id set (a revoked
+/// permission, a mailbox mid-migration) spends the whole sync issuing requests
+/// that cannot succeed and one `warn!` for each. Giving up after this many
+/// leaves the pass's successful downloads in place and the rest new.
+const BATCH_FAILURE_BUDGET: usize = 50;
+
+/// How many individual sub-request failures are logged before the pass falls
+/// back to a single summary line.
+const BATCH_FAILURE_WARN_LIMIT: usize = 5;
+
+/// Ceiling on a `Retry-After` a 429 sub-response asks for, so a hostile or
+/// mistaken header cannot park a sync for hours.
+const MAX_RETRY_AFTER_SECS: u64 = 120;
+
+/// Pages the folder enumeration will walk before giving up.
+///
+/// At `$top=200` this covers a 50 000-message folder. The guard exists because
+/// a `@odata.nextLink` loop has no other termination proof; hitting it marks
+/// the enumeration incomplete rather than truncating silently, because a short
+/// enumeration read as truth is a mass prune (see [`FolderEnumeration`]).
+const MAX_ENUMERATION_PAGES: usize = 250;
+
+/// The characters a Graph message id must not carry unescaped into a `/$batch`
+/// sub-request URL.
+///
+/// A direct `reqwest` GET hands the id to `Url`, which escapes what a path
+/// segment cannot hold; inside `/$batch` the URL is a JSON string that Graph
+/// parses itself, so the escaping has to happen here. v1.0 REST ids are
+/// base64url plus `=`, all legal in a path segment, so in practice this changes
+/// nothing; immutable ids and the standard base64 alphabet are why it is not
+/// nothing in principle (#0065).
+const ID_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
 // ---------------------------------------------------------------------------
 // GraphClient
 // ---------------------------------------------------------------------------
@@ -228,13 +278,64 @@ pub struct FolderEntry {
     pub received: Option<String>,
 }
 
+/// A whole folder as one enumeration saw it, and whether it saw all of it.
+///
+/// The flag is the prune's licence. `known − enumerated` is only a set of
+/// vanished messages if the enumeration actually covered the folder; an
+/// enumeration cut short by [`MAX_ENUMERATION_PAGES`] would make every message
+/// past the cut look deleted, so an incomplete pass is a pass that may fetch
+/// and re-flag but must not delete (#0065).
+#[derive(Debug, Clone, Default)]
+pub struct FolderEnumeration {
+    /// Every message the folder listed, keyed by its trimmed
+    /// `internetMessageId`.
+    pub entries: HashMap<String, FolderEntry>,
+    /// False when the page guard stopped the walk before the server ran out of
+    /// pages.
+    pub complete: bool,
+}
+
+/// What one target's fetch pass learned: the messages it downloaded, the ones
+/// it skipped as already known, the folder as enumerated, and whether `limit`
+/// cut the download short.
+pub struct FolderFetch {
+    pub new_emails: Vec<FetchedEmail>,
+    pub skipped: usize,
+    pub enumeration: FolderEnumeration,
+    /// True when there were more new messages than `limit` allowed, so the
+    /// leftovers are queued for a later pass. See [`sync_mailboxes_graph`] for
+    /// why that suspends the prune.
+    pub download_truncated: bool,
+}
+
 /// One entry of a `/$batch` response.
 #[derive(Debug, Deserialize)]
 struct GraphBatchEntry {
     id: String,
     status: u16,
+    /// The sub-response's own headers. Only `Retry-After` is read, and only on
+    /// a 429: Graph throttles per sub-request, so the outer POST can be a 200
+    /// while individual messages are being told to slow down.
+    #[serde(default)]
+    headers: HashMap<String, String>,
     #[serde(default)]
     body: Option<serde_json::Value>,
+}
+
+impl GraphBatchEntry {
+    /// The `Retry-After` this sub-response asks for, in seconds, when it is a
+    /// throttle. Header names are matched case-insensitively because Graph
+    /// does not promise a casing.
+    fn retry_after_secs(&self) -> Option<u64> {
+        if self.status != 429 {
+            return None;
+        }
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,16 +378,18 @@ fn format_recipients(recipients: &[GraphRecipient]) -> String {
 /// The JSON body of a `/$batch` call fetching one message per id.
 ///
 /// The request id is the index into `ids`, which is how the caller matches a
-/// response back to the message it asked for.
+/// response back to the message it asked for. The message id is percent-encoded
+/// ([`ID_ENCODE_SET`]) because nothing else on this path will do it.
 fn batch_request_body(ids: &[&str]) -> serde_json::Value {
     let requests: Vec<serde_json::Value> = ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
+            let encoded = percent_encoding::utf8_percent_encode(id, ID_ENCODE_SET);
             serde_json::json!({
                 "id": i.to_string(),
                 "method": "GET",
-                "url": format!("/me/messages/{}?$select={}", id, MESSAGE_SELECT),
+                "url": format!("/me/messages/{}?$select={}", encoded, MESSAGE_SELECT),
             })
         })
         .collect();
@@ -406,12 +509,25 @@ impl GraphClient {
     ///
     /// A message that fails inside the batch is logged and skipped: the rest of
     /// the pass still lands, and a message that was not ingested is simply new
-    /// again next sync.
+    /// again next sync. Two guards keep that from becoming a treadmill (#0065):
+    /// a 429 sub-response's `Retry-After` paces the remaining chunks, and after
+    /// [`BATCH_FAILURE_BUDGET`] failures the pass stops asking and reports what
+    /// it got, so a systematically failing id set costs one pass rather than
+    /// one request and one log line per message.
     pub async fn fetch_messages_by_ids(&self, ids: &[&str]) -> Result<Vec<FetchedEmail>> {
         let url = format!("{}/$batch", GRAPH_BASE);
         let mut emails = Vec::with_capacity(ids.len());
+        let mut failures = 0usize;
 
         for chunk in ids.chunks(BATCH_MAX_REQUESTS) {
+            if failures >= BATCH_FAILURE_BUDGET {
+                warn!(
+                    "Giving up on this pass's remaining message downloads after {failures} failed \
+                     sub-requests; {} message(s) landed and the rest stay new",
+                    emails.len(),
+                );
+                break;
+            }
             let resp = self
                 .client
                 .post(&url)
@@ -436,6 +552,9 @@ impl GraphClient {
                 .await
                 .context("Failed to parse the batch response")?;
 
+            // The longest pause any sub-response in this chunk asked for,
+            // applied once before the next chunk goes out.
+            let mut retry_after = None;
             for entry in batch.responses {
                 // Graph is free to reorder the responses, so the request id
                 // (the index into `chunk`) is the only correlation.
@@ -446,23 +565,48 @@ impl GraphClient {
                     .and_then(|i| chunk.get(i).copied())
                     .unwrap_or("<unknown>");
                 if entry.status != 200 {
-                    warn!(
-                        "Batch fetch of message {} failed (HTTP {}): {}",
-                        requested,
-                        entry.status,
-                        entry.body.map(|b| b.to_string()).unwrap_or_default(),
-                    );
+                    retry_after = retry_after.max(entry.retry_after_secs());
+                    failures += 1;
+                    if failures <= BATCH_FAILURE_WARN_LIMIT {
+                        warn!(
+                            "Batch fetch of message {} failed (HTTP {}): {}",
+                            requested,
+                            entry.status,
+                            entry.body.map(|b| b.to_string()).unwrap_or_default(),
+                        );
+                    }
                     continue;
                 }
                 let Some(body) = entry.body else {
-                    warn!("Batch fetch of message {requested} returned no body");
+                    failures += 1;
+                    if failures <= BATCH_FAILURE_WARN_LIMIT {
+                        warn!("Batch fetch of message {requested} returned no body");
+                    }
                     continue;
                 };
                 match serde_json::from_value::<GraphMessage>(body) {
                     Ok(msg) => emails.push(self.hydrate(&msg).await),
-                    Err(e) => warn!("Batch fetch of message {requested} did not parse: {e}"),
+                    Err(e) => {
+                        failures += 1;
+                        if failures <= BATCH_FAILURE_WARN_LIMIT {
+                            warn!("Batch fetch of message {requested} did not parse: {e}");
+                        }
+                    }
                 }
             }
+
+            if let Some(secs) = retry_after {
+                info!("Graph asked for {secs}s before the next batch; pacing the rest of the pass");
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+        }
+
+        if failures > BATCH_FAILURE_WARN_LIMIT {
+            warn!(
+                "{failures} of {} batch sub-requests failed this pass (first \
+                 {BATCH_FAILURE_WARN_LIMIT} logged above); those messages stay new",
+                ids.len(),
+            );
         }
 
         Ok(emails)
@@ -643,15 +787,37 @@ impl GraphClient {
     /// downloaded but dropped locally if an older sync did download it;
     /// Exchange stamps the header on everything that goes through transport,
     /// which is what makes that acceptable.
-    pub async fn enumerate_folder(&self, folder: &str) -> Result<HashMap<String, FolderEntry>> {
+    ///
+    /// The walk is ordered by `receivedDateTime desc` (the same `$orderby`
+    /// [`GraphClient::fetch_messages`] uses on this endpoint, so it is known to
+    /// be supported without a `$filter`). Unordered paging lets a concurrent
+    /// arrival shift the skiptoken window and drop a message from the middle of
+    /// the walk, and a dropped message is indistinguishable from a deleted one:
+    /// with newest-first ordering an arrival lands on a page the walk has
+    /// already passed instead (#0065).
+    pub async fn enumerate_folder(&self, folder: &str) -> Result<FolderEnumeration> {
         let folder_path = resolve_folder_path(folder);
         let mut result = HashMap::new();
+        let mut complete = false;
+        let mut pages = 0usize;
         let mut url = format!(
-            "{}/me/mailFolders/{}/messages?$select=id,internetMessageId,isRead,receivedDateTime&$top=200",
+            "{}/me/mailFolders/{}/messages?\
+             $select=id,internetMessageId,isRead,receivedDateTime&\
+             $orderby=receivedDateTime%20desc&\
+             $top=200",
             GRAPH_BASE, folder_path
         );
 
         loop {
+            if pages >= MAX_ENUMERATION_PAGES {
+                warn!(
+                    "Enumeration of '{folder}' stopped at {pages} pages ({} messages); \
+                     this pass will not prune",
+                    result.len(),
+                );
+                break;
+            }
+            pages += 1;
             let resp = self
                 .client
                 .get(&url)
@@ -674,56 +840,111 @@ impl GraphClient {
             let page: GraphMessageIdList =
                 resp.json().await.context("Failed to parse message ID list")?;
 
-            for entry in page.value {
-                if let Some(mid) = entry.internet_message_id {
-                    if !mid.is_empty() {
-                        result.insert(
-                            mid,
-                            FolderEntry {
-                                graph_id: entry.id,
-                                is_read: entry.is_read,
-                                received: entry.received_date_time,
-                            },
-                        );
-                    }
-                }
-            }
+            absorb_page(&mut result, page.value);
 
             match page.next_link {
                 Some(next) => url = next,
-                None => break,
+                None => {
+                    complete = true;
+                    break;
+                }
             }
         }
 
-        Ok(result)
+        Ok(FolderEnumeration { entries: result, complete })
     }
 
     /// Two-pass fetch: enumerate the folder, then download by id the messages
     /// the store does not hold.
     ///
-    /// Returns (new_emails, skipped_count, folder_enumeration). The enumeration
-    /// covers *every* message in the folder, so the caller can both apply
-    /// read-status changes to rows it already holds and see what has gone.
+    /// The enumeration in the returned [`FolderFetch`] covers every message in
+    /// the folder, so the caller can both apply read-status changes to rows it
+    /// already holds and see what has gone.
     pub async fn fetch_new_messages(
         &self,
         folder: &str,
         limit: usize,
         known_ids: &HashSet<String>,
-    ) -> Result<(Vec<FetchedEmail>, usize, HashMap<String, FolderEntry>)> {
-        let server = self.enumerate_folder(folder).await?;
-        let mut new = new_ids_newest_first(&server, known_ids);
-        let skipped = server.len() - new.len();
-        new.truncate(limit);
+    ) -> Result<FolderFetch> {
+        let enumeration = self.enumerate_folder(folder).await?;
+        let (new, found) = select_for_download(&enumeration.entries, known_ids, limit);
+        let download_truncated = found > new.len();
+        let skipped = enumeration.entries.len() - found;
 
         if new.is_empty() {
-            return Ok((Vec::new(), skipped, server));
+            return Ok(FolderFetch {
+                new_emails: Vec::new(),
+                skipped,
+                enumeration,
+                download_truncated,
+            });
         }
 
         let graph_ids: Vec<&str> = new.iter().map(|entry| entry.graph_id.as_str()).collect();
-        let emails = self.fetch_messages_by_ids(&graph_ids).await?;
+        let new_emails = self.fetch_messages_by_ids(&graph_ids).await?;
 
-        Ok((emails, skipped, server))
+        Ok(FolderFetch { new_emails, skipped, enumeration, download_truncated })
     }
+}
+
+/// Fold one page of an enumeration into the map.
+///
+/// The key is `internetMessageId` **trimmed**, because that is the identity
+/// [`crate::ingest::resolve_message_id`] stores and [`crate::ingest::graph_uid`]
+/// hashes. Keying on the header verbatim made a single padded id look both new
+/// (no matching row) and vanished (no matching enumeration key) on every pass:
+/// a delete-and-re-download loop, with the flags never applying because the uid
+/// was computed from the untrimmed string (#0065).
+///
+/// A message with no usable `internetMessageId` is dropped; see
+/// [`GraphClient::enumerate_folder`] for why that is acceptable.
+fn absorb_page(result: &mut HashMap<String, FolderEntry>, page: Vec<GraphMessageIdEntry>) {
+    for entry in page {
+        let Some(mid) = entry.internet_message_id else { continue };
+        let mid = mid.trim();
+        if mid.is_empty() {
+            continue;
+        }
+        result.insert(
+            mid.to_string(),
+            FolderEntry {
+                graph_id: entry.id,
+                is_read: entry.is_read,
+                received: entry.received_date_time,
+            },
+        );
+    }
+}
+
+/// The messages this pass will download, and how many new ones it found in all.
+///
+/// The two differ exactly when `limit` left some behind, and that difference is
+/// what suspends the prune: a pass that could not fetch everything it found
+/// cannot also be trusted to say what has been deleted (see [`pass_may_prune`]).
+fn select_for_download<'a>(
+    server: &'a HashMap<String, FolderEntry>,
+    known_ids: &HashSet<String>,
+    limit: usize,
+) -> (Vec<&'a FolderEntry>, usize) {
+    let mut new = new_ids_newest_first(server, known_ids);
+    let found = new.len();
+    new.truncate(limit);
+    (new, found)
+}
+
+/// Whether a pass may apply the prunes it collected, given `(enumeration was
+/// complete, download was truncated)` for every target it synced.
+///
+/// One partial target suspends the prune for *all* of them, which is the whole
+/// point: the reason an inbox row may be deleted is that some other target
+/// ingested the copy the message moved to, so a target that did not finish
+/// invalidates every other target's diff as well. A full sync
+/// (`limit = usize::MAX`) never truncates, so the deferred prunes are applied
+/// by the next uncapped pass; nothing is lost, only postponed (#0065).
+fn pass_may_prune(coverage: &[(bool, bool)]) -> bool {
+    coverage
+        .iter()
+        .all(|&(complete, truncated)| complete && !truncated)
 }
 
 /// The folder's messages the store does not hold, newest first.
@@ -756,10 +977,16 @@ fn new_ids_newest_first<'a>(
 ///
 /// The Graph counterpart of [`crate::imap_client::vanished_uids`], and simpler:
 /// the enumeration covers the whole folder rather than a recency window, so
-/// there is no range to clamp the diff to. An enumeration that came back short
-/// is not a case to defend against here, because a failed page is an error the
-/// caller skips the whole target on; an enumeration that came back empty means
-/// an empty folder, and emptying a folder on the server does empty it locally.
+/// there is no range to clamp the diff to. An enumeration that came back empty
+/// means an empty folder, and emptying a folder on the server does empty it
+/// locally.
+///
+/// What replaces the IMAP clamp is the caller's two gates, because both of the
+/// cases the clamp defends against exist here too (#0065): a pass that did not
+/// see the whole folder or could not download its whole backlog does not prune
+/// at all ([`sync_mailboxes_graph`]), and a row too freshly dated to be
+/// anything but a local ingest the server has yet to file is held back
+/// ([`crate::ingest::prunable_uids`]).
 fn vanished_graph_uids(
     known_ids: &HashSet<String>,
     server: &HashMap<String, FolderEntry>,
@@ -789,6 +1016,15 @@ fn vanished_graph_uids(
 /// target has been ingested, so a message archived in Outlook web has its
 /// archive row before its inbox row goes and never spends a window with no row
 /// anywhere (#0055).
+///
+/// Three conditions gate that prune, standing in for the IMAP window clamp
+/// (#0065): the pass must have enumerated every target in full, it must not
+/// have left any target's backlog undownloaded (a quick sync's `limit` can),
+/// and a row dated within [`crate::ingest::PRUNE_MIN_AGE_SECS`] of now is left
+/// alone. Without the first two, a message moved between two folders in a batch
+/// larger than `limit` loses its source row in the pass that could not yet
+/// fetch its destination copy, and holds no row anywhere until the backlog
+/// drains.
 ///
 /// TODO(#0042): this still enumerates `internetMessageId` for the whole folder
 /// on every pass. The `sync_cursors.deltalink` column is written as NULL until
@@ -821,20 +1057,31 @@ pub async fn sync_mailboxes_graph(
     // Every prune this run will apply, collected here and applied after the
     // loop: see the second pass below for why it cannot run per target.
     let mut prunes: Vec<(String, Vec<i64>)> = Vec::new();
+    // `(enumeration complete, download truncated)` per target, which decides
+    // whether the prunes above may be applied at all: see `pass_may_prune`.
+    let mut coverage: Vec<(bool, bool)> = Vec::with_capacity(targets.len());
 
     for target in targets {
         let known = crate::ingest::known_message_ids(&store, account_name, &target.role)?;
 
-        let (new_emails, skipped, server) = match client
+        let fetch = match client
             .fetch_new_messages(&target.server_name, limit, &known)
             .await
         {
             Ok(v) => v,
             Err(e) => {
                 warn!("Graph sync failed for {}: {}", target.role, e);
+                // A target that did not sync at all is the strongest form of
+                // partial pass: the copy that would justify another target's
+                // deletion may be exactly what this fetch failed to bring in.
+                coverage.push((false, false));
                 continue;
             }
         };
+        let FolderFetch { new_emails, skipped, enumeration, download_truncated } = fetch;
+        coverage.push((enumeration.complete, download_truncated));
+        let complete = enumeration.complete;
+        let server = enumeration.entries;
         result.skipped += skipped;
         span.mark(&format!("fetch:{}", target.role));
 
@@ -902,19 +1149,24 @@ pub async fn sync_mailboxes_graph(
             prunes.push((target.role.clone(), vanished));
         }
 
-        crate::ingest::record_mailbox_cursor(
-            &store,
-            account_name,
-            &target.role,
-            &crate::ingest::MailboxCursor {
-                uidvalidity: None,
-                last_uid: None,
-                uidnext: None,
-                exists: Some(server.len() as i64),
-                highest_modseq: None,
-                deltalink: None,
-            },
-        )?;
+        // Only a complete enumeration knows how many messages the folder
+        // holds; a short one would record a count the UI shows as truth, so
+        // the last known-good stays instead.
+        if complete {
+            crate::ingest::record_mailbox_cursor(
+                &store,
+                account_name,
+                &target.role,
+                &crate::ingest::MailboxCursor {
+                    uidvalidity: None,
+                    last_uid: None,
+                    uidnext: None,
+                    exists: Some(server.len() as i64),
+                    highest_modseq: None,
+                    deltalink: None,
+                },
+            )?;
+        }
     }
 
     // Second pass: every prune, after every target has been ingested. The
@@ -922,8 +1174,23 @@ pub async fn sync_mailboxes_graph(
     // here for the same reason: targets are synced inbox, archive, sent, so
     // pruning inside the loop would delete the inbox row of a message archived
     // in Outlook web before the archive pass ingests it.
-    for (role, vanished) in &prunes {
-        result.pruned += crate::ingest::prune_vanished(&store, &blobs, account_name, role, vanished);
+    if pass_may_prune(&coverage) {
+        let now = crate::outbox::unix_now();
+        for (role, vanished) in &prunes {
+            // The age guard is the other half: a row the outbox has just
+            // ingested locally is not something the server ever listed under
+            // that identity, so it is in every vanished set until the server's
+            // own copy shows up.
+            let prunable =
+                crate::ingest::prunable_uids(&store, account_name, role, vanished, now);
+            result.pruned +=
+                crate::ingest::prune_vanished(&store, &blobs, account_name, role, &prunable);
+        }
+    } else if !prunes.is_empty() {
+        info!(
+            "Graph sync: {} pending prune(s) deferred; this pass did not see every message",
+            prunes.len(),
+        );
     }
     span.mark("prune");
 
@@ -1630,6 +1897,155 @@ mod tests {
     fn a_folder_the_store_matches_prunes_nothing() {
         let server = folder(&[("<a@x>", "AAA", None), ("<b@x>", "BBB", None)]);
         assert!(vanished_graph_uids(&known(&["<a@x>", "<b@x>"]), &server).is_empty());
+    }
+
+    /// #0065 item 2. The enumeration keys on the trimmed `internetMessageId`,
+    /// which is what ingest stores. Keyed verbatim, a padded header made the
+    /// same message look new (its trimmed row id is not the map key) *and*
+    /// vanished (its row id is not in the map): a delete-and-re-download loop
+    /// once the prune landed.
+    #[test]
+    fn a_padded_internet_message_id_neither_loops_nor_prunes() {
+        let mut map = HashMap::new();
+        absorb_page(
+            &mut map,
+            vec![GraphMessageIdEntry {
+                id: "AAA".into(),
+                internet_message_id: Some("  <padded@x>\r\n".into()),
+                is_read: false,
+                received_date_time: Some("2026-08-06T10:00:00Z".into()),
+            }],
+        );
+        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["<padded@x>"]);
+
+        // The store holds it under the id `resolve_message_id` produced, which
+        // is the same trim.
+        let stored = known(&["<padded@x>"]);
+        assert!(
+            select_for_download(&map, &stored, usize::MAX).0.is_empty(),
+            "a message the store holds must not be downloaded again",
+        );
+        assert!(
+            vanished_graph_uids(&stored, &map).is_empty(),
+            "a message the folder still lists must not be pruned",
+        );
+    }
+
+    /// An entry with no usable id is dropped rather than keyed on an empty
+    /// string, which would collide every such message onto one map entry.
+    #[test]
+    fn an_entry_without_a_message_id_is_dropped() {
+        let mut map = HashMap::new();
+        absorb_page(
+            &mut map,
+            vec![
+                GraphMessageIdEntry {
+                    id: "AAA".into(),
+                    internet_message_id: None,
+                    is_read: false,
+                    received_date_time: None,
+                },
+                GraphMessageIdEntry {
+                    id: "BBB".into(),
+                    internet_message_id: Some("   ".into()),
+                    is_read: false,
+                    received_date_time: None,
+                },
+            ],
+        );
+        assert!(map.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // #0065 item 4: a capped pass does not prune
+    // -----------------------------------------------------------------------
+
+    /// `limit` cuts the download, and the cut is reported: `found` is what the
+    /// pass would have taken, the vector is what it took.
+    #[test]
+    fn a_capped_pass_reports_what_it_left_behind() {
+        let server = folder(&[
+            ("<a@x>", "A", Some("2026-08-06T03:00:00Z")),
+            ("<b@x>", "B", Some("2026-08-06T02:00:00Z")),
+            ("<c@x>", "C", Some("2026-08-06T01:00:00Z")),
+        ]);
+        let (selected, found) = select_for_download(&server, &HashSet::new(), 2);
+        assert_eq!(found, 3);
+        assert_eq!(
+            selected.iter().map(|e| e.graph_id.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B"],
+        );
+        let (all, found) = select_for_download(&server, &HashSet::new(), usize::MAX);
+        assert_eq!((all.len(), found), (3, 3), "a full sync never truncates");
+    }
+
+    /// The gate itself. A quick sync that could not download its whole backlog
+    /// must not delete anything, and it must not delete anything *anywhere*:
+    /// the inbox row of a message archived elsewhere is only safe to drop
+    /// because the archive pass ingested its copy, and the archive pass is the
+    /// one that was capped.
+    #[test]
+    fn one_capped_target_suspends_the_prune_for_every_target() {
+        // (enumeration complete, download truncated) per target.
+        assert!(pass_may_prune(&[(true, false), (true, false), (true, false)]));
+        assert!(!pass_may_prune(&[(true, false), (true, true), (true, false)]));
+        assert!(!pass_may_prune(&[(false, false), (true, false)]));
+        assert!(pass_may_prune(&[]), "a pass with no targets prunes nothing anyway");
+    }
+
+    // -----------------------------------------------------------------------
+    // #0065 items 5 and 6: the /$batch sub-requests
+    // -----------------------------------------------------------------------
+
+    /// Graph parses the sub-request URL out of the JSON itself, so nothing else
+    /// on this path escapes the id.
+    #[test]
+    fn batch_sub_request_ids_are_percent_encoded() {
+        let body = batch_request_body(&["AA/BB+CC=", "plain-_id="]);
+        let url = body["requests"][0]["url"].as_str().unwrap();
+        assert!(url.starts_with("/me/messages/AA%2FBB%2BCC=?"), "got {url}");
+        // The base64url alphabet and `=` stay legible: the common case is
+        // unchanged.
+        let url = body["requests"][1]["url"].as_str().unwrap();
+        assert!(url.starts_with("/me/messages/plain-_id=?"), "got {url}");
+    }
+
+    fn batch_entry(status: u16, headers: &[(&str, &str)]) -> GraphBatchEntry {
+        GraphBatchEntry {
+            id: "0".into(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: None,
+        }
+    }
+
+    /// A 429 *sub*-response inside a 200 batch is the throttle a big first sync
+    /// actually meets; its `Retry-After` paces the remaining chunks.
+    #[test]
+    fn a_throttled_sub_response_asks_for_a_pause() {
+        assert_eq!(
+            batch_entry(429, &[("Retry-After", "7")]).retry_after_secs(),
+            Some(7),
+        );
+        assert_eq!(
+            batch_entry(429, &[("retry-after", " 7 ")]).retry_after_secs(),
+            Some(7),
+            "Graph promises no casing",
+        );
+        assert_eq!(
+            batch_entry(429, &[("Retry-After", "999999")]).retry_after_secs(),
+            Some(MAX_RETRY_AFTER_SECS),
+            "a hostile header cannot park the sync",
+        );
+        assert_eq!(batch_entry(429, &[]).retry_after_secs(), None);
+        assert_eq!(
+            batch_entry(404, &[("Retry-After", "7")]).retry_after_secs(),
+            None,
+            "only a throttle is a reason to wait",
+        );
     }
 
     #[test]

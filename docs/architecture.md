@@ -114,6 +114,7 @@ The folder enumeration returns every message's `internetMessageId`, read flag an
 Graph never returns RFC822, so rows get `raw_blob` NULL and the HTML part is stored as an `html` blob instead.
 Graph has no UID, so the row's `uid` is a 63-bit hash of the Message-ID (`ingest::graph_uid`), which keeps the `(account, mailbox, uid)` identity meaningful.
 Since #0055 the orchestration mirrors the IMAP one line for line, prune pass included.
+The enumeration is keyed on the trimmed `internetMessageId`, walks the folder newest-first, and reports whether it saw all of it; #0065 turned that report into the prune's precondition.
 
 ### Watchers
 
@@ -224,6 +225,9 @@ This happened once already (#0004).
 - **The prune is clamped to the window's UID range.**
 `UID SEARCH ALL` returns the whole mailbox but the window is only its newest `limit` UIDs, so only a known UID *between* the window's lowest and highest is provably gone from the server.
 Negative UIDs (the local-move sentinel) and hash-sized UIDs (an APPEND with no `APPENDUID`) fall outside by construction.
+- **The Graph prune runs only on a pass that saw everything, and never on a fresh row.**
+Graph enumerates the whole folder, so there is no UID range to clamp to; what stands in for the clamp is that every target must have enumerated in full and downloaded its whole backlog before any prune applies (a capped quick sync defers them), and that a row dated within `ingest::PRUNE_MIN_AGE_SECS` of now is skipped.
+The age window is what keeps the prune from deleting the copy of a just-sent message, which the store files under our own Message-ID and the server lists under one of its own (#0065).
 - **Prunes run after every target is ingested.**
 Targets sync in order, so pruning inside the loop would delete the inbox row of a message archived elsewhere before the archive pass ingests it, leaving a window with no row anywhere and blobs dropping to refcount zero.
 Both backends hold their prunes back for this reason.

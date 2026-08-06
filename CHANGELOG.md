@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The Graph prune no longer deletes the copy of a message you just sent
+  (#0065).** Sending through Graph files the local copy under a uid derived
+  from our own `Message-ID`, but `sendMail` transmits JSON and Exchange stamps
+  an id of its own, so the Sent folder never lists the message under the
+  identity the store gave it: the prune #0055 added saw an orphan and deleted
+  it, releasing the raw MIME with it, which for a Graph account is the only
+  copy there will ever be. A row dated within the watcher's longest poll
+  interval is now left alone, which carries the copy through the window where
+  the server has not filed the item yet without making it immortal: once the
+  server's own copy is in the store, the later pass still clears the duplicate.
+  Five more hardenings on the same two functions. The folder enumeration keys
+  on the trimmed `internetMessageId`, matching what ingest stores, so a padded
+  header can no longer make every message look new *and* vanished at once, a
+  delete-and-re-download loop every sync. The enumeration walks the folder
+  newest-first and gives up after 250 pages, so a message can neither be shifted
+  out of an unordered page window by a concurrent arrival nor silently dropped
+  by an endless `nextLink` chain. **A capped quick sync no longer prunes at
+  all**: with `-n 100` and a larger backlog, the inbox rows of a hundred
+  messages moved to Archive at once used to go in the pass that had not yet
+  downloaded their archive copies, leaving them with no row anywhere until the
+  backlog drained; the prune now waits for a pass that saw every message in
+  every mailbox. Batch sub-request ids are percent-encoded, and a throttled
+  sub-response's `Retry-After` paces the rest of the pass rather than being
+  ignored, with a give-up after fifty failures so a systematically failing first
+  sync costs one pass and six log lines instead of one request and one warning
+  per message.
 - **A Graph sync now converges, prunes, and says so in the timing log
   (#0055).** The sync fixes the IMAP path got over the last months had never
   reached the Graph backend, which still behaved like the file era. Six defects

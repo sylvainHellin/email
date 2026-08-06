@@ -1187,6 +1187,99 @@ fn a_graph_message_archived_on_the_server_is_pruned_from_the_inbox() {
     assert_eq!(archive, vec![moved.to_string()]);
 }
 
+/// #0065 item 1. A Graph send files its own copy locally under
+/// `graph_uid(<our Message-ID>)`, but `sendMail` transmits no `Message-ID`, so
+/// Exchange stamps its own and the Sent enumeration never lists ours. The row
+/// is therefore in every vanished set the sync computes, and deleting it
+/// releases the raw MIME blob for good: Graph never returns RFC822, so nothing
+/// can fetch it back and "show source" for that message dies with it.
+///
+/// The age guard is what carries the copy through the window where the server
+/// has not filed the item yet, without making the row immortal: once it is
+/// older than one poll cycle the server's own copy is in the store and ours is
+/// a duplicate, which is exactly what the prune is for.
+#[test]
+fn a_just_sent_graph_copy_survives_the_prune_that_never_listed_it() {
+    let f = Fixture::new();
+    let mid = "<local-send@example.com>";
+    let raw = message(
+        &format!(
+            "From: me@example.com\r\nTo: b@example.com\r\nSubject: just sent\r\n\
+             Date: {}\r\nMessage-ID: {mid}\r\n",
+            chrono::Utc::now().to_rfc2822(),
+        ),
+        b"sent body\r\n",
+    );
+    email::outbox::ingest_sent_copy(&f.store, &f.blobs, "acct", "sent", &raw, mid, None).unwrap();
+
+    let uid = email::ingest::graph_uid(mid);
+    let row: i64 = f
+        .store
+        .conn()
+        .query_row("SELECT id FROM messages WHERE uid = ?1", [uid], |r| r.get(0))
+        .unwrap();
+    let raw_hash = f.text(row, "raw_blob");
+    assert!(!raw_hash.is_empty(), "the local copy is the only MIME there is");
+
+    // The pass's diff: the folder listed the server's id, so our row is
+    // "vanished" from it.
+    let vanished = vec![uid];
+    let now = email::outbox::unix_now();
+    let prunable = email::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, now);
+    assert!(prunable.is_empty(), "a copy the server may not have filed yet");
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &prunable),
+        0
+    );
+    assert_eq!(f.message_rows(), 1);
+    assert_eq!(f.refcount(&raw_hash), 1);
+    assert!(f.blobs.contains(&BlobHash::parse(&raw_hash).unwrap()));
+
+    // One poll cycle on, the row is prunable again and the duplicate goes.
+    let later = now + email::ingest::PRUNE_MIN_AGE_SECS + 1;
+    assert_eq!(
+        email::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, later),
+        vec![uid]
+    );
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &[uid]),
+        1
+    );
+    assert_eq!(f.message_rows(), 0);
+    assert_eq!(f.refcount(&raw_hash), 0);
+}
+
+/// The guard is a delay, not an exemption, and it is not a licence for the rest
+/// of the mailbox: a row that is genuinely gone and older than the window is
+/// still pruned in the same call that holds the fresh one back.
+#[test]
+fn the_prune_age_guard_holds_back_only_the_fresh_row() {
+    let f = Fixture::new();
+    let old = "<old@example.com>";
+    let fresh = "<fresh@example.com>";
+    let mut old_email = graph_email(old, false);
+    old_email.date = "Mon, 01 Jan 2024 12:00:00 +0000".into();
+    let mut fresh_email = graph_email(fresh, false);
+    fresh_email.date = chrono::Utc::now().to_rfc2822();
+    f.ingest("inbox", email::ingest::graph_uid(old), &old_email, None);
+    f.ingest("inbox", email::ingest::graph_uid(fresh), &fresh_email, None);
+
+    let vanished = vec![email::ingest::graph_uid(old), email::ingest::graph_uid(fresh)];
+    let prunable = email::ingest::prunable_uids(
+        &f.store,
+        "acct",
+        "inbox",
+        &vanished,
+        email::outbox::unix_now(),
+    );
+    assert_eq!(prunable, vec![email::ingest::graph_uid(old)]);
+    assert_eq!(
+        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &prunable),
+        1
+    );
+    assert_eq!(f.message_rows(), 1);
+}
+
 /// The whole folder's read flags in one transaction: every changed row lands,
 /// a UID the store does not hold is a no-op rather than an error, and the
 /// return value counts only the rows that actually changed.

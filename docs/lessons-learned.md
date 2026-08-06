@@ -448,3 +448,20 @@ Rebuilding the Graph client on every watcher pass cost a keyring read and a fres
 Keeping one client for the life of the watcher removes the cost and the refresh together, and an access token expires after about an hour, so the loop would have started 401-ing mid-session with nothing in the code saying why.
 `GraphClient::refresh_token` now updates the token in place and the watcher calls it once per pass, which keeps the pool and re-reads the cached token only ([src/graph.rs](../src/graph.rs), [src/tui/helpers.rs](../src/tui/helpers.rs)).
 Before hoisting a construction out of a loop, list what the constructor did besides construct.
+
+## A prune deletes by identity, so a row the server never listed under that identity is always "vanished"
+
+The Graph prune computes `store − server` over `internetMessageId` and deletes the difference, which is correct for every row the server put there.
+A Graph send does not produce one: `sendMail` takes JSON with no `Message-ID`, Exchange stamps its own, and the outbox has already filed the local copy under a uid derived from *our* id, so that row is in the difference on every pass from the moment it is written (#0065).
+Deleting it releases the raw MIME, which on a Graph account is the only copy that will ever exist.
+The IMAP path is immune by accident rather than by design: its prune is clamped to the fetch window's numeric range, and a `graph_uid` hash sits far above any real UID.
+Two shapes of row are exposed this way, the locally synthesised one and the one whose server copy has not been filed yet, and both are recent; the guard is therefore an age window on the row rather than an exemption for the `sent` role, which would have made the duplicate permanent ([src/ingest.rs](../src/ingest.rs), `prunable_uids`).
+When a diff drives deletions, ask which rows were written by something other than that diff's own source.
+
+## A capped download and an uncapped diff are safe only one target at a time
+
+A quick sync caps the download at `limit` and computes the vanished set over the whole folder, which reads as a conservative pairing: fetch less, delete only what is provably gone.
+It is not, because the argument that lets an inbox row go is that *another* target ingested the copy the message moved to, and the target that was capped is the one holding that copy (#0065).
+Gating each target's prune on its own coverage would have left exactly the reported case unfixed, since the inbox pass truncates nothing when a hundred messages are moved to Archive at once.
+The gate is therefore the whole pass: every target enumerated in full and downloaded in full, or nothing is pruned this run ([src/graph.rs](../src/graph.rs), `pass_may_prune`).
+When two halves of an operation have different scopes, the safety condition belongs to whichever half the *other* one depends on.

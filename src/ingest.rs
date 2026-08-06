@@ -727,6 +727,84 @@ pub fn apply_seen_flags(
     updated
 }
 
+/// How close to now a row's own `Date:` may be before the prune leaves it
+/// alone: 15 minutes, the watcher's longest poll delay
+/// ([`crate::outbox::backoff_secs`]'s ceiling), so a row survives at least one
+/// full poll cycle at the worst backoff before anything can delete it.
+pub const PRUNE_MIN_AGE_SECS: i64 = 900;
+
+/// Whether a row dated `date_sort` is too fresh for a prune to touch, given the
+/// current time.
+///
+/// The window is symmetric because the input is the message's own `Date:`
+/// header, not an ingest timestamp: a sender's clock running fast puts a
+/// just-arrived message slightly in the future, and that message needs the same
+/// protection. Symmetry also keeps the guard from being permanent -- a header
+/// dated 2099 is far outside the window in the other direction, so it is
+/// prunable rather than immortal. An unparseable date stores `0`, which is
+/// prunable, matching the rest of the code's treatment of it as "oldest".
+fn too_fresh_to_prune(date_sort: i64, now: i64) -> bool {
+    (now - date_sort).abs() < PRUNE_MIN_AGE_SECS
+}
+
+/// Of `vanished`, the UIDs whose rows are old enough for the prune to delete.
+///
+/// This is the Graph path's answer to a row the server has never listed under
+/// the identity the store gave it. A Graph send transmits no `Message-ID`
+/// (Graph's `sendMail` takes JSON and Exchange stamps its own
+/// `internetMessageId`), so [`crate::outbox::ingest_sent_copy`] files the local
+/// copy under [`graph_uid`] of *our* id, which no Sent enumeration will ever
+/// return. Every pass therefore sees it as vanished, and pruning it releases
+/// the raw MIME blob -- the only copy, because Graph never returns RFC822, so
+/// "show source" for that message dies with it (#0065).
+///
+/// The guard, rather than exempting the `sent` role: the local row is a
+/// duplicate of the server's copy once Exchange files it, and the prune is what
+/// clears it. Exempting the role would trade a rare permanent data loss for one
+/// permanent duplicate row per message ever sent through Graph. Delaying the
+/// prune by one poll cycle keeps both properties: the copy survives the window
+/// where the server has not filed it yet, and a later pass still tidies up.
+///
+/// The age is the row's `date_sort` (its `Date:` header) because the store has
+/// no ingest timestamp; for a message this client just composed the two are the
+/// same instant. The cost is that a message *received* in the last few minutes
+/// and deleted on the server keeps its row for one more cycle, which the next
+/// pass corrects.
+pub fn prunable_uids(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    vanished: &[i64],
+    now: i64,
+) -> Vec<i64> {
+    let mut prunable = Vec::with_capacity(vanished.len());
+    let mut held_back = 0;
+    for &uid in vanished {
+        let date_sort: i64 = store
+            .conn()
+            .query_row(
+                "SELECT IFNULL(date_sort, 0) FROM messages
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+                rusqlite::params![account, mailbox, uid],
+                |row| row.get(0),
+            )
+            // No row: nothing to hold back, and the delete is a no-op.
+            .unwrap_or(0);
+        if too_fresh_to_prune(date_sort, now) {
+            held_back += 1;
+        } else {
+            prunable.push(uid);
+        }
+    }
+    if held_back > 0 {
+        info!(
+            "Held {held_back} freshly-dated row(s) back from the prune of '{mailbox}': \
+             a just-sent or just-arrived message the server may not have filed yet"
+        );
+    }
+    prunable
+}
+
 /// Drop the rows of `mailbox` whose UIDs the server no longer lists, returning
 /// how many went.
 ///
@@ -919,6 +997,23 @@ mod tests {
             vec!["<a@x>", "<b@x>", "<c@x>"]
         );
         assert!(split_message_ids("garbage").is_empty());
+    }
+
+    /// The window the Graph prune leaves alone (#0065). Symmetric, so a
+    /// sender's fast clock is covered, and bounded, so nothing is immortal.
+    #[test]
+    fn a_freshly_dated_row_is_held_back_from_the_prune() {
+        let now = 1_800_000_000;
+        assert!(too_fresh_to_prune(now, now), "a message dated this instant");
+        assert!(too_fresh_to_prune(now - PRUNE_MIN_AGE_SECS + 1, now));
+        assert!(!too_fresh_to_prune(now - PRUNE_MIN_AGE_SECS, now));
+        assert!(!too_fresh_to_prune(now - 86_400, now));
+        // Clock skew in both directions, and the absurd date that must not buy
+        // a row permanent residence.
+        assert!(too_fresh_to_prune(now + 60, now));
+        assert!(!too_fresh_to_prune(now + 10 * 365 * 86_400, now));
+        // An unparseable `Date:` stores 0, which is prunable like any old row.
+        assert!(!too_fresh_to_prune(0, now));
     }
 
     #[test]
