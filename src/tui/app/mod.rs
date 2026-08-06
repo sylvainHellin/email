@@ -917,31 +917,39 @@ impl App {
     // Lazy bodies (#0038 scope item 5)
     // ---------------------------------------------------------------
 
-    /// What the preview memo must answer to right now: the cursor's message
+    /// What the preview memo must answer to right now: the cursor's entry
     /// under the active account and the current list generation. `None` when
-    /// nothing is selected, or when the selected entry has no store row (a
-    /// server-search hit, which carries its own body).
+    /// nothing is selected, or when the selected entry has no name at all (a
+    /// server-search hit that resolved to no local row, which carries its own
+    /// body).
     fn preview_body_key(&self) -> Option<BodyKey> {
         Some((
             self.active_account,
-            self.selected_email()?.msg?,
+            self.selected_email()?.key()?,
             self.mailbox_load_generation,
         ))
     }
 
-    /// Refresh the preview body memo, reading one blob when the cursor, the
-    /// account or the list generation moved under it.
+    /// Refresh the preview body memo, reading one blob (or one draft file)
+    /// when the cursor, the account or the list generation moved under it.
     ///
     /// Called once at the top of the render pass, which is the only place that
     /// knows a body is about to be shown and still holds `&mut App`. A frame
     /// on an unchanged selection does no work at all.
+    ///
+    /// The two arms are the two things a row can be. A received message's body
+    /// is a blob keyed by its store row; a draft's is the markdown in the file
+    /// the index points at, read straight through and handed to the same
+    /// wrapper the message body goes through, so the pane renders both the
+    /// same way.
     pub(crate) fn refresh_preview_body(&mut self) {
         let key = self.preview_body_key();
-        if self.preview_body.holds(key) {
+        if self.preview_body.holds(&key) {
             return;
         }
-        let text = match key {
-            Some((_, msg, _)) => self.load_message_body(msg).unwrap_or_default(),
+        let text = match &key {
+            Some((_, EntryKey::Msg(msg), _)) => self.load_message_body(*msg).unwrap_or_default(),
+            Some((_, EntryKey::Draft(id), _)) => self.load_draft_body(id).unwrap_or_default(),
             None => String::new(),
         };
         self.preview_body.fill(key, text);
@@ -955,12 +963,13 @@ impl App {
     /// not an invite: the flag on the row answers that without a blob read.
     pub(crate) fn refresh_preview_invite(&mut self) {
         let key = self.preview_body_key();
-        if self.preview_invite.holds(key) {
+        if self.preview_invite.holds(&key) {
             return;
         }
         let is_invite = self.selected_email().is_some_and(|e| e.is_invite);
-        let event = match (key, is_invite) {
-            (Some((_, msg, _)), true) => self.load_message_invite(msg),
+        let event = match (&key, is_invite) {
+            (Some((_, EntryKey::Msg(msg), _)), true) => self.load_message_invite(*msg),
+            // A draft carries no ics blob, so the card has nothing to show.
             _ => None,
         };
         self.preview_invite.fill(key, event);
@@ -1023,6 +1032,45 @@ impl App {
             log::warn!("[store] {msg} is not in the store; previewing an empty body");
         }
         body
+    }
+
+    /// Read one draft's body from the file the drafts index points at.
+    ///
+    /// [`crate::store::Store::open`] rather than `open_store`, for the reason
+    /// every drafts path gives: drafts are local-only files, so an account that
+    /// has never synced has no store *file* and still has drafts.
+    ///
+    /// A plain read, deliberately: this runs on the UI thread inside the render
+    /// pass, and `drafts::refresh` is a write transaction over the whole
+    /// directory. The one-second fingerprint poll in the event loop is what
+    /// keeps the index current; the preview only consumes it.
+    ///
+    /// `None` degrades to an empty pane, which is what a stale index looks
+    /// like: the row names a file that has been moved, retired by a send, or
+    /// rewritten into something that no longer parses.
+    fn load_draft_body(&self, id: &str) -> Option<String> {
+        let account = &self.account_config.name;
+        let store = crate::store::Store::open(crate::config::store_path(account))
+            .map_err(|e| log::warn!("[drafts] could not open the store for {account}: {e:#}"))
+            .ok()?;
+        let row = match crate::store::drafts::find(&store, account, id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                log::warn!("[drafts] {id} is no longer indexed; previewing an empty body");
+                return None;
+            }
+            Err(e) => {
+                log::warn!("[drafts] looking up {id}: {e:#}");
+                return None;
+            }
+        };
+        match crate::draft::parse_email_draft(&row.path) {
+            Ok(draft) => Some(draft.body_markdown),
+            Err(e) => {
+                log::warn!("[drafts] reading {}: {e:#}", row.path.display());
+                None
+            }
+        }
     }
 
     /// Park `text` as the preview body of the current selection, exactly as a

@@ -404,6 +404,14 @@ When a destructive step is justified by a compensating step elsewhere, the two b
 Only `Store::open`'s own `forget_integrity_check` on the rebuild path hid it, which makes the correctness of a cache entry depend on what the caller does with the error.
 A memo of "this was verified" is written on the success branch, never before the branch ([src/store/mod.rs](../src/store/mod.rs)).
 
+## A memo keyed on one row kind blanks the other kind instead of failing
+
+The preview body was memoised under a key built with `self.selected_email()?.msg?`, and a draft row has no `msg`.
+The `?` turned "this key cannot name a draft" into `None`, `None` filled the memo with an empty string, and the Body pane rendered blank for every draft with no error, no log line and no failing test.
+Nothing in the code said drafts were unsupported; the capability gap was expressed only as a silently absorbed `Option`.
+The fix was to widen the key to the enum that already names both kinds of row (`EntryKey::Msg` / `EntryKey::Draft`) so each arm has to be written out and a new kind of row breaks the match instead of the pane ([src/tui/app/mod.rs](../src/tui/app/mod.rs)).
+Where a key is derived from a value that has more than one shape, prefer the enum over a chain of `?`: a `None` that means "not applicable" and a `None` that means "nothing selected" must not be the same value.
+
 ## Under server-as-truth, a local artifact that has been submitted has to be retired, not annotated
 
 Sending a draft rewrote its `status:` to `sent` in place, which was correct while `sent/` was a directory of `.md` files and the draft was the only local record.

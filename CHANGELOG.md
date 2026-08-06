@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The Body pane fills for a draft row.** Selecting a draft in the TUI showed
+  its headers and an empty body: the preview's memo was keyed on the store row
+  a draft does not have, so the key never built and the pane was never filled.
+  The memo is now keyed on the entry, message or draft, and a draft row reads
+  its markdown from the file the drafts index points at. The lookup is a plain
+  read on the UI thread, never a re-index. A row whose file has gone from under
+  the index previews empty rather than failing the frame.
 - **A sent draft leaves `drafts/`.** Sending rewrote the draft's `status:` to
   `sent` and left the file where it was, so a message that was already gone sat
   in the TUI's Drafts list and in `mp list` forever with nothing left to do to

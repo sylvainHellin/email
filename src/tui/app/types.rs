@@ -422,15 +422,22 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
 // Lazy bodies
 // ---------------------------------------------------------------------------
 
-/// What a memoised body belongs to: the account it was read for, the message,
+/// What a memoised body belongs to: the account it was read for, the entry,
 /// and the list generation that was current at the time.
+///
+/// The entry is an [`EntryKey`] and not a bare [`MessageRef`] because the
+/// preview has two kinds of row to answer for: a received message, whose body
+/// is a blob, and a draft, whose body is the markdown in its file. Keying on
+/// the message alone meant a draft row could never build a key, which left the
+/// Body pane blank for every draft.
 ///
 /// The generation is the guard. `App::mailbox_load_generation` is bumped by
 /// every mailbox load request and by every optimistic list mutation, so a body
 /// read before a re-sync is discarded by the same counter that discards a
 /// stale background load. The account index is in the key because a
-/// [`MessageRef`] is only meaningful inside one account's store.
-pub(crate) type BodyKey = (usize, MessageRef, u64);
+/// [`MessageRef`] is only meaningful inside one account's store, and a drafts
+/// `id:` inside one account's index.
+pub(crate) type BodyKey = (usize, EntryKey, u64);
 
 /// One-slot memo of the body behind the preview pane.
 ///
@@ -455,8 +462,8 @@ impl PreviewBody {
     }
 
     /// True when the memo already answers for `key`.
-    pub(crate) fn holds(&self, key: Option<BodyKey>) -> bool {
-        self.key == key
+    pub(crate) fn holds(&self, key: &Option<BodyKey>) -> bool {
+        &self.key == key
     }
 
     /// Park `text` as the body for `key`.
@@ -492,8 +499,8 @@ impl PreviewInvite {
     }
 
     /// True when the memo already answers for `key`.
-    pub(crate) fn holds(&self, key: Option<BodyKey>) -> bool {
-        self.key == key
+    pub(crate) fn holds(&self, key: &Option<BodyKey>) -> bool {
+        &self.key == key
     }
 
     /// Park `event` as the invite for `key`.
@@ -2184,6 +2191,84 @@ mod tests {
 
         app.refresh_preview_body();
         assert_eq!(app.preview_body.text(), "a corrected body");
+    }
+
+    /// An app parked on the Drafts mailbox, which lists from the drafts index
+    /// rather than from `messages`.
+    fn app_on_drafts() -> crate::tui::app::App {
+        let mut app = crate::tui::app::App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.mailboxes = vec![mb(
+            "Drafts",
+            crate::config::drafts_dir("alice"),
+            MailboxKind::Drafts,
+        )];
+        app.mailbox_counts = vec![0];
+        app.email_cache = vec![None];
+        app.emails = std::sync::Arc::new(load_emails("alice", "drafts"));
+        app.email_cache[0] = Some(std::sync::Arc::clone(&app.emails));
+        app.rebuild_visible();
+        app
+    }
+
+    /// Park the cursor on the draft whose subject is `subject`, whatever order
+    /// the index listed the directory in.
+    fn cursor_on(app: &mut crate::tui::app::App, subject: &str) {
+        app.list_index = app
+            .visible
+            .iter()
+            .position(|&i| app.emails[i].subject == subject)
+            .unwrap_or_else(|| panic!("no draft row for {subject}"));
+    }
+
+    /// The Body pane of a draft row shows the draft's own markdown. It was
+    /// blank for every draft, because the memo was keyed on a `MessageRef` and
+    /// a draft has none: the key never built, so the pane never filled.
+    #[test]
+    fn the_preview_shows_the_body_of_the_selected_draft() {
+        let _data = DataDir::new();
+        external_draft("2026-07-01-note.md", "a@example.com", "Hello", "draft");
+        external_draft("2026-07-02-later.md", "b@example.com", "Later", "approved");
+
+        let mut app = app_on_drafts();
+        cursor_on(&mut app, "Hello");
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "Body of Hello");
+
+        // The memo follows the cursor across drafts, one file read per move.
+        cursor_on(&mut app, "Later");
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "Body of Later");
+
+        // A frame that changes nothing re-reads nothing and answers the same.
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "Body of Later");
+
+        // A draft carries no ics blob, so the invite card stays empty rather
+        // than reaching for a store row that does not exist.
+        app.refresh_preview_invite();
+        assert!(app.preview_invite.event().is_none());
+    }
+
+    /// The index can name a file that is no longer there: another process moved
+    /// it, or a send retired it between the poll and the frame. The preview
+    /// degrades to an empty pane, one draft wide, and does not panic.
+    #[test]
+    fn a_draft_whose_file_vanished_previews_empty() {
+        let _data = DataDir::new();
+        let path = external_draft("2026-07-01-note.md", "a@example.com", "Hello", "draft");
+
+        let mut app = app_on_drafts();
+        cursor_on(&mut app, "Hello");
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "Body of Hello");
+
+        // The row survives in the list (it was loaded before), the file does
+        // not, and the generation bump is what asks the memo again.
+        std::fs::remove_file(&path).unwrap();
+        app.mailbox_load_generation += 1;
+        app.refresh_preview_body();
+        assert_eq!(app.preview_body.text(), "");
     }
 
     /// Body search (`\`) reads the mailbox's bodies from the blob store and
