@@ -86,6 +86,9 @@ Neither ordering survives a crash between the halves; the durable queue that wou
 
 ### Send
 
+`send::send_draft(&EmailDraft, &SendContext) -> SentDraft` is the one orchestration behind `mp send`, `mp send-approved` and both TUI send keys: it builds the bytes, commits the outbox row, submits over SMTP or Graph depending on which the context names, and retires the draft file.
+Callers keep only what differs between them, the confirmation prompt, the wording of the result and the exit code.
+
 `src/send.rs` builds the message, then `DurableSend::begin` commits the raw bytes as a blob and a `pending_send` outbox row *before* SMTP opens.
 Submission is per recipient: each recipient gets an individual envelope while the visible To and Cc headers are preserved for all, which gives per-recipient success and failure tracking.
 `src/outbox.rs` owns the four-state machine (`pending_send`, `sent_pending_append`, `done`, `failed`) and the exactly-once marker: `submission_started_at` is committed immediately before the SMTP session opens, so a `pending_send` row found on restart says whether the transport was ever entered.
@@ -135,8 +138,8 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/dump.rs` | `mp dump-mailbox`: path-free NDJSON envelope dump of the store, the parity harness for the data-layer rewrite |
 | `src/reconcile.rs` | iMIP invite reconciliation, folded over the rows at display time and never persisted |
 | `src/parse.rs` | RFC822 parsing, attachment extraction and sanitisation, `open_file_with_system()`, `materialisation_dir()`, `stable_attachments_dir()`, `ensure_utf8_charset()` |
-| `src/draft.rs` | Draft parsing and validation, reply and forward creation, `source_from_row`, status transitions, `settle_sent_draft` |
-| `src/send.rs` | `markdown_to_html`, message building, per-recipient submission, `DurableSend`, `resume_outbox` |
+| `src/draft.rs` | Draft parsing and validation, reply and forward creation (`create_draft_from_source`), `source_from_row`, status transitions, `settle_sent_draft` |
+| `src/send.rs` | `markdown_to_html`, message building, `send_draft` + `SendContext`, per-recipient submission, `DurableSend`, `resume_outbox` |
 | `src/outbox.rs` | The durable send state machine and its blob refcounting |
 | `src/graph.rs` | Microsoft Graph REST client: folders, fetch, sync, send, move, delete, read flags, search |
 | `src/calendar.rs` + `src/invite.rs` | iCalendar receive-side parsing and send-side building |

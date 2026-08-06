@@ -5,7 +5,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use std::collections::HashSet;
 use std::fs;
@@ -1142,6 +1142,199 @@ where
         send_result,
         state: Some(state),
         row_id: Some(durable.row_id()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// One draft, sent (#0058)
+// ---------------------------------------------------------------------------
+
+/// Everything one durable send needs that does not come out of the draft.
+///
+/// `graph` being `Some` is what picks the Graph submission over SMTP, the same
+/// test `mp send` makes on `AuthMethod::Graph`; `smtp` is what the SMTP path
+/// submits through and where its `from` fallback comes from.
+pub struct SendContext {
+    pub graph: Option<crate::config::GraphConfig>,
+    pub smtp: Option<SmtpConfig>,
+    pub account: crate::config::AccountConfig,
+    pub email_settings: EmailSettings,
+    pub signature: Option<String>,
+}
+
+impl SendContext {
+    /// The address a draft that names no `from:` of its own is sent from.
+    ///
+    /// The Graph path has no SMTP config to take a fallback from, so it takes
+    /// the account's; identical bytes either way (see
+    /// [`build_draft_message`]).
+    fn default_from(&self) -> Result<&str> {
+        match (self.graph.as_ref(), self.smtp.as_ref()) {
+            (Some(_), _) => Ok(&self.account.default_from),
+            (None, Some(smtp)) => Ok(&smtp.default_from),
+            (None, None) => Err(anyhow!("SMTP not configured")),
+        }
+    }
+}
+
+/// What [`send_draft`] did: the durable send, and what became of the file.
+pub struct SentDraft {
+    /// Where the submission got to, per recipient and in the outbox.
+    pub report: SendReport,
+    /// The bookkeeping error a submission that did go out nevertheless hit
+    /// while retiring the draft file. The message is on the server either
+    /// way, so this is a line for the caller to word, never a failed send.
+    pub settle_error: Option<anyhow::Error>,
+}
+
+/// Parse an address string like `"Name <addr>"` or `"addr"` into
+/// `(name, address)`.
+fn parse_name_address(s: &str) -> (String, String) {
+    let s = s.trim();
+    if let Some(lt) = s.find('<') {
+        if let Some(gt) = s.find('>') {
+            let name = s[..lt].trim().trim_matches('"').trim().to_string();
+            let addr = s[lt + 1..gt].trim().to_string();
+            return (name, addr);
+        }
+    }
+    // Plain address
+    (String::new(), s.to_string())
+}
+
+/// Parse a frontmatter address field (comma-separated) into `(name, address)`
+/// pairs, which is the shape the Graph API takes its recipients in.
+fn parse_graph_recipients(field: Option<&str>) -> Vec<(String, String)> {
+    match field {
+        Some(s) if !s.trim().is_empty() => split_addresses(s)
+            .into_iter()
+            .map(|a| parse_name_address(&a))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The attachments a draft names, read off the paths in its frontmatter.
+///
+/// Only the Graph path needs them separately: the SMTP path's bytes are built
+/// by [`build_draft_message`], which reads the same list itself and fails the
+/// same way on a path that is not there.
+fn draft_attachments(draft: &EmailDraft) -> Result<Vec<(String, Vec<u8>, String)>> {
+    let mut data = Vec::new();
+    let Some(attachments) = draft.frontmatter.attachments.as_ref() else {
+        return Ok(data);
+    };
+    for att_path in attachments {
+        let expanded = shellexpand::tilde(att_path);
+        let path = Path::new(expanded.as_ref());
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read attachment: {}", att_path))?;
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string());
+        let content_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        data.push((filename, content, content_type));
+    }
+    Ok(data)
+}
+
+/// Send one draft: the single orchestration behind `mp send`,
+/// `mp send-approved` and the TUI's send key (#0058).
+///
+/// The order is the durable one (#0037 item 5): the bytes are built first
+/// (which is where the approved-status requirement is enforced, by
+/// [`build_draft_message`]), committed to the outbox, submitted over whichever
+/// transport `ctx` names, and only then is the draft file touched. A
+/// submission that reached at least one recipient rewrites the draft's
+/// `status:` to `sent`; one that reached *every* recipient and got an outbox
+/// row additionally takes the file out of `drafts/`, see
+/// [`crate::draft::settle_sent_draft`]. The sent copy is the outbox's
+/// business, not this function's.
+///
+/// What is left to the caller is what differs between the three: the
+/// confirmation prompt, the wording of the status line, the exit code, and the
+/// drafts-index refresh (a send-approved run pays for one refresh at the end
+/// rather than one per draft).
+pub async fn send_draft(draft: &EmailDraft, ctx: &SendContext) -> Result<SentDraft> {
+    let built = build_draft_message(
+        draft,
+        ctx.default_from()?,
+        &ctx.email_settings,
+        ctx.signature.as_deref(),
+        None,
+    )?;
+
+    let report = match ctx.graph.as_ref() {
+        Some(graph_config) => {
+            let to = parse_graph_recipients(draft.frontmatter.to.as_deref());
+            let cc = parse_graph_recipients(draft.frontmatter.cc.as_deref());
+            let bcc = parse_graph_recipients(draft.frontmatter.bcc.as_deref());
+            let to_refs: Vec<(&str, &str)> =
+                to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+            let cc_refs: Vec<(&str, &str)> =
+                cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+            let bcc_refs: Vec<(&str, &str)> =
+                bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+
+            // The quoted reply lives in the companion HTML the draft builder
+            // wrote; the Graph API takes a rendered body rather than bytes.
+            let quoted_html = draft.path.with_extension("html");
+            let quoted = if quoted_html.exists() {
+                fs::read_to_string(&quoted_html).ok()
+            } else {
+                None
+            };
+            let html_body = markdown_to_html(
+                &draft.body_markdown,
+                &ctx.email_settings,
+                ctx.signature.as_deref(),
+                quoted.as_deref(),
+            );
+            let att_data = draft_attachments(draft)?;
+            let client = crate::graph::GraphClient::new_async(graph_config).await?;
+            // Graph files its own copy in Sent Items, so the outbox row never
+            // carries a target mailbox; what it buys here is exactly-once
+            // durability of the submission.
+            send_durably_via(
+                &built,
+                &ctx.account,
+                client.send_mail(
+                    &to_refs,
+                    &cc_refs,
+                    &bcc_refs,
+                    &draft.frontmatter.subject,
+                    &html_body,
+                    &att_data,
+                ),
+            )
+            .await?
+        }
+        None => {
+            let smtp = ctx
+                .smtp
+                .as_ref()
+                .ok_or_else(|| anyhow!("SMTP not configured"))?;
+            send_durably(&built, &ctx.account, smtp).await?
+        }
+    };
+
+    let mut settle_error = None;
+    if report.send_result.any_succeeded() {
+        if let Err(e) = crate::draft::settle_sent_draft(draft, &report, Some(&built.message_id)) {
+            warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
+            settle_error = Some(e);
+        }
+        // Best-effort, no-op without a contacts cache; the message went out,
+        // so the correspondent is worth remembering whether or not the file
+        // could be retired.
+        crate::contacts::hooks::bump_after_send(&ctx.account, draft);
+    }
+    Ok(SentDraft {
+        report,
+        settle_error,
     })
 }
 

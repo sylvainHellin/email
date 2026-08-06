@@ -482,33 +482,6 @@ fn prompt_confirmation(message: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Parse an address string like `"Name <addr>"` or `"addr"` into `(name, address)`.
-fn parse_name_address(s: &str) -> (String, String) {
-    let s = s.trim();
-    if let Some(lt) = s.find('<') {
-        if let Some(gt) = s.find('>') {
-            let name = s[..lt].trim().trim_matches('"').trim().to_string();
-            let addr = s[lt + 1..gt].trim().to_string();
-            return (name, addr);
-        }
-    }
-    // Plain address
-    (String::new(), s.to_string())
-}
-
-/// Parse a frontmatter address field (comma-separated) into `(name, address)` pairs.
-fn parse_recipients(field: Option<&str>) -> Vec<(String, String)> {
-    match field {
-        Some(s) if !s.trim().is_empty() => {
-            split_addresses(s)
-                .into_iter()
-                .map(|a| parse_name_address(&a))
-                .collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
 /// CLI arguments for `mp send --invite`.
 struct InviteArgs {
     to: Option<String>,
@@ -1043,10 +1016,18 @@ async fn main() -> Result<()> {
             let draft = parse_email_draft(&row.path)?;
             validate_draft(&draft)?;
 
-            if account_config.auth_method == AuthMethod::Graph {
-                // Graph API send path
-                let graph_config = GraphConfig::load(&account_config)?;
+            // Which transport carries it is the account's business, and the
+            // send itself is `send::send_draft`'s (#0058). What stays here is
+            // the CLI's own half: the preview, the confirmation and the
+            // wording of what happened.
+            let is_graph = account_config.auth_method == AuthMethod::Graph;
+            let graph = if is_graph {
+                Some(GraphConfig::load(&account_config)?)
+            } else {
+                None
+            };
 
+            if is_graph {
                 // Preview (simplified -- no SMTP config needed)
                 println!("{}", "--- Email Preview ---".bold());
                 println!("  {} {}", "To:".green(), draft.frontmatter.to.as_deref().unwrap_or("(none)"));
@@ -1058,94 +1039,7 @@ async fn main() -> Result<()> {
                 }
                 println!("  {} {}", "Subject:".yellow(), draft.frontmatter.subject);
                 println!("{}", "---".dimmed());
-
-                if !yes && !prompt_confirmation("Send this email?") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-
-                println!("Sending via Graph API...");
-                let to = parse_recipients(draft.frontmatter.to.as_deref());
-                let cc = parse_recipients(draft.frontmatter.cc.as_deref());
-                let bcc = parse_recipients(draft.frontmatter.bcc.as_deref());
-
-                let to_refs: Vec<(&str, &str)> = to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                let cc_refs: Vec<(&str, &str)> = cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                let bcc_refs: Vec<(&str, &str)> = bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-
-                // Render HTML
-                let quoted_html = draft.path.with_extension("html");
-                let quoted = if quoted_html.exists() { fs::read_to_string(&quoted_html).ok() } else { None };
-                let html_body = markdown_to_html(
-                    &draft.body_markdown,
-                    &global_config.email,
-                    signature_content.as_deref(),
-                    quoted.as_deref(),
-                );
-
-                // Read attachments
-                let mut att_data: Vec<(String, Vec<u8>, String)> = Vec::new();
-                if let Some(ref attachments) = draft.frontmatter.attachments {
-                    for att_path in attachments {
-                        let expanded = shellexpand::tilde(att_path);
-                        let path = Path::new(expanded.as_ref());
-                        let content = fs::read(path)
-                            .with_context(|| format!("Failed to read attachment: {}", att_path))?;
-                        let filename = path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "attachment".to_string());
-                        let content_type = mime_guess::from_path(path)
-                            .first_or_octet_stream()
-                            .to_string();
-                        att_data.push((filename, content, content_type));
-                    }
-                }
-
-                let client = graph::GraphClient::new_async(&graph_config).await?;
-                let built = email::send::build_draft_message(
-                    &draft,
-                    &account_config.default_from,
-                    &global_config.email,
-                    signature_content.as_deref(),
-                    None,
-                )?;
-                // Graph files its own copy in Sent Items, so the outbox row
-                // never carries a target mailbox; what it buys here is
-                // exactly-once durability of the submission.
-                let report = email::send::send_durably_via(
-                    &built,
-                    &account_config,
-                    client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
-                )
-                .await?;
-                if !report.send_result.any_succeeded() {
-                    return Err(anyhow!(
-                        "{}",
-                        report
-                            .send_result
-                            .failed()
-                            .first()
-                            .and_then(|r| r.error.clone())
-                            .unwrap_or_else(|| "Graph send failed".to_string())
-                    ));
-                }
-
-                // The message is out; a bookkeeping failure here is a warning,
-                // not a failed send.
-                if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
-                    warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
-                    println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
-                }
-                info!("Email sent via Graph and marked as sent: {}", draft.path.display());
-                email::contacts::hooks::bump_after_send(&account_config, &draft);
-                reindex_drafts(&account_config.name);
-                println!(
-                    "{} Email sent successfully via Graph API [{}]",
-                    "✓".green().bold(),
-                    report.status_line()
-                );
             } else {
-                // SMTP send path (existing)
                 preview_draft(
                     &draft,
                     &smtp_config,
@@ -1153,29 +1047,63 @@ async fn main() -> Result<()> {
                     signature_content.as_deref(),
                     false,
                 )?;
+            }
 
-                if !yes && !prompt_confirmation("Send this email?") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !yes && !prompt_confirmation("Send this email?") {
+                println!("Cancelled.");
+                return Ok(());
+            }
 
+            if is_graph {
+                println!("Sending via Graph API...");
+            } else {
                 println!("Sending email...");
-                let built = email::send::build_draft_message(
-                    &draft,
-                    &smtp_config.default_from,
-                    &global_config.email,
-                    signature_content.as_deref(),
-                    None,
-                )?;
-                let report =
-                    email::send::send_durably(&built, &account_config, &smtp_config).await?;
-                let send_result = &report.send_result;
+            }
 
+            let ctx = email::send::SendContext {
+                graph,
+                smtp: (!is_graph).then(|| smtp_config.clone()),
+                account: account_config.clone(),
+                email_settings: global_config.email.clone(),
+                signature: signature_content.clone(),
+            };
+            let sent = email::send::send_draft(&draft, &ctx).await?;
+            let report = &sent.report;
+            let send_result = &report.send_result;
+
+            // The message is out; a bookkeeping failure here is a warning,
+            // not a failed send (the log line is `send_draft`'s).
+            let retire_warning = || {
+                if let Some(e) = sent.settle_error.as_ref() {
+                    println!("{} (sent but failed to retire draft: {})", "\u{26a0}".yellow(), e);
+                }
+            };
+
+            if is_graph {
+                if !send_result.any_succeeded() {
+                    return Err(anyhow!(
+                        "{}",
+                        send_result
+                            .failed()
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "Graph send failed".to_string())
+                    ));
+                }
+                retire_warning();
+                info!("Email sent via Graph and marked as sent: {}", draft.path.display());
+                reindex_drafts(&account_config.name);
+                println!(
+                    "{} Email sent successfully via Graph API [{}]",
+                    "\u{2713}".green().bold(),
+                    report.status_line()
+                );
+            } else {
                 // Display per-recipient results
                 for r in &send_result.succeeded() {
                     println!(
                         "  {} {} ({})",
-                        "✓".green(),
+                        "\u{2713}".green(),
                         r.address,
                         r.role
                     );
@@ -1183,7 +1111,7 @@ async fn main() -> Result<()> {
                 for r in &send_result.failed() {
                     println!(
                         "  {} {} ({}): {}",
-                        "✗".red(),
+                        "\u{2717}".red(),
                         r.address,
                         r.role,
                         r.error.as_deref().unwrap_or("unknown error")
@@ -1191,41 +1119,29 @@ async fn main() -> Result<()> {
                 }
 
                 if send_result.all_succeeded() {
-                    if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
-                        warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
-                        println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
-                    }
+                    retire_warning();
                     info!("Email marked as sent: {}", draft.path.display());
-
-                    // Incremental contacts-index update (best-effort, no-op if no cache)
-                    email::contacts::hooks::bump_after_send(&account_config, &draft);
                     reindex_drafts(&account_config.name);
 
                     println!(
                         "{} Email sent successfully to all {} recipient(s) [{}]",
-                        "✓".green().bold(),
+                        "\u{2713}".green().bold(),
                         send_result.results.len(),
                         report.status_line()
                     );
                 } else if send_result.any_succeeded() {
-                    if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id)) {
-                        warn!("Sent but failed to retire {}: {e:#}", draft.path.display());
-                        println!("{} (sent but failed to retire draft: {})", "⚠".yellow(), e);
-                    }
+                    retire_warning();
                     warn!(
                         "Partial send: {} succeeded, {} failed for {}",
                         send_result.succeeded().len(),
                         send_result.failed().len(),
                         draft.path.display()
                     );
-
-                    // Incremental contacts-index update (best-effort)
-                    email::contacts::hooks::bump_after_send(&account_config, &draft);
                     reindex_drafts(&account_config.name);
 
                     println!(
                         "{} Partial send: {} succeeded, {} failed [{}] (marked as sent -- see logs for details)",
-                        "⚠".yellow().bold(),
+                        "\u{26a0}".yellow().bold(),
                         send_result.succeeded().len().to_string().green(),
                         send_result.failed().len().to_string().red(),
                         report.status_line()
@@ -1315,160 +1231,85 @@ async fn main() -> Result<()> {
             let mut sent_count = 0;
             let mut failed_count = 0;
 
-            if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                let client = graph::GraphClient::new_async(&graph_config).await?;
+            // One transport for the whole batch, one send implementation for
+            // every draft in it (#0058): what this loop owns is the running
+            // tally and the per-draft line.
+            let is_graph = account_config.auth_method == AuthMethod::Graph;
+            let ctx = email::send::SendContext {
+                graph: if is_graph {
+                    Some(GraphConfig::load(&account_config)?)
+                } else {
+                    None
+                },
+                smtp: (!is_graph).then(|| smtp_config.clone()),
+                account: account_config.clone(),
+                email_settings: global_config.email.clone(),
+                signature: signature_content.clone(),
+            };
 
-                for draft in drafts {
-                    print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
-                    io::stdout().flush()?;
+            for draft in drafts {
+                print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
+                io::stdout().flush()?;
 
-                    let to = parse_recipients(draft.frontmatter.to.as_deref());
-                    let cc = parse_recipients(draft.frontmatter.cc.as_deref());
-                    let bcc = parse_recipients(draft.frontmatter.bcc.as_deref());
-                    let to_refs: Vec<(&str, &str)> = to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                    let cc_refs: Vec<(&str, &str)> = cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-                    let bcc_refs: Vec<(&str, &str)> = bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-
-                    let quoted_html = draft.path.with_extension("html");
-                    let quoted = if quoted_html.exists() { fs::read_to_string(&quoted_html).ok() } else { None };
-                    let html_body = markdown_to_html(
-                        &draft.body_markdown,
-                        &global_config.email,
-                        signature_content.as_deref(),
-                        quoted.as_deref(),
-                    );
-
-                    let mut att_data: Vec<(String, Vec<u8>, String)> = Vec::new();
-                    if let Some(ref attachments) = draft.frontmatter.attachments {
-                        for att_path in attachments {
-                            let expanded = shellexpand::tilde(att_path);
-                            let path = Path::new(expanded.as_ref());
-                            if let Ok(content) = fs::read(path) {
-                                let filename = path.file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "attachment".to_string());
-                                let ct = mime_guess::from_path(path).first_or_octet_stream().to_string();
-                                att_data.push((filename, content, ct));
-                            }
-                        }
-                    }
-
-                    let built = match email::send::build_draft_message(
-                        &draft,
-                        &account_config.default_from,
-                        &global_config.email,
-                        signature_content.as_deref(),
-                        None,
-                    ) {
-                        Ok(built) => built,
-                        Err(e) => {
-                            println!("{} {}", "✗".red(), e);
-                            error!("Failed to build {}: {}", draft.path.display(), e);
-                            failed_count += 1;
-                            continue;
-                        }
-                    };
-                    let report = email::send::send_durably_via(
-                        &built,
-                        &account_config,
-                        client.send_mail(&to_refs, &cc_refs, &bcc_refs, &draft.frontmatter.subject, &html_body, &att_data),
-                    )
-                    .await?;
-                    if report.send_result.any_succeeded() {
-                        if let Err(e) = settle_sent_draft(&draft, &report, Some(&built.message_id))
-                        {
-                            println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
-                        } else {
-                            email::contacts::hooks::bump_after_send(&account_config, &draft);
-                            println!("{} [{}]", "✓".green(), report.status_line());
-                        }
-                        sent_count += 1;
-                    } else {
-                        let err = report
-                            .send_result
-                            .failed()
-                            .first()
-                            .and_then(|r| r.error.clone())
-                            .unwrap_or_else(|| "Graph send failed".to_string());
-                        println!("{} {}", "✗".red(), err);
-                        error!("Graph send error for {}: {}", draft.path.display(), err);
+                let sent = match email::send::send_draft(&draft, &ctx).await {
+                    Ok(sent) => sent,
+                    Err(e) => {
+                        println!("{} {}", "\u{2717}".red(), e);
+                        error!("Send failed for {}: {e:#}", draft.path.display());
                         failed_count += 1;
+                        continue;
                     }
-                }
-            } else {
-                for draft in drafts {
-                    print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
-                    io::stdout().flush()?;
+                };
+                let send_result = &sent.report.send_result;
 
-                    let built = match email::send::build_draft_message(
-                        &draft,
-                        &smtp_config.default_from,
-                        &global_config.email,
-                        signature_content.as_deref(),
-                        None,
-                    ) {
-                        Ok(built) => built,
-                        Err(e) => {
-                            println!("{} {}", "✗".red(), e);
-                            error!("Failed to build {}: {}", draft.path.display(), e);
-                            failed_count += 1;
-                            continue;
-                        }
-                    };
-                    match email::send::send_durably(&built, &account_config, &smtp_config).await {
-                        Ok(report) => {
-                            let send_result = &report.send_result;
-                            if send_result.any_succeeded() {
-                                if let Err(e) =
-                                    settle_sent_draft(&draft, &report, Some(&built.message_id))
-                                {
-                                    println!("{} (sent but failed to update status: {})", "⚠".yellow(), e);
-                                } else {
-                                    // Incremental contacts-index update (best-effort)
-                                    email::contacts::hooks::bump_after_send(&account_config, &draft);
-                                    if send_result.all_succeeded() {
-                                        println!("{} [{}]", "✓".green(), report.status_line());
-                                    } else {
-                                        println!(
-                                            "{} (partial: {}/{} recipients) [{}]",
-                                            "⚠".yellow(),
-                                            send_result.succeeded().len(),
-                                            send_result.results.len(),
-                                            report.status_line()
-                                        );
-                                    }
-                                }
-                                for r in &send_result.failed() {
-                                    warn!(
-                                        "Failed recipient {} ({}) for {}: {}",
-                                        r.address,
-                                        r.role,
-                                        draft.path.display(),
-                                        r.error.as_deref().unwrap_or("unknown")
-                                    );
-                                }
-                                sent_count += 1;
-                            } else {
-                                println!("{} all recipients failed [{}]", "✗".red(), report.status_line());
-                                for r in &send_result.failed() {
-                                    error!(
-                                        "Failed recipient {} ({}) for {}: {}",
-                                        r.address,
-                                        r.role,
-                                        draft.path.display(),
-                                        r.error.as_deref().unwrap_or("unknown")
-                                    );
-                                }
-                                failed_count += 1;
-                            }
-                        }
-                        Err(e) => {
-                            println!("{} {}", "✗".red(), e);
-                            error!("Fatal send error for {}: {}", draft.path.display(), e);
-                            failed_count += 1;
-                        }
+                if send_result.any_succeeded() {
+                    if let Some(e) = sent.settle_error.as_ref() {
+                        println!("{} (sent but failed to update status: {})", "\u{26a0}".yellow(), e);
+                    } else if send_result.all_succeeded() {
+                        println!("{} [{}]", "\u{2713}".green(), sent.report.status_line());
+                    } else {
+                        println!(
+                            "{} (partial: {}/{} recipients) [{}]",
+                            "\u{26a0}".yellow(),
+                            send_result.succeeded().len(),
+                            send_result.results.len(),
+                            sent.report.status_line()
+                        );
                     }
+                    for r in &send_result.failed() {
+                        warn!(
+                            "Failed recipient {} ({}) for {}: {}",
+                            r.address,
+                            r.role,
+                            draft.path.display(),
+                            r.error.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    sent_count += 1;
+                } else {
+                    match send_result.failed().first().and_then(|r| r.error.clone()) {
+                        Some(reason) => println!(
+                            "{} all recipients failed: {} [{}]",
+                            "\u{2717}".red(),
+                            reason,
+                            sent.report.status_line()
+                        ),
+                        None => println!(
+                            "{} all recipients failed [{}]",
+                            "\u{2717}".red(),
+                            sent.report.status_line()
+                        ),
+                    }
+                    for r in &send_result.failed() {
+                        error!(
+                            "Failed recipient {} ({}) for {}: {}",
+                            r.address,
+                            r.role,
+                            draft.path.display(),
+                            r.error.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    failed_count += 1;
                 }
             }
 
@@ -1657,18 +1498,15 @@ async fn main() -> Result<()> {
             let source = source_from_row(&store, &blobs, &row, false)?;
             drop(store);
 
-            let dir = email::config::drafts_dir(&account_config.name);
-            let path = email::draft::create_reply_draft_from(
-                &source,
-                all,
+            let (_path, draft) = email::draft::create_draft_from_source(
+                &account_config.name,
                 &account_config.default_from,
-                Some(&dir),
+                &source,
+                email::draft::DraftFromSource::Reply { all },
+                None,
             )?;
-            let id = email::store::drafts::new_id();
-            email::draft::set_draft_id(&path, &id)?;
-            reindex_drafts(&account_config.name);
             println!("{} reply to {}", "\u{2713}".green(), canonical);
-            println!("{}", Selector::for_draft(&account_config.name, &id));
+            println!("{}", draft);
         }
 
         Some(Commands::Forward { selector, mailbox }) => {
@@ -1679,17 +1517,15 @@ async fn main() -> Result<()> {
             let source = source_from_row(&store, &blobs, &row, true)?;
             drop(store);
 
-            let dir = email::config::drafts_dir(&account_config.name);
-            let path = email::draft::create_forward_draft_from(
-                &source,
+            let (_path, draft) = email::draft::create_draft_from_source(
+                &account_config.name,
                 &account_config.default_from,
-                Some(&dir),
+                &source,
+                email::draft::DraftFromSource::Forward,
+                None,
             )?;
-            let id = email::store::drafts::new_id();
-            email::draft::set_draft_id(&path, &id)?;
-            reindex_drafts(&account_config.name);
             println!("{} forward of {}", "\u{2713}".green(), canonical);
-            println!("{}", Selector::for_draft(&account_config.name, &id));
+            println!("{}", draft);
         }
 
         Some(Commands::Invite { action }) => {

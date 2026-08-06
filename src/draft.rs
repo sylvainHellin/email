@@ -444,6 +444,49 @@ pub fn create_forward_draft_from(
     Ok(dest)
 }
 
+/// Which draft a [`SourceMessage`] is turned into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftFromSource {
+    Reply { all: bool },
+    Forward,
+}
+
+/// Write the draft `source` produces into the account's drafts directory,
+/// mint its `id:`, refresh the index, and hand back the file and the selector
+/// that names it.
+///
+/// The one sequence behind `mp reply`, `mp forward` and the TUI's `r` / `R` /
+/// `w` (#0058): build, optional header rewrite, `set_draft_id`, reindex, name
+/// the draft. The index is refreshed before the selector is handed out
+/// because that selector has to resolve the moment it is printed or shown
+/// (#0050's post-write refresh discipline).
+///
+/// `headers` is the compose wizard's recipient/subject block, applied to the
+/// file before the id is minted so the index holds the final content. `None`
+/// is the direct reply/forward, which takes the builder's own headers.
+pub fn create_draft_from_source(
+    account: &str,
+    default_from: &str,
+    source: &SourceMessage,
+    kind: DraftFromSource,
+    headers: Option<&DraftRecipientEdit>,
+) -> Result<(PathBuf, crate::selector::Selector)> {
+    let dir = crate::config::drafts_dir(account);
+    let path = match kind {
+        DraftFromSource::Reply { all } => {
+            create_reply_draft_from(source, all, default_from, Some(&dir))?
+        }
+        DraftFromSource::Forward => create_forward_draft_from(source, default_from, Some(&dir))?,
+    };
+    if let Some(edit) = headers {
+        rewrite_draft_recipients(&path, edit)?;
+    }
+    let id = crate::store::drafts::new_id();
+    set_draft_id(&path, &id)?;
+    crate::store::drafts::refresh_account(account)?;
+    Ok((path, crate::selector::Selector::for_draft(account, &id)))
+}
+
 /// New recipient/subject values for an in-place draft frontmatter rewrite.
 /// Empty strings clear the corresponding optional field (to/cc/bcc).
 pub struct DraftRecipientEdit {

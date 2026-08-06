@@ -18,7 +18,8 @@ use super::mutations::{self, Backend, Prepared, ServerOp};
 use super::ui;
 
 use crate::draft::{
-    find_drafts, new_draft_skeleton, settle_sent_draft, DraftRecipientEdit, SourceMessage,
+    create_draft_from_source, find_drafts, new_draft_skeleton, DraftFromSource,
+    DraftRecipientEdit, SourceMessage,
 };
 use crate::selector::Selector;
 use crate::send::SendReport;
@@ -226,13 +227,6 @@ pub(super) fn html_rendition(app: &mut App, html: &str, stem: &str) -> Option<Pa
 // Drafts written from a source message (#0052 scope items 1, 2 and 11)
 // ---------------------------------------------------------------------------
 
-/// Which draft a [`SourceMessage`] is turned into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DraftFromSource {
-    Reply { all: bool },
-    Forward,
-}
-
 /// The message under the cursor, or `None` with the status line saying why
 /// there is not one.
 ///
@@ -289,41 +283,6 @@ fn source_for_msg(
     }
 }
 
-/// Write the draft `source` produces, mint its `id:`, and refresh the drafts
-/// index so the selector this hands back resolves before the status line shows
-/// it (#0050's post-write refresh discipline).
-///
-/// `headers` is the compose wizard's recipient/subject block, applied to the
-/// file before the id is minted so the index holds the final content. `None`
-/// is the direct reply/forward, which takes the builder's own headers.
-///
-/// Shared by the list, the preview and the search overlay, and byte for byte
-/// the CLI's sequence: build, `set_draft_id`, reindex, name the draft.
-fn draft_from_source(
-    account: &str,
-    default_from: &str,
-    source: &SourceMessage,
-    kind: DraftFromSource,
-    headers: Option<&DraftRecipientEdit>,
-) -> Result<(PathBuf, Selector)> {
-    let dir = crate::config::drafts_dir(account);
-    let path = match kind {
-        DraftFromSource::Reply { all } => {
-            crate::draft::create_reply_draft_from(source, all, default_from, Some(&dir))?
-        }
-        DraftFromSource::Forward => {
-            crate::draft::create_forward_draft_from(source, default_from, Some(&dir))?
-        }
-    };
-    if let Some(edit) = headers {
-        crate::draft::rewrite_draft_recipients(&path, edit)?;
-    }
-    let id = crate::store::drafts::new_id();
-    crate::draft::set_draft_id(&path, &id)?;
-    crate::store::drafts::refresh_account(account)?;
-    Ok((path, Selector::for_draft(account, &id)))
-}
-
 /// The address a draft this account writes is sent from: the SMTP config's,
 /// falling back to the account's own default.
 fn default_from(app: &App) -> String {
@@ -345,7 +304,7 @@ fn write_draft_and_edit(
 ) -> Result<()> {
     let account = app.account_config.name.clone();
     let from = default_from(app);
-    let (path, selector) = match draft_from_source(&account, &from, source, kind, None) {
+    let (path, selector) = match create_draft_from_source(&account, &from, source, kind, None) {
         Ok(pair) => pair,
         Err(e) => {
             app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
@@ -596,139 +555,30 @@ fn status_flip_batch(app: &mut App, ids: &[String], flip: DraftStatusFlip) {
 // Send (#0052 scope item 3)
 // ---------------------------------------------------------------------------
 
-/// Everything one durable send needs that does not come out of the draft.
-///
-/// `graph` being `Some` is what picks the Graph submission over SMTP, the same
-/// test `mp send` makes on `AuthMethod::Graph`; `smtp` is what the SMTP path
-/// submits through and where its `from` fallback comes from.
-struct SendCtx {
-    graph: Option<crate::config::GraphConfig>,
-    smtp: Option<crate::config::SmtpConfig>,
-    account: crate::config::AccountConfig,
-    email_settings: crate::config::EmailSettings,
-    signature: Option<String>,
-}
-
-/// The attachments a draft names, read off the paths in its frontmatter.
-///
-/// Only the Graph path needs them separately: the SMTP path's bytes are built
-/// by [`crate::send::build_draft_message`], which reads the same list itself.
-fn draft_attachments(draft: &crate::types::EmailDraft) -> Result<Vec<(String, Vec<u8>, String)>> {
-    let mut data = Vec::new();
-    let Some(attachments) = draft.frontmatter.attachments.as_ref() else {
-        return Ok(data);
-    };
-    for att_path in attachments {
-        let expanded = shellexpand::tilde(att_path);
-        let path = Path::new(expanded.as_ref());
-        let content = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("reading the attachment {att_path}: {e}"))?;
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_string());
-        let content_type = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-        data.push((filename, content, content_type));
-    }
-    Ok(data)
-}
-
 /// Send one draft the way `mp send <selector>` does, and leave the same trail.
 ///
-/// The order is the CLI's, and the durability is the outbox's (#0037 item 5):
-/// the bytes are built first (which is where the approved-status requirement
-/// is enforced, by [`crate::send::build_draft_message`]), committed to the
-/// outbox, submitted, and only a submission that reached at least one
-/// recipient rewrites the draft's `status:` to `sent`. A submission that
-/// reached *every* recipient and got an outbox row additionally takes the file
-/// out of `drafts/`; see [`crate::draft::settle_sent_draft`]. The sent copy is
-/// the outbox's business, not this function's.
-///
-/// The drafts index is refreshed afterwards so the retirement (or the `sent`
-/// status a partial send leaves) is the answer the next selector resolution
-/// gives, without waiting for the one-second poll (#0050's post-write refresh
-/// discipline).
+/// The orchestration itself is [`crate::send::send_draft`] (#0058): the outbox
+/// commit, the transport choice, the sent copy and the draft file's fate are
+/// all shared with the CLI. What is added here is the TUI's own half: the
+/// blocking bridge into the async path, and the drafts-index refresh so the
+/// retirement (or the `sent` status a partial send leaves) is the answer the
+/// next selector resolution gives, without waiting for the one-second poll
+/// (#0050's post-write refresh discipline).
 fn send_one_draft(
     rt: &tokio::runtime::Runtime,
     draft: &crate::types::EmailDraft,
-    ctx: &SendCtx,
+    ctx: &crate::send::SendContext,
 ) -> Result<SendReport> {
-    // The Graph path has no SMTP config to take a `from` fallback from, so it
-    // takes the account's; identical bytes either way (see
-    // `build_draft_message`).
-    let default_from = match (ctx.graph.as_ref(), ctx.smtp.as_ref()) {
-        (Some(_), _) => ctx.account.default_from.clone(),
-        (None, Some(smtp)) => smtp.default_from.clone(),
-        (None, None) => anyhow::bail!("SMTP not configured"),
-    };
-    let built = crate::send::build_draft_message(
-        draft,
-        &default_from,
-        &ctx.email_settings,
-        ctx.signature.as_deref(),
-        None,
-    )?;
-
-    let report = match ctx.graph.as_ref() {
-        Some(graph_config) => {
-            let to = parse_graph_recipients(draft.frontmatter.to.as_deref());
-            let cc = parse_graph_recipients(draft.frontmatter.cc.as_deref());
-            let bcc = parse_graph_recipients(draft.frontmatter.bcc.as_deref());
-            let to_refs: Vec<(&str, &str)> =
-                to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-            let cc_refs: Vec<(&str, &str)> =
-                cc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-            let bcc_refs: Vec<(&str, &str)> =
-                bcc.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-
-            // The quoted reply lives in the companion HTML the draft builder
-            // wrote; the Graph API takes a rendered body rather than bytes.
-            let quoted_html = draft.path.with_extension("html");
-            let quoted = if quoted_html.exists() {
-                std::fs::read_to_string(&quoted_html).ok()
-            } else {
-                None
-            };
-            let html_body = crate::send::markdown_to_html(
-                &draft.body_markdown,
-                &ctx.email_settings,
-                ctx.signature.as_deref(),
-                quoted.as_deref(),
-            );
-            let att_data = draft_attachments(draft)?;
-            let client = rt.block_on(crate::graph::GraphClient::new_async(graph_config))?;
-            rt.block_on(crate::send::send_durably_via(
-                &built,
-                &ctx.account,
-                client.send_mail(
-                    &to_refs,
-                    &cc_refs,
-                    &bcc_refs,
-                    &draft.frontmatter.subject,
-                    &html_body,
-                    &att_data,
-                ),
-            ))?
+    let sent = rt.block_on(crate::send::send_draft(draft, ctx))?;
+    if sent.report.send_result.any_succeeded() {
+        if let Some(e) = sent.settle_error.as_ref() {
+            log::warn!("[drafts] the send left the draft file behind: {e:#}");
         }
-        None => {
-            let smtp = ctx
-                .smtp
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SMTP not configured"))?;
-            rt.block_on(crate::send::send_durably(&built, &ctx.account, smtp))?
-        }
-    };
-
-    if report.send_result.any_succeeded() {
-        settle_sent_draft(draft, &report, Some(&built.message_id))?;
-        crate::contacts::hooks::bump_after_send(&ctx.account, draft);
         if let Err(e) = crate::store::drafts::refresh_account(&ctx.account.name) {
             log::warn!("[drafts] refreshing after the send failed: {e:#}");
         }
     }
-    Ok(report)
+    Ok(sent.report)
 }
 
 /// The status line one finished send shows, which is the CLI's own report:
@@ -974,7 +824,7 @@ pub(super) fn handle_action(
                 app.set_status_level("SMTP not configured".to_string(), StatusLevel::Error);
                 return Ok(());
             }
-            let ctx = SendCtx {
+            let ctx = crate::send::SendContext {
                 graph,
                 smtp,
                 account: account_config,
@@ -1064,220 +914,89 @@ pub(super) fn handle_action(
         }
 
         Action::SendApproved => {
-            if let Some(dir) = app.active_dir().cloned() {
-                if app.is_graph() {
-                    let graph_config = app.graph_config.clone().unwrap();
-                    let email_settings = app.global_config.email.clone();
-                    let account_config = app.account_config.clone();
-                    let signature = app.signature_content.clone();
-
-                    app.bg_count += 1;
-                    app.set_status_level(
-                        "Sending approved via Graph...".to_string(),
-                        StatusLevel::Progress,
-                    );
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = (|| -> anyhow::Result<String> {
-                            let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
-                            if drafts.is_empty() {
-                                return Ok("No approved emails found".to_string());
-                            }
-
-                            let mut sent = 0usize;
-                            let mut failed = 0usize;
-
-                            for draft in &drafts {
-                                let send_result = (|| -> anyhow::Result<(String, SendReport)> {
-                                    let to = parse_graph_recipients(
-                                        draft.frontmatter.to.as_deref(),
-                                    );
-                                    let cc = parse_graph_recipients(
-                                        draft.frontmatter.cc.as_deref(),
-                                    );
-                                    let bcc = parse_graph_recipients(
-                                        draft.frontmatter.bcc.as_deref(),
-                                    );
-                                    let to_refs: Vec<(&str, &str)> = to
-                                        .iter()
-                                        .map(|(n, a)| (n.as_str(), a.as_str()))
-                                        .collect();
-                                    let cc_refs: Vec<(&str, &str)> = cc
-                                        .iter()
-                                        .map(|(n, a)| (n.as_str(), a.as_str()))
-                                        .collect();
-                                    let bcc_refs: Vec<(&str, &str)> = bcc
-                                        .iter()
-                                        .map(|(n, a)| (n.as_str(), a.as_str()))
-                                        .collect();
-
-                                    let quoted_html = draft.path.with_extension("html");
-                                    let quoted = if quoted_html.exists() {
-                                        std::fs::read_to_string(&quoted_html).ok()
-                                    } else {
-                                        None
-                                    };
-                                    let html_body = crate::send::markdown_to_html(
-                                        &draft.body_markdown,
-                                        &email_settings,
-                                        signature.as_deref(),
-                                        quoted.as_deref(),
-                                    );
-
-                                    let mut att_data: Vec<(String, Vec<u8>, String)> = Vec::new();
-                                    if let Some(ref attachments) = draft.frontmatter.attachments {
-                                        for att_path in attachments {
-                                            let expanded = shellexpand::tilde(att_path);
-                                            let p = std::path::Path::new(expanded.as_ref());
-                                            let content = std::fs::read(p)?;
-                                            let filename = p
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| "attachment".to_string());
-                                            let content_type = mime_guess::from_path(p)
-                                                .first_or_octet_stream()
-                                                .to_string();
-                                            att_data.push((filename, content, content_type));
-                                        }
-                                    }
-
-                                    let client = rt.block_on(
-                                        crate::graph::GraphClient::new_async(&graph_config),
-                                    )?;
-                                    let built = crate::send::build_draft_message(
-                                        draft,
-                                        &account_config.default_from,
-                                        &email_settings,
-                                        signature.as_deref(),
-                                        None,
-                                    )?;
-                                    let report = rt.block_on(crate::send::send_durably_via(
-                                        &built,
-                                        &account_config,
-                                        client.send_mail(
-                                            &to_refs,
-                                            &cc_refs,
-                                            &bcc_refs,
-                                            &draft.frontmatter.subject,
-                                            &html_body,
-                                            &att_data,
-                                        ),
-                                    ))?;
-                                    if !report.send_result.any_succeeded() {
-                                        anyhow::bail!("Graph send failed");
-                                    }
-                                    Ok((built.message_id, report))
-                                })();
-
-                                match send_result {
-                                    Ok((message_id, report)) => {
-                                        let _ = settle_sent_draft(
-                                            draft,
-                                            &report,
-                                            Some(&message_id),
-                                        );
-                                        crate::contacts::hooks::bump_after_send(
-                                            &account_config,
-                                            draft,
-                                        );
-                                        sent += 1;
-                                    }
-                                    Err(_) => failed += 1,
-                                }
-                            }
-
-                            Ok(format!("{} sent, {} failed", sent, failed))
-                        })();
-                        let _ = tx.send(BgResult::SendApproved {
-                            account_index: acct_idx,
-                            result: result.map_err(|e| e.to_string()),
-                        });
-                    });
+            // `mp send-approved` in-process, over the same one send
+            // implementation the single-draft key and the CLI use (#0058):
+            // every approved draft in the open Drafts directory goes through
+            // [`crate::send::send_draft`], which owns the outbox commit, the
+            // transport choice and the draft file's fate. What is counted
+            // here is only how many made it.
+            let Some(dir) = app.active_dir().cloned() else {
+                return Ok(());
+            };
+            // A Graph account sends over Graph or not at all: an SMTP config
+            // that happens to be loaded is not a fallback for a token that is
+            // not.
+            let is_graph = app.is_graph();
+            let (graph, smtp) = if is_graph {
+                (app.graph_config.clone(), None)
+            } else {
+                (None, app.smtp_config.clone())
+            };
+            if graph.is_none() && smtp.is_none() {
+                let missing = if is_graph {
+                    "Graph not configured"
                 } else {
-                    let smtp_config = match app.smtp_config.clone() {
-                        Some(c) => c,
-                        None => {
-                            app.set_status_level(
-                                "SMTP not configured".to_string(),
-                                StatusLevel::Error,
-                            );
-                            return Ok(());
-                        }
-                    };
-                    let email_settings = app.global_config.email.clone();
-                    let account_config = app.account_config.clone();
-                    let signature = app.signature_content.clone();
-
-                    app.bg_count += 1;
-                    app.set_status_level(
-                        "Sending approved...".to_string(),
-                        StatusLevel::Progress,
-                    );
-                    let acct_idx = app.active_account;
-                    let tx = bg_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create tokio runtime");
-                        let result = (|| -> anyhow::Result<String> {
-                            let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
-                            if drafts.is_empty() {
-                                return Ok("No approved emails found".to_string());
-                            }
-
-                            let mut sent = 0usize;
-                            let mut failed = 0usize;
-
-                            for draft in &drafts {
-                                let built = match crate::send::build_draft_message(
-                                    draft,
-                                    &smtp_config.default_from,
-                                    &email_settings,
-                                    signature.as_deref(),
-                                    None,
-                                ) {
-                                    Ok(built) => built,
-                                    Err(_) => {
-                                        failed += 1;
-                                        continue;
-                                    }
-                                };
-                                match rt.block_on(crate::send::send_durably(
-                                    &built,
-                                    &account_config,
-                                    &smtp_config,
-                                )) {
-                                    Ok(report) => {
-                                        if report.send_result.any_succeeded() {
-                                            let _ = settle_sent_draft(
-                                                draft,
-                                                &report,
-                                                Some(&built.message_id),
-                                            );
-                                            crate::contacts::hooks::bump_after_send(
-                                                &account_config,
-                                                draft,
-                                            );
-                                            sent += 1;
-                                        } else {
-                                            failed += 1;
-                                        }
-                                    }
-                                    Err(_) => failed += 1,
-                                }
-                            }
-
-                            Ok(format!("{} sent, {} failed", sent, failed))
-                        })();
-                        let _ = tx.send(BgResult::SendApproved {
-                            account_index: acct_idx,
-                            result: result.map_err(|e| e.to_string()),
-                        });
-                    });
-                }
+                    "SMTP not configured"
+                };
+                app.set_status_level(missing.to_string(), StatusLevel::Error);
+                return Ok(());
             }
+            let ctx = crate::send::SendContext {
+                graph,
+                smtp,
+                account: app.account_config.clone(),
+                email_settings: app.global_config.email.clone(),
+                signature: app.signature_content.clone(),
+            };
+
+            app.bg_count += 1;
+            app.set_status_level(
+                if is_graph {
+                    "Sending approved via Graph...".to_string()
+                } else {
+                    "Sending approved...".to_string()
+                },
+                StatusLevel::Progress,
+            );
+            let acct_idx = app.active_account;
+            let tx = bg_tx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                let result = (|| -> anyhow::Result<String> {
+                    let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
+                    if drafts.is_empty() {
+                        return Ok("No approved emails found".to_string());
+                    }
+
+                    let mut sent = 0usize;
+                    let mut failed = 0usize;
+                    for draft in &drafts {
+                        match rt.block_on(crate::send::send_draft(draft, &ctx)) {
+                            Ok(outcome) if outcome.report.send_result.any_succeeded() => sent += 1,
+                            Ok(_) => failed += 1,
+                            Err(e) => {
+                                log::warn!(
+                                    "[send] {} was not sent: {e:#}",
+                                    draft.path.display()
+                                );
+                                failed += 1;
+                            }
+                        }
+                    }
+                    // One refresh for the batch, not one per draft: the index
+                    // is read again the moment the status line lands.
+                    if sent > 0 {
+                        if let Err(e) = crate::store::drafts::refresh_account(&ctx.account.name) {
+                            log::warn!("[drafts] refreshing after send-approved failed: {e:#}");
+                        }
+                    }
+                    Ok(format!("{} sent, {} failed", sent, failed))
+                })();
+                let _ = tx.send(BgResult::SendApproved {
+                    account_index: acct_idx,
+                    result: result.map_err(|e| e.to_string()),
+                });
+            });
         }
 
         Action::NewDraft => {
@@ -2259,7 +1978,7 @@ fn submit_compose_wizard(
         };
         let account = app.account_config.name.clone();
         let from = default_from(app);
-        let (path, selector) = match draft_from_source(
+        let (path, selector) = match create_draft_from_source(
             &account,
             &from,
             &source,
@@ -2732,28 +2451,6 @@ fn set_read_flag(
     true
 }
 
-fn parse_name_address(s: &str) -> (String, String) {
-    let s = s.trim();
-    if let Some(lt) = s.find('<') {
-        if let Some(gt) = s.find('>') {
-            let name = s[..lt].trim().trim_matches('"').trim().to_string();
-            let addr = s[lt + 1..gt].trim().to_string();
-            return (name, addr);
-        }
-    }
-    (String::new(), s.to_string())
-}
-
-fn parse_graph_recipients(field: Option<&str>) -> Vec<(String, String)> {
-    match field {
-        Some(s) if !s.trim().is_empty() => crate::send::split_addresses(s)
-            .into_iter()
-            .map(|a| parse_name_address(&a))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3088,7 +2785,7 @@ mod store_backed_drafts {
         let row = fx.ingest(&fixture_email("Hello"));
         let source = fx.source(&row, false);
 
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3133,7 +2830,7 @@ mod store_backed_drafts {
         let row = fx.ingest(&fixture_email("Meeting"));
         let source = fx.source(&row, false);
 
-        let (path, _) = draft_from_source(
+        let (path, _) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3176,7 +2873,7 @@ mod store_backed_drafts {
         let row = fx.ingest(&email);
         let source = fx.source(&row, true);
 
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3217,7 +2914,7 @@ mod store_backed_drafts {
         let row = fx.ingest(&fixture_email("Report"));
         let source = fx.source(&row, true);
 
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3255,7 +2952,7 @@ mod store_backed_drafts {
         let fx = Fixture::new();
         let row = fx.ingest(&fixture_email("Hello"));
         let source = fx.source(&row, false);
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3309,7 +3006,7 @@ mod store_backed_drafts {
         )
         .unwrap();
 
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3341,11 +3038,14 @@ mod store_backed_drafts {
 /// The store-backed mutation flows (#0052 unit B), over the same fixture:
 /// send, approve, mark-draft and the batch forms of the last two.
 ///
-/// The send tests are offline by construction. The two halves of `mp send`'s
-/// contract that do not need a server are exactly the two worth pinning: a
-/// draft that is not approved is refused before anything is enqueued, and a
-/// submission that reaches nobody still leaves the durable record the outbox
-/// exists for, with the draft file untouched.
+/// The send tests run against [`crate::send::send_draft`], which is the one
+/// implementation `mp send`, `mp send-approved` and this key all reach
+/// (#0058), so what they pin holds for the CLI too. They are offline by
+/// construction. Three halves of the contract need no server and are exactly
+/// the ones worth pinning: a draft that is not approved is refused before
+/// anything is enqueued, a submission that reaches nobody still leaves the
+/// durable record the outbox exists for with the draft file untouched, and a
+/// context naming no transport at all refuses before the draft is read.
 #[cfg(test)]
 mod store_backed_mutations {
     use super::store_backed_drafts::{fixture_email, Fixture};
@@ -3355,8 +3055,8 @@ mod store_backed_mutations {
 
     /// An account that submits to a closed port: the SMTP conversation fails
     /// on connect, deterministically and without a network.
-    fn dead_smtp_ctx() -> SendCtx {
-        SendCtx {
+    fn dead_smtp_ctx() -> crate::send::SendContext {
+        crate::send::SendContext {
             graph: None,
             smtp: Some(crate::config::SmtpConfig {
                 host: "127.0.0.1".to_string(),
@@ -3419,7 +3119,7 @@ mod store_backed_mutations {
     fn a_draft(fx: &Fixture) -> (PathBuf, Selector, String) {
         let row = fx.ingest(&fixture_email("Hello"));
         let source = fx.source(&row, false);
-        let (path, selector) = draft_from_source(
+        let (path, selector) = create_draft_from_source(
             "alice",
             "me@example.com",
             &source,
@@ -3446,7 +3146,7 @@ mod store_backed_mutations {
         let draft = crate::draft::parse_email_draft(&path).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match send_one_draft(&rt, &draft, &dead_smtp_ctx()) {
+        let err = match rt.block_on(crate::send::send_draft(&draft, &dead_smtp_ctx())) {
             Ok(_) => panic!("an unapproved draft must not be sent"),
             Err(e) => e,
         };
@@ -3471,9 +3171,16 @@ mod store_backed_mutations {
         let draft = crate::draft::parse_email_draft(&path).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let report = send_one_draft(&rt, &draft, &dead_smtp_ctx()).unwrap();
+        let sent = rt
+            .block_on(crate::send::send_draft(&draft, &dead_smtp_ctx()))
+            .unwrap();
+        let report = sent.report;
 
         assert!(!report.send_result.any_succeeded());
+        assert!(
+            sent.settle_error.is_none(),
+            "nothing was sent, so nothing was retired"
+        );
         assert!(report.row_id.is_some(), "the message reached the outbox");
         assert!(matches!(
             report.state,
@@ -3492,6 +3199,30 @@ mod store_backed_mutations {
             .unwrap()
             .contains("status: approved"));
         assert_eq!(fx.resolve(&selector).status, "approved");
+    }
+
+    /// A context that names neither transport is a configuration error, and it
+    /// is caught before the outbox hears about the draft: the same refusal the
+    /// TUI shows when `resolve_send_account` finds no SMTP and no Graph.
+    #[test]
+    fn a_context_with_no_transport_refuses_before_anything_is_enqueued() {
+        let fx = Fixture::new();
+        let (path, _selector, _id) = a_draft(&fx);
+        crate::draft::mark_as_approved(&path).unwrap();
+        let draft = crate::draft::parse_email_draft(&path).unwrap();
+        let ctx = crate::send::SendContext {
+            smtp: None,
+            ..dead_smtp_ctx()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(crate::send::send_draft(&draft, &ctx)) {
+            Ok(_) => panic!("a draft with no transport must not be sent"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.to_string(), "SMTP not configured");
+        assert_eq!(outbox_counts(&fx).total(), 0, "nothing was enqueued");
     }
 
     /// Approve and mark-draft flip the file `mp mark-approved` /

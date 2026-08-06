@@ -487,3 +487,11 @@ A safety flag derived from one cause of a condition asserts the condition; deriv
 The intended meaning of the default was "no such row, so the delete is a no-op", which is true only for `QueryReturnedNoRows`; every other error arrived at the same place and failed open, on the one code path in the crate whose failure mode is deletion.
 The arms are now separate, and a lookup that errors holds the row back (#0065 follow-up, [src/ingest.rs](../src/ingest.rs)).
 `unwrap_or` on a query is a decision about every error the query can produce; when the caller deletes things, write the arms out.
+
+## Four copies of one orchestration do not drift evenly; they drift toward the weakest error handling
+
+`mp send`, `mp send-approved` and the two TUI send keys each carried their own copy of build, submit, settle, bump, reindex (#0058).
+Diffing them before merging turned up three divergences that no test and no reader had noticed: the TUI's send-approved never refreshed the drafts index, the CLI's Graph send-approved silently dropped an attachment it could not read (`if let Ok(content)` where the other three propagated), and a Graph transport error in that same loop aborted the whole batch where the SMTP loop counted one failure and carried on.
+None of the three is a copy-paste slip; each is a place where one copy was edited and the others were not, and the weaker handling is the one that survives because it never fails a test.
+Unification is therefore not a mechanical merge: every divergence found is a decision to take deliberately and to write down, because whichever copy you started from silently becomes the contract for all four call sites.
+When collapsing duplicated orchestrations, diff them first and treat the differences as the findings, not as noise.

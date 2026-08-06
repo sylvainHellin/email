@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **One send implementation behind `mp send`, `mp send-approved` and both TUI
+  send keys (#0058).** Sending a draft was written out four times, each with
+  its own copy of the recipient parsing, the attachment reading, the quoted
+  HTML lookup, the SMTP-or-Graph choice and the post-send bookkeeping, so every
+  durability fix had to be made four times and the copies had already drifted:
+  the TUI's send-approved never refreshed the drafts index, `mp send-approved`
+  over Graph skipped an attachment it could not read and sent the mail without
+  it, and a Graph transport error there aborted the whole batch instead of
+  counting one failure. `send::send_draft(&draft, &SendContext)` is now the
+  single orchestration: it builds the bytes (which is where the approved-status
+  requirement lives), commits the outbox row, submits over whichever transport
+  the context names, and retires the draft file. The four call sites keep only
+  what differs between them, the prompt, the wording and the exit code. Reply
+  and forward draft creation was duplicated the same way and is now
+  `draft::create_draft_from_source`, one build-rewrite-mint-reindex sequence for
+  `mp reply`, `mp forward` and the TUI's `r` / `R` / `w`. Net 200 lines of
+  duplication gone, with the two behaviour changes that follow from sharing one
+  path: an attachment that cannot be read fails the send everywhere rather than
+  being dropped in silence, and the contacts index is bumped on every send that
+  reached a recipient, including one whose draft file could not be retired
+  afterwards. `mp send-approved` now also names the reason on the line that
+  says every recipient failed.
+
 ### Fixed
 - **The Graph prune no longer deletes the copy of a message you just sent
   (#0065).** Sending through Graph files the local copy under a uid derived

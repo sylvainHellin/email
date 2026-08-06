@@ -3,7 +3,7 @@ id: 0058
 title: One send implementation shared by the CLI and the TUI, plus reply/forward dedup
 type: refactor
 priority: next
-status: open
+status: done
 created: 2026-08-06
 ---
 
