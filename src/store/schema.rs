@@ -61,12 +61,15 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///
 /// Identity notes that are load-bearing rather than cosmetic:
 ///
-/// - Every table carries `account`, although one store file only ever holds
-///   one account. The redundancy is deliberate (#0054): it keeps a future
-///   shared database a schema change rather than a rewrite of every query, and
-///   it is cheaper to carry the column than to explain per table why this one
-///   is exempt. `sync_cursors` and `pending_ops` were the two exceptions and
-///   are no longer.
+/// - Every per-account, row-scoped table carries `account`, although one store
+///   file only ever holds one account. The redundancy is deliberate (#0054):
+///   it keeps a future shared database a schema change rather than a rewrite
+///   of every query, and it is cheaper to carry the column than to explain per
+///   table why this one is exempt. `sync_cursors` and `pending_ops` were the
+///   two exceptions among those tables and are no longer. The convention does
+///   not reach `meta` (file-scoped), `blobs` (content-addressed and shared by
+///   construction), `message_blobs` (scoped by its `messages` foreign key) or
+///   `messages_fts` (an index keyed on the `messages` rowid).
 /// - `messages` has a synthetic `id` so a move or a UIDVALIDITY reset does not
 ///   invalidate references held elsewhere; `UNIQUE (account, mailbox, uid)` is
 ///   the real identity and the target of the ingest UPSERT.
@@ -119,14 +122,17 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   and there is nothing to rebuild from, because a store that loses its index
 ///   is dropped and refilled by the next sync.
 /// - `sync_cursors` keeps the two resume points apart, because they are not
-///   the same number: `last_uid` is the highest UID the recording fetch saw
-///   and is what the IMAP pull resumes from today, while `highest_modseq` is a
-///   CONDSTORE modification sequence and stays NULL until #0041 issues
-///   `CHANGEDSINCE`. Until then it is unused, like `deltalink` (Graph's
-///   `deltaLink`, waiting on #0042). They were one column until #0054, which
-///   stored a UID in `highest_modseq`: a UID-sized number read as a modseq
-///   makes the server return nothing and no error, which is the #0004 failure
-///   mode with no symptom.
+///   the same number: `last_uid` is the highest UID the recording fetch saw,
+///   while `highest_modseq` is a CONDSTORE modification sequence. Both are
+///   write-only today. The IMAP pull resumes from `known_uids_with_cursor`
+///   (the stored UID set plus uidvalidity), not from `last_uid`; `last_uid` is
+///   what #0041 and #0059 will resume from once the pull is a delta rather
+///   than a window. `highest_modseq` stays NULL until #0041 issues
+///   `CHANGEDSINCE`, as does `deltalink` (Graph's `deltaLink`, waiting on
+///   #0042). They were one column until #0054, which stored a UID in
+///   `highest_modseq`: a UID-sized number read as a modseq makes the server
+///   return nothing and no error, which is the #0004 failure mode with no
+///   symptom.
 /// - `pending_ops` is the durable mutation queue #0039 will drain; only its
 ///   shape lives here so far. `updated` is the last-attempt timestamp the
 ///   backoff is a function of (`updated + backoff_secs(attempts) > now`, the
@@ -168,7 +174,8 @@ CREATE TABLE messages (
     has_attachments  INTEGER NOT NULL DEFAULT 0,
     body_blob        TEXT,
     raw_blob         TEXT,
-    -- size is the retention input: eviction picks its victims by it.
+    -- size will be the retention input: eviction, when it lands (#0060), picks
+    -- its victims by it. Nothing evicts anything today.
     size             INTEGER,
     UNIQUE (account, mailbox, uid)
 );

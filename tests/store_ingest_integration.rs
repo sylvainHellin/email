@@ -803,6 +803,11 @@ fn mailbox_cursors_round_trip() {
         Some(42),
         "another account's cursor for the same mailbox name is a separate row"
     );
+    assert_eq!(
+        email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
+        Some(43),
+        "writing another account's cursor leaves the first account's row alone"
+    );
 }
 
 /// `known_uids` is what lets an incremental fetch skip bodies it already holds.

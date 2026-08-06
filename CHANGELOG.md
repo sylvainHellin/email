@@ -21,12 +21,13 @@ All notable changes to this project are documented in this file.
   still takes the arrivals a user is waiting for. **The TUI watcher compares the
   set of inbox ids rather than how many there are**, so one arrival plus one
   archive inside the same minute is no longer invisible, and it keeps one client
-  (refreshing only the token) instead of paying a keyring read and a fresh
-  connection pool every poll. **A revoked Graph token now reaches the user**: it
-  used to be one silent failed request per minute forever, and is now a widening
-  poll interval sharing the outbox's backoff curve, up to 15 minutes, plus a
-  visible watch error after three consecutive failures. A sync's per-message
-  read-flag updates land in **one transaction per mailbox** on both backends
+  instead of building a fresh one every poll, which saves the connection pool
+  and the network refresh of an unexpired token (the cached token blob is still
+  read and decrypted on every pass). **A revoked Graph token now reaches the
+  user**: it used to be one silent failed request per minute forever, and is now
+  a widening poll interval sharing the outbox's backoff curve, up to 15 minutes,
+  plus a visible watch error after three consecutive failures. A sync's
+  per-message read-flag updates land in **one transaction per mailbox** on both backends
   rather than one commit per message, and the Graph sync path carries the same
   `[TIMING]` marks as the IMAP one.
 - **A contacts rebuild no longer wipes the frecency index (#0053).** The
@@ -122,12 +123,12 @@ All notable changes to this project are documented in this file.
 - **Store schema v4: the sync cursor stops storing a UID as a modification
   sequence (#0054).** `sync_cursors.highest_modseq` held the highest UID a
   fetch had seen, which nothing read as a modseq yet. It is now split in two:
-  `last_uid` is what the incremental fetch resumes from, and `highest_modseq`
-  only ever holds a CONDSTORE modification sequence, staying NULL until #0041
-  issues `CHANGEDSINCE`. A UID-sized number passed as a modseq makes the server
-  return nothing **and no error**, so the trap would have been silent. Three
-  smaller corrections ride the same version bump: `sync_cursors` and
-  `pending_ops` now carry the `account` column the rest of the schema carries
+  `last_uid` holds the highest UID a fetch saw and is what #0041 will resume
+  from, and `highest_modseq` only ever holds a CONDSTORE modification sequence,
+  staying NULL until #0041 issues `CHANGEDSINCE`. A UID-sized number passed as
+  a modseq makes the server return nothing **and no error**, so the trap would
+  have been silent. Three smaller corrections ride the same version bump:
+  `sync_cursors` and `pending_ops` now carry the `account` column the rest of the schema carries
   (the cursor row is keyed `(account, mailbox)` like every other per-mailbox
   row), `pending_ops` gains the `updated` timestamp the #0039 backoff is a
   function of, and the two write-only columns (`messages.mtime`,
