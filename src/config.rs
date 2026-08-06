@@ -95,6 +95,26 @@ pub struct AccountConfig {
     pub save_to_sent: SaveToSent,
 }
 
+impl AccountConfig {
+    /// Whether this account has no remote source at all: no IMAP host (nor the
+    /// SMTP host [`ImapConfig::load`] falls back to) and no Graph.
+    ///
+    /// Such an account is legitimate: drafts are local files, so a config can
+    /// hold an account that only ever writes them. The TUI already supports it
+    /// (startup auto-fetch skips accounts with neither transport); `mp sync
+    /// --all-accounts` used to count it as a failure and exit 1 forever.
+    ///
+    /// Configured-but-unusable is deliberately *not* local-only: an account
+    /// with a host and a missing password must still be reported as a failure,
+    /// which is why this reads the config rather than asking whether
+    /// [`ImapConfig::load`] succeeds.
+    pub fn is_local_only(&self) -> bool {
+        self.auth_method != AuthMethod::Graph
+            && self.imap.host.trim().is_empty()
+            && self.smtp.host.trim().is_empty()
+    }
+}
+
 /// Whether the client APPENDs its own copy of a sent message to the Sent
 /// mailbox (#0037 item 5).
 ///
@@ -1034,6 +1054,53 @@ host = "imap.example.com"
             account.imap.host.clone()
         };
         assert_eq!(host, "smtp.example.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // AccountConfig::is_local_only (#0071 review follow-up)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_account_without_any_host_is_local_only() {
+        let account = AccountConfig {
+            name: "drafts-only".to_string(),
+            ..Default::default()
+        };
+        assert!(account.is_local_only());
+    }
+
+    /// The SMTP host is what `ImapConfig::load` falls back to, so an account
+    /// that only names it still has a remote source.
+    #[test]
+    fn either_host_makes_an_account_remote() {
+        let imap_only = AccountConfig {
+            imap: ImapSettings {
+                host: "imap.example.com".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!imap_only.is_local_only());
+
+        let smtp_only = AccountConfig {
+            smtp: SmtpSettings {
+                host: "smtp.example.com".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!smtp_only.is_local_only());
+    }
+
+    /// A Graph account has no IMAP host by construction; skipping it as
+    /// local-only would silence the one transport it does have.
+    #[test]
+    fn a_graph_account_is_never_local_only() {
+        let account = AccountConfig {
+            auth_method: AuthMethod::Graph,
+            ..Default::default()
+        };
+        assert!(!account.is_local_only());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use super::super::app::{hint_bindings, prefix_continuations, App, KeyCtx, View};
 use super::super::theme;
-use super::util::{desc_span, hint_span};
+use super::util::{desc_span, display_width, hint_span};
 
 /// herdr-style mode/hint bar (#0032): a single line showing an accent-bg mode
 /// badge plus the next valid keystrokes for the current context, all derived
@@ -156,11 +156,14 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         format!("{} {}/{} ", app.active_label(), app.list_index + 1, shown)
     };
-    let right_len = (sel_text.len()
-        + unread_text.len()
-        + outbox_text.len()
-        + watch_prefix.len()
-        + mailbox_text.len()
+    // Display cells, not bytes: a mailbox label with an umlaut or a wide glyph
+    // would otherwise reserve more columns than it draws and eat into the
+    // account strip on the left.
+    let right_len = (display_width(&sel_text)
+        + display_width(&unread_text)
+        + display_width(&outbox_text)
+        + display_width(watch_prefix)
+        + display_width(&mailbox_text)
         + 1) as u16;
 
     let chunks = Layout::default()
@@ -274,4 +277,125 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         .style(Style::default().bg(theme::active().surface))
         .alignment(Alignment::Right);
     frame.render_widget(right, chunks[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_health::SyncHealth;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    /// A minimal `AccountState`, built as a struct literal rather than through
+    /// `AccountState::new`, which reads the user's config and keyring.
+    fn account(name: &str, sync_health: SyncHealth) -> crate::tui::app::AccountState {
+        crate::tui::app::AccountState {
+            account_config: crate::config::AccountConfig {
+                name: name.to_string(),
+                ..Default::default()
+            },
+            imap_config: None,
+            smtp_config: None,
+            graph_config: None,
+            signature_content: None,
+            archive_server_name: "Archive".to_string(),
+            drafts_dir: None,
+            mailboxes: Vec::new(),
+            mailbox_counts: Vec::new(),
+            email_cache: Vec::new(),
+            sidebar_index: 0,
+            active_mailbox: 0,
+            list_index: 0,
+            cursor_ref: None,
+            headers_scroll: 0,
+            preview_scroll: 0,
+            selection: std::collections::HashSet::new(),
+            search_query: String::new(),
+            search_includes_body: false,
+            bg_mutations: 0,
+            watcher_active: false,
+            outbox: crate::outbox::OutboxCounts::default(),
+            has_unseen: false,
+            sync_health,
+        }
+    }
+
+    fn failed_at(hour: u32, minute: u32) -> SyncHealth {
+        SyncHealth::default().updated(Err("IMAP login failed: no such user"), local(hour, minute))
+    }
+
+    fn local(hour: u32, minute: u32) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(2026, 8, 6, hour, minute, 0)
+            .single()
+            .expect("unambiguous local time")
+    }
+
+    /// An app with `accounts`, the first one active, and just enough mailbox
+    /// state for the status bar's counters to resolve.
+    fn app_with(accounts: Vec<crate::tui::app::AccountState>) -> App {
+        let mut app = App::default_for_tests();
+        app.accounts = accounts;
+        app.active_account = 0;
+        app.mailbox_counts = vec![0];
+        app
+    }
+
+    fn render(app: &App, width: u16) -> Buffer {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_status_bar(app, frame, frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &Buffer) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    }
+
+    /// The only surface that shows a *non-active* account's failure (#0071):
+    /// the sidebar block follows the account being viewed, so without this
+    /// strip a broken account nobody has switched to says nothing at all.
+    #[test]
+    fn the_strip_marks_a_non_active_failing_account() {
+        let app = app_with(vec![
+            account("tum", SyncHealth::Ok { at: local(15, 43) }),
+            account("perso", failed_at(15, 42)),
+        ]);
+        let buffer = render(&app, 60);
+        let text = row_text(&buffer);
+        assert!(
+            text.contains("\u{26a0}PERSO"),
+            "the failing account carries the marker; got:\n{text}"
+        );
+        assert!(
+            text.contains("[TUM]"),
+            "and the active account stays bracketed; got:\n{text}"
+        );
+
+        let marker = text.find('\u{26a0}').expect("marker rendered") as u16;
+        assert_eq!(
+            buffer[(marker, 0)].style().fg,
+            Some(theme::active().error),
+            "a failure needs a human, so it gets the error colour"
+        );
+    }
+
+    /// A healthy strip carries no marker and no error colour: the mark means
+    /// something only because the quiet case is silent.
+    #[test]
+    fn a_healthy_strip_carries_no_marker() {
+        let app = app_with(vec![
+            account("tum", SyncHealth::Ok { at: local(15, 43) }),
+            account("perso", SyncHealth::Unknown),
+        ]);
+        let text = row_text(&render(&app, 60));
+        assert!(!text.contains('\u{26a0}'), "got:\n{text}");
+        assert!(text.contains("PERSO"), "got:\n{text}");
+    }
 }

@@ -520,3 +520,9 @@ The `outbox` sat in the same file and was deleted with it, although it is the re
 Two things generalise.
 A durability claim belongs to a table, not to the file the table happens to live in, so a disposable file needs its exception list written down next to the code that disposes of it ([src/store/rebuild.rs](../src/store/rebuild.rs)).
 And any content-addressed store whose refcounts live in the disposable file leaks its whole tree on every rebuild, because the files outlive the counts; the drop has to sweep them or take the directory with it.
+
+## A second doc-comment paragraph on a clap field reformats the whole subcommand's `--help`
+
+Adding a rationale paragraph under the `///` line of a `Commands::Sync` field (#0071 review) flipped `mp sync --help` from clap's short help to its long help: every option grew a hanging description block, `--help` started advertising `(see a summary with '-h')`, and `tests/cli_help_snapshot.rs` failed with a 27-line diff for a change that touched no user-visible behaviour.
+clap treats the first doc-comment line as `about` and everything after the blank line as `long_about`, and the presence of a long help on any argument switches that command's `--help` to the long format.
+Explanatory prose that is not meant for the user belongs in a plain `//` comment above the `#[arg(...)]`.

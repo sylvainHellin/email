@@ -22,17 +22,35 @@ pub(super) fn desc_span(desc: &str) -> Span<'_> {
     Span::styled(desc, Style::default().fg(theme::active().text_muted))
 }
 
+/// Cut `s` to at most `max_width` display cells, ellipsising when it does not
+/// fit. Callers pass column counts, so the measure is display width and not a
+/// char count: a wide glyph (CJK, a boxed icon) otherwise overflows its column
+/// by one cell per char and pushes the rest of the row out of the pane.
 pub(super) fn truncate(s: &str, max_width: usize) -> String {
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
     if max_width <= 3 {
-        return s.chars().take(max_width).collect();
+        return take_width(s, max_width);
     }
-    let char_count = s.chars().count();
-    if char_count <= max_width {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_width - 1).collect();
-        format!("{truncated}\u{2026}")
+    // One cell is spent on the ellipsis. `take_width` may stop one cell short
+    // when the cut lands mid-glyph, which is the safe side to be on.
+    format!("{}\u{2026}", take_width(s, max_width - 1))
+}
+
+/// The longest prefix of `s` that fits in `max_width` display cells.
+pub(super) fn take_width(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = char_display_width(c);
+        if used + w > max_width {
+            break;
+        }
+        used += w;
+        out.push(c);
     }
+    out
 }
 
 /// Display width of a single char, treating control chars as zero-width so a
@@ -157,6 +175,20 @@ pub(super) fn scrolled_input_value(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_measures_display_cells_not_chars() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 8), "hello w\u{2026}");
+        // Width-2 chars: four of them are eight cells, so a six-cell column
+        // holds two plus the ellipsis. Counting chars would have kept four
+        // and overflowed by two cells.
+        let cjk = "\u{65e5}\u{672c}\u{8a9e}\u{306e}";
+        assert_eq!(truncate(cjk, 6), "\u{65e5}\u{672c}\u{2026}");
+        assert!(display_width(&truncate(cjk, 6)) <= 6);
+        // A cut that lands mid-glyph stops short rather than over.
+        assert!(display_width(&truncate(cjk, 5)) <= 5);
+    }
 
     #[test]
     fn short_ascii_fits_unchanged() {

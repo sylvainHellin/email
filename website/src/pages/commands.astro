@@ -67,7 +67,6 @@ const fetchOptions = [
 const syncOptions = [
   { command: '-n, --limit <N>', description: 'Max messages per mailbox (default: 50)' },
   { command: '--mailbox <name>...', description: 'Mailboxes to sync (default: all configured)' },
-  { command: '--reconcile', description: 'Also detect server-side moves and deletes' },
   { command: '--dry-run', description: 'Show what would change without modifying files' },
   { command: '--all-accounts', description: 'Sync every configured account (names the failures, exits 1 if any failed)' },
 ];
@@ -179,10 +178,9 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         then fetches full RFC822 bodies only for messages not already stored locally.
       </p>
       <p>
-        With <code>--reconcile</code>, a second pass detects server-side moves and deletes.
-        It compares local files against INBOX and Archive on the server, moving or removing
-        local files to match. The Sent directory is never reconciled -- locally-authored
-        files are the source of truth.
+        Deletes are handled by the same pass: a message the server no longer lists inside
+        the window the sync just read is pruned from the local store, so a mailbox emptied
+        elsewhere does not linger.
       </p>
     </section>
 

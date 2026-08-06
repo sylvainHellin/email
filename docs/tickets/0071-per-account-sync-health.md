@@ -87,3 +87,39 @@ The third acceptance criterion is `tui::bg::tests::a_failed_account_stays_failed
 
 Live, against the still-broken `perso` bridge account: `mp sync --all-accounts -n 5` printed `✓` for `assistant` and `tum`, `✗ perso: IMAP login failed: ...`, the summary line, and exited 1.
 In the TUI the status bar read `[ASSISTANT] TUM  ⚠PERSO` after all three startup syncs had finished, and switching to `perso` showed the sidebar block with the timestamp and the wrapped reason while `assistant` and `tum` showed nothing.
+
+## Review follow-up
+
+Landed after the review of 44f5c58, in one commit.
+
+Four defects the review found in the shipped code:
+
+- `mp sync --all-accounts` counted a local-only account as a failure and exited 1 forever on any config holding one.
+  An account with no IMAP host (nor the SMTP host `ImapConfig::load` falls back to) and no Graph is now skipped with `- <name>: local-only, skipped`, and skipped accounts are out of both the summary's denominator and the exit code.
+  `AccountConfig::is_local_only` reads the config rather than asking whether `ImapConfig::load` succeeds, which is deliberately stricter than the TUI's `ImapConfig::load(..).ok().is_none()`: an account with a host and a missing password is a misconfiguration, and the CLI keeps reporting it as a failure.
+- `mp sync -A perso --all-accounts` ignored the selector.
+  The two now conflict at the clap level.
+- `mp sync` on a config with no accounts reported `✗ : <error>` for `AccountConfig::default()`, whose name is empty.
+  It now errors with `No account to sync (check mp config show)`, which also covers a `-A` that named nothing.
+- The website still documented a `--reconcile` flag that no longer exists, in `commands.astro`, `faq.astro` and `getting-started.astro`.
+  Replaced by what sync actually does: a row the server no longer lists inside the window the fetch just read is pruned.
+
+Two rendering follow-ups:
+
+- `truncate` and the sidebar's `wrap_to` measured char counts where the callers pass column counts, so a wide glyph in a server error overflowed the pane by one cell per char.
+  Both now measure display width (`take_width` / `display_width`), as does the status bar's reservation for its right-hand block, which was counting bytes.
+  This does not change how `⚠` is measured: `unicode-width` reports U+26A0 as width 1 (East Asian Ambiguous), while several terminals draw it in two cells, so the headline can still overflow by one cell there.
+  Fixing that would mean either the CJK width table or a narrow marker, and neither is worth the churn for one cell in a block the terminal clips.
+- `src/tui/ui/status.rs` had no tests at all, though the account strip is the only surface that shows a *non-active* account's failure.
+  Two `TestBackend` render tests now pin the `⚠` prefix and the error colour, and the silence of the healthy case.
+
+### Known limitations
+
+Not defects of this ticket; recorded here because this is where a reader looks for what the health mark does and does not cover.
+
+- Health is account-level only.
+  A per-mailbox failure inside a sync warns and continues (`imap_client::store_sync`), and the account's own result is still `Ok`, so a single folder that is persistently broken (a renamed server mailbox, a permission change) reads as healthy on every surface.
+  Covering it needs a per-mailbox health of its own.
+- The status-bar account strip shares its half of the bar with the status message and the background-op spinner, so it is hidden while either is showing.
+  A status message expires on `tick_status`, which only fires on a poll timeout, so under continuous key input the strip can stay hidden for as long as the user keeps typing.
+  Pre-existing mechanism, shared by everything drawn on the left of the status bar.

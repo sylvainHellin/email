@@ -91,8 +91,8 @@ cargo install --path .`}
       </p>
       <p>
         Sync is additive by default: it only downloads new messages, deduplicating by
-        Message-ID. Add <code>--reconcile</code> to also detect server-side moves and
-        deletes.
+        Message-ID. Messages the server no longer lists in the window it just read are
+        pruned from the local store.
       </p>
     </section>
 

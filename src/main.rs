@@ -212,7 +212,13 @@ enum Commands {
         dry_run: bool,
         /// Sync every configured account (failures are named at the end;
         /// exit code 1 if any account failed)
-        #[arg(long)]
+        //
+        // Conflicts with `-A/--account`: the two answer the same question, and
+        // silently ignoring the selector is how a cron line ends up syncing
+        // accounts it never named. A second doc-comment paragraph would turn
+        // this into clap's long help and reformat the whole subcommand's
+        // `--help`, so the rationale stays a plain comment.
+        #[arg(long, conflicts_with = "account")]
         all_accounts: bool,
     },
     /// Watch a mailbox for changes using IMAP IDLE
@@ -1775,19 +1781,31 @@ async fn main() -> Result<()> {
             } else {
                 vec![account_config.clone()]
             };
-            if accounts.is_empty() {
-                return Err(anyhow!("No account configured (check `mp config show`)"));
+            // An empty config (or a `-A` that named nothing) resolves to
+            // `AccountConfig::default()`, whose name is empty: without this the
+            // run reports `✗ : <error>` for an account that does not exist
+            // (#0071 review).
+            if accounts.is_empty() || accounts.iter().all(|a| a.name.is_empty()) {
+                return Err(anyhow!("No account to sync (check `mp config show`)"));
             }
 
             // One account's failure does not abort the others: the run
             // continues and every failure is named at the end (#0071). The
             // seven-week outage in #0068 was a failure nothing named.
-            let total = accounts.len();
+            let mut attempted = 0usize;
             let mut failed: Vec<String> = Vec::new();
             for account_config in &accounts {
-                if total > 1 {
+                if accounts.len() > 1 {
                     println!("\n{}", format!("── {} ──", account_config.name).bold());
                 }
+                // A drafts-only account has nothing to sync and is not a
+                // failure; counting it as one exits 1 on every run of a config
+                // that legitimately holds one (#0071 review).
+                if account_config.is_local_only() {
+                    println!("{} {}: local-only, skipped", "-".dimmed(), account_config.name);
+                    continue;
+                }
+                attempted += 1;
                 if let Err(e) =
                     sync_one_account(account_config, limit, mailbox.as_deref(), dry_run).await
                 {
@@ -1797,7 +1815,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if let Some(summary) = email::sync_health::failure_summary(total, &failed) {
+            // Skipped accounts are out of the denominator too: "1 of 2" when
+            // the second was never synced would be a claim about an account
+            // this run said nothing about.
+            if let Some(summary) = email::sync_health::failure_summary(attempted, &failed) {
                 eprintln!("{} {}", "✗".red(), summary);
             }
             let code = email::sync_health::exit_code(&failed);

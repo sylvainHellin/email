@@ -98,6 +98,15 @@ All notable changes to this project are documented in this file.
   for; a distinct partial code is only legible to a caller that already knows
   how many accounts are configured. The single-account form already exited
   non-zero and still does.
+
+  Three review follow-ups ride along. `mp sync --all-accounts` no longer counts
+  a local-only account as a failure: an account with no IMAP host and no Graph
+  config is the drafts-only case the TUI already supports, so the run prints
+  `- <name>: local-only, skipped` and leaves the exit code alone, where it used
+  to exit 1 on every run of a config that legitimately holds one.
+  `--all-accounts` and `-A/--account` now conflict instead of the selector being
+  ignored in silence. An `mp sync` with no account to sync says so instead of
+  reporting `✗ : <error>` for the empty default account.
 - **An account whose sync fails now says so in the log (#0068).** A sync that
   died at the account level, a refused IMAP login above all, produced one
   transient TUI status line and nothing else: in a multi-account sync the

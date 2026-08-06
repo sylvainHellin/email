@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use super::super::app::{App, Focus, StatusLevel};
 use super::super::theme;
-use super::util::{pane_border_style, truncate};
+use super::util::{display_width, pane_border_style, take_width, truncate};
 
 /// The persistent sync-failure lines for the account the sidebar is showing
 /// (#0071), or `None` when its last sync worked or none has run yet.
@@ -40,11 +40,13 @@ pub(super) fn sync_health_rows(app: &App) -> u16 {
 }
 
 /// Hard-wrap `text` on word boundaries into exactly `rows` lines of at most
-/// `width` characters, padding with empty lines and ellipsising the last one
+/// `width` display cells, padding with empty lines and ellipsising the last one
 /// when the text does not fit.
 ///
 /// A word longer than `width` (a URL, a base64 blob in an error) is broken
-/// rather than allowed to overflow.
+/// rather than allowed to overflow. The measure is display width, not a char
+/// count: a wide glyph in a server error would otherwise push the block past
+/// the sidebar border.
 fn wrap_to(text: &str, width: usize, rows: usize) -> Vec<String> {
     if width == 0 || rows == 0 {
         return vec![String::new(); rows];
@@ -55,8 +57,8 @@ fn wrap_to(text: &str, width: usize, rows: usize) -> Vec<String> {
         let mut word = word;
         loop {
             let sep = if current.is_empty() { 0 } else { 1 };
-            let room = width.saturating_sub(current.chars().count() + sep);
-            if word.chars().count() <= room {
+            let room = width.saturating_sub(display_width(&current) + sep);
+            if display_width(word) <= room {
                 if sep == 1 {
                     current.push(' ');
                 }
@@ -67,9 +69,21 @@ fn wrap_to(text: &str, width: usize, rows: usize) -> Vec<String> {
                 lines.push(std::mem::take(&mut current));
                 continue;
             }
-            // An oversized word on an empty line: break it at the width.
-            let head: String = word.chars().take(width).collect();
+            // An oversized word on an empty line: break it at the width. A
+            // glyph that straddles the edge goes to the next line whole.
+            let head = take_width(word, width);
             let consumed = head.len();
+            if consumed == 0 {
+                // `width` is narrower than the first glyph: emit it alone
+                // rather than loop forever on a line that can never fit.
+                let first = word.chars().next().expect("split_whitespace yields non-empty words");
+                lines.push(first.to_string());
+                word = &word[first.len_utf8()..];
+                if word.is_empty() {
+                    break;
+                }
+                continue;
+            }
             lines.push(head);
             word = &word[consumed..];
         }
@@ -81,12 +95,14 @@ fn wrap_to(text: &str, width: usize, rows: usize) -> Vec<String> {
     lines.truncate(rows);
     if overflowed {
         if let Some(last) = lines.last_mut() {
-            let mut chars: Vec<char> = last.chars().collect();
-            if chars.len() >= width {
-                chars.truncate(width - 1);
+            let mut kept = last.clone();
+            while display_width(&kept) + 1 > width {
+                if kept.pop().is_none() {
+                    break;
+                }
             }
-            chars.push('\u{2026}');
-            *last = chars.into_iter().collect();
+            kept.push('\u{2026}');
+            *last = kept;
         }
     }
     lines.resize(rows, String::new());
@@ -292,6 +308,18 @@ mod tests {
             vec!["üüüü".to_string(), "üüü".to_string()]
         );
         assert_eq!(wrap_to("anything", 0, 2), vec![String::new(), String::new()]);
+    }
+
+    /// The wrap is measured in display cells: a width-2 glyph fills two of
+    /// them, so half as many fit as a char count would have allowed.
+    #[test]
+    fn wrap_to_measures_display_cells() {
+        let wrapped = wrap_to("\u{65e5}\u{672c}\u{8a9e}\u{306e}", 4, 2);
+        assert_eq!(
+            wrapped,
+            vec!["\u{65e5}\u{672c}".to_string(), "\u{8a9e}\u{306e}".to_string()]
+        );
+        assert!(wrapped.iter().all(|l| display_width(l) <= 4));
     }
 
     fn failed_at(hour: u32, minute: u32) -> SyncHealth {

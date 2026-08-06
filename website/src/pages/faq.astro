@@ -105,17 +105,15 @@ import AccordionItem from '../components/AccordionItem.astro';
             <code>mp sync</code> is additive by default -- it only downloads new emails,
             deduplicating by Message-ID. It uses a two-pass approach: first fetches headers (~50
             bytes per message) to check what is new, then downloads full messages only for emails
-            not already stored locally. Add <code>--reconcile</code> to also detect server-side
-            moves and deletes.
+            not already stored locally.
           </p>
         </AccordionItem>
 
-        <AccordionItem question="What does reconciliation do?">
+        <AccordionItem question="What happens to messages deleted on the server?">
           <p>
-            With <code>--reconcile</code>, sync compares local files against server state for INBOX
-            and Archive. Emails moved on the server are moved locally to match. Emails deleted on
-            the server are removed locally. The Sent directory is never reconciled -- locally-authored
-            files are the source of truth.
+            The same sync pass prunes them: a message the server no longer lists inside the
+            window the sync just read is removed from the local store, so a mailbox cleaned up
+            in another client converges on the next sync.
           </p>
         </AccordionItem>
 
