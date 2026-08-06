@@ -69,6 +69,7 @@ const syncOptions = [
   { command: '--mailbox <name>...', description: 'Mailboxes to sync (default: all configured)' },
   { command: '--reconcile', description: 'Also detect server-side moves and deletes' },
   { command: '--dry-run', description: 'Show what would change without modifying files' },
+  { command: '--all-accounts', description: 'Sync every configured account (names the failures, exits 1 if any failed)' },
 ];
 
 const globalOptions = [

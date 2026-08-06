@@ -105,7 +105,12 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         let left_col = columns[0];
         let right_col = columns[1];
 
-        let sidebar_height = (app.mailboxes.len() as u16) + 3;
+        // Two border rows, one per mailbox, one spare, plus whatever the
+        // #0071 sync-failure block needs when there is a failure to show.
+        // The headers pane on the right is sized from the same number, which
+        // is what keeps the two panes aligned.
+        let sidebar_height =
+            (app.mailboxes.len() as u16) + 3 + sidebar::sync_health_rows(app);
         let left = split_left_column(app, left_col, sidebar_height);
 
         sidebar::render_sidebar(app, frame, left.sidebar);
@@ -134,7 +139,8 @@ pub fn view(app: &mut App, frame: &mut Frame) {
             calendar::render_calendar(app, frame, right_col);
         }
     } else if show_sidebar {
-        let sidebar_height = (app.mailboxes.len() as u16) + 2;
+        let sidebar_height =
+            (app.mailboxes.len() as u16) + 2 + sidebar::sync_health_rows(app);
         let left = split_left_column(app, main_area, sidebar_height);
 
         sidebar::render_sidebar(app, frame, left.sidebar);

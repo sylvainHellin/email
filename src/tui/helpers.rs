@@ -706,6 +706,7 @@ mod tests {
             watcher_active: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
+            sync_health: crate::sync_health::SyncHealth::default(),
         }
     }
 

@@ -6,7 +6,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 ## Now
 
-> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056, #0057 and #0058 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0071; #0065 and #0068 have shipped.
+> Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056, #0057 and #0058 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0071; #0065, #0068 and #0071 have shipped.
 
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
 - [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature
@@ -15,7 +15,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
-- [#0071 Persistent per-account sync-health surface](docs/tickets/0071-per-account-sync-health.md) -- bug _(from the #0068 diagnosis)_
 - [#0066 A drop-and-rebuild discards outbox rows and orphans blob files](docs/tickets/0066-store-rebuild-loses-outbox-and-blobs.md) -- bug
 - [#0063 Send durability gaps (partial recipients, double submit)](docs/tickets/0063-send-durability-gaps.md) -- bug _(the Graph-resume scope item is parked with the Graph backend)_
 - [#0064 Retire path-shaped identity (MailboxRole, MailboxInfo.id, EmailStatus)](docs/tickets/0064-identity-type-cleanup.md) -- refactor _(before #TKT-0051; concrete half of #0022)_

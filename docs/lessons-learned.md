@@ -503,3 +503,12 @@ When collapsing duplicated orchestrations, diff them first and treat the differe
 The `Graph not configured` status written for exactly that case was unreachable, because the only way to reach it was for the account to be Graph with no Graph config, which is the condition the guard had just answered `false` to.
 The guard now keys off `auth_method` alone and the missing config is the error (`tui::helpers::resolve_send_transport`).
 A guard over "what is this thing" must not be conjoined with "did its optional setup succeed": the second question belongs to the branch, where its failure has somewhere to be reported.
+
+## A shared status line is a last-writer-wins register, so it reports the slowest path and never the fastest failure
+
+Three accounts sync concurrently at TUI startup and every one of them reports its outcome by writing `app.status_message` (#0068, #0071).
+`perso` failed at IMAP login after 54 ms; `tum` and `assistant` finished fifteen seconds later and wrote `Fetch complete` over it.
+The register does not lose a random writer, it always loses the fast one, and a failure that dies at authentication is always the fast one, so the arrangement systematically reports success and hides refused logins: seven weeks and roughly 2900 of them, in this case.
+Adding a log line makes the failure recoverable after the fact; it does not make it visible.
+The fix is that a per-entity outcome must be stored on the entity, not in a register shared with its peers, and rendered from there every frame ([src/sync_health.rs](../src/sync_health.rs), `AccountState::sync_health`).
+Whenever N concurrent workers report into one slot, assume the slot shows the slowest one, and ask what the fastest one was trying to say.

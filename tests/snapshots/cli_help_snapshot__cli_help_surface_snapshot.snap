@@ -314,6 +314,7 @@ Options:
   -n, --limit <LIMIT>          Max messages per mailbox (default: 50) [default: 50]
       --mailbox <MAILBOX>      Mailboxes to sync (default: INBOX, Archive, Sent)
       --dry-run                Show what would be ingested without writing anything
+      --all-accounts           Sync every configured account (failures are named at the end; exit code 1 if any account failed)
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

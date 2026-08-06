@@ -193,7 +193,15 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         if app.accounts.len() > 1 {
             for (i, acct) in app.accounts.iter().enumerate() {
                 let name = &acct.account_config.name;
-                let label = name.to_uppercase();
+                // The account's own last sync outcome, not the shared status
+                // line, so a failure survives every later success of another
+                // account (#0071, the race #0068 lost).
+                let failed = acct.sync_health.is_failed();
+                let label = if failed {
+                    format!("\u{26a0}{}", name.to_uppercase())
+                } else {
+                    name.to_uppercase()
+                };
                 if i == app.active_account {
                     spans.push(Span::styled(
                         format!("[{}]", label),
@@ -202,7 +210,9 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                             .bg(theme::active().accent),
                     ));
                 } else {
-                    let style = if acct.has_unseen {
+                    let style = if failed {
+                        Style::default().fg(theme::active().error)
+                    } else if acct.has_unseen {
                         Style::default().fg(theme::active().success)
                     } else {
                         Style::default().fg(theme::active().text_faint)

@@ -210,6 +210,10 @@ enum Commands {
         /// Show what would be ingested without writing anything
         #[arg(long)]
         dry_run: bool,
+        /// Sync every configured account (failures are named at the end;
+        /// exit code 1 if any account failed)
+        #[arg(long)]
+        all_accounts: bool,
     },
     /// Watch a mailbox for changes using IMAP IDLE
     Watch {
@@ -892,6 +896,119 @@ fn resolve_received_arg(
 ) -> Result<(email::store::read::MessageRow, Selector)> {
     let query = email::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
     email::selector::resolve_received(store, &query)
+}
+
+/// One account's `mp sync`: the outbox drain, the sync itself, the contacts
+/// hook, and the per-account summary lines.
+///
+/// Factored out of the `Sync` arm so `--all-accounts` is a loop over exactly
+/// the single-account body (#0071). `Err` is an account-level failure, a
+/// refused login above all; the caller names it and keeps going.
+async fn sync_one_account(
+    account_config: &AccountConfig,
+    limit: usize,
+    mailbox: Option<&[String]>,
+    dry_run: bool,
+) -> Result<()> {
+    let targets: Vec<imap_client::SyncTarget> = if let Some(user_mailboxes) = mailbox {
+        user_mailboxes
+            .iter()
+            .map(|mb| imap_client::SyncTarget {
+                role: mb.clone(),
+                server_name: find_server_name_for_role(account_config, mb),
+            })
+            .collect()
+    } else {
+        all_configured_mailboxes(account_config)
+            .iter()
+            .map(|(role, mapping)| imap_client::SyncTarget {
+                role: role.clone(),
+                server_name: mapping.server.clone(),
+            })
+            .collect()
+    };
+
+    if !dry_run {
+        // Resume the outbox first: a message that reached the server
+        // before the last crash gets its Sent copy before this sync
+        // reads the mailbox it belongs in (#0037 item 5).
+        let drained = email::send::resume_outbox(account_config).await;
+        if drained.completed > 0 || drained.still_open > 0 {
+            println!(
+                "  {} outbox: {} completed, {} still pending",
+                "↻".dimmed(),
+                drained.completed,
+                drained.still_open + drained.awaiting_submission
+            );
+        }
+    }
+
+    let result = if account_config.auth_method == AuthMethod::Graph {
+        let graph_config = GraphConfig::load(account_config)?;
+        graph::sync_mailboxes_graph(
+            &graph_config,
+            &account_config.name,
+            &targets,
+            limit,
+            dry_run,
+        )
+        .await?
+    } else {
+        let imap_config = ImapConfig::load(account_config)?;
+        sync_mailboxes(&imap_config, &account_config.name, &targets, limit, dry_run).await?
+    };
+
+    if !dry_run {
+        // Incremental contacts-index update (best-effort).
+        email::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
+    }
+
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+
+    if result.skipped > 0 {
+        println!(
+            "{} {}Synced: {} new, {} already present",
+            "✓".green(),
+            prefix,
+            result.saved,
+            result.skipped,
+        );
+    } else {
+        println!(
+            "{} {}Synced: {} email(s) {}",
+            "✓".green(),
+            prefix,
+            result.saved,
+            if dry_run { "to download" } else { "ingested" },
+        );
+    }
+
+    if result.read_updated > 0 {
+        println!(
+            "{} {}Read status updated on {} message(s)",
+            "ℹ".blue(),
+            prefix,
+            result.read_updated,
+        );
+    }
+    if result.uid_rebound > 0 {
+        println!(
+            "{} {}Rebound {} message(s) to new UIDs after a UIDVALIDITY reset",
+            "ℹ".blue(),
+            prefix,
+            result.uid_rebound,
+        );
+    }
+    if result.pruned > 0 {
+        println!(
+            "{} {}{} message(s) left their mailbox on the server",
+            "ℹ".blue(),
+            prefix,
+            result.pruned,
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -1648,113 +1765,44 @@ async fn main() -> Result<()> {
             // and can key a row.
         }
 
-        Some(Commands::Sync { limit, mailbox, dry_run }) => {
-            let targets: Vec<imap_client::SyncTarget> = if let Some(ref user_mailboxes) = mailbox {
-                user_mailboxes
-                    .iter()
-                    .map(|mb| imap_client::SyncTarget {
-                        role: mb.clone(),
-                        server_name: find_server_name_for_role(&account_config, mb),
-                    })
-                    .collect()
+        Some(Commands::Sync { limit, mailbox, dry_run, all_accounts }) => {
+            // `--all-accounts` is a loop over the same body rather than a
+            // second code path, like `send-approved --all-accounts`: each
+            // account resolves its own transport and targets, so the
+            // per-account sync is exactly what the single-account form does.
+            let accounts: Vec<AccountConfig> = if all_accounts {
+                global_config.accounts.clone()
             } else {
-                all_configured_mailboxes(&account_config)
-                    .iter()
-                    .map(|(role, mapping)| imap_client::SyncTarget {
-                        role: role.clone(),
-                        server_name: mapping.server.clone(),
-                    })
-                    .collect()
+                vec![account_config.clone()]
             };
+            if accounts.is_empty() {
+                return Err(anyhow!("No account configured (check `mp config show`)"));
+            }
 
-            if !dry_run {
-                // Resume the outbox first: a message that reached the server
-                // before the last crash gets its Sent copy before this sync
-                // reads the mailbox it belongs in (#0037 item 5).
-                let drained = email::send::resume_outbox(&account_config).await;
-                if drained.completed > 0 || drained.still_open > 0 {
-                    println!(
-                        "  {} outbox: {} completed, {} still pending",
-                        "↻".dimmed(),
-                        drained.completed,
-                        drained.still_open + drained.awaiting_submission
-                    );
+            // One account's failure does not abort the others: the run
+            // continues and every failure is named at the end (#0071). The
+            // seven-week outage in #0068 was a failure nothing named.
+            let total = accounts.len();
+            let mut failed: Vec<String> = Vec::new();
+            for account_config in &accounts {
+                if total > 1 {
+                    println!("\n{}", format!("── {} ──", account_config.name).bold());
+                }
+                if let Err(e) =
+                    sync_one_account(account_config, limit, mailbox.as_deref(), dry_run).await
+                {
+                    error!("[sync] account '{}' failed: {e:#}", account_config.name);
+                    eprintln!("{} {}: {:#}", "✗".red(), account_config.name, e);
+                    failed.push(account_config.name.clone());
                 }
             }
 
-            let result = if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                graph::sync_mailboxes_graph(
-                    &graph_config,
-                    &account_config.name,
-                    &targets,
-                    limit,
-                    dry_run,
-                )
-                .await?
-            } else {
-                let imap_config = ImapConfig::load(&account_config)?;
-                sync_mailboxes(
-                    &imap_config,
-                    &account_config.name,
-                    &targets,
-                    limit,
-                    dry_run,
-                )
-                .await?
-            };
-
-            if !dry_run {
-                // Incremental contacts-index update (best-effort).
-                email::contacts::hooks::bump_after_sync(
-                    &account_config,
-                    &result.fresh_observations,
-                );
+            if let Some(summary) = email::sync_health::failure_summary(total, &failed) {
+                eprintln!("{} {}", "✗".red(), summary);
             }
-
-            let prefix = if dry_run { "[dry-run] " } else { "" };
-
-            if result.skipped > 0 {
-                println!(
-                    "{} {}Synced: {} new, {} already present",
-                    "✓".green(),
-                    prefix,
-                    result.saved,
-                    result.skipped,
-                );
-            } else {
-                println!(
-                    "{} {}Synced: {} email(s) {}",
-                    "✓".green(),
-                    prefix,
-                    result.saved,
-                    if dry_run { "to download" } else { "ingested" },
-                );
-            }
-
-            if result.read_updated > 0 {
-                println!(
-                    "{} {}Read status updated on {} message(s)",
-                    "ℹ".blue(),
-                    prefix,
-                    result.read_updated,
-                );
-            }
-            if result.uid_rebound > 0 {
-                println!(
-                    "{} {}Rebound {} message(s) to new UIDs after a UIDVALIDITY reset",
-                    "ℹ".blue(),
-                    prefix,
-                    result.uid_rebound,
-                );
-            }
-            if result.pruned > 0 {
-                println!(
-                    "{} {}{} message(s) left their mailbox on the server",
-                    "ℹ".blue(),
-                    prefix,
-                    result.pruned,
-                );
+            let code = email::sync_health::exit_code(&failed);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
 

@@ -667,6 +667,11 @@ pub struct AccountState {
     /// a message stuck between SMTP and its Sent copy is visible rather than
     /// silent.
     pub outbox: crate::outbox::OutboxCounts,
+    /// Outcome of this account's last completed sync (#0071). Written when
+    /// that account's own `BgResult::Fetch`/`BgResult::Sync` lands, so it
+    /// survives every later success of a *different* account: the exact race
+    /// #0068 lost. Session-scoped, never read from disk.
+    pub sync_health: crate::sync_health::SyncHealth,
 }
 
 impl AccountState {
@@ -733,6 +738,7 @@ impl AccountState {
             watcher_active: false,
             has_unseen: false,
             outbox,
+            sync_health: crate::sync_health::SyncHealth::default(),
         }
     }
 

@@ -147,6 +147,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/config_cmd/` | Config subcommands: init wizard, add-account, show, set-password, oauth2-login, reset-secrets, path |
 | `src/calendar_cmd.rs` | `mp calendar rebuild`: reports what the invite fold resolves, writes nothing |
 | `src/notify.rs` | Desktop notifications for new mail, shelling out to `osascript` / `notify-send` |
+| `src/sync_health.rs` | `SyncHealth`, the per-account outcome of the last sync, plus the `mp sync` failure summary and exit code (#0071) |
 | `src/timing.rs` | `TimingSpan`, which emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
 | **`src/store/`** | |
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |

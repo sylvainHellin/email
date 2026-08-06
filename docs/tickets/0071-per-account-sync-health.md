@@ -3,7 +3,7 @@ id: 0071
 title: Persistent per-account sync-health surface (TUI indicator, mp sync exit code)
 type: bug
 priority: next
-status: open
+status: done
 created: 2026-08-06
 ---
 
@@ -39,3 +39,51 @@ The failure becomes one transient status line, and in a multi-account sync it lo
 - An account that cannot authenticate is visibly marked in the TUI after a sync, and stays marked while a healthy account syncs afterwards.
 - `mp sync` over several accounts, one of which fails, exits non-zero and names the failing account.
 - A test pins that a failing account's health survives a later successful sync of a different account, which is the exact race #0068 lost.
+
+## Resolution
+
+Shipped 2026-08-06.
+
+### State
+
+`AccountState::sync_health: SyncHealth` (`src/sync_health.rs`), one value per account, session-scoped and never read from disk.
+`SyncHealth` is `Unknown` / `Ok { at }` / `Failed { reason, at, consecutive }`, and `SyncHealth::updated(outcome, at)` is the only transition: a success clears the mark outright, a failure keeps counting from the previous one so an outage reads differently from a hiccup.
+`reason` is the error's first non-empty line capped at 80 characters, sized to the two sidebar rows that render it.
+
+Every sync completion path writes it, because every one of them already arrived as a `BgResult::Fetch` or a `BgResult::Sync` carrying its account index: the startup multi-account fetch, the watcher-triggered quick sync, `F`, `S`, over IMAP or Graph alike.
+`tui::bg::record_sync_health` is the single write, called before the existing status-line branch.
+The `BgResult` channel is unchanged.
+
+### TUI
+
+Two surfaces, neither of which can be raced away, because both read the account's own state every frame rather than the shared status line.
+
+- Sidebar, a three-row block under the mailbox list of the account on screen: a bold headline `⚠ sync failed [xN] HH:MM` and the reason word-wrapped over two rows.
+  The layout pays for those rows (`sidebar::sync_health_rows`), so the block is not clipped in the narrow tier.
+- Status-bar account strip, next to the existing unseen badge: a failing account's label is prefixed `⚠` and drawn in the error colour, active or not.
+
+The account-level failure status line now also names its account (`Fetch failed (perso): ...`), which is what the activity log keeps.
+
+### CLI
+
+`mp sync --all-accounts` syncs every configured account, one failure not stopping the others.
+The per-account body is the same function the single-account form calls, so the two cannot drift.
+Every failure is named on its own `✗ <account>: <error>` line and again in the closing summary, `✗ 1 of 3 account(s) failed to sync: perso`.
+
+Exit code, the deliberate decision the scope asked for: 1 for any failure, partial or total, and the same code whether one account was named or `--all-accounts` was passed.
+A caller writes `mp sync --all-accounts || alert`, and a partial failure exiting 0 is exactly the silence this ticket exists to remove.
+A distinct code for "some but not all" was rejected: it is only readable by a caller that already knows how many accounts are configured.
+The single-account form already exited non-zero (the error propagated out of `main`) and still does, now with the account named.
+
+### Scope item 4
+
+Answered by `consecutive` rather than by a notification system: the sidebar headline carries `xN` from the second failure on, so seven weeks of refused logins is visibly different from one tick that timed out.
+
+### Verification
+
+`cargo test` 835 passing, +21.
+The pure seams are covered in `src/sync_health.rs` (the reason cap, the transitions, the summary and the exit code) and `src/tui/ui/sidebar.rs` (the wrap).
+The third acceptance criterion is `tui::bg::tests::a_failed_account_stays_failed_while_another_account_syncs_cleanly`, which drives `handle_bg_result` with `perso` failing and then `tum` succeeding and asserts both that `perso` keeps its mark and that the status line does show `tum`'s success, i.e. that the race is still lost and no longer matters.
+
+Live, against the still-broken `perso` bridge account: `mp sync --all-accounts -n 5` printed `✓` for `assistant` and `tum`, `✗ perso: IMAP login failed: ...`, the summary line, and exited 1.
+In the TUI the status bar read `[ASSISTANT] TUM  ⚠PERSO` after all three startup syncs had finished, and switching to `perso` showed the sidebar block with the timestamp and the wrapped reason while `assistant` and `tum` showed nothing.

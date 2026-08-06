@@ -21,4 +21,5 @@ pub mod dump;
 pub mod outbox;
 pub mod send;
 pub mod store;
+pub mod sync_health;
 pub mod tui;

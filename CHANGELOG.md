@@ -45,6 +45,33 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A failed sync is now visible without reading the log, per account and per
+  exit code (#0071).** #0068's account-level `error!` line put the failure in
+  the log file; it was still invisible on screen, because the outcome of a sync
+  only ever existed as one shared status line and the last writer won. The last
+  writer is whichever account is slowest, which is never the one that failed
+  fast: `perso` failed after 54 ms and `tum` overwrote the line with
+  `Fetch complete` fifteen seconds later, every tick, for seven weeks. Each
+  account now carries its own `SyncHealth` (`Unknown` / `Ok` / `Failed` with the
+  reason, the time and a consecutive-failure count), written when that account's
+  own result lands, so a failure survives every later success of a different
+  account and clears only when that same account syncs cleanly. Every sync path
+  writes it: the startup multi-account fetch, the watcher-triggered quick sync,
+  `F`, `S`, IMAP and Graph alike. The TUI reads it in two places that no status
+  line can race away, a three-row block under the sidebar's mailbox list
+  (`⚠ sync failed x12 15:42` and the wrapped reason) and a `⚠` marker on the
+  failing account in the status-bar account strip, next to the unseen badge. The
+  status line that reports the failure now names its account too.
+
+  `mp sync` gained `--all-accounts`, a loop over exactly the single-account
+  body: one account's failure no longer stops the others, every failure is named
+  on its own line and again in a closing `1 of 3 account(s) failed to sync:
+  perso`, and the run exits 1. One code for any failure, partial or total, and
+  the same code for `--all-accounts` as for a single named account, because the
+  caller writing `mp sync --all-accounts || alert` is the reader this exists
+  for; a distinct partial code is only legible to a caller that already knows
+  how many accounts are configured. The single-account form already exited
+  non-zero and still does.
 - **An account whose sync fails now says so in the log (#0068).** A sync that
   died at the account level, a refused IMAP login above all, produced one
   transient TUI status line and nothing else: in a multi-account sync the
@@ -53,7 +80,7 @@ All notable changes to this project are documented in this file.
   roughly 2900 logins were refused. The per-mailbox failure right below it had
   warned all along; the account-level one now logs at error level too. The
   persistent surface this also wants, a per-account health mark in the TUI and
-  an `mp sync` that exits non-zero naming the failed accounts, is #0071.
+  an `mp sync` that exits non-zero naming the failed accounts, is #0071, above.
 - **A Graph account with an unloadable Graph config no longer sends over SMTP
   (#0058 follow-up).** Both TUI send keys chose their transport by asking
   whether a `GraphConfig` had loaded, but `AccountState` loads that config

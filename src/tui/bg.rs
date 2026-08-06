@@ -80,6 +80,31 @@ fn refresh_outbox(app: &mut App, account_index: usize) {
     }
 }
 
+/// ` (name)` for a known account of a multi-account setup, empty otherwise,
+/// for status lines that would not otherwise say which account they are about.
+fn account_label(app: &App, account_index: usize) -> String {
+    match app.accounts.get(account_index) {
+        Some(acct) if app.accounts.len() > 1 => format!(" ({})", acct.account_config.name),
+        _ => String::new(),
+    }
+}
+
+/// Record the outcome of one account's sync on that account (#0071).
+///
+/// Every sync completion path lands here: the startup multi-account fetch, the
+/// watcher-triggered quick sync, a manual `F`, a full `S`, over IMAP or Graph
+/// alike, because all of them arrive as `BgResult::Fetch` or `BgResult::Sync`
+/// carrying the account they belong to. Writing the outcome *on the account*
+/// rather than into the shared status line is the whole fix: an account that
+/// failed keeps its mark while the accounts that succeeded overwrite the line
+/// (#0068).
+fn record_sync_health(app: &mut App, account_index: usize, outcome: Result<(), &str>) {
+    let now = chrono::Local::now();
+    if let Some(acct) = app.accounts.get_mut(account_index) {
+        acct.sync_health = acct.sync_health.updated(outcome, now);
+    }
+}
+
 pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
     app.bg_count = app.bg_count.saturating_sub(1);
     match &result {
@@ -273,6 +298,11 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             result,
             new_inbox_mail,
         } => {
+            record_sync_health(
+                app,
+                account_index,
+                result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+            );
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Fetch complete".into() } else { msg };
@@ -291,18 +321,31 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                     }
                     refresh_after_server_sync(app, account_index);
                 }
-                Err(e) => app.set_status_level(format!("Fetch failed: {e}"), StatusLevel::Error),
+                Err(e) => {
+                    // Named, because a multi-account run turns an anonymous
+                    // "Fetch failed" into a line nobody can act on (#0068).
+                    let name = account_label(app, account_index);
+                    app.set_status_level(format!("Fetch failed{name}: {e}"), StatusLevel::Error)
+                }
             }
         }
 
         BgResult::Sync { account_index, result } => {
+            record_sync_health(
+                app,
+                account_index,
+                result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+            );
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Sync complete".into() } else { msg };
                     app.set_status_level(text, StatusLevel::Success);
                     refresh_after_server_sync(app, account_index);
                 }
-                Err(e) => app.set_status_level(format!("Sync failed: {e}"), StatusLevel::Error),
+                Err(e) => {
+                    let name = account_label(app, account_index);
+                    app.set_status_level(format!("Sync failed{name}: {e}"), StatusLevel::Error)
+                }
             }
         }
 
@@ -585,6 +628,7 @@ mod tests {
             watcher_active: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
+            sync_health: crate::sync_health::SyncHealth::default(),
         }
     }
 
@@ -655,5 +699,114 @@ mod tests {
         );
         assert!(app.pending_actions.is_empty(), "nothing to reload");
         assert_eq!(app.mailbox_counts, vec![3, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-account sync health (#0071, the race #0068 lost)
+    // -----------------------------------------------------------------------
+
+    /// Two accounts, one broken. `perso` fails at login in milliseconds,
+    /// `tum` finishes fifteen seconds later and overwrites the status line
+    /// with a success. That is the exact sequence that hid a seven-week
+    /// outage: the assertion is that `perso` is still marked failed
+    /// afterwards, with its reason intact, while `tum` reads healthy.
+    #[test]
+    fn a_failed_account_stays_failed_while_another_account_syncs_cleanly() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+        app.accounts = vec![background_account("perso"), background_account("tum")];
+        app.active_account = 0;
+
+        handle_bg_result(
+            &mut app,
+            BgResult::Fetch {
+                account_index: 0,
+                result: Err("IMAP login failed: no such user".to_string()),
+                new_inbox_mail: Vec::new(),
+            },
+        );
+        handle_bg_result(
+            &mut app,
+            BgResult::Fetch {
+                account_index: 1,
+                result: Ok("Synced: 8 new, 0 existing".to_string()),
+                new_inbox_mail: Vec::new(),
+            },
+        );
+
+        assert!(
+            app.accounts[0].sync_health.is_failed(),
+            "the broken account keeps its mark after another account succeeds"
+        );
+        assert_eq!(
+            app.accounts[0].sync_health.failure_lines().unwrap().1,
+            "IMAP login failed: no such user"
+        );
+        assert!(!app.accounts[1].sync_health.is_failed());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Synced: 8 new, 0 existing"),
+            "the status line still shows the last writer, which is why the \
+             health lives on the account instead"
+        );
+    }
+
+    /// The mark is cleared by that same account syncing cleanly, not by the
+    /// next status line, and a full sync (`BgResult::Sync`) clears a quick
+    /// sync's failure: both paths write the same per-account state.
+    #[test]
+    fn an_accounts_own_success_clears_its_mark() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+        app.accounts = vec![background_account("perso")];
+        app.active_account = 0;
+
+        handle_bg_result(
+            &mut app,
+            BgResult::Fetch {
+                account_index: 0,
+                result: Err("IMAP login failed".to_string()),
+                new_inbox_mail: Vec::new(),
+            },
+        );
+        assert!(app.accounts[0].sync_health.is_failed());
+
+        handle_bg_result(
+            &mut app,
+            BgResult::Sync {
+                account_index: 0,
+                result: Ok("Synced: 3 new, 0 existing".to_string()),
+            },
+        );
+        assert!(!app.accounts[0].sync_health.is_failed());
+        assert_eq!(app.accounts[0].sync_health.failure_lines(), None);
+    }
+
+    /// Repeated failures of the same account count up rather than resetting,
+    /// so an outage reads differently from a hiccup.
+    #[test]
+    fn repeated_failures_of_one_account_accumulate_across_results() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+        app.accounts = vec![background_account("perso")];
+        app.active_account = 0;
+
+        for _ in 0..3 {
+            handle_bg_result(
+                &mut app,
+                BgResult::Fetch {
+                    account_index: 0,
+                    result: Err("IMAP login failed".to_string()),
+                    new_inbox_mail: Vec::new(),
+                },
+            );
+        }
+
+        assert!(app.accounts[0]
+            .sync_health
+            .failure_lines()
+            .unwrap()
+            .0
+            .contains("x3"));
     }
 }
