@@ -769,7 +769,17 @@ fn too_fresh_to_prune(date_sort: i64, now: i64) -> bool {
 /// no ingest timestamp; for a message this client just composed the two are the
 /// same instant. The cost is that a message *received* in the last few minutes
 /// and deleted on the server keeps its row for one more cycle, which the next
-/// pass corrects.
+/// pass corrects. That equivalence is a coupling worth naming: it holds only
+/// while a locally-composed message is ingested at the moment it is dated, so a
+/// future offline or retry queue on the Graph send path (#0063) would ingest a
+/// copy dated hours earlier, past the window, and hand the guard back the exact
+/// data loss it exists to prevent. A real ingest timestamp is the fix at that
+/// point.
+///
+/// A row whose date cannot be read (a query error, as opposed to no such row)
+/// is held back rather than pruned: the guard is about not deleting a message
+/// on incomplete information, and a failed lookup is the least complete
+/// information there is (#0065 follow-up).
 pub fn prunable_uids(
     store: &Store,
     account: &str,
@@ -780,16 +790,24 @@ pub fn prunable_uids(
     let mut prunable = Vec::with_capacity(vanished.len());
     let mut held_back = 0;
     for &uid in vanished {
-        let date_sort: i64 = store
-            .conn()
-            .query_row(
-                "SELECT IFNULL(date_sort, 0) FROM messages
-                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
-                rusqlite::params![account, mailbox, uid],
-                |row| row.get(0),
-            )
+        let date_sort: i64 = match store.conn().query_row(
+            "SELECT IFNULL(date_sort, 0) FROM messages
+             WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            rusqlite::params![account, mailbox, uid],
+            |row| row.get(0),
+        ) {
+            Ok(date_sort) => date_sort,
             // No row: nothing to hold back, and the delete is a no-op.
-            .unwrap_or(0);
+            Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+            Err(e) => {
+                warn!(
+                    "Could not read the date of uid {uid} in '{mailbox}' ({e}); \
+                     holding it back from the prune"
+                );
+                held_back += 1;
+                continue;
+            }
+        };
         if too_fresh_to_prune(date_sort, now) {
             held_back += 1;
         } else {

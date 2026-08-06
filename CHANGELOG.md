@@ -31,6 +31,23 @@ All notable changes to this project are documented in this file.
   ignored, with a give-up after fifty failures so a systematically failing first
   sync costs one pass and six log lines instead of one request and one warning
   per message.
+
+  A follow-up review of that work closed the hole left in the middle of it. The
+  prune gate asked only whether `limit` had capped the download, so a mailbox
+  whose messages were throttled or failed inside the batch reported a complete
+  pass while holding none of them: a sync whose Archive fetch came back empty
+  could still prune the inbox rows of messages that had moved there, which is
+  the exact loss the gate was built to prevent. A pass now counts every way it
+  can come up short, a message asked for and not returned and a message
+  downloaded but not written included. Three smaller ones alongside it. A
+  sub-response header that is a number rather than a string no longer fails the
+  parse of its whole batch, which would have meant zero downloads for that
+  folder on every pass with the prune suspended throughout. If a tenant rejects
+  the newest-first enumeration, the folder is re-walked unordered instead of
+  never syncing again. Throttling no longer spends the failure budget meant for
+  requests that cannot succeed, a 503 carrying a `Retry-After` is read as the
+  throttle it is, and the pause it asks for is taken before the next chunk goes
+  out rather than after the last one, where it delayed the sync for nothing.
 - **A Graph sync now converges, prunes, and says so in the timing log
   (#0055).** The sync fixes the IMAP path got over the last months had never
   reached the Graph backend, which still behaved like the file era. Six defects

@@ -41,8 +41,8 @@ const BATCH_FAILURE_BUDGET: usize = 50;
 /// back to a single summary line.
 const BATCH_FAILURE_WARN_LIMIT: usize = 5;
 
-/// Ceiling on a `Retry-After` a 429 sub-response asks for, so a hostile or
-/// mistaken header cannot park a sync for hours.
+/// Ceiling on a `Retry-After` a throttled sub-response asks for, so a hostile
+/// or mistaken header cannot park a sync for hours.
 const MAX_RETRY_AFTER_SECS: u64 = 120;
 
 /// Pages the folder enumeration will walk before giving up.
@@ -297,16 +297,46 @@ pub struct FolderEnumeration {
 }
 
 /// What one target's fetch pass learned: the messages it downloaded, the ones
-/// it skipped as already known, the folder as enumerated, and whether `limit`
-/// cut the download short.
+/// it skipped as already known, the folder as enumerated, and whether the
+/// download covered everything the enumeration found.
 pub struct FolderFetch {
     pub new_emails: Vec<FetchedEmail>,
     pub skipped: usize,
     pub enumeration: FolderEnumeration,
-    /// True when there were more new messages than `limit` allowed, so the
+    /// True when this pass did not download every new message it found, so the
     /// leftovers are queued for a later pass. See [`sync_mailboxes_graph`] for
     /// why that suspends the prune.
-    pub download_truncated: bool,
+    pub download_incomplete: bool,
+}
+
+/// What one `/$batch` download run returned, and whether it returned all of it.
+///
+/// The count matters as much as the messages: a chunk whose sub-responses
+/// failed, a parse that did not yield a [`FetchedEmail`], and a run that spent
+/// [`BATCH_FAILURE_BUDGET`] all hand back fewer emails than ids asked for, and
+/// all three mean the same thing to the prune: this pass does not know what the
+/// server holds (#0065 follow-up).
+pub struct BatchFetch {
+    /// How many ids the run was asked for.
+    pub requested: usize,
+    pub emails: Vec<FetchedEmail>,
+    /// True when [`BATCH_FAILURE_BUDGET`] stopped the run before it had issued
+    /// every chunk.
+    pub gave_up: bool,
+}
+
+impl BatchFetch {
+    /// Whether fewer messages came back than were asked for.
+    fn fell_short(&self) -> bool {
+        batch_fell_short(self.requested, self.emails.len(), self.gave_up)
+    }
+}
+
+/// The rule behind [`BatchFetch::fell_short`], as counts: a run that handed
+/// back fewer messages than ids, or gave up before issuing every chunk, did not
+/// download what the enumeration found.
+fn batch_fell_short(requested: usize, returned: usize, gave_up: bool) -> bool {
+    gave_up || returned < requested
 }
 
 /// One entry of a `/$batch` response.
@@ -315,27 +345,67 @@ struct GraphBatchEntry {
     id: String,
     status: u16,
     /// The sub-response's own headers. Only `Retry-After` is read, and only on
-    /// a 429: Graph throttles per sub-request, so the outer POST can be a 200
-    /// while individual messages are being told to slow down.
+    /// a throttle: Graph throttles per sub-request, so the outer POST can be a
+    /// 200 while individual messages are being told to slow down.
+    ///
+    /// The values are `serde_json::Value`, not `String`, because this is a
+    /// whole-batch parse: a single sub-response header serialised as a number
+    /// or an array (nothing in the protocol forbids it) would otherwise fail
+    /// the deserialization of *every* entry in the chunk, which means zero
+    /// downloads for that folder on every pass and, since #0065, a prune
+    /// suspended for as long as it lasts. A header this code does not read
+    /// should not be able to do that (#0065 follow-up).
     #[serde(default)]
-    headers: HashMap<String, String>,
+    headers: HashMap<String, serde_json::Value>,
     #[serde(default)]
     body: Option<serde_json::Value>,
 }
 
+/// A header value as a whole number of seconds, whether Graph sent it as a
+/// JSON string (the normal shape) or as a number.
+fn header_secs(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
+}
+
 impl GraphBatchEntry {
-    /// The `Retry-After` this sub-response asks for, in seconds, when it is a
-    /// throttle. Header names are matched case-insensitively because Graph
-    /// does not promise a casing.
-    fn retry_after_secs(&self) -> Option<u64> {
-        if self.status != 429 {
-            return None;
-        }
+    /// This sub-response's `Retry-After` in seconds, whatever its status.
+    /// Header names are matched case-insensitively because Graph does not
+    /// promise a casing.
+    fn retry_after_header(&self) -> Option<u64> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
-            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            .and_then(|(_, v)| header_secs(v))
             .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+    }
+
+    /// The pause this sub-response asks for, in seconds, when it is a throttle.
+    ///
+    /// 429 and 503 both count: Graph's throttling guidance names the two
+    /// together, and a 503 carrying a `Retry-After` is back-pressure in the
+    /// same sense as a 429 (#0065 follow-up).
+    fn retry_after_secs(&self) -> Option<u64> {
+        if !matches!(self.status, 429 | 503) {
+            return None;
+        }
+        self.retry_after_header()
+    }
+
+    /// Whether this sub-response is Graph asking the client to slow down rather
+    /// than reporting a failure.
+    ///
+    /// A throttle does not spend [`BATCH_FAILURE_BUDGET`]: the budget exists to
+    /// stop a pass that cannot succeed (a revoked permission, a mailbox
+    /// mid-migration), and back-pressure is not that. Spending it meant a
+    /// throttled first sync gave up after 50 sub-responses and reported a short
+    /// download. A bare 503 with no `Retry-After` stays a failure, because
+    /// nothing distinguishes it from the service being down.
+    fn is_throttled(&self) -> bool {
+        self.status == 429 || (self.status == 503 && self.retry_after_header().is_some())
     }
 }
 
@@ -511,14 +581,26 @@ impl GraphClient {
     /// A message that fails inside the batch is logged and skipped: the rest of
     /// the pass still lands, and a message that was not ingested is simply new
     /// again next sync. Two guards keep that from becoming a treadmill (#0065):
-    /// a 429 sub-response's `Retry-After` paces the remaining chunks, and after
-    /// [`BATCH_FAILURE_BUDGET`] failures the pass stops asking and reports what
-    /// it got, so a systematically failing id set costs one pass rather than
-    /// one request and one log line per message.
-    pub async fn fetch_messages_by_ids(&self, ids: &[&str]) -> Result<Vec<FetchedEmail>> {
+    /// a throttled sub-response's `Retry-After` paces the remaining chunks, and
+    /// after [`BATCH_FAILURE_BUDGET`] failures the pass stops asking and
+    /// reports what it got, so a systematically failing id set costs one pass
+    /// rather than one request and one log line per message.
+    ///
+    /// Whatever the reason, a short return is *reported* rather than absorbed:
+    /// the caller folds it into the prune gate, because a message that was
+    /// asked for and did not arrive is exactly the copy whose absence would
+    /// make another mailbox's row look deleted (#0065 follow-up).
+    pub async fn fetch_messages_by_ids(&self, ids: &[&str]) -> Result<BatchFetch> {
         let url = format!("{}/$batch", GRAPH_BASE);
         let mut emails = Vec::with_capacity(ids.len());
         let mut failures = 0usize;
+        let mut gave_up = false;
+        // The longest pause a sub-response asked for, applied at the top of the
+        // next chunk. Pacing before a chunk rather than after one is what keeps
+        // a throttle in the *last* chunk from sleeping up to `MAX_RETRY_AFTER_
+        // SECS` with nothing left to pace, and keeps a pass that is about to
+        // give up from sleeping first (#0065 follow-up).
+        let mut pending_retry_after: Option<u64> = None;
 
         for chunk in ids.chunks(BATCH_MAX_REQUESTS) {
             if failures >= BATCH_FAILURE_BUDGET {
@@ -527,7 +609,12 @@ impl GraphClient {
                      sub-requests; {} message(s) landed and the rest stay new",
                     emails.len(),
                 );
+                gave_up = true;
                 break;
+            }
+            if let Some(secs) = pending_retry_after.take() {
+                info!("Graph asked for {secs}s before the next batch; pacing the rest of the pass");
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
             }
             let resp = self
                 .client
@@ -553,9 +640,6 @@ impl GraphClient {
                 .await
                 .context("Failed to parse the batch response")?;
 
-            // The longest pause any sub-response in this chunk asked for,
-            // applied once before the next chunk goes out.
-            let mut retry_after = None;
             for entry in batch.responses {
                 // Graph is free to reorder the responses, so the request id
                 // (the index into `chunk`) is the only correlation.
@@ -565,8 +649,15 @@ impl GraphClient {
                     .ok()
                     .and_then(|i| chunk.get(i).copied())
                     .unwrap_or("<unknown>");
+                if entry.is_throttled() {
+                    pending_retry_after = pending_retry_after.max(entry.retry_after_secs());
+                    debug!(
+                        "Graph throttled the batch fetch of message {} (HTTP {})",
+                        requested, entry.status,
+                    );
+                    continue;
+                }
                 if entry.status != 200 {
-                    retry_after = retry_after.max(entry.retry_after_secs());
                     failures += 1;
                     if failures <= BATCH_FAILURE_WARN_LIMIT {
                         warn!(
@@ -595,11 +686,6 @@ impl GraphClient {
                     }
                 }
             }
-
-            if let Some(secs) = retry_after {
-                info!("Graph asked for {secs}s before the next batch; pacing the rest of the pass");
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            }
         }
 
         if failures > BATCH_FAILURE_WARN_LIMIT {
@@ -610,7 +696,7 @@ impl GraphClient {
             );
         }
 
-        Ok(emails)
+        Ok(BatchFetch { requested: ids.len(), emails, gave_up })
     }
 
     /// Turn one Graph message into a [`FetchedEmail`], pulling its attachments
@@ -796,18 +882,23 @@ impl GraphClient {
     /// the walk, and a dropped message is indistinguishable from a deleted one:
     /// with newest-first ordering an arrival lands on a page the walk has
     /// already passed instead (#0065).
+    ///
+    /// If the server rejects the `$orderby` outright (a 4xx on the first page,
+    /// which some tenant or folder shapes may do and which no live Graph call
+    /// has yet ruled out), the walk retries once without it. Unordered paging
+    /// is a degradation, not a loss: a fully-paged enumeration still lists the
+    /// whole folder, so `complete` stays honest and the prune stays open; what
+    /// comes back is the pre-#0065 churn of an occasional message re-downloaded
+    /// after a concurrent arrival shifted the window. A folder that never
+    /// enumerates at all would be the worse failure, and that is what this
+    /// avoids (#0065 follow-up).
     pub async fn enumerate_folder(&self, folder: &str) -> Result<FolderEnumeration> {
         let folder_path = resolve_folder_path(folder);
         let mut result = HashMap::new();
         let mut complete = false;
         let mut pages = 0usize;
-        let mut url = format!(
-            "{}/me/mailFolders/{}/messages?\
-             $select=id,internetMessageId,isRead,receivedDateTime&\
-             $orderby=receivedDateTime%20desc&\
-             $top=200",
-            GRAPH_BASE, folder_path
-        );
+        let mut ordered = true;
+        let mut url = enumeration_url(&folder_path, ordered);
 
         loop {
             if pages >= MAX_ENUMERATION_PAGES {
@@ -830,6 +921,17 @@ impl GraphClient {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+                if ordered && pages == 1 && status.is_client_error() {
+                    warn!(
+                        "Graph rejected the ordered enumeration of '{folder}' (HTTP {status}); \
+                         retrying unordered, which pages this folder correctly but may re-download \
+                         a message a concurrent arrival shifts out of the walk"
+                    );
+                    ordered = false;
+                    pages = 0;
+                    url = enumeration_url(&folder_path, ordered);
+                    continue;
+                }
                 return Err(anyhow!(
                     "Fetch message IDs from '{}' failed (HTTP {}): {}",
                     folder,
@@ -861,6 +963,13 @@ impl GraphClient {
     /// The enumeration in the returned [`FolderFetch`] covers every message in
     /// the folder, so the caller can both apply read-status changes to rows it
     /// already holds and see what has gone.
+    ///
+    /// `download_incomplete` counts both ways a pass can come up short: `limit`
+    /// leaving new messages unfetched, and the batch handing back fewer
+    /// messages than were asked for. The second was the gap the first shipped
+    /// with (#0065 follow-up): a throttled-out archive target returned an empty
+    /// vector, reported a complete download, and opened the prune gate on inbox
+    /// rows whose archive copies had never landed.
     pub async fn fetch_new_messages(
         &self,
         folder: &str,
@@ -869,7 +978,7 @@ impl GraphClient {
     ) -> Result<FolderFetch> {
         let enumeration = self.enumerate_folder(folder).await?;
         let (new, found) = select_for_download(&enumeration.entries, known_ids, limit);
-        let download_truncated = found > new.len();
+        let capped = found > new.len();
         let skipped = enumeration.entries.len() - found;
 
         if new.is_empty() {
@@ -877,15 +986,40 @@ impl GraphClient {
                 new_emails: Vec::new(),
                 skipped,
                 enumeration,
-                download_truncated,
+                download_incomplete: capped,
             });
         }
 
         let graph_ids: Vec<&str> = new.iter().map(|entry| entry.graph_id.as_str()).collect();
-        let new_emails = self.fetch_messages_by_ids(&graph_ids).await?;
+        let batch = self.fetch_messages_by_ids(&graph_ids).await?;
+        let download_incomplete = capped || batch.fell_short();
 
-        Ok(FolderFetch { new_emails, skipped, enumeration, download_truncated })
+        Ok(FolderFetch {
+            new_emails: batch.emails,
+            skipped,
+            enumeration,
+            download_incomplete,
+        })
     }
+}
+
+/// The first-page URL of a folder enumeration, with or without the `$orderby`.
+///
+/// Split out so the ordered form and the fallback
+/// ([`GraphClient::enumerate_folder`] retries once unordered on a 4xx) are one
+/// definition rather than two literals that can drift apart.
+fn enumeration_url(folder_path: &str, ordered: bool) -> String {
+    let orderby = if ordered {
+        "$orderby=receivedDateTime%20desc&"
+    } else {
+        ""
+    };
+    format!(
+        "{}/me/mailFolders/{}/messages?\
+         $select=id,internetMessageId,isRead,receivedDateTime&\
+         {}$top=200",
+        GRAPH_BASE, folder_path, orderby
+    )
 }
 
 /// Fold one page of an enumeration into the map.
@@ -934,7 +1068,7 @@ fn select_for_download<'a>(
 }
 
 /// Whether a pass may apply the prunes it collected, given `(enumeration was
-/// complete, download was truncated)` for every target it synced.
+/// complete, download was incomplete)` for every target it synced.
 ///
 /// One partial target suspends the prune for *all* of them, which is the whole
 /// point: the reason an inbox row may be deleted is that some other target
@@ -1019,13 +1153,14 @@ fn vanished_graph_uids(
 /// anywhere (#0055).
 ///
 /// Three conditions gate that prune, standing in for the IMAP window clamp
-/// (#0065): the pass must have enumerated every target in full, it must not
-/// have left any target's backlog undownloaded (a quick sync's `limit` can),
-/// and a row dated within [`crate::ingest::PRUNE_MIN_AGE_SECS`] of now is left
-/// alone. Without the first two, a message moved between two folders in a batch
-/// larger than `limit` loses its source row in the pass that could not yet
-/// fetch its destination copy, and holds no row anywhere until the backlog
-/// drains.
+/// (#0065): the pass must have enumerated every target in full, it must have
+/// landed every new message it found (a quick sync's `limit`, a batch
+/// sub-response failure, a throttle that ran the pass out of budget and an
+/// ingest error all count against this), and a row dated within
+/// [`crate::ingest::PRUNE_MIN_AGE_SECS`] of now is left alone. Without the
+/// first two, a message moved between two folders loses its source row in the
+/// pass that could not fetch its destination copy, and holds no row anywhere
+/// until the backlog drains.
 ///
 /// TODO(#0042): this still enumerates `internetMessageId` for the whole folder
 /// on every pass. The `sync_cursors.deltalink` column is written as NULL until
@@ -1079,18 +1214,22 @@ pub async fn sync_mailboxes_graph(
                 continue;
             }
         };
-        let FolderFetch { new_emails, skipped, enumeration, download_truncated } = fetch;
-        coverage.push((enumeration.complete, download_truncated));
+        let FolderFetch { new_emails, skipped, enumeration, download_incomplete } = fetch;
         let complete = enumeration.complete;
         let server = enumeration.entries;
         result.skipped += skipped;
         span.mark(&format!("fetch:{}", target.role));
 
         if dry_run {
+            coverage.push((complete, download_incomplete));
             result.saved += new_emails.len();
             continue;
         }
 
+        // A message that was downloaded but not written is as absent from the
+        // store as one that was never fetched, so it counts against this
+        // target's coverage too (#0065 follow-up).
+        let mut ingest_failed = false;
         for email in &new_emails {
             let message_id = crate::ingest::resolve_message_id(email, None);
             let uid = crate::ingest::graph_uid(&message_id);
@@ -1125,9 +1264,13 @@ pub async fn sync_mailboxes_graph(
                         date: email.date.clone(),
                     });
                 }
-                Err(e) => warn!("Failed to ingest {} from {}: {:#}", message_id, target.role, e),
+                Err(e) => {
+                    ingest_failed = true;
+                    warn!("Failed to ingest {} from {}: {:#}", message_id, target.role, e);
+                }
             }
         }
+        coverage.push((complete, download_incomplete || ingest_failed));
         span.mark(&format!("ingest:{}", target.role));
 
         // Read status for messages the store already holds, one transaction
@@ -2017,7 +2160,7 @@ mod tests {
             status,
             headers: headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
                 .collect(),
             body: None,
         }
@@ -2047,6 +2190,100 @@ mod tests {
             None,
             "only a throttle is a reason to wait",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #0065 follow-up: the batch's own failure modes
+    // -----------------------------------------------------------------------
+
+    /// A header value that is not a JSON string must not fail the parse of the
+    /// whole chunk. It used to: `HashMap<String, String>` made one numeric or
+    /// array-valued header on one sub-response into zero downloads for that
+    /// folder, on every pass, with the prune suspended throughout.
+    #[test]
+    fn a_non_string_sub_response_header_does_not_fail_the_batch() {
+        let raw = serde_json::json!({
+            "responses": [
+                {
+                    "id": "0",
+                    "status": 429,
+                    "headers": {
+                        "Retry-After": 9,
+                        "Content-Length": 512,
+                        "X-Weird": ["a", "b"],
+                    },
+                },
+                { "id": "1", "status": 200, "headers": { "Content-Type": "application/json" } },
+            ]
+        });
+        let parsed: GraphBatchResponse =
+            serde_json::from_value(raw).expect("a header shape this code does not read cannot \
+                                                be allowed to fail the whole chunk");
+        assert_eq!(parsed.responses.len(), 2);
+        assert_eq!(
+            parsed.responses[0].retry_after_secs(),
+            Some(9),
+            "a numeric Retry-After is still a Retry-After",
+        );
+        assert_eq!(parsed.responses[1].retry_after_secs(), None);
+    }
+
+    /// Throttling is back-pressure, not failure: it paces the pass but does not
+    /// spend the budget that exists to stop a pass that cannot succeed. A 503
+    /// counts as a throttle only when it carries the header, because a bare one
+    /// is indistinguishable from the service being down.
+    #[test]
+    fn a_throttle_is_not_a_failure_but_a_bare_503_is() {
+        assert!(batch_entry(429, &[("Retry-After", "7")]).is_throttled());
+        assert!(batch_entry(429, &[]).is_throttled(), "429 throttles with or without the header");
+        assert!(batch_entry(503, &[("Retry-After", "7")]).is_throttled());
+        assert_eq!(
+            batch_entry(503, &[("Retry-After", "7")]).retry_after_secs(),
+            Some(7),
+            "Graph's throttling guidance names 503 alongside 429",
+        );
+        assert!(!batch_entry(503, &[]).is_throttled());
+        assert!(!batch_entry(404, &[("Retry-After", "7")]).is_throttled());
+        assert!(!batch_entry(200, &[]).is_throttled());
+    }
+
+    /// The gap #0065 shipped with: `download_incomplete` was derived from
+    /// `limit` alone, so a target whose batch was throttled out returned no
+    /// messages and still reported a complete download. The prune gate then
+    /// opened on inbox rows whose archive copies had never landed.
+    #[test]
+    fn a_short_batch_return_marks_the_pass_incomplete() {
+        // (ids asked for, messages returned, the budget ran out).
+        assert!(!batch_fell_short(20, 20, false));
+        assert!(
+            batch_fell_short(20, 19, false),
+            "one failed sub-response is one message the store does not hold",
+        );
+        assert!(
+            batch_fell_short(20, 0, false),
+            "a wholly throttled-out target is the case that opened the gate",
+        );
+        assert!(
+            batch_fell_short(0, 0, true),
+            "a pass that spent its failure budget did not see the folder",
+        );
+        // And the gate is closed by it, whichever target came up short.
+        assert!(!pass_may_prune(&[(true, false), (true, true)]));
+    }
+
+    /// The `$orderby` fallback: a tenant that rejects the ordered enumeration
+    /// gets an unordered walk rather than a folder that never syncs.
+    #[test]
+    fn the_enumeration_url_can_drop_the_orderby() {
+        let ordered = enumeration_url("inbox", true);
+        assert!(ordered.contains("$orderby=receivedDateTime%20desc"), "got {ordered}");
+        let unordered = enumeration_url("inbox", false);
+        assert!(!unordered.contains("$orderby"), "got {unordered}");
+        for url in [&ordered, &unordered] {
+            assert!(url.contains("/me/mailFolders/inbox/messages?"), "got {url}");
+            assert!(url.contains("$select=id,internetMessageId,isRead,receivedDateTime"));
+            assert!(url.contains("$top=200"));
+        }
     }
 
     #[test]

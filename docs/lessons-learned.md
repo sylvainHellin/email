@@ -465,3 +465,25 @@ It is not, because the argument that lets an inbox row go is that *another* targ
 Gating each target's prune on its own coverage would have left exactly the reported case unfixed, since the inbox pass truncates nothing when a hundred messages are moved to Archive at once.
 The gate is therefore the whole pass: every target enumerated in full and downloaded in full, or nothing is pruned this run ([src/graph.rs](../src/graph.rs), `pass_may_prune`).
 When two halves of an operation have different scopes, the safety condition belongs to whichever half the *other* one depends on.
+
+## A tolerant parse is a prune-safety property when the strict one fails a whole batch
+
+`GraphBatchEntry.headers` was `HashMap<String, String>`, which is the honest type for what an HTTP header is and the wrong one for what a `/$batch` response is: the twenty sub-responses are parsed as one document, so a single header value serialised as a number or an array fails the deserialization of all of them.
+That is not one lost message but zero downloads for that folder on every pass, and, since the prune now waits for a pass that downloaded everything it found (#0065), a prune suspended for as long as it lasts.
+The value type is `serde_json::Value` and the seconds are extracted where they are read (#0065 follow-up, [src/graph.rs](../src/graph.rs)).
+A field the code never reads should not be able to fail the parse of the fields it does; when a parse covers a batch, its strictness is measured in units of the whole batch.
+
+## "Did it fetch everything" is not the same question as "did the limit truncate it"
+
+The Graph prune gate derived its coverage flag from `found > new.len()`, the cap, and stopped there.
+Everything else that makes a download short was invisible to it: a failed sub-response, a batch that spent its failure budget, a body that did not parse, an ingest that errored and only warned.
+A throttled-out Archive pass therefore returned an empty vector, reported a complete download, and opened the gate on inbox rows whose archive copies had never landed, which is precisely the loss the gate was added to prevent.
+The flag is now folded from the counts at each step, ids asked for against messages returned against rows written ([src/graph.rs](../src/graph.rs), `fetch_new_messages`).
+A safety flag derived from one cause of a condition asserts the condition; derive it from the effect instead.
+
+## A query error and an empty result are different answers, and `unwrap_or` merges them
+
+`prunable_uids` read each candidate row's date with `.unwrap_or(0)`, and `0` is "very old", so a locked database or a malformed row made the row maximally prunable.
+The intended meaning of the default was "no such row, so the delete is a no-op", which is true only for `QueryReturnedNoRows`; every other error arrived at the same place and failed open, on the one code path in the crate whose failure mode is deletion.
+The arms are now separate, and a lookup that errors holds the row back (#0065 follow-up, [src/ingest.rs](../src/ingest.rs)).
+`unwrap_or` on a query is a decision about every error the query can produce; when the caller deletes things, write the arms out.
