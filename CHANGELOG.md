@@ -4,6 +4,41 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Sync prunes the rows the server no longer lists (#0038 follow-up).** A
+  message archived, moved or deleted in another client kept its local row
+  forever, and because ingest identity is per mailbox the same message was
+  inserted again when the archive synced: the user saw it in two mailboxes at
+  once. Sync now compares what the store holds against what the server listed
+  and **deletes the local rows the server no longer lists in that mailbox**,
+  clamped to the numeric range the fetch window actually covered, so a short
+  `-n 50` window can only ever prune inside what the server proved and a
+  UIDVALIDITY reset prunes nothing. The prunes are applied after every target
+  mailbox has been ingested, so a message that merely moved is already present
+  at its destination before its source row goes: it is never absent from the
+  store, and its body blob is never released or deleted from disk in between.
+  The count is reported by `mp sync` and in the TUI status line. The Graph
+  backend still has the same gap and is untouched.
+- **The list reloads after a fetch or a sync (#0038 follow-up).** Both only set
+  a status line, on a comment that stopped being true when the read path moved
+  onto the store: the user pressed refresh and nothing refreshed until a mailbox
+  switch or a restart. Every per-mailbox cache of the synced account is now
+  dropped, the open mailbox is reloaded off the UI thread the way a mailbox
+  switch reloads it, and the sidebar counts are recomputed.
+- **The queued-sync status line stops stacking.** One `s` on a busy account
+  produced roughly four "Quick sync queued" activity lines a second for as long
+  as the background work ran: the event loop released the parked action on one
+  condition and the action re-entered a gate reading another. Release and gate
+  are now the same condition, and re-parking the same action is silent.
+- **Keypress lag and slow startup from a full-file `integrity_check`.** The
+  check walks every page of the store (240 ms on a 44 MB file) and ran on every
+  open, which the TUI does per call: once per keypress on the preview path and
+  ten times before the first paint. It now runs once per file per process. The
+  first open still validates in full and still triggers the drop-and-rebuild on
+  failure, a rebuilt file is validated on its own next open rather than
+  inheriting the dead one's verdict, and a file that fails is walked again
+  rather than remembered as checked.
+
 ### Changed
 - **View switching moved to a `Space` leader; list toggle-select moved to `v`
   (#0033 follow-up).** The TUI view switcher is now **`Space m`** (Mail),

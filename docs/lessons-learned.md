@@ -389,3 +389,17 @@ That was true for exactly one ticket, the #0037 interim state where ingest wrote
 #0038 moved the list onto the store and nobody went back for the comment, so refresh stopped refreshing: new mail, applied read flags and rows the server had dropped were all invisible until a mailbox switch or a restart.
 The comment is what made it survive review, because it reads as a considered decision rather than as a gap.
 A comment that justifies an absence should name the condition it depends on, so that grepping for the condition finds the comment when the condition changes ([src/tui/bg.rs](../src/tui/bg.rs), #0038 follow-up).
+
+## A delete and the insert that justifies it must not be split across iterations of a loop
+
+The prune deleted the rows a mailbox's fetch proved gone, and its safety argument was that a message archived in another client is re-ingested at its destination by the same sync.
+That argument holds for the sync, not for one iteration of it: targets are walked in order (inbox, archive, sent), so a prune applied inside the loop deleted the inbox row a full mailbox fetch before the archive pass inserted the replacement.
+In that window the store held no row for the message at all, its body blob dropped to refcount zero and was unlinked from disk, and an archive fetch that failed (the loop logs and continues to the next target) left the message locally lost until a later sync.
+The fix is to collect the per-target diffs during the loop and apply every delete in a second pass after it, so the ordering the comment claims is the ordering the code has ([src/imap_client/store_sync.rs](../src/imap_client/store_sync.rs), #0038 follow-up).
+When a destructive step is justified by a compensating step elsewhere, the two belong in the same phase, and the test that pins it has to assert the state *between* them (never zero rows, never a released blob) rather than only the endpoints.
+
+## Registering a check before its verdict makes a failure look like a pass
+
+`open_validated` noted the file as integrity-checked and then compared the result, so a store that failed the walk was recorded as checked for the rest of the process.
+Only `Store::open`'s own `forget_integrity_check` on the rebuild path hid it, which makes the correctness of a cache entry depend on what the caller does with the error.
+A memo of "this was verified" is written on the success branch, never before the branch ([src/store/mod.rs](../src/store/mod.rs)).
