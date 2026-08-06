@@ -45,6 +45,32 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A store rebuild no longer discards queued mail or orphans its blob files
+  (#0066).** `Store::open` answers an unusable store file, a schema version that
+  moved, a failed `integrity_check`, a file that will not open as a database, by
+  deleting it and creating an empty one, on the grounds that the store is a
+  cache the next sync refills. That is true of every table but `outbox`, which
+  is the record of what has been submitted to a mail server and which no sync
+  can reconstruct: a message accepted by SMTP but not yet copied to Sent, or one
+  queued for a retry, simply stopped existing, with nothing said to the user
+  although `mp outbox list` presents those rows as durable send state. The v4
+  bump (#0054) triggered that path for every account at once. Unfinished rows
+  (`pending_send`, `sent_pending_append`, `failed`) are now read out of the old
+  file before it goes, column by column and by name so an outbox of an older
+  shape still comes across, and written into the new one with a reference on the
+  raw RFC822 blob each one points at. `done` rows owe nothing and stay behind;
+  a row whose state is unreadable is carried as `failed` rather than as
+  something a driver would re-submit.
+
+  The blob files were the other half: they survived the rebuild while the
+  refcount rows did not, so everything the next sync did not fetch again became
+  a permanent orphan that nothing reclaimed. The rebuild now sweeps the blob
+  tree against the rebuilt `blobs` table, taking misplaced blobs and `.tmp`
+  leftovers with it, and keeping exactly what the carried outbox rows point at.
+  Anything that could not be carried is named in a `store-rebuild-<timestamp>.txt`
+  note next to the store and in the log line the rebuild already emitted, which
+  now counts what was carried, what was discarded and how many blob files were
+  swept.
 - **A failed sync is now visible without reading the log, per account and per
   exit code (#0071).** #0068's account-level `error!` line put the failure in
   the log file; it was still invisible on screen, because the outcome of a sync

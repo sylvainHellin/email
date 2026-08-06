@@ -37,8 +37,14 @@ One `store.sqlite3` per account, in the account directory, opened in WAL mode wi
 
 The drop-and-rebuild contract is the reason there is no migrator.
 `Store::open` rebuilds the file from scratch when the stamped schema version is not the current one, when a required table is missing, when `PRAGMA integrity_check` fails, or when the file does not open as a database at all.
-None of those is a user-visible error: the store holds no truth, so the answer is a log line and an empty file.
+None of those is a user-visible error: the store holds no truth, so the answer is a log line and a file built from scratch.
 The integrity check walks the whole file, so it runs once per file per process rather than on every open.
+
+One table is not a cache and does not go with the file: `outbox` (#0066, `src/store/rebuild.rs`).
+Before the old file is deleted its unfinished rows (`pending_send`, `sent_pending_append`, `failed`) are read back defensively, by column name, so an outbox of an older shape still comes across, and are written into the new file with a reference on the raw RFC822 blob each one points at.
+`done` rows owe nothing and stay behind.
+A row that cannot be carried, because its bytes are gone from the blob store or its columns are unreadable, is named in a `store-rebuild-<timestamp>.txt` note written next to the store; nothing about a submitted message is discarded silently.
+The same pass then sweeps the blob tree, deleting every file the rebuilt store holds no refcount row for, so a rebuild cannot leave the blob directory full of orphans that nothing reclaims.
 
 Schema v4 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
 

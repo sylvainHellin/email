@@ -2,16 +2,19 @@
 //!
 //! There is no migrator and there never will be one: the store is a cache in
 //! front of IMAP, so a version mismatch is answered by dropping the file and
-//! rebuilding it empty (see [`super::Store::open`]). That is why every
-//! statement below is a plain `CREATE`, and why the only stateful thing in the
-//! file is the `schema_version` row in `meta`.
+//! rebuilding it (see [`super::Store::open`]). That is why every statement
+//! below is a plain `CREATE`, and why the only stateful thing in the file is
+//! the `schema_version` row in `meta`. The one table that is not a cache,
+//! `outbox`, is carried across that rebuild rather than recreated from a
+//! server that never had it; [`super::rebuild`] owns that half.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Version stamped into `meta.schema_version`. Bump this whenever any
 /// statement in [`SCHEMA_SQL`] changes; every existing store is then dropped
-/// and rebuilt on the next open.
+/// and rebuilt on the next open, keeping only what [`super::rebuild`] carries
+/// across.
 ///
 /// v2 added `message_blobs` for the ingest path (#0037 unit 4a), then
 /// `outbox.submission_started_at` and the `html` blob kind in the #0037 review

@@ -2,12 +2,37 @@
 //!
 //! One `store.sqlite3` per account directory, opened in WAL mode with a 5 s
 //! busy timeout and `synchronous = NORMAL`. The file is a cache in front of
-//! IMAP, never a system of record, so there is no migrator: a version
-//! mismatch, a failed `integrity_check` or a file that cannot be opened as a
-//! database is dropped and rebuilt empty, with a log line and no user-visible
-//! error. The next sync refills it. The `integrity_check` behind that contract
-//! is a full walk of the file, so it runs once per file per process (see
-//! [`INTEGRITY_CHECKED`]) rather than on every open.
+//! IMAP rather than a system of record (with one exception, the `outbox`
+//! below), so there is no migrator: a version mismatch, a failed
+//! `integrity_check` or a file that cannot be opened as a database is dropped
+//! and rebuilt, with a log line and no user-visible error. The next sync
+//! refills it. The `integrity_check` behind that contract is a full walk of
+//! the file, so it runs once per file per process (see [`INTEGRITY_CHECKED`])
+//! rather than on every open.
+//!
+//! ## What survives a rebuild
+//!
+//! "A cache" is true of every table but one, so the rebuild is not quite an
+//! empty file (#0066, implemented in [`rebuild`]):
+//!
+//! - `messages`, `message_blobs`, `messages_fts`, `mailboxes`, `sync_cursors`,
+//!   `drafts`, `pending_ops` and `meta` are dropped. The server holds the
+//!   first five back, the drafts directory on disk is truth for `drafts`,
+//!   `pending_ops` is shape only so far (#0039), and `meta` is stamped afresh
+//!   by [`schema::create`].
+//! - `outbox` is carried: every row still in `pending_send`,
+//!   `sent_pending_append` or `failed` is read out of the old file before it
+//!   is deleted and written into the new one, with its raw RFC822 blob
+//!   reference. It is the record of what has been submitted to a mail server,
+//!   which no sync can reconstruct. `done` rows owe nothing and are not
+//!   carried. A row that cannot be carried (its bytes are gone from the blob
+//!   store, its columns are unreadable) is named in a
+//!   `store-rebuild-<timestamp>.txt` note written next to the store, never
+//!   dropped silently.
+//! - Blob *files* whose refcount row did not survive are deleted by the same
+//!   pass, so a rebuild cannot leave the blob directory full of orphans that
+//!   nothing reclaims. The blobs the carried outbox rows point at are what the
+//!   sweep keeps.
 //!
 //! This module knows nothing about IMAP, MIME or Markdown. It owns the file,
 //! the pragmas and the schema; everything above it speaks SQL.
@@ -20,6 +45,7 @@
 pub mod blobs;
 pub mod drafts;
 pub mod read;
+pub mod rebuild;
 pub mod schema;
 pub mod write;
 
@@ -63,6 +89,11 @@ impl Store {
                 .with_context(|| format!("creating store directory {}", parent.display()))?;
         }
 
+        // Set when the existing file had to go, to the reason it had to go.
+        // The salvaged outbox rows travel with it: they are read before the
+        // deletion and replayed after the new file exists.
+        let mut dropped: Option<(String, Vec<rebuild::SalvagedRow>)> = None;
+
         if path.exists() {
             match open_validated(&path) {
                 Ok(conn) => {
@@ -72,15 +103,17 @@ impl Store {
                 Err(err) => {
                     // Not a user-visible error: the store holds no truth.
                     warn!(
-                        "[store] {} is unusable ({err:#}); dropping and rebuilding empty",
+                        "[store] {} is unusable ({err:#}); dropping and rebuilding",
                         path.display()
                     );
+                    let salvaged = rebuild::salvage_outbox(&path);
                     // The file about to be created is a different file, so the
                     // "already checked this incarnation" note must go with the
                     // one being deleted.
                     forget_integrity_check(&path);
                     remove_store_files(&path)?;
                     span.mark("dropped");
+                    dropped = Some((format!("{err:#}"), salvaged));
                 }
             }
         }
@@ -91,6 +124,28 @@ impl Store {
             path.display()
         );
         span.mark("created");
+
+        if let Some((reason, salvaged)) = dropped {
+            let report = rebuild::finish(&conn, &path, salvaged);
+            let notice = rebuild::write_notice(&path, &reason, &report);
+            warn!(
+                "[store] rebuilt {}: {} outbox row(s) carried, {} discarded, {} orphaned blob \
+                 file(s) swept ({} bytes){}",
+                path.display(),
+                report.carried.len(),
+                report.lost.len(),
+                report.swept_files,
+                report.swept_bytes,
+                notice
+                    .map(|p| format!("; details in {}", p.display()))
+                    .unwrap_or_default(),
+            );
+            for (row, why) in &report.lost {
+                warn!("[store] outbox row {row} did not survive the rebuild: {why}");
+            }
+            span.mark("salvaged");
+        }
+
         Ok(Self { conn, path })
     }
 

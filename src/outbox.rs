@@ -68,6 +68,14 @@
 //! transition into `failed` itself, because the whole point of that state is
 //! that a human can still read the bytes that did not make it.
 //!
+//! ## Surviving a store rebuild
+//!
+//! The rest of the store is dropped and rebuilt when its file goes bad or its
+//! schema version moves, because the server holds it back. Nothing holds an
+//! outbox row back, so it is carried across the rebuild instead, with its raw
+//! blob (#0066, [`crate::store::rebuild`]). A row that cannot be carried is
+//! named in a note file next to the store rather than discarded silently.
+//!
 //! ## Transport seam
 //!
 //! [`SentMailbox`] is the only thing this module knows about IMAP. The live

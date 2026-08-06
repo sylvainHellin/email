@@ -512,3 +512,11 @@ The register does not lose a random writer, it always loses the fast one, and a 
 Adding a log line makes the failure recoverable after the fact; it does not make it visible.
 The fix is that a per-entity outcome must be stored on the entity, not in a register shared with its peers, and rendered from there every frame ([src/sync_health.rs](../src/sync_health.rs), `AccountState::sync_health`).
 Whenever N concurrent workers report into one slot, assume the slot shows the slowest one, and ask what the fastest one was trying to say.
+
+## "It is only a cache" is a claim about a file, and one table in it can be the exception
+
+The per-account store is dropped and rebuilt whenever its schema version moves or its `integrity_check` fails, which is safe because the server holds every message back (#0066).
+The `outbox` sat in the same file and was deleted with it, although it is the record of what has already been submitted to a mail server and no sync can reconstruct it: a message accepted by SMTP but not yet copied to Sent disappeared, silently, and the v4 bump ran that path for every account at once.
+Two things generalise.
+A durability claim belongs to a table, not to the file the table happens to live in, so a disposable file needs its exception list written down next to the code that disposes of it ([src/store/rebuild.rs](../src/store/rebuild.rs)).
+And any content-addressed store whose refcounts live in the disposable file leaks its whole tree on every rebuild, because the files outlive the counts; the drop has to sweep them or take the directory with it.
