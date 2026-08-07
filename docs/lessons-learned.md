@@ -6,7 +6,19 @@ Format: short imperative title, one-paragraph description, and (when useful) a c
 
 ## `cargo install --path .` leaves a stale `email` binary after the `mp` rename
 
-The CLI binary was renamed `email` -> `mp` (ticket #0022). `cargo install --path .` installs `~/.cargo/bin/mp` but does **not** remove the previously installed `~/.cargo/bin/email`, so a stale old binary lingers and shadows nothing but confuses `which email`. On this dev machine the fix is a symlink so old muscle memory / scripts keep working: `rm -f ~/.cargo/bin/email && ln -s mp ~/.cargo/bin/email` (relative target, resolves within `~/.cargo/bin`). This is a local convenience only -- it is not created by any install step and does not ship anywhere. The Cargo package/library are still named `email` internally; only the `[[bin]]` target changed, so `use email::...` imports are unaffected.
+The CLI binary was renamed `email` -> `mp` (ticket #0022). `cargo install --path .` installs `~/.cargo/bin/mp` but does **not** remove the previously installed `~/.cargo/bin/email`, so a stale old binary lingers and shadows nothing but confuses `which email`. On this dev machine the fix is a symlink so old muscle memory / scripts keep working: `rm -f ~/.cargo/bin/email && ln -s mp ~/.cargo/bin/email` (relative target, resolves within `~/.cargo/bin`). This is a local convenience only: it is not created by any install step and does not ship anywhere. The Cargo package/library were also renamed to `mailypoppins` later, in the same ticket, so imports read `use mailypoppins::...`.
+
+## Renaming the Cargo package needs one `cargo install --path . --force`
+
+`cargo install` tracks what it installed by *package* name, not binary name, so after `email` -> `mailypoppins` (#0022) the documented `cargo install --path .` fails with "binary `mp` already exists in destination as part of `email v0.8.0`". One `--force` fixes it permanently: the `.crates.toml` entry is rewritten and plain `cargo install --path .` works from then on. Worth knowing before assuming the build is broken.
+
+## Renaming the Cargo package renames every `insta` snapshot file
+
+`insta` keys snapshot filenames on the crate name, so `email` -> `mailypoppins` (#0022) turned all 11 committed `.snap` files into misses and wrote 11 `.snap.new` beside them, in `src/snapshots/` and `src/tui/ui/snapshots/`. Do not answer that with `cargo insta accept`: it re-derives the goldens from the code being changed, which is exactly the review a golden frame exists to force. `git mv` each `email__*.snap` to `mailypoppins__*.snap`, then diff the pending `.snap.new` against it ignoring the `assertion_line:` header and confirm every pair is identical before deleting the `.new` files. If a pair is not identical, the rename was not the only thing that changed.
+
+## The config directory move is a location change, not a data migration
+
+The "no migration paths until v1.0" invariant blocked the `~/.config/email` -> `~/.config/mailypoppins` rename for a long time (#0022). It should not have: the invariant is scoped to data formats, secret storage and wire protocols, and a directory rename reads not one byte inside the directory. `config::migrate_legacy_config_dir()` is one `fs::rename` at startup, which is what makes it idempotent and concurrency-safe for free (the loser of a race gets `ENOENT`, and old-absent plus new-present is success). The part worth copying elsewhere is what it refuses to do: there is no read fallback to the old path. A client that quietly keeps reading the old location when the move fails never finishes the move, and every later release has to keep carrying both paths.
 
 ## HTML charset must be injected before saving
 

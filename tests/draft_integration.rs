@@ -1,8 +1,8 @@
-use email::draft::{
+use mailypoppins::draft::{
     create_forward_draft_from, create_reply_draft_from, find_drafts, mark_as_approved,
     mark_as_draft, mark_draft_sent, parse_email_draft, validate_draft, SourceMessage,
 };
-use email::types::EmailStatus;
+use mailypoppins::types::EmailStatus;
 use std::fs;
 use tempfile::tempdir;
 
@@ -250,7 +250,7 @@ fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     let account = tmp.path().join("account");
     let drafts = account.join("drafts");
 
-    let stable = email::parse::stable_attachments_dir(&account, "<att-archive@example.com>");
+    let stable = mailypoppins::parse::stable_attachments_dir(&account, "<att-archive@example.com>");
     fs::create_dir_all(&stable).unwrap();
     fs::write(stable.join("report.pdf"), b"fake pdf").unwrap();
 
@@ -630,9 +630,9 @@ fn test_reply_deduplicates_cc_addresses() {
 
 #[test]
 fn test_validate_draft_missing_attachment_warning() {
-    let draft = email::types::EmailDraft {
+    let draft = mailypoppins::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
-        frontmatter: email::types::EmailFrontmatter {
+        frontmatter: mailypoppins::types::EmailFrontmatter {
             id: None,
             date: None,
             to: Some("alice@example.com".to_string()),
@@ -664,9 +664,9 @@ fn test_validate_draft_existing_attachment_no_warning() {
     let att_path = tmp.path().join("doc.pdf");
     fs::write(&att_path, b"fake pdf").unwrap();
 
-    let draft = email::types::EmailDraft {
+    let draft = mailypoppins::types::EmailDraft {
         path: std::path::PathBuf::from("test.md"),
-        frontmatter: email::types::EmailFrontmatter {
+        frontmatter: mailypoppins::types::EmailFrontmatter {
             id: None,
             date: None,
             to: Some("alice@example.com".to_string()),

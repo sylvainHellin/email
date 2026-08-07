@@ -27,9 +27,9 @@ All logic lives in `src/lib.rs` modules so the TUI can call them directly withou
 Config types derive `Clone` so they can be moved into background threads.
 
 The installed binary is `mp` (`cargo install --path .`).
-The Cargo package and library are still named `email` internally for historical reasons.
-That name is invisible to users (it only shows up in `use email::...` imports), so it was left untouched during the `email` to `mp` binary rename.
+The Cargo package and library are `mailypoppins` (#0022), so imports read `use mailypoppins::...` and `insta` snapshot files are prefixed `mailypoppins__`.
 The user-facing name and version string is `mailypoppins X.Y.Z`, set via clap `#[command(name = "mailypoppins")]` and `#[command(version)]` in `src/main.rs`; the Homebrew formula test asserts against that string.
+The one place the old spelling survives is the keyring service fallback below.
 
 ## The store
 
@@ -150,7 +150,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | File | Responsibility |
 |------|---------------|
 | `src/types.rs` | Shared types: `EmailStatus` (the three draft states), `MessageFlags` (the received-mail status axis: seen, answered, forwarded), `MailboxRole` (the store's mailbox key), `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
-| `src/config.rs` | Config loading (`~/.config/email/config.toml`), secrets-backend dispatch, data dir helpers (`mailypoppins_data_dir`, `account_dir`, `store_path`, `blobs_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
+| `src/config.rs` | Config loading (`~/.config/mailypoppins/config.toml`), `config_dir` + the one-time #0022 legacy move, secrets-backend dispatch, data dir helpers (`mailypoppins_data_dir`, `account_dir`, `store_path`, `blobs_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
 | `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). See [secrets.md](secrets.md). |
 | `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |
 | `src/ingest.rs` | The receive-path writer: fetched message to one `messages` row plus blobs, FTS maintenance, cursors, `prune_vanished`, `apply_seen_flags`, `graph_uid` |
@@ -266,9 +266,18 @@ Fetch and sync are deferred while mutations are in flight (`bg_mutations > 0`) a
 
 User-owned config:
 
-- The config file is `~/.config/email/config.toml`, a multi-account `[[accounts]]` array.
+- The config file is `~/.config/mailypoppins/config.toml`, a multi-account `[[accounts]]` array.
   It is user-edited and references signature paths and account-level settings.
-- The secrets file is `~/.config/email/secrets.enc`, machine-bound encrypted (see [secrets.md](secrets.md)).
+- The secrets file is `~/.config/mailypoppins/secrets.enc`, machine-bound encrypted (see [secrets.md](secrets.md)).
+
+Both live under `config_dir()`, overridable with the `MAILYPOPPINS_CONFIG_DIR` env var, which mirrors `MAILYPOPPINS_DATA_DIR` and is what the CLI integration tests point at a tempdir.
+
+The directory was `~/.config/email` before #0022, and `config::migrate_legacy_config_dir()` moves it once, at startup in `main()`, before anything reads config or secrets.
+This does not contradict the no-migrations invariant: that invariant is scoped to data formats, secret storage and wire protocols, and a directory rename reads not one byte inside the directory.
+A hard cut would instead have cost every stored SMTP/IMAP password.
+The move is one `fs::rename` and nothing else, which is what makes it idempotent and safe under two concurrent `mp` invocations: the loser of the race gets `ENOENT` and treats old-absent plus new-present as success.
+There is no copy fallback and, more importantly, no read fallback: a rename that fails names both paths and the exact `mv` to run and exits 1, because a client that quietly kept reading `~/.config/email` would never finish the move.
+Setting `MAILYPOPPINS_CONFIG_DIR` skips the move entirely, since an explicit override must not carry a migration side effect.
 
 App-managed data, all under `mailypoppins_data_dir()`:
 
@@ -295,13 +304,14 @@ Override the root via the `MAILYPOPPINS_DATA_DIR` env var, which tests use and w
 
 `retention` is parsed and validated in config but not enforced yet: the blob store grows without bound until #0060 lands.
 
-The OS keyring service name (when the keyring backend is opted into) remains `email-cli` (constant `KEYRING_SERVICE` in `src/secrets.rs`).
+The OS keyring service name (when the keyring backend is opted into) is `mailypoppins` (constant `KEYRING_SERVICE` in `src/secrets.rs`).
+It was `email-cli` before #0022, and `get` falls back to that name so a user who opted in before the rename is not locked out of stored credentials; `set` and `delete` touch the new service only, so the next `mp config set-password` migrates the credential and leaves a harmless stale entry behind.
 
 ## Testing
 
-- **920 tests**, run by `cargo test`.
+- **935 tests**, run by `cargo test`.
 All of them run offline in under a second.
-- Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_DATA_DIR` for isolation.
+- Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
 `cargo insta review` approves changes; a diff there is a decision, not an approval reflex.
 - The store side is fixture-driven: `tests/store_ingest_integration.rs` ingests real RFC822 bytes and asserts rows, blobs, refcounts and FTS state; `tests/outbox_integration.rs` drives the state machine against a fake Sent mailbox.

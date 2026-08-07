@@ -2,7 +2,7 @@
 //! machine-ID-derived key. Skipped silently if the host doesn't expose a
 //! readable machine ID (e.g. some CI sandboxes).
 
-use email::secrets::{decrypt_blob, encrypt_blob, EncryptedFileBackend, SecretsBackend};
+use mailypoppins::secrets::{decrypt_blob, encrypt_blob, EncryptedFileBackend, SecretsBackend};
 use std::fs;
 use tempfile::tempdir;
 

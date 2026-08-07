@@ -84,7 +84,7 @@ Cannot decrypt secrets store on this machine. Run `mp config reset-secrets` to w
 `mp config reset-secrets`:
 
 1. Confirms the destructive operation interactively.
-2. Removes `~/.config/email/secrets.enc`.
+2. Removes `~/.config/mailypoppins/secrets.enc`.
 3. Removes all `*.enc` files under `<mailypoppins_data_dir>/tokens/`.
 4. Walks each configured `[[accounts]]` and re-prompts for SMTP / IMAP
    passwords. For OAuth2 / Graph accounts, prints a hint to re-run
@@ -94,7 +94,7 @@ Cannot decrypt secrets store on this machine. Run `mp config reset-secrets` to w
 
 Power users on a release-signed build (Apple Developer ID, Linux Secret
 Service, etc.) can switch to the OS keyring by adding to
-`~/.config/email/config.toml`:
+`~/.config/mailypoppins/config.toml`:
 
 ```toml
 secrets_backend = "keyring"
@@ -103,6 +103,11 @@ secrets_backend = "keyring"
 This swaps the storage at startup. There is no automatic migration: you
 will need to re-set passwords via `mp config set-password <which>
 --account <name>` after flipping the switch.
+
+The keyring service name is `mailypoppins`.
+It was `email-cli` before #0022, so a lookup that misses under `mailypoppins` retries under `email-cli` and nobody who opted in before the rename loses access to a stored password.
+Writes and deletes go to `mailypoppins` only, so the next `mp config set-password` moves the credential across and leaves a stale, harmless `email-cli` entry behind.
+Clear those by hand if you want them gone (Keychain Access on macOS, `secret-tool` / Seahorse on Linux).
 
 On macOS, the keyring backend will re-prompt for every keychain item every
 time the binary is rebuilt with a different code-signing identity (which

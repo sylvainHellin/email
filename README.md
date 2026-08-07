@@ -21,12 +21,12 @@ This will:
 1. Prompt for SMTP and IMAP credentials
 2. Test the connections
 3. Discover server mailboxes and assign roles (inbox, archive, sent)
-4. Write the config to `~/.config/email/config.toml`
+4. Write the config to `~/.config/mailypoppins/config.toml`
 5. Store passwords securely in the OS keyring (macOS Keychain, Windows Credential Manager, or Linux Secret Service)
 
 ### Configuration file
 
-All configuration lives in `~/.config/email/config.toml`:
+All configuration lives in `~/.config/mailypoppins/config.toml`:
 
 ```toml
 [email]

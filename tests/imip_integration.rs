@@ -8,7 +8,7 @@
 //! `message_blobs` rows and the blob bytes. The classification being asserted
 //! is unchanged.
 
-use email::parse::{parse_rfc822_to_fetched_email, CALENDAR_SIDECAR_NAME};
+use mailypoppins::parse::{parse_rfc822_to_fetched_email, CALENDAR_SIDECAR_NAME};
 use tempfile::tempdir;
 
 /// Ingest one parsed message into a throwaway store and expose what the row
@@ -16,19 +16,19 @@ use tempfile::tempdir;
 /// landed instead of on a `.md` file that is no longer written (#0037).
 struct Ingested {
     _tmp: tempfile::TempDir,
-    store: email::store::Store,
-    blobs: email::store::BlobStore,
+    store: mailypoppins::store::Store,
+    blobs: mailypoppins::store::BlobStore,
     row: i64,
 }
 
-fn ingest(email: &email::parse::FetchedEmail, mailbox: &str) -> Ingested {
+fn ingest(email: &mailypoppins::parse::FetchedEmail, mailbox: &str) -> Ingested {
     let tmp = tempdir().unwrap();
-    let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
-    let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
-    let outcome = email::ingest::ingest_message(
+    let store = mailypoppins::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+    let blobs = mailypoppins::store::BlobStore::new(tmp.path().join("blobs"));
+    let outcome = mailypoppins::ingest::ingest_message(
         &store,
         &blobs,
-        &email::ingest::IngestInput {
+        &mailypoppins::ingest::IngestInput {
             account: "acct",
             mailbox,
             uid: 1,
@@ -71,7 +71,7 @@ impl Ingested {
             .ok();
         hash.map(|h| {
             self.blobs
-                .read(&email::store::blobs::BlobHash::parse(&h).unwrap())
+                .read(&mailypoppins::store::blobs::BlobHash::parse(&h).unwrap())
                 .unwrap()
         })
     }
@@ -441,8 +441,8 @@ fn plain_multipart_email_is_unchanged() {
 #[test]
 fn sent_invite_roundtrips_through_receive_parser() {
     use chrono::{TimeZone, Utc};
-    use email::invite::{build_invite_ics, generate_uid, InviteSpec};
-    use email::send::build_invite_mime_body;
+    use mailypoppins::invite::{build_invite_ics, generate_uid, InviteSpec};
+    use mailypoppins::send::build_invite_mime_body;
     use lettre::message::Message;
 
     let organizer = "chair@tum.de";
@@ -533,25 +533,25 @@ fn sent_invite_roundtrips_through_receive_parser() {
 /// fresh store per call).
 struct Mailstore {
     _tmp: tempfile::TempDir,
-    store: email::store::Store,
-    blobs: email::store::BlobStore,
+    store: mailypoppins::store::Store,
+    blobs: mailypoppins::store::BlobStore,
 }
 
 impl Mailstore {
     fn new() -> Self {
         let tmp = tempdir().unwrap();
-        let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
-        let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
+        let store = mailypoppins::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let blobs = mailypoppins::store::BlobStore::new(tmp.path().join("blobs"));
         Mailstore { _tmp: tmp, store, blobs }
     }
 
     /// Ingest raw RFC822 bytes through the real parse + ingest path.
     fn ingest_raw(&self, raw: &[u8], mailbox: &str, uid: i64) -> i64 {
         let email = parse_rfc822_to_fetched_email(raw).unwrap();
-        email::ingest::ingest_message(
+        mailypoppins::ingest::ingest_message(
             &self.store,
             &self.blobs,
-            &email::ingest::IngestInput {
+            &mailypoppins::ingest::IngestInput {
                 account: "acct",
                 mailbox,
                 uid,
@@ -563,8 +563,8 @@ impl Mailstore {
         .row_id
     }
 
-    fn invites(&self) -> Vec<email::reconcile::InviteMessage> {
-        email::reconcile::load_invites(&self.store, &self.blobs, "acct")
+    fn invites(&self) -> Vec<mailypoppins::reconcile::InviteMessage> {
+        mailypoppins::reconcile::load_invites(&self.store, &self.blobs, "acct")
     }
 }
 
@@ -604,17 +604,17 @@ fn only_imip_classified_messages_reach_the_calendar_path() {
 /// invitation, so a second pass reports the same numbers.
 #[test]
 fn an_rsvp_reply_reconciles_against_the_stored_invite() {
-    use email::invite::Rsvp;
+    use mailypoppins::invite::Rsvp;
 
     let ms = Mailstore::new();
     let request = ms.ingest_raw(OUTLOOK_INLINE_REQUEST.as_bytes(), "inbox", 1);
 
     // Read the invitation back out of the store, exactly as the TUI does.
-    let ics = email::store::read::load_invite_ics(&ms.store, &ms.blobs, request)
+    let ics = mailypoppins::store::read::load_invite_ics(&ms.store, &ms.blobs, request)
         .expect("the invite.ics blob");
-    let ctx = email::invite::reply_context_from_ics(&ics).unwrap();
-    let reply_ics = email::invite::build_reply_ics(&ctx, "me@example.com", Rsvp::Declined).unwrap();
-    let built = email::send::build_reply_message(
+    let ctx = mailypoppins::invite::reply_context_from_ics(&ics).unwrap();
+    let reply_ics = mailypoppins::invite::build_reply_ics(&ctx, "me@example.com", Rsvp::Declined).unwrap();
+    let built = mailypoppins::send::build_reply_message(
         "me@example.com",
         &ctx.organizer,
         "Declined: LOC Day planning",
@@ -627,29 +627,29 @@ fn an_rsvp_reply_reconciles_against_the_stored_invite() {
 
     let invites = ms.invites();
     assert_eq!(invites.len(), 2, "the REQUEST and our sent REPLY");
-    let replies = email::reconcile::fold_replies(&invites);
+    let replies = mailypoppins::reconcile::fold_replies(&invites);
     let by_addr = replies.get("outlook-uid-1@tum.de");
 
     let request = invites
         .iter()
         .find(|i| i.method() == "REQUEST")
         .expect("the REQUEST");
-    let mut event = email::calendar::event_frontmatter(&request.parsed);
-    email::reconcile::apply_replies(&mut event, request.parsed.sequence, by_addr);
+    let mut event = mailypoppins::calendar::event_frontmatter(&request.parsed);
+    mailypoppins::reconcile::apply_replies(&mut event, request.parsed.sequence, by_addr);
     assert_eq!(event.attendees[0].address, "me@example.com");
     assert_eq!(event.attendees[0].status, "declined");
     assert_eq!(
-        email::reconcile::own_rsvp(&event, "me@example.com", by_addr),
+        mailypoppins::reconcile::own_rsvp(&event, "me@example.com", by_addr),
         "declined"
     );
 
     // The report is a read: two passes, same numbers, nothing written.
-    let first = email::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct");
+    let first = mailypoppins::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct");
     assert_eq!(first.invites_seen, 1);
     assert_eq!(first.replies_seen, 1);
     assert_eq!(first.resolved, 1);
     assert_eq!(
-        email::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct"),
+        mailypoppins::reconcile::reconcile_account(&ms.store, &ms.blobs, "acct"),
         first
     );
 }

@@ -1,14 +1,14 @@
-use email::types::*;
-use email::config::*;
-use email::parse::*;
-use email::imap_client::{self, *};
-use email::draft::*;
-use email::send::*;
-use email::config_cmd::*;
-use email::graph;
-use email::selector::{Namespace, Selector};
-use email::store::read::materialise_attachments;
-use email::store::Store;
+use mailypoppins::types::*;
+use mailypoppins::config::*;
+use mailypoppins::parse::*;
+use mailypoppins::imap_client::{self, *};
+use mailypoppins::draft::*;
+use mailypoppins::send::*;
+use mailypoppins::config_cmd::*;
+use mailypoppins::graph;
+use mailypoppins::selector::{Namespace, Selector};
+use mailypoppins::store::read::materialise_attachments;
+use mailypoppins::store::Store;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -514,18 +514,18 @@ struct InviteArgs {
 /// the difference, so the row waits in `failed` until a human has looked in the
 /// recipient's mailbox and decided between `retry` and `discard`.
 async fn cmd_outbox(
-    account_config: &email::config::AccountConfig,
+    account_config: &mailypoppins::config::AccountConfig,
     action: OutboxAction,
 ) -> Result<()> {
-    use email::outbox::{self, OutboxState};
+    use mailypoppins::outbox::{self, OutboxState};
 
-    let path = email::config::store_path(&account_config.name);
+    let path = mailypoppins::config::store_path(&account_config.name);
     if !path.exists() {
         println!("  {} nothing has been queued for {} yet", "·".dimmed(), account_config.name);
         return Ok(());
     }
-    let store = email::store::Store::open(&path)?;
-    let blobs = email::store::BlobStore::for_account(&account_config.name);
+    let store = mailypoppins::store::Store::open(&path)?;
+    let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
 
     match action {
         OutboxAction::List => {
@@ -604,8 +604,8 @@ async fn cmd_outbox(
             );
             // Drop the handle first: the resume path opens the store itself.
             drop(store);
-            let result = email::send::resume_outbox(account_config).await;
-            let store = email::store::Store::open(&path)?;
+            let result = mailypoppins::send::resume_outbox(account_config).await;
+            let store = mailypoppins::store::Store::open(&path)?;
             match outbox::load(&store, id)? {
                 Some(row) => println!("  {} row {id} is now {}", "\u{2713}".green(), row.state),
                 None => println!("  {} row {id} is gone", "\u{2713}".green()),
@@ -645,12 +645,12 @@ fn format_unix_time(ts: i64) -> String {
 
 /// Send an iMIP calendar invitation (`METHOD:REQUEST`) over SMTP.
 ///
-/// Builds the `VEVENT` (via `email::invite`), assembles the iMIP MIME tree
+/// Builds the `VEVENT` (via `mailypoppins::invite`), assembles the iMIP MIME tree
 /// (via `build_draft_message(..., Some(ics))`) and submits it through the
 /// durable outbox, which also files the local Sent copy so the #0027 receive
 /// path (and #0030 reconciliation) can pick it up.
 async fn run_send_invite(
-    account_config: &email::config::AccountConfig,
+    account_config: &mailypoppins::config::AccountConfig,
     smtp_config: &SmtpConfig,
     global_config: &GlobalConfig,
     signature: Option<&str>,
@@ -678,7 +678,7 @@ async fn run_send_invite(
 
     // Resolve times with validation (end after start, exactly one of end/duration).
     let (start_dt, end_dt) =
-        email::invite::resolve_times(start, args.end.as_deref(), args.duration.as_deref())?;
+        mailypoppins::invite::resolve_times(start, args.end.as_deref(), args.duration.as_deref())?;
 
     // Attendees from --to/--cc (dedup, bare addresses). To/Cc headers keep the
     // full form; ATTENDEE lines use the extracted address.
@@ -708,8 +708,8 @@ async fn run_send_invite(
         ));
     }
 
-    let uid = email::invite::generate_uid(&organizer);
-    let spec = email::invite::InviteSpec {
+    let uid = mailypoppins::invite::generate_uid(&organizer);
+    let spec = mailypoppins::invite::InviteSpec {
         uid: uid.clone(),
         organizer: organizer.clone(),
         attendees: attendees.clone(),
@@ -719,7 +719,7 @@ async fn run_send_invite(
         location: args.location.clone().filter(|s| !s.trim().is_empty()),
         description: args.description.clone().filter(|s| !s.trim().is_empty()),
     };
-    let ics = email::invite::build_invite_ics(&spec)?;
+    let ics = mailypoppins::invite::build_invite_ics(&spec)?;
 
     // Human-readable body: reuse the description, else a short summary line.
     let body = args
@@ -731,8 +731,8 @@ async fn run_send_invite(
         .unwrap_or_else(|| format!("You are invited to: {}", subject));
 
     // Build the event: frontmatter block from the same ICS (round-trips via #0027).
-    let event = email::calendar::parse_ics(ics.as_bytes())
-        .map(|p| email::calendar::event_frontmatter(&p));
+    let event = mailypoppins::calendar::parse_ics(ics.as_bytes())
+        .map(|p| mailypoppins::calendar::event_frontmatter(&p));
 
     // Synthetic draft, used only to build the message: nothing is written to
     // disk on this path any more (the Sent copy is the outbox's, #0037).
@@ -740,7 +740,7 @@ async fn run_send_invite(
     let draft_path = PathBuf::from(format!(
         "{}-invite-{}.md",
         sent_at.format("%Y%m%d-%H%M%S"),
-        email::parse::slugify_subject(subject)
+        mailypoppins::parse::slugify_subject(subject)
     ));
 
     let draft = EmailDraft {
@@ -789,14 +789,14 @@ async fn run_send_invite(
     }
 
     println!("Sending invitation...");
-    let built = email::send::build_draft_message(
+    let built = mailypoppins::send::build_draft_message(
         &draft,
         &smtp_config.default_from,
         &global_config.email,
         signature,
         Some(&ics),
     )?;
-    let report = email::send::send_durably(&built, account_config, smtp_config).await?;
+    let report = mailypoppins::send::send_durably(&built, account_config, smtp_config).await?;
     let send_result = &report.send_result;
 
     for r in send_result.succeeded() {
@@ -819,7 +819,7 @@ async fn run_send_invite(
         ));
     }
 
-    email::contacts::hooks::bump_after_send(account_config, &draft);
+    mailypoppins::contacts::hooks::bump_after_send(account_config, &draft);
 
     if send_result.all_succeeded() {
         println!(
@@ -873,7 +873,7 @@ impl DraftStatusFilter {
 /// answer from "no such message" and is worth saying: resolving a selector
 /// against an empty index would otherwise report the message as unknown.
 fn received_store(account: &str) -> Result<Store> {
-    let path = email::config::store_path(account);
+    let path = mailypoppins::config::store_path(account);
     if !path.exists() {
         return Err(anyhow!(
             "{account} has no local store yet, so no received mail can be addressed; \
@@ -889,10 +889,10 @@ fn received_store(account: &str) -> Result<Store> {
 /// draft-facing command before it reads the table: a draft an agent wrote a
 /// second ago is in the index by the time the command lists or resolves it.
 fn drafts_store(account: &str) -> Result<Store> {
-    let store = Store::open(email::config::store_path(account))
+    let store = Store::open(mailypoppins::config::store_path(account))
         .with_context(|| format!("opening the store of {account}"))?;
-    let dir = email::config::drafts_dir(account);
-    let (_, collisions) = email::store::drafts::refresh_reporting(&store, account, &dir)
+    let dir = mailypoppins::config::drafts_dir(account);
+    let (_, collisions) = mailypoppins::store::drafts::refresh_reporting(&store, account, &dir)
         .with_context(|| format!("refreshing the drafts index of {account}"))?;
     // Two files claiming one id means one of them is unaddressable. The index
     // cannot decide which the user meant, so it says so rather than dropping
@@ -918,9 +918,9 @@ fn resolve_draft_arg(
     store: &Store,
     selector: &str,
     account: &str,
-) -> Result<(email::store::drafts::DraftRow, Selector)> {
-    let query = email::selector::parse_in(selector, Namespace::Drafts, account, None)?;
-    email::selector::resolve_draft(store, &query)
+) -> Result<(mailypoppins::store::drafts::DraftRow, Selector)> {
+    let query = mailypoppins::selector::parse_in(selector, Namespace::Drafts, account, None)?;
+    mailypoppins::selector::resolve_draft(store, &query)
 }
 
 /// Resolve a received selector to its message row plus the canonical selector.
@@ -929,9 +929,9 @@ fn resolve_received_arg(
     selector: &str,
     account: &str,
     mailbox: Option<&str>,
-) -> Result<(email::store::read::MessageRow, Selector)> {
-    let query = email::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
-    email::selector::resolve_received(store, &query)
+) -> Result<(mailypoppins::store::read::MessageRow, Selector)> {
+    let query = mailypoppins::selector::parse_in(selector, Namespace::Received, account, mailbox)?;
+    mailypoppins::selector::resolve_received(store, &query)
 }
 
 /// The mailboxes an account is configured for, as a human-readable list for
@@ -999,7 +999,7 @@ async fn sync_one_account(
         // Resume the outbox first: a message that reached the server
         // before the last crash gets its Sent copy before this sync
         // reads the mailbox it belongs in (#0037 item 5).
-        let drained = email::send::resume_outbox(account_config).await;
+        let drained = mailypoppins::send::resume_outbox(account_config).await;
         if drained.completed > 0 || drained.still_open > 0 {
             println!(
                 "  {} outbox: {} completed, {} still pending",
@@ -1027,7 +1027,7 @@ async fn sync_one_account(
 
     if !dry_run {
         // Incremental contacts-index update (best-effort).
-        email::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
+        mailypoppins::contacts::hooks::bump_after_sync(account_config, &result.fresh_observations);
     }
 
     let prefix = if dry_run { "[dry-run] " } else { "" };
@@ -1094,7 +1094,15 @@ async fn main() -> Result<()> {
 
     info!("mailypoppins started: {:?}", std::env::args().collect::<Vec<_>>());
 
-    // Load global config from ~/.config/email/config.toml
+    // Move a pre-#0022 ~/.config/email directory before anything reads config
+    // or secrets out of it. A failure here is fatal: the alternative is running
+    // against an empty config and silently re-prompting for every password.
+    if let Err(e) = mailypoppins::config::migrate_legacy_config_dir() {
+        eprintln!("{} {}", "\u{2717}".red(), e);
+        std::process::exit(1);
+    }
+
+    // Load global config from ~/.config/mailypoppins/config.toml
     let global_config = load_global_config().unwrap_or_else(|e| {
         eprintln!("{} {}", "⚠".yellow(), e);
         eprintln!("  Some commands may not work without proper configuration.");
@@ -1103,31 +1111,31 @@ async fn main() -> Result<()> {
 
     // Initialize the secrets backend (encrypted file by default, or OS keyring
     // if the user opted in via `secrets_backend = "keyring"` in config.toml).
-    if let Err(e) = email::config::init_secrets_backend(&global_config) {
+    if let Err(e) = mailypoppins::config::init_secrets_backend(&global_config) {
         match &e {
-            email::secrets::SecretsError::NotInitialized(_) => {
+            mailypoppins::secrets::SecretsError::NotInitialized(_) => {
                 // Empty store at startup is fine -- `mp config init` or
                 // `set-password` will populate it. The actual missing-key
                 // error surfaces later when `SmtpConfig::load` is called.
             }
-            email::secrets::SecretsError::Undecryptable(_, _) => {
+            mailypoppins::secrets::SecretsError::Undecryptable(_, _) => {
                 eprintln!("{} {}", "\u{2717}".red(), e);
                 std::process::exit(1);
             }
-            email::secrets::SecretsError::Other(err) => {
+            mailypoppins::secrets::SecretsError::Other(err) => {
                 eprintln!("{} Could not initialize secrets backend: {}", "\u{26a0}".yellow(), err);
             }
         }
     }
 
     // Resolve which account to use
-    let account_config: email::config::AccountConfig = if let Some(ref name) = cli.account {
+    let account_config: mailypoppins::config::AccountConfig = if let Some(ref name) = cli.account {
         global_config.accounts.iter()
             .find(|a| a.name == *name)
             .cloned()
             .unwrap_or_else(|| {
                 eprintln!("{} Account '{}' not found in config", "⚠".yellow(), name);
-                email::config::AccountConfig::default()
+                mailypoppins::config::AccountConfig::default()
             })
     } else {
         global_config.accounts.first().cloned().unwrap_or_default()
@@ -1144,7 +1152,7 @@ async fn main() -> Result<()> {
             password: String::new(),
             default_from: "user@example.com".to_string(),
             accept_invalid_certs: false,
-            auth_method: email::config::AuthMethod::Password,
+            auth_method: mailypoppins::config::AuthMethod::Password,
         }
     });
 
@@ -1253,14 +1261,14 @@ async fn main() -> Result<()> {
                 println!("Sending email...");
             }
 
-            let ctx = email::send::SendContext {
+            let ctx = mailypoppins::send::SendContext {
                 graph,
                 smtp: (!is_graph).then(|| smtp_config.clone()),
                 account: account_config.clone(),
                 email_settings: global_config.email.clone(),
                 signature: signature_content.clone(),
             };
-            let sent = email::send::send_draft(&draft, &ctx).await?;
+            let sent = mailypoppins::send::send_draft(&draft, &ctx).await?;
             let report = &sent.report;
             let send_result = &report.send_result;
 
@@ -1354,7 +1362,7 @@ async fn main() -> Result<()> {
             // second code path: each account resolves its own SMTP config,
             // signature and drafts index, so the per-account send is exactly
             // what the single-account form does.
-            let accounts: Vec<email::config::AccountConfig> = if all_accounts {
+            let accounts: Vec<mailypoppins::config::AccountConfig> = if all_accounts {
                 global_config.accounts.clone()
             } else {
                 vec![account_config.clone()]
@@ -1379,7 +1387,7 @@ async fn main() -> Result<()> {
             };
             let store = drafts_store(&account_config.name)?;
             let rows =
-                email::store::drafts::list(&store, &account_config.name, Some("approved"))?;
+                mailypoppins::store::drafts::list(&store, &account_config.name, Some("approved"))?;
             drop(store);
             let drafts: Vec<EmailDraft> = rows
                 .iter()
@@ -1428,7 +1436,7 @@ async fn main() -> Result<()> {
             // every draft in it (#0058): what this loop owns is the running
             // tally and the per-draft line.
             let is_graph = account_config.auth_method == AuthMethod::Graph;
-            let ctx = email::send::SendContext {
+            let ctx = mailypoppins::send::SendContext {
                 graph: if is_graph {
                     Some(GraphConfig::load(&account_config)?)
                 } else {
@@ -1444,7 +1452,7 @@ async fn main() -> Result<()> {
                 print!("Sending to {}... ", draft.frontmatter.to.as_deref().unwrap_or("(bcc only)"));
                 io::stdout().flush()?;
 
-                let sent = match email::send::send_draft(&draft, &ctx).await {
+                let sent = match mailypoppins::send::send_draft(&draft, &ctx).await {
                     Ok(sent) => sent,
                     Err(e) => {
                         println!("{} {}", "\u{2717}".red(), e);
@@ -1519,7 +1527,7 @@ async fn main() -> Result<()> {
 
         Some(Commands::List { status }) => {
             let store = drafts_store(&account_config.name)?;
-            let rows = email::store::drafts::list(
+            let rows = mailypoppins::store::drafts::list(
                 &store,
                 &account_config.name,
                 status.map(DraftStatusFilter::as_str),
@@ -1567,7 +1575,7 @@ async fn main() -> Result<()> {
                     let (row, canonical) = resolve_draft_arg(&store, sel, &account_config.name)?;
                     vec![(canonical, row.path)]
                 }
-                None => email::store::drafts::list(&store, &account_config.name, None)?
+                None => mailypoppins::store::drafts::list(&store, &account_config.name, None)?
                     .into_iter()
                     .map(|row| (Selector::for_draft(&account_config.name, &row.id), row.path))
                     .collect(),
@@ -1639,7 +1647,7 @@ async fn main() -> Result<()> {
             } else {
                 format!("{}.md", name)
             };
-            let dir = email::config::drafts_dir(&account_config.name);
+            let dir = mailypoppins::config::drafts_dir(&account_config.name);
             fs::create_dir_all(&dir)?;
             let path = dir.join(&file_name);
             if path.exists() {
@@ -1648,7 +1656,7 @@ async fn main() -> Result<()> {
 
             // The id is minted here rather than by the index, so the selector
             // printed below is the one in the file from the first byte.
-            let id = email::store::drafts::new_id();
+            let id = mailypoppins::store::drafts::new_id();
             let now = chrono::Utc::now().to_rfc2822();
             let skeleton =
                 new_draft_skeleton_with_id(&smtp_config.default_from, &now, &id);
@@ -1687,15 +1695,15 @@ async fn main() -> Result<()> {
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
             let source = source_from_row(&store, &blobs, &row, false)?;
             drop(store);
 
-            let (_path, draft) = email::draft::create_draft_from_source(
+            let (_path, draft) = mailypoppins::draft::create_draft_from_source(
                 &account_config.name,
                 &account_config.default_from,
                 &source,
-                email::draft::DraftFromSource::Reply { all },
+                mailypoppins::draft::DraftFromSource::Reply { all },
                 None,
             )?;
             println!("{} reply to {}", "\u{2713}".green(), canonical);
@@ -1706,15 +1714,15 @@ async fn main() -> Result<()> {
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
             let source = source_from_row(&store, &blobs, &row, true)?;
             drop(store);
 
-            let (_path, draft) = email::draft::create_draft_from_source(
+            let (_path, draft) = mailypoppins::draft::create_draft_from_source(
                 &account_config.name,
                 &account_config.default_from,
                 &source,
-                email::draft::DraftFromSource::Forward,
+                mailypoppins::draft::DraftFromSource::Forward,
                 None,
             )?;
             println!("{} forward of {}", "\u{2713}".green(), canonical);
@@ -1724,13 +1732,13 @@ async fn main() -> Result<()> {
         Some(Commands::Invite { action }) => {
             let (selector, mailbox, rsvp) = match action {
                 InviteAction::Accept { selector, mailbox } => {
-                    (selector, mailbox, email::invite::Rsvp::Accepted)
+                    (selector, mailbox, mailypoppins::invite::Rsvp::Accepted)
                 }
                 InviteAction::Tentative { selector, mailbox } => {
-                    (selector, mailbox, email::invite::Rsvp::Tentative)
+                    (selector, mailbox, mailypoppins::invite::Rsvp::Tentative)
                 }
                 InviteAction::Decline { selector, mailbox } => {
-                    (selector, mailbox, email::invite::Rsvp::Declined)
+                    (selector, mailbox, mailypoppins::invite::Rsvp::Declined)
                 }
             };
             if account_config.auth_method == AuthMethod::Graph {
@@ -1742,14 +1750,14 @@ async fn main() -> Result<()> {
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
             // The invitation's own iMIP payload is the source of truth for the
             // reply, and it is a blob on the row (#0038 item 6).
-            let ics = email::store::read::load_invite_ics(&store, &blobs, row.id)
+            let ics = mailypoppins::store::read::load_invite_ics(&store, &blobs, row.id)
                 .ok_or_else(|| anyhow!("{canonical} carries no invitation to reply to"))?;
             drop(store);
 
-            let outcome = email::send::send_rsvp(
+            let outcome = mailypoppins::send::send_rsvp(
                 &ics,
                 &account_config,
                 &account_config.default_from,
@@ -1770,8 +1778,8 @@ async fn main() -> Result<()> {
 
         Some(Commands::ListMailboxes) => {
             if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = email::config::GraphConfig::load(&account_config)?;
-                let client = email::graph::GraphClient::new_async(&graph_config).await?;
+                let graph_config = mailypoppins::config::GraphConfig::load(&account_config)?;
+                let client = mailypoppins::graph::GraphClient::new_async(&graph_config).await?;
                 let folders = client.list_folders().await?;
 
                 println!("{} Available folders:", "ℹ".blue());
@@ -1888,10 +1896,10 @@ async fn main() -> Result<()> {
             // Skipped accounts are out of the denominator too: "1 of 2" when
             // the second was never synced would be a claim about an account
             // this run said nothing about.
-            if let Some(summary) = email::sync_health::failure_summary(attempted, &failed) {
+            if let Some(summary) = mailypoppins::sync_health::failure_summary(attempted, &failed) {
                 eprintln!("{} {}", "✗".red(), summary);
             }
-            let code = email::sync_health::exit_code(&failed);
+            let code = mailypoppins::sync_health::exit_code(&failed);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1941,7 +1949,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            email::store::write::move_row(&store, row.id, ARCHIVE_MAILBOX)?;
+            mailypoppins::store::write::move_row(&store, row.id, ARCHIVE_MAILBOX)?;
             println!("{} archived {}", "\u{2713}".green(), canonical);
             println!(
                 "  {} {}",
@@ -1964,8 +1972,8 @@ async fn main() -> Result<()> {
                 imap_client::delete_email_on_server(&imap_config, &row.message_id, &source_server)
                     .await?;
             }
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
-            email::store::write::delete_row(&store, &blobs, row.id)?;
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
+            mailypoppins::store::write::delete_row(&store, &blobs, row.id)?;
             println!("{} deleted {}", "\u{2713}".green(), canonical);
         }
 
@@ -1973,18 +1981,18 @@ async fn main() -> Result<()> {
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
             // Attachments are blobs; the system opener needs files, so they are
             // materialised into a temp directory keyed by the row. The TUI's
             // `o` comes through the same helper, so both put them in the same
             // private place.
-            let dir = email::parse::materialisation_dir(&row.id.to_string())?;
+            let dir = mailypoppins::parse::materialisation_dir(&row.id.to_string())?;
             let files = materialise_attachments(&store, &blobs, row.id, &dir)?;
             if files.is_empty() {
                 return Err(anyhow!("{canonical} has no attachments"));
             }
             for file in &files {
-                email::parse::open_file_with_system(file)?;
+                mailypoppins::parse::open_file_with_system(file)?;
                 println!("{} opened {}", "\u{2713}".green(), file.display());
             }
         }
@@ -1993,7 +2001,7 @@ async fn main() -> Result<()> {
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let blobs = email::store::BlobStore::for_account(&account_config.name);
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
             let dest = output.unwrap_or_else(|| PathBuf::from("."));
             let files = materialise_attachments(&store, &blobs, row.id, &dest)?;
             if files.is_empty() {
@@ -2093,7 +2101,7 @@ async fn main() -> Result<()> {
             match action {
                 ContactsAction::Search { query, parsable, limit, account } => {
                     let acct = account.or_else(|| cli.account.clone());
-                    email::contacts_cmd::handle_search(
+                    mailypoppins::contacts_cmd::handle_search(
                         &global_config,
                         query,
                         parsable,
@@ -2103,11 +2111,11 @@ async fn main() -> Result<()> {
                 }
                 ContactsAction::Rebuild { account } => {
                     let acct = account.or_else(|| cli.account.clone());
-                    email::contacts_cmd::handle_rebuild(&global_config, acct)?;
+                    mailypoppins::contacts_cmd::handle_rebuild(&global_config, acct)?;
                 }
                 ContactsAction::Stats { account } => {
                     let acct = account.or_else(|| cli.account.clone());
-                    email::contacts_cmd::handle_stats(&global_config, acct)?;
+                    mailypoppins::contacts_cmd::handle_stats(&global_config, acct)?;
                 }
             }
         }
@@ -2115,7 +2123,7 @@ async fn main() -> Result<()> {
         Some(Commands::Calendar { action }) => match action {
             CalendarAction::Rebuild { account } => {
                 let acct = account.or_else(|| cli.account.clone());
-                email::calendar_cmd::handle_rebuild(&global_config, acct)?;
+                mailypoppins::calendar_cmd::handle_rebuild(&global_config, acct)?;
             }
         },
 
@@ -2125,15 +2133,15 @@ async fn main() -> Result<()> {
 
         Some(Commands::DumpKeys { json }) => {
             if json {
-                print!("{}", email::tui::dump_keys_json());
+                print!("{}", mailypoppins::tui::dump_keys_json());
             } else {
-                print!("{}", email::tui::dump_keys());
+                print!("{}", mailypoppins::tui::dump_keys());
             }
         }
 
         Some(Commands::DumpMailbox { json: _, mailbox }) => {
             // `--json` is `required = true`, so the format is already pinned.
-            let accounts: Vec<email::config::AccountConfig> = match cli.account {
+            let accounts: Vec<mailypoppins::config::AccountConfig> = match cli.account {
                 Some(ref name) => global_config
                     .accounts
                     .iter()
@@ -2146,10 +2154,10 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("No account to dump (check `mp config show`)"));
             }
             let filter = mailbox.unwrap_or_default();
-            let records = email::dump::collect_records(&accounts, &filter);
+            let records = mailypoppins::dump::collect_records(&accounts, &filter);
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            out.write_all(email::dump::to_ndjson(&records).as_bytes())?;
+            out.write_all(mailypoppins::dump::to_ndjson(&records).as_bytes())?;
             out.flush()?;
         }
 
@@ -2193,7 +2201,7 @@ async fn main() -> Result<()> {
                 )?;
             } else {
                 // No file, no subcommand -> launch TUI
-                email::tui::run()?;
+                mailypoppins::tui::run()?;
             }
         }
     }

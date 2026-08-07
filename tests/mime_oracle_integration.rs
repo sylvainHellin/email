@@ -19,7 +19,7 @@
 //! crate is needed to produce them and nothing about the fixture depends on the
 //! developer's locale.
 
-use email::parse::{parse_rfc822_to_fetched_email, FetchedEmail};
+use mailypoppins::parse::{parse_rfc822_to_fetched_email, FetchedEmail};
 
 /// Assemble a raw RFC822 message. `headers` must end with CRLF; the blank line
 /// that terminates the header block is added here.
@@ -39,20 +39,20 @@ fn parse(raw: &[u8]) -> FetchedEmail {
 /// the old save path wrote.
 struct IngestedRow {
     _tmp: tempfile::TempDir,
-    store: email::store::Store,
-    blobs: email::store::BlobStore,
+    store: mailypoppins::store::Store,
+    blobs: mailypoppins::store::BlobStore,
     row: i64,
 }
 
 fn ingest_raw(raw: &[u8]) -> IngestedRow {
     let tmp = tempfile::tempdir().unwrap();
-    let store = email::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
-    let blobs = email::store::BlobStore::new(tmp.path().join("blobs"));
+    let store = mailypoppins::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+    let blobs = mailypoppins::store::BlobStore::new(tmp.path().join("blobs"));
     let fetched = parse(raw);
-    let outcome = email::ingest::ingest_message(
+    let outcome = mailypoppins::ingest::ingest_message(
         &store,
         &blobs,
-        &email::ingest::IngestInput {
+        &mailypoppins::ingest::IngestInput {
             account: "acct",
             mailbox: "inbox",
             uid: 1,
@@ -79,7 +79,7 @@ impl IngestedRow {
     fn blob(&self, column: &str) -> Vec<u8> {
         let hash = self.text(column);
         self.blobs
-            .read(&email::store::blobs::BlobHash::parse(&hash).unwrap())
+            .read(&mailypoppins::store::blobs::BlobHash::parse(&hash).unwrap())
             .unwrap()
     }
 

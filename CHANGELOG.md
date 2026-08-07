@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **The config directory is now `~/.config/mailypoppins/` (#0022).** It was
+  `~/.config/email/`, which was the last user-visible place the old name
+  survived. Your existing directory is moved for you, once, the next time you
+  run `mp`, and the move is announced on stderr. Nothing inside it is read or
+  rewritten, so passwords, signature files and account settings come across
+  untouched. If the move cannot be done, `mp` says so and prints the exact `mv`
+  to run rather than starting up against an empty config.
+
+  One thing the move cannot fix for you: a value in `config.toml` that points
+  *into* the old directory, such as a signature at
+  `~/.config/email/signatures/work.html`. The file moved, the string in your
+  config did not. `mp` names every such key, its old value and the exact
+  replacement, once, right after the move, because otherwise the first you
+  would hear of it is a message going out unsigned.
+
+  Both `config.toml` and `secrets.enc` live there. A new
+  `MAILYPOPPINS_CONFIG_DIR` env var overrides the location, mirroring
+  `MAILYPOPPINS_DATA_DIR`; setting it skips the move entirely.
+
+- **The OS keyring service is now `mailypoppins` (#0022).** Only relevant if
+  you opted into `secrets_backend = "keyring"`. Nothing is lost: a password not
+  found under the new name is looked up under the old `email-cli` one, and your
+  next `mp config set-password` files it under the new name for good.
+
+- **The Cargo package and library are now `mailypoppins` (#0022),** not `email`.
+  Invisible unless you build from source, where imports read
+  `use mailypoppins::...`. The installed binary is still `mp` and the version
+  string is still `mailypoppins X.Y.Z`.
+
+- **A sent draft records `sent_via: "mailypoppins X.Y.Z"` (#0022),** not
+  `email-cli X.Y.Z`.
+
 ### Added
 - **Read a received message in your editor again (#0075).** `Enter` or `e` on
   a message in any mailbox opens it in `$EDITOR`, as Markdown with the headers

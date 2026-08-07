@@ -400,15 +400,41 @@ impl SecretsBackend for EncryptedFileBackend {
 // KeyringBackend (opt-in via `secrets_backend = "keyring"`)
 // ---------------------------------------------------------------------------
 
-const KEYRING_SERVICE: &str = "email-cli";
+const KEYRING_SERVICE: &str = "mailypoppins";
+
+/// The pre-#0022 keyring service name.
+///
+/// Read-only, and only as a fallback: a user who opted into the keyring backend
+/// before the rename still has credentials filed under it, and orphaning them
+/// is the one dangerous direction in a cosmetic rename. `set` and `delete`
+/// operate on [`KEYRING_SERVICE`] alone, so the next `mp config set-password`
+/// migrates the credential naturally and leaves a harmless stale entry behind.
+const LEGACY_KEYRING_SERVICE: &str = "email-cli";
+
+/// Look `key` up under the current service name, then the legacy one.
+///
+/// Parameterised over the lookup so the order is testable without a real
+/// keyring daemon.
+fn keyring_get_with_fallback(
+    key: &str,
+    lookup: impl Fn(&str, &str) -> Result<String>,
+) -> Result<String> {
+    match lookup(KEYRING_SERVICE, key) {
+        Ok(v) => Ok(v),
+        Err(current_err) => lookup(LEGACY_KEYRING_SERVICE, key).map_err(|_| current_err),
+    }
+}
 
 pub struct KeyringBackend;
 
 impl SecretsBackend for KeyringBackend {
     fn get(&self, key: &str) -> Result<String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .context("Failed to create keyring entry")?;
-        entry.get_password().with_context(|| {
+        keyring_get_with_fallback(key, |service, key| {
+            let entry = keyring::Entry::new(service, key)
+                .context("Failed to create keyring entry")?;
+            entry.get_password().map_err(anyhow::Error::from)
+        })
+        .with_context(|| {
             format!(
                 "Password '{}' not found in keyring. Run `mp config set-password`.",
                 key
@@ -439,13 +465,10 @@ impl SecretsBackend for KeyringBackend {
 
 static BACKEND: OnceLock<Box<dyn SecretsBackend>> = OnceLock::new();
 
-/// Return the path to the encrypted secrets file: ~/.config/email/secrets.enc
+/// Return the path to the encrypted secrets file:
+/// ~/.config/mailypoppins/secrets.enc
 pub fn secrets_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("email")
-        .join("secrets.enc")
+    crate::config::config_dir().join("secrets.enc")
 }
 
 /// Initialize the process-wide secrets backend from the given kind.
@@ -492,6 +515,55 @@ fn backend() -> Result<&'static (dyn SecretsBackend + 'static)> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // -----------------------------------------------------------------------
+    // Keyring service rename (#0022)
+    // -----------------------------------------------------------------------
+
+    /// A fake keyring: `(service, key) -> value`.
+    fn fake_keyring<'a>(
+        entries: &'a [(&'a str, &'a str, &'a str)],
+    ) -> impl Fn(&str, &str) -> Result<String> + 'a {
+        move |service: &str, key: &str| {
+            entries
+                .iter()
+                .find(|(s, k, _)| *s == service && *k == key)
+                .map(|(_, _, v)| v.to_string())
+                .ok_or_else(|| anyhow!("no entry for {service}/{key}"))
+        }
+    }
+
+    /// The dangerous direction: a user who opted into the keyring before the
+    /// rename must not be locked out of credentials filed under `email-cli`.
+    #[test]
+    fn keyring_get_falls_back_to_the_legacy_service() {
+        let entries = [(LEGACY_KEYRING_SERVICE, "smtp-password-work", "old-secret")];
+        let got = keyring_get_with_fallback("smtp-password-work", fake_keyring(&entries)).unwrap();
+        assert_eq!(got, "old-secret");
+    }
+
+    /// The other lookup order: once a credential exists under the new service
+    /// it wins, so a stale `email-cli` entry can never shadow a fresh password.
+    #[test]
+    fn keyring_get_prefers_the_current_service_over_the_legacy_one() {
+        let entries = [
+            (KEYRING_SERVICE, "smtp-password-work", "new-secret"),
+            (LEGACY_KEYRING_SERVICE, "smtp-password-work", "old-secret"),
+        ];
+        let got = keyring_get_with_fallback("smtp-password-work", fake_keyring(&entries)).unwrap();
+        assert_eq!(got, "new-secret");
+    }
+
+    /// Neither service has it: the error is the current service's, not the
+    /// legacy one's, so the message points at where a password should live.
+    #[test]
+    fn keyring_get_missing_everywhere_reports_the_current_service() {
+        let entries: [(&str, &str, &str); 0] = [];
+        let err = keyring_get_with_fallback("smtp-password-work", fake_keyring(&entries))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(KEYRING_SERVICE), "{err}");
+    }
 
     #[test]
     fn round_trip_set_save_reload_get() {

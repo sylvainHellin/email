@@ -1536,7 +1536,7 @@ pub fn preview_draft(
 pub fn mark_draft_sent(draft: &EmailDraft, message_id: Option<&str>) -> Result<()> {
     info!("Updating status to sent: {}", draft.path.display());
     let sent_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let sent_via = format!("email-cli v{}", env!("CARGO_PKG_VERSION"));
+    let sent_via = format!("mailypoppins v{}", env!("CARGO_PKG_VERSION"));
 
     let content = match fs::read_to_string(&draft.path) {
         Ok(content) => content,
@@ -2736,7 +2736,7 @@ mod tests {
         assert!(after.contains("  - urgent\n"), "{after}");
         assert!(after.contains("message_id: \"<abc@example.com>\"\n"), "{after}");
         assert!(after.contains("sent_at: 20"), "{after}");
-        assert!(after.contains("sent_via: \"email-cli v"), "{after}");
+        assert!(after.contains("sent_via: \"mailypoppins v"), "{after}");
         assert!(after.contains("Body stays put.\n"), "{after}");
         // The re-parsed file still round-trips through the struct.
         let reparsed = parse_email_draft(&path).unwrap();

@@ -1,12 +1,12 @@
 [package]
-name = "email"
+name = "mailypoppins"
 version = "0.8.0"
 edition = "2021"
 description = "A CLI tool for sending emails from Markdown drafts with YAML frontmatter"
 authors = ["Sylvain Hellin"]
 
 [lib]
-name = "email"
+name = "mailypoppins"
 path = "src/lib.rs"
 
 [[bin]]

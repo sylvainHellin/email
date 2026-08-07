@@ -15,7 +15,7 @@ This guide walks through setting up the email CLI with a Microsoft 365 (Exchange
 3. Select "App registrations" in the left sidebar
 4. Click "New registration"
 5. Fill in:
-   - Name: `Email CLI` (or any descriptive name)
+   - Name: `mailypoppins` (or any descriptive name; this is the label in your tenant, nothing reads it back)
    - Supported account types: "Accounts in this organizational directory only"
    - Redirect URI: leave blank (not needed for device code flow)
 6. Click "Register"
@@ -51,7 +51,7 @@ From the app registration "Overview" page, copy:
 - **Application (client) ID**: e.g., `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 - **Directory (tenant) ID**: e.g., `yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy`
 
-## Step 5: Configure the Email CLI
+## Step 5: Configure mailypoppins
 
 ### Option A: Interactive Setup
 
@@ -63,7 +63,7 @@ Select "3. Microsoft 365 / Exchange Online (OAuth2)" and follow the prompts. You
 
 ### Option B: Manual Configuration
 
-Add to `~/.config/email/config.toml`:
+Add to `~/.config/mailypoppins/config.toml`:
 
 ```toml
 [[accounts]]

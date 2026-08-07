@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use email::ingest::{ingest_message, IngestInput};
-use email::parse::FetchedEmail;
-use email::selector::{self, Namespace};
-use email::store::{BlobStore, Store};
+use mailypoppins::ingest::{ingest_message, IngestInput};
+use mailypoppins::parse::FetchedEmail;
+use mailypoppins::selector::{self, Namespace};
+use mailypoppins::store::{BlobStore, Store};
 use tempfile::TempDir;
 
 const MP: &str = env!("CARGO_BIN_EXE_mp");
@@ -35,7 +35,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tmp = TempDir::new().expect("tempdir");
-        let config_dir = tmp.path().join("home/.config/email");
+        let config_dir = tmp.path().join("config");
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("config.toml"),
@@ -47,6 +47,10 @@ impl Fixture {
 
     fn home(&self) -> PathBuf {
         self.tmp.path().join("home")
+    }
+
+    fn config(&self) -> PathBuf {
+        self.tmp.path().join("config")
     }
 
     fn data(&self) -> PathBuf {
@@ -61,6 +65,7 @@ impl Fixture {
         Command::new(MP)
             .args(args)
             .env("HOME", self.home())
+            .env("MAILYPOPPINS_CONFIG_DIR", self.config())
             .env("MAILYPOPPINS_DATA_DIR", self.data())
             .output()
             .expect("mp must run")
@@ -266,7 +271,7 @@ fn renaming_a_draft_keeps_its_selector_working() {
 /// Two halves, because the product has two readers. `mp list` is a fresh
 /// process that refreshes the index at engine start, so its bound is its own
 /// startup. The TUI is a long-running process, and what it polls is
-/// [`email::store::drafts::fingerprint`]; the loop below is that poll, run at
+/// [`mailypoppins::store::drafts::fingerprint`]; the loop below is that poll, run at
 /// the same one-second budget the event loop gives it.
 #[test]
 fn an_externally_written_draft_shows_up_within_one_second() {
@@ -274,14 +279,14 @@ fn an_externally_written_draft_shows_up_within_one_second() {
     external_draft(&fx.drafts_dir(), "first.md", "First");
     assert_eq!(selectors_in(&fx.ok(&["list"])).len(), 1);
 
-    let before = email::store::drafts::fingerprint(&fx.drafts_dir());
+    let before = mailypoppins::store::drafts::fingerprint(&fx.drafts_dir());
     let started = Instant::now();
     external_draft(&fx.drafts_dir(), "second.md", "Second");
 
     // The long-running reader: the stat-only poll notices, inside its budget.
     let mut noticed = None;
     while started.elapsed() < Duration::from_secs(1) {
-        let now = email::store::drafts::fingerprint(&fx.drafts_dir());
+        let now = mailypoppins::store::drafts::fingerprint(&fx.drafts_dir());
         if now != before {
             noticed = Some(started.elapsed());
             break;

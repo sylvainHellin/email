@@ -15,7 +15,7 @@ pub fn cmd_config_path() {
 pub fn cmd_config_show() -> Result<()> {
     let config = load_global_config()?;
 
-    println!("{}", "=== Email CLI Configuration ===".bold().cyan());
+    println!("{}", "=== mailypoppins configuration ===".bold().cyan());
     println!("{}: {}", "Config file".bold(), config_path().display());
     println!("{}: {}", "Data dir".bold(), mailypoppins_data_dir().display());
 

@@ -12,7 +12,7 @@ use chrono::Utc;
 use crate::types::MailboxRole;
 
 // ---------------------------------------------------------------------------
-// Global config (loaded from ~/.config/email/config.toml)
+// Global config (loaded from ~/.config/mailypoppins/config.toml)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -502,16 +502,203 @@ pub fn init_secrets_backend(config: &GlobalConfig) -> std::result::Result<(), cr
 // Config loading
 // ---------------------------------------------------------------------------
 
-/// Return the path to the global config file: ~/.config/email/config.toml
-pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("email")
-        .join("config.toml")
+/// Environment variable overriding the config directory.
+///
+/// Mirrors `MAILYPOPPINS_DATA_DIR`, and is what test harnesses point at a
+/// tempdir instead of writing into the real `$HOME`. Setting it also disables
+/// [`migrate_legacy_config_dir`]: an explicit override names a location the
+/// caller chose, and must never trigger a migration side effect.
+pub const CONFIG_DIR_ENV: &str = "MAILYPOPPINS_CONFIG_DIR";
+
+fn home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
 
-/// Load the global config from ~/.config/email/config.toml
+/// The pre-#0022 config directory, `~/.config/email`.
+///
+/// Only [`migrate_legacy_config_dir`] reads this. Nothing else may fall back to
+/// it: a config that failed to move must fail loudly, not be quietly read from
+/// the old place forever.
+fn legacy_config_dir() -> PathBuf {
+    home_dir().join(".config").join("email")
+}
+
+/// Return the config directory: `$MAILYPOPPINS_CONFIG_DIR`, else
+/// `~/.config/mailypoppins`.
+pub fn config_dir() -> PathBuf {
+    if let Ok(p) = std::env::var(CONFIG_DIR_ENV) {
+        if !p.is_empty() {
+            return PathBuf::from(shellexpand::tilde(&p).into_owned());
+        }
+    }
+    home_dir().join(".config").join("mailypoppins")
+}
+
+/// Return the path to the global config file: ~/.config/mailypoppins/config.toml
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Move a pre-#0022 `~/.config/email` directory to `~/.config/mailypoppins`,
+/// once, at startup.
+///
+/// The "no migration paths until v1.0" invariant is scoped to data formats,
+/// secret storage and wire protocols. This is a location change: not one byte
+/// inside the directory is read or rewritten. A hard cut would instead cost the
+/// user every stored SMTP/IMAP password and OAuth2 client id, which is a real
+/// price for a cosmetic rename.
+///
+/// `fs::rename` is the whole operation, which is what makes it idempotent and
+/// safe under two concurrent `mp` invocations: the second process either finds
+/// the new directory already there and does nothing, or loses the rename race
+/// and gets `ENOENT` because the old directory is already gone. Old-absent plus
+/// new-present is success in both cases.
+///
+/// No copy fallback. Both paths sit under `~/.config`, so they are on one
+/// filesystem in practice; a rename that fails anyway names both paths and the
+/// exact `mv` to run.
+pub fn migrate_legacy_config_dir() -> Result<()> {
+    if std::env::var_os(CONFIG_DIR_ENV).is_some() {
+        return Ok(());
+    }
+    let old = legacy_config_dir();
+    let new = config_dir();
+    if new.exists() || !old.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = new.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create config parent directory: {}", parent.display())
+        })?;
+    }
+    match fs::rename(&old, &new) {
+        Ok(()) => {
+            eprintln!(
+                "{} Moved config directory {} -> {} (#0022)",
+                "ℹ".blue(),
+                old.display(),
+                new.display(),
+            );
+            log::info!(
+                "Moved legacy config directory {} to {}",
+                old.display(),
+                new.display()
+            );
+            warn_about_self_references(&new.join("config.toml"), &old, &new);
+            Ok(())
+        }
+        // Lost the race with a concurrent `mp`: the other process did the move.
+        Err(_) if new.is_dir() && !old.exists() => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Could not move the config directory {} to {}: {e}.\n\
+             mailypoppins reads config and secrets from {} only. Move it by hand and re-run:\n\
+             \x20 mv {} {}",
+            old.display(),
+            new.display(),
+            new.display(),
+            old.display(),
+            new.display(),
+        )),
+    }
+}
+
+/// Point out config values that name the directory the move just emptied.
+///
+/// `fs::rename` moves the file but not the strings inside it, and a config may
+/// well reference its own directory: a signature at
+/// `~/.config/email/signatures/robin.html` resolves to nothing afterwards, and
+/// [`load_signature`] answers a missing signature file with one stderr line and
+/// an unsigned message. From the TUI that line goes nowhere, so the break is
+/// silent, which is the only reason this warning is worth its lines.
+///
+/// It warns and rewrites nothing. `config.toml` is user-edited, and editing it
+/// would turn a location change into a content migration of a file the user is
+/// entitled to own. Warned once, here, at move time: the steady-state signal
+/// stays [`load_signature`]'s own missing-file message.
+fn warn_about_self_references(config_file: &Path, old_dir: &Path, new_dir: &Path) {
+    let Ok(content) = fs::read_to_string(config_file) else {
+        return;
+    };
+    // Both spellings a user could plausibly have written: the tilde form and
+    // the expanded home path. Matched as a directory prefix, so an unrelated
+    // string containing the words cannot trip it.
+    let home = home_dir();
+    let tilde = |dir: &Path| match dir.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    };
+    let prefixes = vec![
+        (tilde(old_dir), tilde(new_dir)),
+        (old_dir.display().to_string(), new_dir.display().to_string()),
+    ];
+
+    let hits = self_referencing_values(&content, &prefixes);
+    if hits.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{} {} still names the old config directory. Nothing inside it was rewritten, so these need one manual edit:",
+        "⚠".yellow(),
+        config_file.display(),
+    );
+    for (key, old_value, new_value) in &hits {
+        eprintln!("    {key} = \"{old_value}\"");
+        eprintln!("      -> \"{new_value}\"");
+    }
+    log::warn!(
+        "{} references the pre-#0022 config directory in {} value(s)",
+        config_file.display(),
+        hits.len()
+    );
+}
+
+/// Find `key = "value"` lines whose value starts with one of `prefixes`,
+/// returning the dotted key path, the old value and its replacement.
+///
+/// Split out from [`warn_about_self_references`] so the TOML walk is testable
+/// without a filesystem.
+fn self_referencing_values(
+    content: &str,
+    prefixes: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    let mut table = String::new();
+    let mut hits = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix("[[").and_then(|l| l.strip_suffix("]]")) {
+            table = header.trim().to_string();
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            table = header.trim().to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        for (old, new) in prefixes {
+            // Directory prefix, not substring: `<old>/...` or `<old>` exactly.
+            let is_prefix = value == old
+                || value
+                    .strip_prefix(old.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'));
+            if is_prefix {
+                let key = key.trim();
+                let dotted = if table.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{table}.{key}")
+                };
+                hits.push((dotted, value.to_string(), value.replacen(old, new, 1)));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Load the global config from ~/.config/mailypoppins/config.toml
 pub fn load_global_config() -> Result<GlobalConfig> {
     let path = config_path();
     if !path.exists() {
@@ -1372,6 +1559,202 @@ name = "test"
         };
         // Should match even when wrapped in a display name
         assert!(find_account_by_from(&config, "Alice Smith <alice@example.com>").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // config_dir + the one-time #0022 legacy move
+    //
+    // These mutate HOME and MAILYPOPPINS_CONFIG_DIR, which are process-global,
+    // so they take the same env guard the data-dir tests use.
+    // -----------------------------------------------------------------------
+
+    /// Save HOME and MAILYPOPPINS_CONFIG_DIR, point HOME at `home`, clear the
+    /// override, and restore both on drop.
+    struct ConfigEnv {
+        prev_home: Option<String>,
+        prev_override: Option<String>,
+    }
+
+    impl ConfigEnv {
+        fn new(home: &Path) -> Self {
+            let saved = ConfigEnv {
+                prev_home: std::env::var("HOME").ok(),
+                prev_override: std::env::var(CONFIG_DIR_ENV).ok(),
+            };
+            std::env::set_var("HOME", home);
+            std::env::remove_var(CONFIG_DIR_ENV);
+            saved
+        }
+    }
+
+    impl Drop for ConfigEnv {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_override.take() {
+                Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
+            }
+        }
+    }
+
+    fn seed_legacy_dir(home: &Path) -> PathBuf {
+        let legacy = home.join(".config").join("email");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("config.toml"), "[[accounts]]\nname = \"a\"\n").unwrap();
+        fs::write(legacy.join("secrets.enc"), b"cipher").unwrap();
+        legacy
+    }
+
+    /// An explicit override names a location the caller chose: it must never
+    /// pull a directory out from under another install.
+    #[test]
+    fn legacy_move_is_skipped_when_the_override_is_set() {
+        let _g = data_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv::new(tmp.path());
+        let legacy = seed_legacy_dir(tmp.path());
+        let elsewhere = tmp.path().join("chosen");
+        std::env::set_var(CONFIG_DIR_ENV, &elsewhere);
+
+        migrate_legacy_config_dir().unwrap();
+
+        assert!(legacy.join("config.toml").exists(), "legacy dir was moved");
+        assert!(!elsewhere.exists(), "override dir was created");
+        assert_eq!(config_path(), elsewhere.join("config.toml"));
+    }
+
+    /// A pre-existing new directory is truth. The move must not clobber it and
+    /// must not merge into it.
+    #[test]
+    fn legacy_move_never_overwrites_an_existing_config_dir() {
+        let _g = data_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv::new(tmp.path());
+        let legacy = seed_legacy_dir(tmp.path());
+        let current = tmp.path().join(".config").join("mailypoppins");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("config.toml"), "[[accounts]]\nname = \"kept\"\n").unwrap();
+
+        migrate_legacy_config_dir().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(current.join("config.toml")).unwrap(),
+            "[[accounts]]\nname = \"kept\"\n"
+        );
+        assert!(legacy.join("config.toml").exists(), "legacy dir was consumed");
+    }
+
+    /// Nothing reads the old location. A config that failed to move must fail
+    /// loudly rather than be served from `~/.config/email` forever.
+    #[test]
+    fn config_and_secrets_paths_never_resolve_into_the_legacy_dir() {
+        let _g = data_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv::new(tmp.path());
+        seed_legacy_dir(tmp.path());
+
+        // Deliberately no migrate call: the legacy dir is the only one present.
+        let expected = tmp.path().join(".config").join("mailypoppins");
+        assert_eq!(config_dir(), expected);
+        assert_eq!(config_path(), expected.join("config.toml"));
+        assert_eq!(
+            crate::secrets::secrets_path(),
+            expected.join("secrets.enc")
+        );
+    }
+
+    /// The gap `fs::rename` leaves: the file moves, the strings inside it do
+    /// not. A signature path into the old directory becomes an unsigned
+    /// message with only an easily-missed stderr line behind it.
+    #[test]
+    fn self_reference_scan_names_the_key_the_old_value_and_the_replacement() {
+        let prefixes = vec![
+            (
+                "~/.config/email".to_string(),
+                "~/.config/mailypoppins".to_string(),
+            ),
+            (
+                "/home/u/.config/email".to_string(),
+                "/home/u/.config/mailypoppins".to_string(),
+            ),
+        ];
+        let toml = r#"
+[[accounts]]
+name = "work"
+
+[accounts.signatures.robin]
+path = "~/.config/email/signatures/robin.html"
+
+[accounts.signatures.plain]
+path = "/home/u/.config/email/signatures/plain.html"
+"#;
+        let hits = self_referencing_values(toml, &prefixes);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].0, "accounts.signatures.robin.path");
+        assert_eq!(hits[0].1, "~/.config/email/signatures/robin.html");
+        assert_eq!(hits[0].2, "~/.config/mailypoppins/signatures/robin.html");
+        assert_eq!(hits[1].0, "accounts.signatures.plain.path");
+        assert_eq!(hits[1].2, "/home/u/.config/mailypoppins/signatures/plain.html");
+    }
+
+    /// Directory prefix, not substring: a value that merely contains the words
+    /// is not a stale reference, and neither is a longer sibling directory.
+    #[test]
+    fn self_reference_scan_does_not_false_positive() {
+        let prefixes = vec![(
+            "~/.config/email".to_string(),
+            "~/.config/mailypoppins".to_string(),
+        )];
+        let toml = r#"
+[[accounts]]
+default_from = "me@example.com"
+note = "my ~/.config/email-archive/notes"
+other = "/srv/.config/email/thing"
+"#;
+        assert!(self_referencing_values(toml, &prefixes).is_empty());
+    }
+
+    #[test]
+    fn legacy_move_relocates_the_whole_directory_once() {
+        let _g = data_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv::new(tmp.path());
+        let legacy = seed_legacy_dir(tmp.path());
+
+        migrate_legacy_config_dir().unwrap();
+
+        let current = tmp.path().join(".config").join("mailypoppins");
+        assert!(!legacy.exists(), "legacy dir survived the move");
+        assert_eq!(
+            fs::read_to_string(current.join("config.toml")).unwrap(),
+            "[[accounts]]\nname = \"a\"\n"
+        );
+        assert_eq!(fs::read(current.join("secrets.enc")).unwrap(), b"cipher");
+
+        // Idempotent: a second pass, and every later run, is a no-op.
+        migrate_legacy_config_dir().unwrap();
+        assert!(current.join("config.toml").exists());
+    }
+
+    /// What a process that lost the rename race sees: old gone, new there.
+    #[test]
+    fn legacy_move_is_a_no_op_with_nothing_to_move() {
+        let _g = data_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ConfigEnv::new(tmp.path());
+
+        // Neither directory exists: no config yet, nothing created.
+        migrate_legacy_config_dir().unwrap();
+        assert!(!tmp.path().join(".config").join("mailypoppins").exists());
+
+        // Only the new one exists.
+        let current = tmp.path().join(".config").join("mailypoppins");
+        fs::create_dir_all(&current).unwrap();
+        migrate_legacy_config_dir().unwrap();
+        assert!(current.exists());
     }
 
     // -----------------------------------------------------------------------

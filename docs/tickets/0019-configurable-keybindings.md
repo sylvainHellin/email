@@ -11,7 +11,7 @@ created: 2026-05-01
 > The `Action` enum + single `KEYMAP` data table delivered there is the groundwork this ticket
 > needs; configurable keybindings fall out of keymap-as-data. Original notes retained for record.
 
-Allow remapping keys via `~/.config/email/config.toml`. The current bindings are vim-flavoured and hardcoded.
+Allow remapping keys via `~/.config/mailypoppins/config.toml`. The current bindings are vim-flavoured and hardcoded.
 
 ## Notes
 

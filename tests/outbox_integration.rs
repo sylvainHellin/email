@@ -11,15 +11,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use email::config::{
+use mailypoppins::config::{
     appends_to_sent, server_saves_to_sent, AccountConfig, AuthMethod, ImapSettings, SaveToSent,
     SmtpSettings,
 };
-use email::outbox::{
+use mailypoppins::outbox::{
     self, Envelope, OutboxState, RecipientVerdicts, SentMailbox, SubmitOutcome,
 };
-use email::send::RecipientRole;
-use email::store::{BlobStore, Store};
+use mailypoppins::send::RecipientRole;
+use mailypoppins::store::{BlobStore, Store};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ impl SentMailbox for FakeSent {
 
     async fn append(&mut self, mailbox: &str, raw: &[u8]) -> anyhow::Result<Option<u32>> {
         *self.appends.borrow_mut() += 1;
-        let message_id = email::send::message_id_of(raw);
+        let message_id = mailypoppins::send::message_id_of(raw);
         if *self.fail_next.borrow() {
             *self.fail_next.borrow_mut() = false;
             return Err(anyhow::anyhow!("APPEND refused"));
@@ -565,7 +565,7 @@ async fn a_second_append_result_cannot_release_the_blob_twice() {
     let hash = outbox::load(&store, id).unwrap().unwrap().raw_blob;
     assert_eq!(state_of(&account, id), OutboxState::Done);
     assert_eq!(
-        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        mailypoppins::store::blobs::refcount(store.conn(), &hash).unwrap(),
         1,
         "the ingested message owns the reference now"
     );
@@ -574,13 +574,13 @@ async fn a_second_append_result_cannot_release_the_blob_twice() {
         &store,
         &blobs,
         id,
-        &email::outbox::AppendOutcome::Appended { uid: Some(999) },
+        &mailypoppins::outbox::AppendOutcome::Appended { uid: Some(999) },
     )
     .unwrap();
 
     assert_eq!(state, OutboxState::Done);
     assert_eq!(
-        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        mailypoppins::store::blobs::refcount(store.conn(), &hash).unwrap(),
         1,
         "a repeated result must not decrement the reference again"
     );
@@ -606,7 +606,7 @@ async fn the_raw_blob_reference_moves_to_the_message_and_survives_completion() {
     let row = outbox::load(&store, id).unwrap().unwrap();
     let hash = row.raw_blob.clone();
     assert_eq!(
-        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        mailypoppins::store::blobs::refcount(store.conn(), &hash).unwrap(),
         1,
         "the outbox row holds a plain blobs-table reference"
     );
@@ -627,7 +627,7 @@ async fn the_raw_blob_reference_moves_to_the_message_and_survives_completion() {
     // The outbox reference is released, the ingested message now owns one, and
     // the file never passed through refcount zero (it is still readable).
     assert_eq!(
-        email::store::blobs::refcount(store.conn(), &hash).unwrap(),
+        mailypoppins::store::blobs::refcount(store.conn(), &hash).unwrap(),
         1
     );
     assert!(blobs.contains(&hash));
@@ -773,7 +773,7 @@ save_to_sent = "never"
 [[accounts]]
 name = "default"
 "#;
-    let config: email::config::GlobalConfig = toml::from_str(toml).unwrap();
+    let config: mailypoppins::config::GlobalConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.accounts[0].save_to_sent, SaveToSent::Always);
     assert_eq!(config.accounts[1].save_to_sent, SaveToSent::Never);
     assert_eq!(

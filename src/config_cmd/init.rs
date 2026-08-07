@@ -68,7 +68,7 @@ pub fn cmd_config_init() -> Result<()> {
         }
     }
 
-    println!("{}", "=== Email CLI Setup ===".bold().cyan());
+    println!("{}", "=== mailypoppins setup ===".bold().cyan());
     println!();
 
     // -- Provider selection
@@ -459,7 +459,7 @@ pub fn cmd_config_init() -> Result<()> {
         );
     } else {
         println!(
-            "{} Passwords stored in encrypted secrets file (~/.config/email/secrets.enc)",
+            "{} Passwords stored in encrypted secrets file (~/.config/mailypoppins/secrets.enc)",
             "\u{2713}".green().bold()
         );
     }
@@ -776,7 +776,7 @@ pub fn cmd_config_add_account() -> Result<()> {
         );
     } else {
         println!(
-            "{} Passwords stored in encrypted secrets file (~/.config/email/secrets.enc)",
+            "{} Passwords stored in encrypted secrets file (~/.config/mailypoppins/secrets.enc)",
             "\u{2713}".green().bold()
         );
     }

@@ -16,16 +16,17 @@
 //! rows, so what is dumped is what a sync produces. The binary is then run
 //! rather than the library called, because the CLI surface (`--json` required,
 //! `-A` selecting one account, `--mailbox` filtering) is part of the contract.
-//! `HOME` and `MAILYPOPPINS_DATA_DIR` point at a temporary tree, so the test
-//! never reads the real mailstore and never touches the network.
+//! `HOME`, `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` point at a
+//! temporary tree, so the test never reads the real mailstore or the real
+//! config and never touches the network.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use email::ingest::{ingest_message, IngestInput};
-use email::parse::{AttachmentData, FetchedEmail};
-use email::store::{BlobStore, Store};
+use mailypoppins::ingest::{ingest_message, IngestInput};
+use mailypoppins::parse::{AttachmentData, FetchedEmail};
+use mailypoppins::store::{BlobStore, Store};
 use tempfile::TempDir;
 
 const MP: &str = env!("CARGO_BIN_EXE_mp");
@@ -97,7 +98,7 @@ default_from = "beta@example.com"
 
 [beta.mailboxes]
 "#;
-    write(&home.join(".config/email/config.toml"), config);
+    write(&home.join("config/config.toml"), config);
 
     // Read, with cc, a unicode subject, two attachments and a message-id.
     // Allow-list: both attachment sizes are present, because an attachment in
@@ -111,7 +112,7 @@ default_from = "beta@example.com"
     );
     bericht.cc = Some("\"Prof. Petzold\" <petzold@example.com>".to_string());
     bericht.message_id = Some("<f7ef260c@example.com>".to_string());
-    bericht.flags = email::types::MessageFlags::seen(true);
+    bericht.flags = mailypoppins::types::MessageFlags::seen(true);
     bericht.has_attachments = true;
     bericht.attachments = vec![
         AttachmentData {
@@ -201,7 +202,7 @@ default_from = "beta@example.com"
         "Sun, 28 Jun 2026 07:00:00 +0000",
     );
     weekly.message_id = Some("<weekly-1@example.com>".to_string());
-    weekly.flags = email::types::MessageFlags::seen(true);
+    weekly.flags = mailypoppins::types::MessageFlags::seen(true);
     ingest(&data, "alpha", "Team/Reports", 1, &weekly);
 
     // Second account, so account ordering is exercised.
@@ -212,7 +213,7 @@ default_from = "beta@example.com"
         "Fri, 1 May 2026 05:00:00 +0000",
     );
     old.message_id = Some("<old-1@example.com>".to_string());
-    old.flags = email::types::MessageFlags::seen(true);
+    old.flags = mailypoppins::types::MessageFlags::seen(true);
     ingest(&data, "beta", "archive", 1, &old);
 
     // Drafts contribute nothing: they have no `messages` rows until #0050
@@ -234,6 +235,7 @@ fn dump(tmp: &TempDir, args: &[&str]) -> String {
     let out = Command::new(MP)
         .args(args)
         .env("HOME", tmp.path())
+        .env("MAILYPOPPINS_CONFIG_DIR", tmp.path().join("config"))
         .env("MAILYPOPPINS_DATA_DIR", tmp.path().join("data"))
         .output()
         .expect("mp must run");
@@ -330,14 +332,14 @@ fn dump_mailbox_reports_the_answered_and_forwarded_flags() {
     let tmp = fixture_tree();
     let account_dir = tmp.path().join("data").join("accounts").join("alpha");
     let store = Store::open(account_dir.join("store.sqlite3")).expect("store");
-    let answered = email::store::read::find_by_message_id(&store, "alpha", "<f7ef260c@example.com>")
+    let answered = mailypoppins::store::read::find_by_message_id(&store, "alpha", "<f7ef260c@example.com>")
         .expect("lookup")
         .remove(0);
-    email::store::write::set_answered(&store, answered.id).expect("set answered");
-    let forwarded = email::store::read::find_by_message_id(&store, "alpha", "<weekly-1@example.com>")
+    mailypoppins::store::write::set_answered(&store, answered.id).expect("set answered");
+    let forwarded = mailypoppins::store::read::find_by_message_id(&store, "alpha", "<weekly-1@example.com>")
         .expect("lookup")
         .remove(0);
-    email::store::write::set_forwarded(&store, forwarded.id).expect("set forwarded");
+    mailypoppins::store::write::set_forwarded(&store, forwarded.id).expect("set forwarded");
     drop(store);
 
     let out = dump(&tmp, &["-A", "alpha", "dump-mailbox", "--json"]);
@@ -367,6 +369,7 @@ fn dump_mailbox_requires_the_json_flag() {
     let out = Command::new(MP)
         .args(["dump-mailbox"])
         .env("HOME", tmp.path())
+        .env("MAILYPOPPINS_CONFIG_DIR", tmp.path().join("config"))
         .env("MAILYPOPPINS_DATA_DIR", tmp.path().join("data"))
         .output()
         .expect("mp must run");

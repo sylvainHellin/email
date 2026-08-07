@@ -13,9 +13,9 @@
 
 use std::collections::HashSet;
 
-use email::ingest::{ingest_message, IngestInput, IngestOutcome};
-use email::parse::{parse_rfc822_to_fetched_email, FetchedEmail};
-use email::store::{blobs::BlobHash, BlobStore, Store};
+use mailypoppins::ingest::{ingest_message, IngestInput, IngestOutcome};
+use mailypoppins::parse::{parse_rfc822_to_fetched_email, FetchedEmail};
+use mailypoppins::store::{blobs::BlobHash, BlobStore, Store};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -607,11 +607,11 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
     f.ingest_raw("inbox", 1, &root);
     let before = f.ingest_raw("inbox", 2, &reply);
     let refs_before = f.blob_refs(before.row_id);
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(1),
             last_uid: Some(2),
             uidnext: Some(3),
@@ -625,7 +625,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
 
     // The server renumbers. UID 1 now holds a different message entirely, and
     // the reply has moved to UID 9.
-    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    let known = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
     assert_eq!(known.uids, HashSet::from([1, 2]));
     assert_eq!(known.uidvalidity, Some(1));
     let (skip, reset) = known.resolve(Some(2));
@@ -657,11 +657,11 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
     assert_eq!(f.message_rows(), 2, "a reset must not duplicate the mailbox");
 
     // Once the new cursor is recorded, the next sync skips normally again.
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(2),
             last_uid: Some(9),
             uidnext: Some(10),
@@ -672,7 +672,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
         },
     )
     .unwrap();
-    let (skip, reset) = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+    let (skip, reset) = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
         .unwrap()
         .resolve(Some(2));
     assert!(!reset);
@@ -680,12 +680,12 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
 
     // A first sync (no stored cursor) and a server that reports no UIDVALIDITY
     // are both "cannot tell", and must not throw the skip list away.
-    let (skip, reset) = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+    let (skip, reset) = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
         .unwrap()
         .resolve(None);
     assert!(!reset);
     assert_eq!(skip.len(), 2);
-    let (skip, reset) = email::ingest::KnownUids {
+    let (skip, reset) = mailypoppins::ingest::KnownUids {
         uids: HashSet::from([7]),
         uidvalidity: None,
         arrival_mark: None,
@@ -728,7 +728,7 @@ fn the_same_message_in_two_mailboxes_is_two_rows() {
 #[test]
 fn mailbox_cursors_round_trip() {
     let f = Fixture::new();
-    let cursor = email::ingest::MailboxCursor {
+    let cursor = mailypoppins::ingest::MailboxCursor {
         uidvalidity: Some(42),
         last_uid: Some(1234),
         uidnext: Some(1235),
@@ -737,9 +737,9 @@ fn mailbox_cursors_round_trip() {
         deltalink: None,
         arrival_mark: None,
     };
-    email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor).unwrap();
+    mailypoppins::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor).unwrap();
 
-    let loaded = email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap();
+    let loaded = mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap();
     assert_eq!(loaded.uidvalidity, Some(42));
     assert_eq!(loaded.last_uid, Some(1234));
     assert_eq!(loaded.highest_modseq, Some(7));
@@ -773,11 +773,11 @@ fn mailbox_cursors_round_trip() {
     assert_eq!((uidvalidity, uidnext, exists), (42, 1235, 56));
 
     // Recording again updates in place rather than inserting a second cursor.
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(43),
             last_uid: Some(1),
             ..cursor.clone()
@@ -791,12 +791,12 @@ fn mailbox_cursors_round_trip() {
         .unwrap();
     assert_eq!(cursors, 1);
     assert_eq!(
-        email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
+        mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
         Some(43)
     );
 
     // The row is keyed on (account, mailbox), like every other table.
-    email::ingest::record_mailbox_cursor(&f.store, "other", "inbox", &cursor).unwrap();
+    mailypoppins::ingest::record_mailbox_cursor(&f.store, "other", "inbox", &cursor).unwrap();
     let cursors: i64 = f
         .store
         .conn()
@@ -804,12 +804,12 @@ fn mailbox_cursors_round_trip() {
         .unwrap();
     assert_eq!(cursors, 2);
     assert_eq!(
-        email::ingest::load_mailbox_cursor(&f.store, "other", "inbox").unwrap().unwrap().uidvalidity,
+        mailypoppins::ingest::load_mailbox_cursor(&f.store, "other", "inbox").unwrap().unwrap().uidvalidity,
         Some(42),
         "another account's cursor for the same mailbox name is a separate row"
     );
     assert_eq!(
-        email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
+        mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
         Some(43),
         "writing another account's cursor leaves the first account's row alone"
     );
@@ -822,7 +822,7 @@ fn mailbox_cursors_round_trip() {
 fn the_arrival_mark_survives_the_cursor_round_trip() {
     let f = Fixture::new();
     f.ingest_raw("inbox", 400, &plain("top of the window"));
-    let cursor = |arrival_mark| email::ingest::MailboxCursor {
+    let cursor = |arrival_mark| mailypoppins::ingest::MailboxCursor {
         uidvalidity: Some(7),
         last_uid: Some(400),
         uidnext: Some(401),
@@ -833,8 +833,8 @@ fn the_arrival_mark_survives_the_cursor_round_trip() {
     };
 
     // A pass that came up short leaves its mark behind.
-    email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(Some(100))).unwrap();
-    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    mailypoppins::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(Some(100))).unwrap();
+    let known = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
     assert_eq!(
         known.arrival_mark,
         Some(100),
@@ -842,9 +842,9 @@ fn the_arrival_mark_survives_the_cursor_round_trip() {
     );
 
     // A pass that caught up clears it, which is what reopens the gate.
-    email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(None)).unwrap();
+    mailypoppins::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(None)).unwrap();
     assert_eq!(
-        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+        mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
             .unwrap()
             .arrival_mark,
         None
@@ -852,7 +852,7 @@ fn the_arrival_mark_survives_the_cursor_round_trip() {
 
     // A mailbox that has never synced owes nothing.
     assert_eq!(
-        email::ingest::known_uids_with_cursor(&f.store, "acct", "archive")
+        mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "archive")
             .unwrap()
             .arrival_mark,
         None
@@ -868,7 +868,7 @@ fn the_recorded_top_tells_first_contact_from_an_emptied_mailbox() {
 
     // Never synced: no cursor row, so no floor to stand on.
     assert_eq!(
-        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+        mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
             .unwrap()
             .prior_high_water,
         None,
@@ -877,11 +877,11 @@ fn the_recorded_top_tells_first_contact_from_an_emptied_mailbox() {
 
     // Synced once and then emptied in another client: the rows are gone but
     // the recorded top remains, and it is what a bulk move is measured against.
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(7),
             last_uid: Some(100),
             uidnext: Some(101),
@@ -892,16 +892,16 @@ fn the_recorded_top_tells_first_contact_from_an_emptied_mailbox() {
         },
     )
     .unwrap();
-    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    let known = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
     assert!(known.uids.is_empty());
     assert_eq!(known.prior_high_water, Some(100));
 
     // A cursor that recorded no UID at all is still history, not first contact.
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(7),
             last_uid: None,
             uidnext: None,
@@ -913,7 +913,7 @@ fn the_recorded_top_tells_first_contact_from_an_emptied_mailbox() {
     )
     .unwrap();
     assert_eq!(
-        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+        mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
             .unwrap()
             .prior_high_water,
         Some(0)
@@ -935,14 +935,14 @@ fn known_uids_reports_what_the_store_holds() {
     f.ingest_raw("archive", 9, &raw(9));
 
     assert_eq!(
-        email::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
+        mailypoppins::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
         HashSet::from([1, 4])
     );
     assert_eq!(
-        email::ingest::known_uids(&f.store, "acct", "archive").unwrap(),
+        mailypoppins::ingest::known_uids(&f.store, "acct", "archive").unwrap(),
         HashSet::from([9])
     );
-    assert!(email::ingest::known_uids(&f.store, "other", "inbox").unwrap().is_empty());
+    assert!(mailypoppins::ingest::known_uids(&f.store, "other", "inbox").unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -966,11 +966,11 @@ fn a_message_without_raw_bytes_ingests_and_upserts() {
         has_attachments: false,
         message_id: Some("<g1@example.com>".into()),
         attachments: Vec::new(),
-        flags: email::types::MessageFlags::seen(true),
+        flags: mailypoppins::types::MessageFlags::seen(true),
         calendar_ics: None,
         event: None,
     };
-    let uid = email::ingest::graph_uid("<g1@example.com>");
+    let uid = mailypoppins::ingest::graph_uid("<g1@example.com>");
     assert!(uid > 0);
 
     let outcome = f.ingest("inbox", uid, &email, None);
@@ -1007,12 +1007,12 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
         has_attachments: false,
         message_id: Some("<g-html@example.com>".into()),
         attachments: Vec::new(),
-        flags: email::types::MessageFlags::seen(true),
+        flags: mailypoppins::types::MessageFlags::seen(true),
         calendar_ics: None,
         event: None,
     };
 
-    let outcome = f.ingest("inbox", email::ingest::graph_uid("<g-html@example.com>"), &email, None);
+    let outcome = f.ingest("inbox", mailypoppins::ingest::graph_uid("<g-html@example.com>"), &email, None);
     let refs = f.blob_refs(outcome.row_id);
     let (_, _, hash, _) = refs
         .iter()
@@ -1027,7 +1027,7 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
     // Re-ingesting with new HTML re-points the reference and releases the old.
     let old_hash = hash.clone();
     email.html_body = Some("<html><body><p>edited</p></body></html>".into());
-    let again = f.ingest("inbox", email::ingest::graph_uid("<g-html@example.com>"), &email, None);
+    let again = f.ingest("inbox", mailypoppins::ingest::graph_uid("<g-html@example.com>"), &email, None);
     let refs = f.blob_refs(again.row_id);
     let (_, _, new_hash, _) = refs.iter().find(|r| r.0 == "html").unwrap();
     assert_ne!(new_hash, &old_hash);
@@ -1053,7 +1053,7 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
 /// pass without needing a server.
 fn sync_prune(f: &Fixture, mailbox: &str, listed: &[u32]) -> usize {
     let vanished = fetch_diff(f, mailbox, listed);
-    email::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished)
+    mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished)
 }
 
 /// The diff half on its own, for the test that has to hold a prune back until
@@ -1063,7 +1063,7 @@ fn sync_prune(f: &Fixture, mailbox: &str, listed: &[u32]) -> usize {
 /// window (#0072). The ceiling stands in for `UIDNEXT - 1`, one above the
 /// highest UID either side knows about.
 fn fetch_diff(f: &Fixture, mailbox: &str, listed: &[u32]) -> Vec<u32> {
-    let known = email::ingest::known_uids(&f.store, "acct", mailbox).unwrap();
+    let known = mailypoppins::ingest::known_uids(&f.store, "acct", mailbox).unwrap();
     let ceiling = known
         .iter()
         .filter(|&&uid| uid > 0 && uid < u32::MAX as i64)
@@ -1071,7 +1071,7 @@ fn fetch_diff(f: &Fixture, mailbox: &str, listed: &[u32]) -> Vec<u32> {
         .chain(listed.iter().copied())
         .max()
         .unwrap_or(0);
-    email::imap_client::vanished_uids(&known, listed, ceiling)
+    mailypoppins::imap_client::vanished_uids(&known, listed, ceiling)
 }
 
 fn plain(name: &str) -> Vec<u8> {
@@ -1097,8 +1097,8 @@ fn a_uid_missing_from_the_listing_loses_its_row_and_its_blob_refs() {
     assert_eq!(sync_prune(&f, "inbox", &[1, 3]), 1);
 
     assert_eq!(f.message_rows(), 2);
-    assert!(email::store::read::find_by_id(&f.store, gone.row_id).unwrap().is_none());
-    assert!(email::store::read::find_by_id(&f.store, stays.row_id).unwrap().is_some());
+    assert!(mailypoppins::store::read::find_by_id(&f.store, gone.row_id).unwrap().is_none());
+    assert!(mailypoppins::store::read::find_by_id(&f.store, stays.row_id).unwrap().is_some());
     assert!(f.blob_refs(gone.row_id).is_empty(), "the reference list outlived its row");
     assert_eq!(f.refcount(&gone_hash), 0, "the pruned row kept its blob alive");
     let fts: i64 = f
@@ -1125,7 +1125,7 @@ fn the_oldest_uid_archived_elsewhere_is_pruned() {
     // The server enumerated the whole mailbox and UID 1 was not in it.
     assert_eq!(sync_prune(&f, "inbox", &[2, 3, 4, 5, 6]), 1);
     assert_eq!(
-        email::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
+        mailypoppins::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
         HashSet::from([2, 3, 4, 5, 6])
     );
 
@@ -1144,11 +1144,11 @@ fn a_row_above_the_ceiling_survives_a_listing_that_omits_it() {
     for uid in 1..=3 {
         f.ingest_raw("sent", uid, &plain(&format!("m{uid}")));
     }
-    let placeholder = email::ingest::graph_uid("<not-yet-filed@example.com>");
+    let placeholder = mailypoppins::ingest::graph_uid("<not-yet-filed@example.com>");
     f.ingest_raw("sent", placeholder, &plain("not-yet-filed"));
 
-    let known = email::ingest::known_uids(&f.store, "acct", "sent").unwrap();
-    let vanished = email::imap_client::vanished_uids(&known, &[1, 2, 3], 3);
+    let known = mailypoppins::ingest::known_uids(&f.store, "acct", "sent").unwrap();
+    let vanished = mailypoppins::imap_client::vanished_uids(&known, &[1, 2, 3], 3);
     assert!(vanished.is_empty(), "the placeholder is not a server UID");
     assert_eq!(f.message_rows(), 4);
 }
@@ -1162,11 +1162,11 @@ fn a_uidvalidity_reset_prunes_nothing() {
     for uid in 1..=3 {
         f.ingest_raw("inbox", uid, &plain(&format!("m{uid}")));
     }
-    email::ingest::record_mailbox_cursor(
+    mailypoppins::ingest::record_mailbox_cursor(
         &f.store,
         "acct",
         "inbox",
-        &email::ingest::MailboxCursor {
+        &mailypoppins::ingest::MailboxCursor {
             uidvalidity: Some(1),
             last_uid: Some(3),
             uidnext: Some(4),
@@ -1179,13 +1179,13 @@ fn a_uidvalidity_reset_prunes_nothing() {
     .unwrap();
 
     // The server renumbered: UIDs 90..=92 now hold the same three messages.
-    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    let known = mailypoppins::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
     let (resolved, reset) = known.resolve(Some(2));
     assert!(reset);
-    let vanished = email::imap_client::vanished_uids(&resolved, &[90, 91, 92], 92);
+    let vanished = mailypoppins::imap_client::vanished_uids(&resolved, &[90, 91, 92], 92);
     assert!(vanished.is_empty(), "a reset must never prune");
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished),
         0
     );
     assert_eq!(f.message_rows(), 3);
@@ -1241,11 +1241,11 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
 
     // Prune pass, after every target has been ingested.
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &inbox_vanished),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &inbox_vanished),
         1
     );
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "archive", &archive_vanished),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "archive", &archive_vanished),
         0
     );
     assert_eq!(rows_for_message(), 1, "the archive row, and it never went to zero");
@@ -1253,13 +1253,13 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
     assert!(f.blobs.contains(&blob), "the body blob was never unlinked");
 
     assert_eq!(f.message_rows(), 2, "the archived message plus the untouched one");
-    let mailboxes: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+    let mailboxes: Vec<String> = mailypoppins::store::read::list_mailbox(&f.store, "acct", "inbox")
         .unwrap()
         .iter()
         .map(|e| e.message_id.clone())
         .collect();
     assert_eq!(mailboxes, vec!["<other@example.com>".to_string()]);
-    let archive: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "archive")
+    let archive: Vec<String> = mailypoppins::store::read::list_mailbox(&f.store, "acct", "archive")
         .unwrap()
         .iter()
         .map(|e| e.message_id.clone())
@@ -1275,7 +1275,7 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
 fn the_answered_and_forwarded_flags_reach_the_row_and_the_read_path() {
     let f = Fixture::new();
     let mut message = graph_email("<answered@example.com>", true);
-    message.flags = email::types::MessageFlags {
+    message.flags = mailypoppins::types::MessageFlags {
         seen: true,
         answered: true,
         forwarded: true,
@@ -1283,7 +1283,7 @@ fn the_answered_and_forwarded_flags_reach_the_row_and_the_read_path() {
     let outcome = f.ingest("inbox", 11, &message, None);
 
     assert_eq!(f.text(outcome.row_id, "flags"), "\\Seen \\Answered $Forwarded");
-    let row = email::store::read::find_by_id(&f.store, outcome.row_id)
+    let row = mailypoppins::store::read::find_by_id(&f.store, outcome.row_id)
         .unwrap()
         .unwrap();
     assert!(row.is_read() && row.is_answered() && row.is_forwarded());
@@ -1296,20 +1296,20 @@ fn the_answered_and_forwarded_flags_reach_the_row_and_the_read_path() {
 fn an_imap_pass_replaces_the_whole_flag_set() {
     let f = Fixture::new();
     let mut message = graph_email("<flags@example.com>", true);
-    message.flags = email::types::MessageFlags {
+    message.flags = mailypoppins::types::MessageFlags {
         seen: true,
         answered: true,
         forwarded: false,
     };
     f.ingest("inbox", 21, &message, None);
 
-    let updated = email::ingest::apply_flags(
+    let updated = mailypoppins::ingest::apply_flags(
         &f.store,
         "acct",
         "inbox",
         [(
             21,
-            email::types::MessageFlags {
+            mailypoppins::types::MessageFlags {
                 seen: true,
                 answered: false,
                 forwarded: true,
@@ -1317,7 +1317,7 @@ fn an_imap_pass_replaces_the_whole_flag_set() {
         )],
     );
     assert_eq!(updated, 1);
-    let row = email::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
+    let row = mailypoppins::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
     assert_eq!(row[0].flags.as_deref(), Some("\\Seen $Forwarded"));
 }
 
@@ -1328,17 +1328,17 @@ fn an_imap_pass_replaces_the_whole_flag_set() {
 fn a_graph_pass_updates_the_read_bit_without_erasing_the_history_bits() {
     let f = Fixture::new();
     let mut message = graph_email("<graph-answered@example.com>", false);
-    message.flags = email::types::MessageFlags {
+    message.flags = mailypoppins::types::MessageFlags {
         seen: false,
         answered: true,
         forwarded: true,
     };
-    let uid = email::ingest::graph_uid("<graph-answered@example.com>");
+    let uid = mailypoppins::ingest::graph_uid("<graph-answered@example.com>");
     f.ingest("inbox", uid, &message, None);
 
-    let updated = email::ingest::apply_seen_flags(&f.store, "acct", "inbox", [(uid, true)]);
+    let updated = mailypoppins::ingest::apply_seen_flags(&f.store, "acct", "inbox", [(uid, true)]);
     assert_eq!(updated, 1);
-    let row = email::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
+    let row = mailypoppins::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
     assert_eq!(row[0].flags.as_deref(), Some("\\Seen \\Answered $Forwarded"));
 }
 
@@ -1354,7 +1354,7 @@ fn graph_email(message_id: &str, is_read: bool) -> FetchedEmail {
         has_attachments: false,
         message_id: Some(message_id.to_string()),
         attachments: Vec::new(),
-        flags: email::types::MessageFlags::seen(is_read),
+        flags: mailypoppins::types::MessageFlags::seen(is_read),
         calendar_ics: None,
         event: None,
     }
@@ -1370,8 +1370,8 @@ fn a_graph_message_archived_on_the_server_is_pruned_from_the_inbox() {
     let f = Fixture::new();
     let moved = "<moved@example.com>";
     let stays = "<stays@example.com>";
-    let moved_uid = email::ingest::graph_uid(moved);
-    let stays_uid = email::ingest::graph_uid(stays);
+    let moved_uid = mailypoppins::ingest::graph_uid(moved);
+    let stays_uid = mailypoppins::ingest::graph_uid(stays);
     f.ingest("inbox", moved_uid, &graph_email(moved, false), None);
     f.ingest("inbox", stays_uid, &graph_email(stays, false), None);
 
@@ -1381,18 +1381,18 @@ fn a_graph_message_archived_on_the_server_is_pruned_from_the_inbox() {
 
     // Inbox prune: the server enumeration no longer lists the moved message.
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &[moved_uid]),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &[moved_uid]),
         1
     );
     assert_eq!(f.message_rows(), 2);
 
-    let inbox: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+    let inbox: Vec<String> = mailypoppins::store::read::list_mailbox(&f.store, "acct", "inbox")
         .unwrap()
         .iter()
         .map(|e| e.message_id.clone())
         .collect();
     assert_eq!(inbox, vec![stays.to_string()]);
-    let archive: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "archive")
+    let archive: Vec<String> = mailypoppins::store::read::list_mailbox(&f.store, "acct", "archive")
         .unwrap()
         .iter()
         .map(|e| e.message_id.clone())
@@ -1423,9 +1423,9 @@ fn a_just_sent_graph_copy_survives_the_prune_that_never_listed_it() {
         ),
         b"sent body\r\n",
     );
-    email::outbox::ingest_sent_copy(&f.store, &f.blobs, "acct", "sent", &raw, mid, None).unwrap();
+    mailypoppins::outbox::ingest_sent_copy(&f.store, &f.blobs, "acct", "sent", &raw, mid, None).unwrap();
 
-    let uid = email::ingest::graph_uid(mid);
+    let uid = mailypoppins::ingest::graph_uid(mid);
     let row: i64 = f
         .store
         .conn()
@@ -1437,11 +1437,11 @@ fn a_just_sent_graph_copy_survives_the_prune_that_never_listed_it() {
     // The pass's diff: the folder listed the server's id, so our row is
     // "vanished" from it.
     let vanished = vec![uid];
-    let now = email::outbox::unix_now();
-    let prunable = email::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, now);
+    let now = mailypoppins::outbox::unix_now();
+    let prunable = mailypoppins::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, now);
     assert!(prunable.is_empty(), "a copy the server may not have filed yet");
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &prunable),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &prunable),
         0
     );
     assert_eq!(f.message_rows(), 1);
@@ -1449,13 +1449,13 @@ fn a_just_sent_graph_copy_survives_the_prune_that_never_listed_it() {
     assert!(f.blobs.contains(&BlobHash::parse(&raw_hash).unwrap()));
 
     // One poll cycle on, the row is prunable again and the duplicate goes.
-    let later = now + email::ingest::PRUNE_MIN_AGE_SECS + 1;
+    let later = now + mailypoppins::ingest::PRUNE_MIN_AGE_SECS + 1;
     assert_eq!(
-        email::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, later),
+        mailypoppins::ingest::prunable_uids(&f.store, "acct", "sent", &vanished, later),
         vec![uid]
     );
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &[uid]),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "sent", &[uid]),
         1
     );
     assert_eq!(f.message_rows(), 0);
@@ -1474,20 +1474,20 @@ fn the_prune_age_guard_holds_back_only_the_fresh_row() {
     old_email.date = "Mon, 01 Jan 2024 12:00:00 +0000".into();
     let mut fresh_email = graph_email(fresh, false);
     fresh_email.date = chrono::Utc::now().to_rfc2822();
-    f.ingest("inbox", email::ingest::graph_uid(old), &old_email, None);
-    f.ingest("inbox", email::ingest::graph_uid(fresh), &fresh_email, None);
+    f.ingest("inbox", mailypoppins::ingest::graph_uid(old), &old_email, None);
+    f.ingest("inbox", mailypoppins::ingest::graph_uid(fresh), &fresh_email, None);
 
-    let vanished = vec![email::ingest::graph_uid(old), email::ingest::graph_uid(fresh)];
-    let prunable = email::ingest::prunable_uids(
+    let vanished = vec![mailypoppins::ingest::graph_uid(old), mailypoppins::ingest::graph_uid(fresh)];
+    let prunable = mailypoppins::ingest::prunable_uids(
         &f.store,
         "acct",
         "inbox",
         &vanished,
-        email::outbox::unix_now(),
+        mailypoppins::outbox::unix_now(),
     );
-    assert_eq!(prunable, vec![email::ingest::graph_uid(old)]);
+    assert_eq!(prunable, vec![mailypoppins::ingest::graph_uid(old)]);
     assert_eq!(
-        email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &prunable),
+        mailypoppins::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &prunable),
         1
     );
     assert_eq!(f.message_rows(), 1);
@@ -1501,22 +1501,22 @@ fn a_pass_of_server_read_flags_applies_in_one_transaction() {
     let f = Fixture::new();
     let read_already = "<read@example.com>";
     let unread = "<unread@example.com>";
-    f.ingest("inbox", email::ingest::graph_uid(read_already), &graph_email(read_already, true), None);
-    f.ingest("inbox", email::ingest::graph_uid(unread), &graph_email(unread, false), None);
+    f.ingest("inbox", mailypoppins::ingest::graph_uid(read_already), &graph_email(read_already, true), None);
+    f.ingest("inbox", mailypoppins::ingest::graph_uid(unread), &graph_email(unread, false), None);
 
-    let updated = email::ingest::apply_seen_flags(
+    let updated = mailypoppins::ingest::apply_seen_flags(
         &f.store,
         "acct",
         "inbox",
         [
-            (email::ingest::graph_uid(read_already), true),
-            (email::ingest::graph_uid(unread), true),
-            (email::ingest::graph_uid("<never-ingested@example.com>"), true),
+            (mailypoppins::ingest::graph_uid(read_already), true),
+            (mailypoppins::ingest::graph_uid(unread), true),
+            (mailypoppins::ingest::graph_uid("<never-ingested@example.com>"), true),
         ],
     );
     assert_eq!(updated, 1, "only the row whose flags changed");
 
-    let flags: Vec<String> = email::store::read::list_mailbox(&f.store, "acct", "inbox")
+    let flags: Vec<String> = mailypoppins::store::read::list_mailbox(&f.store, "acct", "inbox")
         .unwrap()
         .iter()
         .map(|e| e.flags.clone().unwrap_or_default())

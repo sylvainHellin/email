@@ -1,6 +1,6 @@
 # Authentication methods
 
-Each account in `~/.config/email/config.toml` declares an `auth_method`. Three are supported.
+Each account in `~/.config/mailypoppins/config.toml` declares an `auth_method`. Three are supported.
 
 | `auth_method` | Transport | Use case |
 |--------------|-----------|----------|
@@ -14,7 +14,7 @@ Auth method is set per account; one config can mix all three.
 
 - Passwords stored in the secrets backend under `smtp-password-<account>` and `imap-password-<account>`.
 - IMAP falls back to the SMTP password if `imap-password-<account>` is missing.
-- Default backend: machine-bound encrypted file at `~/.config/email/secrets.enc`. Opt into the OS keyring with `secrets_backend = "keyring"` in `config.toml`. See [secrets.md](secrets.md).
+- Default backend: machine-bound encrypted file at `~/.config/mailypoppins/secrets.enc`. Opt into the OS keyring with `secrets_backend = "keyring"` in `config.toml`. See [secrets.md](secrets.md).
 - Set or rotate via `mp config set-password {smtp|imap} --account <name>`.
 
 ## OAuth2 (IMAP/SMTP, XOAUTH2)
