@@ -345,6 +345,15 @@ fn finish_sync(
     if result.pruned > 0 {
         msg.push_str(&format!(", {} no longer in this mailbox", result.pruned));
     }
+    // Say so rather than reporting a clean sync: the rows are known to be gone
+    // from the server and are still on screen until a pass sees every mailbox
+    // in full (#0072).
+    if result.prunes_deferred > 0 {
+        msg.push_str(&format!(
+            ", {} removal(s) held back (incomplete pass, run a full sync)",
+            result.prunes_deferred
+        ));
+    }
     msg
 }
 

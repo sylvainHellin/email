@@ -70,6 +70,23 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A message archived in another client now leaves the local inbox on the
+  next sync (#0072).** The prune diffed the store's UIDs against the download
+  window only, the last `--limit` UIDs the fetch had read, so a message the
+  server had stopped listing was invisible to it as soon as it sat below that
+  window: archiving the oldest mail elsewhere, which is what everyone does
+  first, left rows that no number of quick syncs could ever remove. The
+  enumeration was there all along, `UID SEARCH ALL` returns the whole mailbox
+  and only the download is capped, so the diff now runs against it. One clamp
+  survives, at `UIDNEXT - 1`, which is the line between a UID the server issued
+  and a placeholder this client wrote for a Sent copy the server has not filed
+  yet. Two conditions hold the prune back for the whole pass rather than risk a
+  wrong deletion: a mailbox whose listing came back shorter than its own
+  `EXISTS`, and a pass that did not ingest every message that arrived above
+  what the store already held (a bulk move whose destination window could not
+  hold every copy). Both are reported now instead of passing for a clean sync,
+  and a full sync applies what a capped one held back. IMAP also runs the age
+  guard that already protected a just-sent copy on the Graph side.
 - **A recipient the server refused is now recorded, retried and reported,
   instead of vanishing with the status line (#0063).** SMTP runs once per
   recipient here, so a submission has one verdict per recipient; the outbox took

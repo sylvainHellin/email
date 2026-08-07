@@ -747,10 +747,35 @@ fn too_fresh_to_prune(date_sort: i64, now: i64) -> bool {
     (now - date_sort).abs() < PRUNE_MIN_AGE_SECS
 }
 
+/// Whether a pass may apply the prunes it collected, given `(enumeration was
+/// complete, download was incomplete)` for every target it synced.
+///
+/// One partial target suspends the prune for *all* of them, which is the whole
+/// point: the reason an inbox row may be deleted is that some other target
+/// ingested the copy the message moved to, so a target that did not finish
+/// invalidates every other target's diff as well. A full sync
+/// (`limit = usize::MAX`) never truncates, so the deferred prunes are applied
+/// by the next uncapped pass; nothing is lost, only postponed (#0065).
+///
+/// Both backends gate on this. What the two flags *mean* is backend-specific:
+/// Graph pages a folder and counts every message it found but could not fetch
+/// ([`crate::graph::sync_mailboxes_graph`]), while IMAP enumerates the whole
+/// mailbox in one `UID SEARCH ALL` and counts only the arrivals above its
+/// high-water mark, because its window is positional and the backlog under it
+/// is skipped by design (#0072).
+pub fn pass_may_prune(coverage: &[(bool, bool)]) -> bool {
+    coverage
+        .iter()
+        .all(|&(complete, truncated)| complete && !truncated)
+}
+
 /// Of `vanished`, the UIDs whose rows are old enough for the prune to delete.
 ///
-/// This is the Graph path's answer to a row the server has never listed under
-/// the identity the store gave it. A Graph send transmits no `Message-ID`
+/// This is the answer to a row the server has never listed under the identity
+/// the store gave it. The shape came from Graph, and IMAP runs it too since
+/// #0072 widened its diff to the whole mailbox: the placeholder a Sent copy is
+/// filed under is no longer kept safe by a window clamp alone. A Graph send
+/// transmits no `Message-ID`
 /// (Graph's `sendMail` takes JSON and Exchange stamps its own
 /// `internetMessageId`), so [`crate::outbox::ingest_sent_copy`] files the local
 /// copy under [`graph_uid`] of *our* id, which no Sent enumeration will ever
@@ -827,11 +852,12 @@ pub fn prunable_uids(
 /// how many went.
 ///
 /// On the IMAP side the set comes from [`crate::imap_client::vanished_uids`],
-/// which clamps it to the numeric range the fetch window actually covered, so a
-/// short window can only ever prune inside what the server proved. The Graph
-/// side enumerates the whole folder every pass and needs no clamp, and its UIDs
-/// are the 63-bit [`graph_uid`] hashes rather than IMAP's `u32`: hence the
-/// generic width.
+/// which diffs against the mailbox's whole `UID SEARCH ALL` listing and clamps
+/// only at `UIDNEXT - 1`, above which sit this client's own placeholder rows.
+/// The Graph side enumerates the whole folder every pass and needs no clamp,
+/// and its UIDs are the 63-bit [`graph_uid`] hashes rather than IMAP's `u32`:
+/// hence the generic width. Both are gated by [`pass_may_prune`] and filtered
+/// by [`prunable_uids`] before they get here.
 ///
 /// Delete is the whole of it: there is no tombstone and no attempt to guess
 /// where the message went. The store is a droppable cache in front of the

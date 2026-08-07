@@ -14,7 +14,7 @@
 //!   `(account, mailbox, uid)` makes a duplicate impossible);
 //! - the EXISTS/UIDNEXT reconciliation heuristic and its `mailbox-states.json`
 //!   cache (superseded by `sync_cursors`; a row the server no longer lists is
-//!   now pruned from the fetch's own window, see
+//!   pruned from the fetch's own enumeration of the mailbox, see
 //!   [`crate::imap_client::vanished_uids`]).
 
 use anyhow::{anyhow, Result};
@@ -63,10 +63,13 @@ pub struct SyncResult {
     pub skipped: usize,
     /// Rows whose `\Seen` flag was updated from the server.
     pub read_updated: usize,
-    /// Rows deleted because the server no longer lists their UID inside the
-    /// window the fetch covered (a message archived, moved or deleted in
-    /// another client).
+    /// Rows deleted because the server no longer lists their UID (a message
+    /// archived, moved or deleted in another client).
     pub pruned: usize,
+    /// Rows this pass found vanished but did not delete, because some mailbox
+    /// it touched came back short and the diff cannot be trusted until one
+    /// does not (see [`crate::ingest::pass_may_prune`]).
+    pub prunes_deferred: usize,
     /// Rows rebound to a new UID after a UIDVALIDITY reset.
     pub uid_rebound: usize,
     /// Mailboxes whose server-side UIDVALIDITY no longer matched the stored
@@ -110,6 +113,10 @@ pub async fn sync_mailboxes(
     // Every prune this run will apply, collected here and applied after the
     // loop: see the second pass below for why it cannot run per target.
     let mut prunes: Vec<(MailboxRole, Vec<u32>)> = Vec::new();
+    // `(enumeration complete, download short)` per target, which decides
+    // whether the prunes above may be applied at all (#0072). Mirrors the
+    // Graph backend; the shared gate is `ingest::pass_may_prune`.
+    let mut coverage: Vec<(bool, bool)> = Vec::with_capacity(targets.len());
 
     for target in targets {
         // The skip list travels with the UIDVALIDITY it was recorded under, so
@@ -126,6 +133,10 @@ pub async fn sync_mailboxes(
                     "Failed to sync mailbox '{}': {}. Continuing with next.",
                     target.server_name, e
                 );
+                // A target that did not sync at all is the strongest form of
+                // partial pass: the copy that would justify another target's
+                // deletion may be exactly what this fetch failed to bring in.
+                coverage.push((false, false));
                 continue;
             }
         };
@@ -137,16 +148,22 @@ pub async fn sync_mailboxes(
         }
 
         if dry_run {
+            coverage.push((fetched.enumeration_complete, fetched.download_incomplete));
             result.saved += new_messages.len();
             continue;
         }
 
+        // A message that was downloaded but not written is as absent from the
+        // store as one that was never fetched, so it counts against this
+        // target's coverage too.
+        let mut ingest_failed = false;
         for message in &new_messages {
             let Some(mut email) = parse_rfc822_to_fetched_email(&message.raw) else {
                 warn!(
                     "Skipping UID {} in '{}': the message did not parse",
                     message.uid, target.server_name
                 );
+                ingest_failed = true;
                 continue;
             };
             email.is_read = message.is_read;
@@ -184,12 +201,19 @@ pub async fn sync_mailboxes(
                         date: email.date.clone(),
                     });
                 }
-                Err(e) => warn!(
-                    "Failed to ingest UID {} from '{}': {:#}",
-                    message.uid, target.server_name, e
-                ),
+                Err(e) => {
+                    ingest_failed = true;
+                    warn!(
+                        "Failed to ingest UID {} from '{}': {:#}",
+                        message.uid, target.server_name, e
+                    );
+                }
             }
         }
+        coverage.push((
+            fetched.enumeration_complete,
+            fetched.download_incomplete || ingest_failed,
+        ));
 
         result.read_updated += ingest::apply_seen_flags(
             &store,
@@ -201,9 +225,9 @@ pub async fn sync_mailboxes(
                 .map(|(uid, is_read)| (uid as i64, is_read)),
         );
 
-        // The other half of the same diff: the UIDs the store holds inside
-        // the window's range that the server did not list. Held back until
-        // every target has been ingested (see the second pass below).
+        // The other half of the same diff: the UIDs the store holds for this
+        // mailbox that the server did not list. Held back until every target
+        // has been ingested (see the second pass below).
         if !fetched.vanished.is_empty() {
             prunes.push((target.role.clone(), fetched.vanished));
         }
@@ -235,9 +259,31 @@ pub async fn sync_mailboxes(
     // unlinked, and a failed archive fetch (the `continue` above) loses it
     // locally until a later sync. Applying the prunes here means the
     // destination row already exists when the source row goes.
-    for (role, vanished) in &prunes {
-        result.pruned +=
-            ingest::prune_vanished(&store, &blobs, account_name, role.as_str(), vanished);
+    //
+    // Whether they run at all is the coverage gate (#0072): one mailbox that
+    // came back short invalidates every target's diff, because the argument
+    // that lets an inbox row go is that another target ingested the copy the
+    // message moved to.
+    if ingest::pass_may_prune(&coverage) {
+        let now = crate::outbox::unix_now();
+        for (role, vanished) in &prunes {
+            // The age guard is the other half: a row this client has just
+            // written locally (a Sent copy the server has not filed yet) is in
+            // every vanished set until the server's own copy shows up.
+            let vanished: Vec<i64> = vanished.iter().map(|&uid| uid as i64).collect();
+            let prunable =
+                ingest::prunable_uids(&store, account_name, role.as_str(), &vanished, now);
+            result.pruned +=
+                ingest::prune_vanished(&store, &blobs, account_name, role.as_str(), &prunable);
+        }
+    } else {
+        result.prunes_deferred = prunes.iter().map(|(_, v)| v.len()).sum();
+        if result.prunes_deferred > 0 {
+            info!(
+                "IMAP sync: {} pending prune(s) deferred; this pass did not see every message",
+                result.prunes_deferred,
+            );
+        }
     }
     span.mark("prune");
 

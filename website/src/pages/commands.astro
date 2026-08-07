@@ -178,9 +178,10 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         then fetches full RFC822 bodies only for messages not already stored locally.
       </p>
       <p>
-        Deletes are handled by the same pass: a message the server no longer lists inside
-        the window the sync just read is pruned from the local store, so a mailbox emptied
-        elsewhere does not linger.
+        Deletes are handled by the same pass. The download is capped by <code>--limit</code>,
+        the enumeration never is, so a message the server no longer lists is pruned from the
+        local store however far it sits below the newest ones, and a mailbox emptied elsewhere
+        does not linger.
       </p>
     </section>
 

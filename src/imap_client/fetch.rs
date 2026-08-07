@@ -110,47 +110,105 @@ pub struct StoreFetch {
     pub known_flags: Vec<(u32, bool)>,
     /// What SELECT said about the mailbox.
     pub state: MailboxState,
-    /// UIDs the store holds for this mailbox that the server no longer lists,
-    /// restricted to the numeric range the window covers. See
-    /// [`vanished_uids`].
+    /// UIDs the store holds for this mailbox that the server no longer lists.
+    /// See [`vanished_uids`].
     pub vanished: Vec<u32>,
     /// True when the server's UIDVALIDITY no longer matches the stored one, so
     /// this fetch deliberately skipped nothing and redownloaded the window.
     pub uidvalidity_reset: bool,
+    /// True when `UID SEARCH ALL` listed at least as many UIDs as `SELECT`
+    /// announced in `EXISTS`, i.e. the enumeration [`vanished`] was computed
+    /// from is the whole mailbox rather than a short answer.
+    ///
+    /// [`vanished`]: StoreFetch::vanished
+    pub enumeration_complete: bool,
+    /// True when this pass did not ingest every message that arrived in the
+    /// mailbox since the store last saw it: the `limit` window cut some off,
+    /// a body did not come back, or the caller failed to ingest one. Backlog
+    /// *older* than what the store already holds does not count; see
+    /// [`arrivals_missed`].
+    pub download_incomplete: bool,
 }
 
-/// The UIDs the store holds that the server did not list, clamped to the
-/// window's own numeric range.
+/// The UIDs the store holds that the server did not list, up to `ceiling`.
 ///
-/// The clamp is the whole safety argument. `UID SEARCH ALL` returns the entire
-/// mailbox, but the window is only its last `limit` UIDs, so `known − window`
-/// on a 12k mailbox with `-n 50` is 12k UIDs that are merely *older* than the
-/// window, not gone. Only a known UID that falls between the window's lowest
-/// and highest UID is provably absent from the server: the server listed every
-/// UID in that range and this one was not among them.
+/// `listed` is the *whole* mailbox as `UID SEARCH ALL` returned it, not the
+/// download window: the enumeration is complete even when the fetch is capped,
+/// so a message archived, moved or deleted in another client is absent from it
+/// whatever its UID. Diffing against the window instead was #0072, where
+/// archiving the oldest mail elsewhere left rows below the window's bottom
+/// that nothing could ever reach.
 ///
-/// Negative UIDs are skipped: they are the `-id` sentinel a local move parks a
-/// row on (see [`crate::store::write`]), a row waiting for the destination's
-/// next sync to give it a real UID, not something the server ever knew about.
+/// Two kinds of known UID are still exempt, both of them locally written rather
+/// than server-issued:
 ///
-/// The same clamp saves the other placeholder, from the other end of the
-/// number line: a Sent copy appended without an `APPENDUID` is stored under
-/// [`crate::ingest::graph_uid`], a 63-bit hash of the Message-ID that is
-/// always far above any real `hi`, so it falls outside the window's range and
-/// survives until a real sync rebinds it to the server's UID.
-pub fn vanished_uids(known: &std::collections::HashSet<i64>, window: &[u32]) -> Vec<u32> {
-    let (Some(&lo), Some(&hi)) = (window.iter().min(), window.iter().max()) else {
-        return Vec::new();
-    };
-    let listed: std::collections::HashSet<u32> = window.iter().copied().collect();
+/// - negative UIDs, the `-id` sentinel a local move parks a row on (see
+///   [`crate::store::write`]), waiting for the destination's next sync to give
+///   it a real UID;
+/// - anything above `ceiling`, which the caller sets to `UIDNEXT - 1`. A Sent
+///   copy appended without an `APPENDUID` is stored under
+///   [`crate::ingest::graph_uid`], a 63-bit hash of the Message-ID that no
+///   server would ever assign, and a row written optimistically ahead of the
+///   server sits just above the same line. `UIDNEXT` is the right ceiling
+///   rather than `max(listed)` because it does not drop when the newest
+///   message is the one that was deleted.
+///
+/// Whether the result may be *applied* is a separate question, answered by the
+/// coverage flags on [`StoreFetch`] and by [`crate::ingest::pass_may_prune`].
+pub fn vanished_uids(
+    known: &std::collections::HashSet<i64>,
+    listed: &[u32],
+    ceiling: u32,
+) -> Vec<u32> {
+    let listed: std::collections::HashSet<u32> = listed.iter().copied().collect();
     let mut out: Vec<u32> = known
         .iter()
-        .filter(|&&uid| uid >= lo as i64 && uid <= hi as i64)
+        .filter(|&&uid| uid > 0 && uid <= ceiling as i64)
         .map(|&uid| uid as u32)
         .filter(|uid| !listed.contains(uid))
         .collect();
     out.sort_unstable();
     out
+}
+
+/// The highest UID `known` holds that a server could have issued, i.e. the
+/// mailbox's local high-water mark.
+///
+/// Placeholder rows are excluded by the same `ceiling` the prune uses, so a
+/// `graph_uid` hash cannot push the mark to 2^62 and make every real arrival
+/// look old.
+fn high_water(known: &std::collections::HashSet<i64>, ceiling: u32) -> u32 {
+    known
+        .iter()
+        .filter(|&&uid| uid > 0 && uid <= ceiling as i64)
+        .map(|&uid| uid as u32)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether any message that arrived since the store's high-water mark was not
+/// ingested by this pass.
+///
+/// "Arrival" is the load-bearing word. A quick sync downloads the last `limit`
+/// UIDs and deliberately ignores the backlog below them, so measuring coverage
+/// as `everything the folder holds` would report every capped pass as short and
+/// suspend the prune forever on any mailbox bigger than the window. What the
+/// prune actually depends on is that the copy of a message *moved into* this
+/// mailbox landed, and a move issues a fresh UID at the top of the folder;
+/// anything above `high_water` is such an arrival, and all of them must be in.
+fn arrivals_missed(
+    listed: &[u32],
+    known: &std::collections::HashSet<i64>,
+    ceiling: u32,
+    ingested: &[u32],
+) -> bool {
+    let mark = high_water(known, ceiling);
+    let ingested: std::collections::HashSet<u32> = ingested.iter().copied().collect();
+    listed
+        .iter()
+        .filter(|&&uid| uid > mark)
+        .filter(|&&uid| !known.contains(&(uid as i64)))
+        .any(|uid| !ingested.contains(uid))
 }
 
 /// Two-pass fetch for the store ingest path.
@@ -197,29 +255,66 @@ pub async fn fetch_new_raw_on_session(
             mailbox, stored_uidvalidity, state.uid_validity
         );
     }
-    let empty = |state: MailboxState| StoreFetch {
-        messages: Vec::new(),
-        skipped: 0,
-        known_flags: Vec::new(),
-        state,
-        vanished: Vec::new(),
-        uidvalidity_reset,
-    };
-
     let uids = session
         .uid_search("ALL")
         .await
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
     span.mark("uid_search");
-    if uids.is_empty() {
+
+    let mut listed: Vec<u32> = uids.into_iter().collect();
+    listed.sort_unstable();
+
+    // The prune's top clamp, and the line that separates a server UID from a
+    // locally written placeholder. `UIDNEXT` is what SELECT promised; a server
+    // that withholds it leaves the highest UID it did list.
+    let ceiling = state
+        .uid_next
+        .map(|n| n.saturating_sub(1))
+        .or_else(|| listed.last().copied())
+        .unwrap_or(0);
+    // A listing shorter than the EXISTS the same SELECT announced is a partial
+    // answer, and a partial answer reads exactly like a mass deletion.
+    let enumeration_complete = listed.len() >= state.exists as usize;
+    if !enumeration_complete {
+        warn!(
+            "'{}' listed {} UID(s) but announced EXISTS {}: treating the enumeration as short, \
+             nothing will be pruned this pass",
+            mailbox,
+            listed.len(),
+            state.exists
+        );
+    }
+    let vanished = if enumeration_complete {
+        vanished_uids(&known_uids, &listed, ceiling)
+    } else {
+        Vec::new()
+    };
+    if !vanished.is_empty() {
+        info!(
+            "Store fetch for '{}': {} row(s) are no longer on the server",
+            mailbox,
+            vanished.len()
+        );
+    }
+
+    let empty = |state: MailboxState| StoreFetch {
+        messages: Vec::new(),
+        skipped: 0,
+        known_flags: Vec::new(),
+        state,
+        vanished: vanished.clone(),
+        uidvalidity_reset,
+        enumeration_complete,
+        download_incomplete: false,
+    };
+
+    if listed.is_empty() {
         return Ok(empty(state));
     }
 
-    let mut uid_list: Vec<u32> = uids.into_iter().collect();
-    uid_list.sort_unstable();
     let mut window: Vec<u32> = match limit {
-        Some(n) => uid_list.into_iter().rev().take(n).collect(),
-        None => uid_list,
+        Some(n) => listed.iter().rev().take(n).copied().collect(),
+        None => listed.clone(),
     };
     window.sort_unstable();
     if window.is_empty() {
@@ -249,17 +344,6 @@ pub async fn fetch_new_raw_on_session(
         }
     }
     let skipped = known_flags.len();
-    // A UIDVALIDITY reset empties `known_uids`, so this is empty too: the
-    // server renumbering says nothing about which messages are gone, and the
-    // rows are about to be rebound through their Message-IDs.
-    let vanished = vanished_uids(&known_uids, &window);
-    if !vanished.is_empty() {
-        info!(
-            "Store fetch for '{}': {} row(s) inside the window range are no longer on the server",
-            mailbox,
-            vanished.len()
-        );
-    }
 
     if new_uids.is_empty() {
         return Ok(StoreFetch {
@@ -269,6 +353,8 @@ pub async fn fetch_new_raw_on_session(
             state,
             vanished,
             uidvalidity_reset,
+            enumeration_complete,
+            download_incomplete: arrivals_missed(&listed, &known_uids, ceiling, &[]),
         });
     }
     info!(
@@ -300,6 +386,7 @@ pub async fn fetch_new_raw_on_session(
         });
     }
 
+    let downloaded: Vec<u32> = out.iter().map(|m| m.uid).collect();
     Ok(StoreFetch {
         messages: out,
         skipped,
@@ -307,6 +394,8 @@ pub async fn fetch_new_raw_on_session(
         state,
         vanished,
         uidvalidity_reset,
+        enumeration_complete,
+        download_incomplete: arrivals_missed(&listed, &known_uids, ceiling, &downloaded),
     })
 }
 
@@ -315,52 +404,100 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// A UID inside the window's range that the server did not list is gone.
+    /// A UID the server no longer lists is gone.
     #[test]
-    fn a_uid_missing_from_the_middle_of_the_window_is_vanished() {
+    fn a_uid_missing_from_the_listing_is_vanished() {
         let known = HashSet::from([10, 11, 12, 13]);
-        assert_eq!(vanished_uids(&known, &[10, 12, 13]), vec![11]);
+        assert_eq!(vanished_uids(&known, &[10, 12, 13], 13), vec![11]);
     }
 
-    /// The clamp: with a small `-n` the window is the tail of the mailbox, and
-    /// everything older than it is outside the range the server proved
-    /// anything about. Without this the first quick sync would delete the
-    /// whole archive.
+    /// #0072: the reported bug. The oldest inbox message is archived in another
+    /// client, so it is below every UID the server still lists. The old
+    /// window-range clamp could not see it; the full listing can.
     #[test]
-    fn uids_below_the_window_survive() {
+    fn the_oldest_uid_archived_elsewhere_is_vanished() {
+        let known: HashSet<i64> = (1..=83).collect();
+        let listed: Vec<u32> = (2..=83).collect();
+        assert_eq!(vanished_uids(&known, &listed, 83), vec![1]);
+    }
+
+    /// A capped download does not cap the diff: `UID SEARCH ALL` enumerated the
+    /// whole mailbox even when only its last 50 UIDs were fetched, so the rows
+    /// below the window are proved present, not merely unexamined.
+    #[test]
+    fn uids_below_the_download_window_are_kept_when_the_server_still_lists_them() {
         let known: HashSet<i64> = (1..=100).collect();
-        assert_eq!(vanished_uids(&known, &[98, 99, 100]), Vec::<u32>::new());
+        let listed: Vec<u32> = (1..=100).collect();
+        assert_eq!(vanished_uids(&known, &listed, 100), Vec::<u32>::new());
     }
 
-    /// Symmetrically, a UID above the window's highest is not covered either:
-    /// only a row that was optimistically written ahead of the server can be
-    /// there, and the next fetch will list it.
+    /// The one clamp that survives: above `UIDNEXT - 1` sit the locally written
+    /// placeholders (a `graph_uid` hash, a row written ahead of the server),
+    /// which the server was never asked about.
     #[test]
-    fn uids_above_the_window_survive() {
-        let known = HashSet::from([5, 6, 7, 42]);
-        assert_eq!(vanished_uids(&known, &[5, 7]), vec![6]);
+    fn uids_above_the_ceiling_survive() {
+        let known = HashSet::from([5, 6, 7, 4_611_686_018_427_387_904]);
+        assert_eq!(vanished_uids(&known, &[5, 7], 7), vec![6]);
     }
 
     /// A UIDVALIDITY reset hands `resolve` an empty known set, which must
     /// produce an empty prune: a renumbering says nothing about what is gone.
     #[test]
     fn an_empty_known_set_prunes_nothing() {
-        assert_eq!(vanished_uids(&HashSet::new(), &[1, 2, 3]), Vec::<u32>::new());
+        assert_eq!(
+            vanished_uids(&HashSet::new(), &[1, 2, 3], 3),
+            Vec::<u32>::new()
+        );
     }
 
-    /// An empty window is "the server told us nothing", not "the mailbox is
-    /// gone".
+    /// A mailbox the server lists as empty holds no rows either. The caller
+    /// only reaches this with `EXISTS 0` agreeing with the empty listing.
     #[test]
-    fn an_empty_window_prunes_nothing() {
+    fn an_empty_listing_prunes_every_known_row() {
         let known = HashSet::from([1, 2, 3]);
-        assert_eq!(vanished_uids(&known, &[]), Vec::<u32>::new());
+        assert_eq!(vanished_uids(&known, &[], 3), vec![1, 2, 3]);
     }
 
     /// The negative sentinel of a locally moved row is not a server UID and
-    /// must never be pruned, whatever the window covers.
+    /// must never be pruned.
     #[test]
     fn a_locally_moved_rows_sentinel_uid_is_never_pruned() {
         let known = HashSet::from([-7, 4, 5]);
-        assert_eq!(vanished_uids(&known, &[4, 5]), Vec::<u32>::new());
+        assert_eq!(vanished_uids(&known, &[4, 5], 5), Vec::<u32>::new());
+    }
+
+    /// The high-water mark ignores the placeholder above the ceiling, which
+    /// would otherwise make every real arrival look older than the store.
+    #[test]
+    fn the_high_water_mark_ignores_placeholders() {
+        let known = HashSet::from([-3, 4, 9, 4_611_686_018_427_387_904]);
+        assert_eq!(high_water(&known, 20), 9);
+    }
+
+    /// Backlog below the high-water mark is not an arrival: a quick sync never
+    /// promised to fetch it, so it must not suspend the prune.
+    #[test]
+    fn old_backlog_the_window_skipped_is_not_a_missed_arrival() {
+        let known = HashSet::from([50, 51]);
+        let listed: Vec<u32> = (1..=51).collect();
+        assert!(!arrivals_missed(&listed, &known, 51, &[]));
+    }
+
+    /// A message that arrived above the mark and was not downloaded is: the
+    /// bulk-move case where the destination window could not hold every copy.
+    #[test]
+    fn an_arrival_the_window_cut_off_is_a_missed_arrival() {
+        let known = HashSet::from([50]);
+        assert!(arrivals_missed(&[50, 51, 52], &known, 52, &[52]));
+        assert!(!arrivals_missed(&[50, 51, 52], &known, 52, &[51, 52]));
+    }
+
+    /// A first sync of a mailbox bigger than the window has no mark to stand
+    /// on, so every listed UID is an arrival and the pass is short. Nothing to
+    /// prune then anyway, and the flag keeps it that way.
+    #[test]
+    fn a_first_sync_of_a_capped_mailbox_is_incomplete() {
+        let known = HashSet::new();
+        assert!(arrivals_missed(&[1, 2, 3], &known, 3, &[2, 3]));
     }
 }

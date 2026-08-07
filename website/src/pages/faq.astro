@@ -111,9 +111,10 @@ import AccordionItem from '../components/AccordionItem.astro';
 
         <AccordionItem question="What happens to messages deleted on the server?">
           <p>
-            The same sync pass prunes them: a message the server no longer lists inside the
-            window the sync just read is removed from the local store, so a mailbox cleaned up
-            in another client converges on the next sync.
+            The same sync pass prunes them. Every sync enumerates the whole mailbox even when
+            it downloads only the newest messages, so a message the server no longer lists is
+            removed from the local store whatever its age, and a mailbox cleaned up in another
+            client converges on the next sync.
           </p>
         </AccordionItem>
 

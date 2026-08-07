@@ -1041,6 +1041,15 @@ async fn sync_one_account(
             result.pruned,
         );
     }
+    if result.prunes_deferred > 0 {
+        println!(
+            "{} {}{} removal(s) held back: this pass did not see every message, \
+             run a full sync to apply them",
+            "⚠".yellow(),
+            prefix,
+            result.prunes_deferred,
+        );
+    }
 
     Ok(())
 }

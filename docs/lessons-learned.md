@@ -454,7 +454,7 @@ Before hoisting a construction out of a loop, list what the constructor did besi
 The Graph prune computes `store − server` over `internetMessageId` and deletes the difference, which is correct for every row the server put there.
 A Graph send does not produce one: `sendMail` takes JSON with no `Message-ID`, Exchange stamps its own, and the outbox has already filed the local copy under a uid derived from *our* id, so that row is in the difference on every pass from the moment it is written (#0065).
 Deleting it releases the raw MIME, which on a Graph account is the only copy that will ever exist.
-The IMAP path is immune by accident rather than by design: its prune is clamped to the fetch window's numeric range, and a `graph_uid` hash sits far above any real UID.
+The IMAP path was immune by accident rather than by design: its prune was clamped to the fetch window's numeric range, and a `graph_uid` hash sits far above any real UID. Since #0072 the clamp is deliberate, `UIDNEXT - 1`, and IMAP runs the same age guard.
 Two shapes of row are exposed this way, the locally synthesised one and the one whose server copy has not been filed yet, and both are recent; the guard is therefore an age window on the row rather than an exemption for the `sent` role, which would have made the duplicate permanent ([src/ingest.rs](../src/ingest.rs), `prunable_uids`).
 When a diff drives deletions, ask which rows were written by something other than that diff's own source.
 
@@ -564,3 +564,18 @@ The sidebar queried the store with the leaf of a `PathBuf` it built from the con
 For `inbox`, `archive` and `sent` the two agreed, so nothing looked wrong; for an `[[mailboxes.extra]]` mailbox the path builder *slugified* the server name, so rows ingested under `Team/Reports` were listed and counted under `team-reports` and the mailbox appeared permanently empty, its quick-move destination wrote rows under a key sync never uses, and `mp dump-mailbox --mailbox Team/Reports` returned nothing.
 The bug had been invisible for as long as it existed because no account here configures an extra mailbox, and the integration test that would have caught it had been written by ingesting under the slug, i.e. against the reader rather than against the writer.
 When two sides of a boundary each derive the same key, the derivation belongs to one of them and the other reads it; a fixture that feeds the reader its own convention proves nothing about the writer.
+
+## A diff computed over the download window answers a question nobody asked
+
+The IMAP prune took the store's UIDs, kept the ones between the lowest and highest UID the fetch had just read, and deleted whatever the server had not listed in that range (#0072).
+The clamp was there to stop a capped sync from deleting the backlog under its window, and it did, but it also made the diff blind in exactly the direction removals arrive: a message archived elsewhere is *absent* from the listing, so it cannot pull the window's bottom down to itself, and archiving the oldest mail first, which is what everyone does, put every removal below the clamp forever.
+The fetch already held the complete answer and was throwing it away: `UID SEARCH ALL` enumerates the whole mailbox, and only the *download* is capped by `limit`.
+The fix is to diff against the enumeration and keep one clamp at the top, `UIDNEXT - 1`, which is the line between a server-issued UID and a placeholder this client wrote ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `vanished_uids`).
+When a safety clamp is derived from a partial input, check whether the complete input was available in the same function; a clamp that hides a whole class of answer is a wrong query, not a cautious one.
+
+## Coverage means "did the arrivals land", not "did the folder fit"
+
+Gating the IMAP prune on the same condition as Graph's, every message found was downloaded, would have suspended it permanently: a quick sync's window is the last 100 UIDs of a mailbox that can hold 8000, so every capped pass reports a backlog it never intended to fetch and the gate never opens (#0072).
+Graph gets away with the strict form because it downloads by id, so its backlog drains one window per pass; IMAP's window is positional and the backlog under it is skipped by design.
+What the prune actually depends on is narrower: an inbox row may go because another mailbox ingested the copy the message moved to, and a move issues a fresh UID at the *top* of the destination, so the flag to compute is whether every UID above the mailbox's local high-water mark landed ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrivals_missed`).
+When two backends share a safety gate, share the predicate and let each compute its own inputs; the flag's name travels, its derivation does not.

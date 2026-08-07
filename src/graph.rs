@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::config::GraphConfig;
 use crate::imap_client::{FreshObservation, SyncResult, SyncTarget};
+use crate::ingest::pass_may_prune;
 use crate::types::MailboxRole;
 use crate::parse::{sanitize_attachment_filename, AttachmentData, FetchedEmail};
 use crate::timing::TimingSpan;
@@ -1068,21 +1069,6 @@ fn select_for_download<'a>(
     (new, found)
 }
 
-/// Whether a pass may apply the prunes it collected, given `(enumeration was
-/// complete, download was incomplete)` for every target it synced.
-///
-/// One partial target suspends the prune for *all* of them, which is the whole
-/// point: the reason an inbox row may be deleted is that some other target
-/// ingested the copy the message moved to, so a target that did not finish
-/// invalidates every other target's diff as well. A full sync
-/// (`limit = usize::MAX`) never truncates, so the deferred prunes are applied
-/// by the next uncapped pass; nothing is lost, only postponed (#0065).
-fn pass_may_prune(coverage: &[(bool, bool)]) -> bool {
-    coverage
-        .iter()
-        .all(|&(complete, truncated)| complete && !truncated)
-}
-
 /// The folder's messages the store does not hold, newest first.
 ///
 /// Newest first is what makes a capped sync useful (the quick sync passes
@@ -1331,11 +1317,14 @@ pub async fn sync_mailboxes_graph(
             result.pruned +=
                 crate::ingest::prune_vanished(&store, &blobs, account_name, role.as_str(), &prunable);
         }
-    } else if !prunes.is_empty() {
-        info!(
-            "Graph sync: {} pending prune(s) deferred; this pass did not see every message",
-            prunes.len(),
-        );
+    } else {
+        result.prunes_deferred = prunes.iter().map(|(_, v)| v.len()).sum();
+        if result.prunes_deferred > 0 {
+            info!(
+                "Graph sync: {} pending prune(s) deferred; this pass did not see every message",
+                result.prunes_deferred,
+            );
+        }
     }
     span.mark("prune");
 

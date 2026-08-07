@@ -941,16 +941,27 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
 /// `vanished_uids` is the diff a fetch computes; `prune_vanished` is what the
 /// sync does with it. Both halves run here so the tests read like one sync
 /// pass without needing a server.
-fn sync_prune(f: &Fixture, mailbox: &str, window: &[u32]) -> usize {
-    let vanished = fetch_diff(f, mailbox, window);
+fn sync_prune(f: &Fixture, mailbox: &str, listed: &[u32]) -> usize {
+    let vanished = fetch_diff(f, mailbox, listed);
     email::ingest::prune_vanished(&f.store, &f.blobs, "acct", mailbox, &vanished)
 }
 
 /// The diff half on its own, for the test that has to hold a prune back until
 /// every target mailbox has been ingested, the way the sync does.
-fn fetch_diff(f: &Fixture, mailbox: &str, window: &[u32]) -> Vec<u32> {
+///
+/// `listed` is the server's whole `UID SEARCH ALL` answer, not the download
+/// window (#0072). The ceiling stands in for `UIDNEXT - 1`, one above the
+/// highest UID either side knows about.
+fn fetch_diff(f: &Fixture, mailbox: &str, listed: &[u32]) -> Vec<u32> {
     let known = email::ingest::known_uids(&f.store, "acct", mailbox).unwrap();
-    email::imap_client::vanished_uids(&known, window)
+    let ceiling = known
+        .iter()
+        .filter(|&&uid| uid > 0 && uid < u32::MAX as i64)
+        .map(|&uid| uid as u32)
+        .chain(listed.iter().copied())
+        .max()
+        .unwrap_or(0);
+    email::imap_client::vanished_uids(&known, listed, ceiling)
 }
 
 fn plain(name: &str) -> Vec<u8> {
@@ -960,12 +971,11 @@ fn plain(name: &str) -> Vec<u8> {
     )
 }
 
-/// A UID inside the window's range that the server did not list is gone from
-/// the mailbox: the row goes, and the blobs it was holding lose their
-/// reference. Before this the row was immortal, because no sync path ever
-/// computed "store UID not in the server window".
+/// A UID the server did not list is gone from the mailbox: the row goes, and
+/// the blobs it was holding lose their reference. Before this the row was
+/// immortal, because no sync path ever computed "store UID not on the server".
 #[test]
-fn a_uid_missing_from_the_window_loses_its_row_and_its_blob_refs() {
+fn a_uid_missing_from_the_listing_loses_its_row_and_its_blob_refs() {
     let f = Fixture::new();
     let gone = f.ingest_raw("inbox", 2, &plain("gone"));
     let stays = f.ingest_raw("inbox", 3, &plain("stays"));
@@ -991,27 +1001,46 @@ fn a_uid_missing_from_the_window_loses_its_row_and_its_blob_refs() {
     assert_eq!(fts, 0);
 }
 
-/// The clamp, which is the difference between a prune and a catastrophe: with
-/// `-n 50` on a 12k mailbox the window is the tail, and everything older than
-/// it is simply outside what the server said anything about.
+/// #0072, the reported defect: the *oldest* inbox message is archived in
+/// another client, which is what everyone does first. It is below every UID the
+/// server still lists, so the old window-range clamp could never reach it and
+/// the row was immortal however often the user pressed `s`.
 #[test]
-fn a_uid_outside_the_window_range_survives() {
+fn the_oldest_uid_archived_elsewhere_is_pruned() {
     let f = Fixture::new();
     for uid in 1..=6 {
         f.ingest_raw("inbox", uid, &plain(&format!("m{uid}")));
     }
 
-    // A short window: the server listed only the last three UIDs.
-    assert_eq!(sync_prune(&f, "inbox", &[4, 5, 6]), 0);
-    assert_eq!(f.message_rows(), 6, "older rows are not in the window's range");
-
-    // Widen it, and the hole inside the new range is prunable.
-    assert_eq!(sync_prune(&f, "inbox", &[1, 2, 4, 5, 6]), 1);
-    assert_eq!(f.message_rows(), 5);
+    // The server enumerated the whole mailbox and UID 1 was not in it.
+    assert_eq!(sync_prune(&f, "inbox", &[2, 3, 4, 5, 6]), 1);
     assert_eq!(
         email::ingest::known_uids(&f.store, "acct", "inbox").unwrap(),
-        HashSet::from([1, 2, 4, 5, 6])
+        HashSet::from([2, 3, 4, 5, 6])
     );
+
+    // A hole in the middle is the same diff, not a different rule.
+    assert_eq!(sync_prune(&f, "inbox", &[2, 3, 5, 6]), 1);
+    assert_eq!(f.message_rows(), 4);
+}
+
+/// The clamp that survives the widening: a row above `UIDNEXT - 1` was written
+/// by this client, not by the server. The Sent copy appended without an
+/// `APPENDUID` lives there, under a `graph_uid` hash, and the server was never
+/// asked about it.
+#[test]
+fn a_row_above_the_ceiling_survives_a_listing_that_omits_it() {
+    let f = Fixture::new();
+    for uid in 1..=3 {
+        f.ingest_raw("sent", uid, &plain(&format!("m{uid}")));
+    }
+    let placeholder = email::ingest::graph_uid("<not-yet-filed@example.com>");
+    f.ingest_raw("sent", placeholder, &plain("not-yet-filed"));
+
+    let known = email::ingest::known_uids(&f.store, "acct", "sent").unwrap();
+    let vanished = email::imap_client::vanished_uids(&known, &[1, 2, 3], 3);
+    assert!(vanished.is_empty(), "the placeholder is not a server UID");
+    assert_eq!(f.message_rows(), 4);
 }
 
 /// A UIDVALIDITY reset empties the known set, so there is nothing to prune: a
@@ -1042,7 +1071,7 @@ fn a_uidvalidity_reset_prunes_nothing() {
     let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
     let (resolved, reset) = known.resolve(Some(2));
     assert!(reset);
-    let vanished = email::imap_client::vanished_uids(&resolved, &[90, 91, 92]);
+    let vanished = email::imap_client::vanished_uids(&resolved, &[90, 91, 92], 92);
     assert!(vanished.is_empty(), "a reset must never prune");
     assert_eq!(
         email::ingest::prune_vanished(&f.store, &f.blobs, "acct", "inbox", &vanished),
@@ -1086,7 +1115,7 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
 
     // Inbox pass: the server stopped listing UID 7, which the fetch reports
     // and the sync holds back.
-    let inbox_vanished = fetch_diff(&f, "inbox", &[6, 8]);
+    let inbox_vanished = fetch_diff(&f, "inbox", &[8]);
     assert_eq!(inbox_vanished, vec![7]);
 
     // Archive pass: its own diff, then the ingest of the moved copy at its new
