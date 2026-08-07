@@ -125,6 +125,27 @@ fn a_source_without_a_message_id_leaves_the_key_out() {
     );
 }
 
+/// A `Message-ID` carrying a backslash is dropped rather than written into
+/// the double-quoted scalar, where it would either mangle the value or fail
+/// the draft's parse outright (#TKT-0051 review N3).
+#[test]
+fn a_message_id_with_a_backslash_leaves_the_key_out() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let mut source = source("alice@example.com", "me@example.com", "Hello", "Body");
+    source.message_id = Some("<a\\qb@example.com>".to_string());
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    assert!(!content.contains("in_reply_to:"), "{content}");
+    assert_eq!(
+        parse_email_draft(&draft_path).unwrap().frontmatter.in_reply_to,
+        None
+    );
+}
+
 #[test]
 fn test_create_reply_draft_already_re_prefix() {
     let tmp = tempdir().unwrap();

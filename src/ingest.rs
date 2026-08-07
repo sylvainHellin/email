@@ -685,6 +685,11 @@ pub fn known_message_ids(
 /// the store does not hold. The server is truth here, so there is no cutoff
 /// guard: a local flag change becomes a `pending_ops` entry (#0039) rather
 /// than a file the sync must not clobber.
+///
+/// Both statements go through `prepare_cached`: this runs once per UID in the
+/// sync window on every pass, so re-preparing them per row would be two fresh
+/// SQL compiles per already-held message on the path #0005 and the latency
+/// work are about.
 pub fn apply_flag(
     store: &Store,
     account: &str,
@@ -692,26 +697,24 @@ pub fn apply_flag(
     uid: i64,
     resolve: impl FnOnce(MessageFlags) -> MessageFlags,
 ) -> Result<bool> {
-    let current: Option<Option<String>> = store
-        .conn()
-        .query_row(
-            "SELECT flags FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
-            rusqlite::params![account, mailbox, uid],
-            |row| row.get(0),
-        )
+    let conn = store.conn();
+    let current: Option<Option<String>> = conn
+        .prepare_cached("SELECT flags FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3")
+        .context("preparing the flag read")?
+        .query_row(rusqlite::params![account, mailbox, uid], |row| row.get(0))
         .optional()
         .context("reading a row's flags")?;
     let Some(current) = current else {
         return Ok(false);
     };
     let flags = resolve(MessageFlags::parse(current.as_deref().unwrap_or_default())).to_flag_string();
-    let changed = store
-        .conn()
-        .execute(
+    let changed = conn
+        .prepare_cached(
             "UPDATE messages SET flags = ?4
              WHERE account = ?1 AND mailbox = ?2 AND uid = ?3 AND IFNULL(flags, '') <> ?4",
-            rusqlite::params![account, mailbox, uid, flags],
         )
+        .context("preparing the flag update")?
+        .execute(rusqlite::params![account, mailbox, uid, flags])
         .context("applying server flags")?;
     Ok(changed > 0)
 }

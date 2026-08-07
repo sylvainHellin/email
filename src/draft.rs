@@ -187,15 +187,22 @@ pub fn fwd_subject(subject: &str) -> String {
 
 /// The source `Message-ID` a draft may quote back, YAML-safe.
 ///
-/// An empty or quote-bearing header is dropped rather than escaped: the value
-/// exists to be looked up in the `messages_message_id` index after a send, and
-/// a Message-ID containing a double quote is not one any server issued.
+/// An empty header, or one carrying a double quote or a backslash, is dropped
+/// rather than escaped: the value exists to be looked up in the
+/// `messages_message_id` index after a send, and a Message-ID containing
+/// either character is not one any server issued.
+///
+/// Both characters matter because the value is written into a YAML
+/// double-quoted scalar. A backslash is an escape there, so `<a\b@x>` would be
+/// read back mangled and `<a\qb@x>` would fail the whole draft's parse, which
+/// is the silent skip #0064 called out: the reply disappears from the drafts
+/// index with only a log line.
 fn source_message_id(source: &SourceMessage) -> Option<&str> {
     source
         .message_id
         .as_deref()
         .map(str::trim)
-        .filter(|id| !id.is_empty() && !id.contains('"'))
+        .filter(|id| !id.is_empty() && !id.contains(['"', '\\']))
 }
 
 /// Reply to a message that is not a file: the #0050 path, used by

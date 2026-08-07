@@ -168,6 +168,21 @@ async fn authenticate_client(
     }
 }
 
+/// How long the TCP connect of a new IMAP session may take before it is given
+/// up on.
+///
+/// Nothing else here is bounded, and nothing else needs to be: a server that
+/// answered the SYN and then went quiet fails its read, while a black-holed
+/// host (a dropped route, a firewall that swallows the SYN) leaves the connect
+/// itself hanging for the OS default, over two minutes on Linux. Every caller
+/// of a session sits on some queue that has to wait for it: a sync thread, the
+/// IDLE watcher, or the post-send flag write, which runs after a message has
+/// already gone out (#0076).
+///
+/// Generous on purpose: this is a black-hole guard, not a latency budget, and
+/// a slow link on a good day must not lose its connection to it.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
 pub async fn open_imap_session(imap_config: &ImapConfig) -> anyhow::Result<ImapSession> {
     use crate::timing::TimingSpan;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
@@ -182,9 +197,19 @@ pub async fn open_imap_session(imap_config: &ImapConfig) -> anyhow::Result<ImapS
     let tls = async_native_tls::TlsConnector::new()
         .danger_accept_invalid_certs(imap_config.accept_invalid_certs);
 
-    let mut tcp_stream = async_std::net::TcpStream::connect(&addr)
-        .await
-        .map_err(|e| anyhow!("Failed to connect to IMAP server: {}", e))?;
+    let mut tcp_stream = async_std::future::timeout(
+        std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        async_std::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Failed to connect to IMAP server: {} did not answer within {}s",
+            addr,
+            CONNECT_TIMEOUT_SECS
+        )
+    })?
+    .map_err(|e| anyhow!("Failed to connect to IMAP server: {}", e))?;
     span.mark("tcp_connect");
 
     if imap_config.port == 993 {

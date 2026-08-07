@@ -50,5 +50,5 @@ The axis below is therefore separate state and `EmailStatus` stays as #0064 left
 
 ## Verification
 
-`cargo test` 919 green (900 before, +19 pinning the axis: flag round-trip, ingest, the IMAP-replaces / Graph-merges split, the read-toggle merge, the draft keys, the local half of the post-send hook, the dump tokens, the marker precedence).
+`cargo test` 920 green (900 before, +20 pinning the axis: flag round-trip, ingest, the IMAP-replaces / Graph-merges split, the read-toggle merge, the draft keys, the local half of the post-send hook, the dump tokens, the marker precedence).
 Live: `mp sync -A assistant` and read-only `mp sync -A tum`, then `mp dump-mailbox` showing `answered` on messages replied to elsewhere.

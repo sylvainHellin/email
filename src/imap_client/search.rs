@@ -32,6 +32,25 @@ pub fn bracketed_message_id(raw: &str) -> String {
     format!("<{}>", normalize_message_id(raw))
 }
 
+/// The `HEADER Message-ID` search term for one Message-ID, with the value
+/// quoted as an IMAP string literal.
+///
+/// A quoted string escapes exactly two characters (RFC 3501 section 4.3):
+/// `\` and `"`. A Message-ID carrying either one interpolated raw would close
+/// the literal early and leave the server parsing the remainder as search
+/// keywords, which is a malformed command rather than a match. The value comes
+/// from a header or from a self-authored draft, so this is hygiene rather than
+/// a live failure, but every site that names a message this way should quote
+/// it the same way.
+///
+/// The value is passed through as given rather than bracketed: the callers
+/// that need the bracket discipline go through [`build_imap_search_query`],
+/// and the per-message ops search for the Message-ID the store holds.
+pub(crate) fn message_id_search_term(message_id: &str) -> String {
+    let escaped = message_id.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("HEADER Message-ID \"{escaped}\"")
+}
+
 /// Drop results whose Message-ID is not exactly `criteria.message_id`.
 ///
 /// Neither backend gives an exact match on its own: IMAP `HEADER` is a substring
@@ -444,6 +463,28 @@ mod tests {
         assert_eq!(normalize_message_id("  <abc@example.com> "), "abc@example.com");
         // Half-bracketed input is left alone rather than silently mangled.
         assert_eq!(normalize_message_id("<abc@example.com"), "<abc@example.com");
+    }
+
+    #[test]
+    fn a_search_term_escapes_the_two_characters_a_quoted_string_has() {
+        assert_eq!(
+            message_id_search_term("<a@b>"),
+            "HEADER Message-ID \"<a@b>\""
+        );
+        assert_eq!(
+            message_id_search_term("<a\\qb@x>"),
+            "HEADER Message-ID \"<a\\\\qb@x>\""
+        );
+        assert_eq!(
+            message_id_search_term("<a\"b@x>"),
+            "HEADER Message-ID \"<a\\\"b@x>\""
+        );
+        // The backslash pass runs first, so an escaped quote is not
+        // double-escaped into a literal backslash plus a bare quote.
+        assert_eq!(
+            message_id_search_term("<a\\\"b@x>"),
+            "HEADER Message-ID \"<a\\\\\\\"b@x>\""
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use futures::TryStreamExt;
 use log::info;
 
 use super::open_imap_session;
+use super::search::message_id_search_term;
 use crate::config::ImapConfig;
 
 /// Move an email to a different mailbox on the IMAP server (#0018).
@@ -154,7 +155,7 @@ pub async fn mark_read_on_server(
         .await
         .map_err(|e| anyhow!("Failed to select {}: {}", mailbox, e))?;
 
-    let query = format!("HEADER Message-ID \"{}\"", message_id);
+    let query = message_id_search_term(message_id);
     let uids = session
         .uid_search(&query)
         .await
@@ -203,7 +204,7 @@ pub async fn add_flag_on_server(
         .await
         .map_err(|e| anyhow!("Failed to select {}: {}", mailbox, e))?;
 
-    let query = format!("HEADER Message-ID \"{}\"", message_id);
+    let query = message_id_search_term(message_id);
     let uids = session
         .uid_search(&query)
         .await

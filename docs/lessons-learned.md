@@ -645,3 +645,10 @@ When a rewrite makes a mechanism impossible, write down what the mechanism was f
 The read-only message view is written mode 0444 so `$EDITOR` opens the buffer read-only, and it lands in the per-row materialisation directory keyed by row id, so opening the same message twice targets the same path.
 The second write then fails on the mode the first one set, and `fs::write` truncating an existing file gives no way around it.
 Remove the file first and treat `NotFound` as success ([src/tui/actions.rs](../src/tui/actions.rs), `write_readonly`); the rendition is rebuilt from the store on every open, so there is nothing to preserve, and a stale copy surviving a rebuild would be worse than the failure.
+
+## A value written into a double-quoted YAML scalar has two dangerous characters, not one
+
+`draft::source_message_id` dropped a `Message-ID` containing `"` and wrote everything else into `in_reply_to: "<...>"` (#TKT-0051 review).
+A backslash is an escape inside a double-quoted YAML scalar, so `<a\b@x>` is read back mangled as `<a\u{8}@x>` and `<a\qb@x>` is not a valid escape at all: it fails the scan, which fails the *whole draft's* parse, and the reply then disappears from the drafts index with only a log line behind it (the silent-skip mode #0064 named).
+Wherever a header value is interpolated into a quoted scalar rather than serialised, both `"` and `\` have to be handled, and the same holds one layer out for an IMAP quoted string, which escapes exactly those two characters (RFC 3501 section 4.3).
+Dropping the value beats escaping it when the value only exists to be looked up again, and a `Message-ID` carrying either character is not one a server issued.

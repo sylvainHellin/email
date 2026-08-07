@@ -432,8 +432,15 @@ fn golden_mail_view_with_selection() {
 
 /// The mail view with the second status axis on screen (#TKT-0051): the same
 /// fixture with one answered row and one forwarded row, so the marker column
-/// carries all four of its states at once (unread, answered, forwarded,
-/// read).
+/// carries three of its states at once (unread, answered, forwarded).
+///
+/// The fourth state, the blank marker of a plain read row, is not in this
+/// frame: every already-read row here is mutated into a history glyph. Nor is
+/// the precedence rule that matters most, unread outranking a history glyph,
+/// which would render as an unread marker and so show nothing a frame can
+/// tell apart. Both are pinned by the unit tests in `ui::list` instead; what
+/// this frame is for is the glyphs' column geometry, which the default frame
+/// above cannot show.
 ///
 /// Captured separately from the default frame, which stays the read/unread
 /// picture users see most, and which is what the pre-nuke parity capture was

@@ -117,6 +117,14 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **An IMAP host that answers nothing at all is given up on after 30 seconds
+  (#0076).** Opening a session had no connect timeout, so a host that swallows
+  the SYN rather than refusing it, a dropped route or a firewall configured
+  that way, held whatever asked for that session for the operating system's own
+  timeout, over two minutes on Linux. A sync, the idle watcher and the flag
+  write that follows a reply all sat on it. Only the TCP connect is bounded,
+  and generously: a server that answers and then goes quiet fails its read on
+  its own, and a slow link on a good day must not lose its connection to this.
 - **A first sync no longer switches the removal prune off for the whole
   account (#0072 sweep review).** The arrival gate derives the line it holds a
   pass to from what the mailbox is known to have held, and an empty store knows
