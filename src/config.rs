@@ -200,7 +200,7 @@ pub struct ImapSettings {
     /// N mailboxes on one session cost N round-trips serially; N connections
     /// overlap the latency. Kept conservative because servers throttle
     /// concurrent connections, Gmail especially. Clamped to [1, 8] at load;
-    /// 1 restores the old single-session behaviour.
+    /// 1 restores the old serial ordering (one session per mailbox, opened in turn).
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
 }

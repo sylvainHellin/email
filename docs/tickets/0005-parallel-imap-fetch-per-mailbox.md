@@ -38,3 +38,7 @@ The concurrency cap is a per-account config value, `[accounts.imap] fetch_concur
 It honours the existing 30s connect timeout on `open_imap_session` unchanged (each parallel session opens through it).
 
 Live smoke (3 mailboxes each, warm store): `assistant` (Gmail) ~1.9s -> ~0.7s, `tum` ~2.5s -> ~1.3s.
+
+Known edge (from the post-ship review): phase 2 collects every mailbox's full fetch window before ingest, so peak memory on a large initial sync scales with mailbox count times the `-n` window, where the old path held one mailbox at a time.
+A bounded fetch-to-ingest pipeline would cap it if huge initial syncs ever matter.
+With `fetch_concurrency = 1` the ordering is the old one, but it still opens one session per mailbox in turn rather than a single shared session; connection churn only, correctness identical.
