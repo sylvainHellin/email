@@ -49,6 +49,21 @@ All notable changes to this project are documented in this file.
   `email-cli X.Y.Z`.
 
 ### Added
+- **Flag important messages with a server-backed star (#0007).** `*` on a
+  message in the list toggles the IMAP `\Flagged` system flag, marking it
+  important the same way every other mail client does. A flagged row shows a
+  coloured flag glyph before its subject, and the star is orthogonal to the
+  read state, so a message can be flagged and still unread. The toggle is
+  optimistic: the local store updates instantly and a background `UID STORE`
+  mirrors it to the server, exactly like the read/unread toggle; if the server
+  refuses, both halves roll back. It rides the same flag column and sync
+  semantics as the read/answered/forwarded axis, so a star set or cleared in
+  another client comes back on the next sync, and `mp dump-mailbox` reports
+  `flagged` in its flags array. With a multi-select active, `*` flags the whole
+  set, flagging when any is unflagged. On a Microsoft Graph account the star is
+  kept locally but not mirrored, because that backend stays read-only-aware for
+  now; a local filtered flagged view is deferred to #0079.
+
 - **Delete a draft (#0073).** A draft could be created, edited, approved and
   sent, but never removed: `mp delete` only spoke the received-mail selector
   grammar, and the TUI `d` key reported "nothing to delete" on a Drafts row.

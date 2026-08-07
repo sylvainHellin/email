@@ -1,8 +1,8 @@
 //! The two halves of a mutation, and the seam between them.
 //!
 //! A flag, a move, an archive or a delete is one local write and one server op.
-//! This module owns the pairing: [`prepare_move`], [`prepare_delete`] and
-//! [`prepare_read_flag`] apply the local write to the store immediately and
+//! This module owns the pairing: [`prepare_move`], [`prepare_delete`],
+//! [`prepare_read_flag`] and [`prepare_flag`] apply the local write to the store immediately and
 //! hand back the [`ServerOp`] the caller fires in the background, together with
 //! the row's previous coordinates so a failed op can be rolled back.
 //!
@@ -44,6 +44,14 @@ pub(crate) enum ServerOp {
         message_id: String,
         mailbox: String,
         read: bool,
+    },
+    /// Toggle the `\Flagged` star (#0007). Like [`ServerOp::SetRead`], the
+    /// server is truth on the IMAP path, so a local toggle needs a UID STORE
+    /// write the next sync restates.
+    SetFlagged {
+        message_id: String,
+        mailbox: String,
+        flagged: bool,
     },
 }
 
@@ -152,6 +160,42 @@ pub(crate) fn prepare_read_flag(
     out
 }
 
+/// Set the `\Flagged` star on rows and return the ops that mirror it to the
+/// server (#0007). The local write lands first, exactly as the read toggle
+/// does; the star rides the same `flags` column through a read-modify-write.
+pub(crate) fn prepare_flag(
+    store: &Store,
+    msgs: &[MessageRef],
+    flagged: bool,
+    server_mailbox: &str,
+) -> Vec<Prepared> {
+    let mut out = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        let previous = match write::row_coordinates(store, msg.row_id()) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                log::warn!("[store] {msg} has no row to flag");
+                continue;
+            }
+            Err(e) => {
+                log::warn!("[store] reading {msg} failed: {e:#}");
+                continue;
+            }
+        };
+        if let Err(e) = write::set_flagged(store, msg.row_id(), flagged) {
+            log::warn!("[store] starring {msg} failed: {e:#}");
+            continue;
+        }
+        let op = ServerOp::SetFlagged {
+            message_id: previous.message_id.clone(),
+            mailbox: server_mailbox.to_string(),
+            flagged,
+        };
+        out.push(Prepared { previous, op });
+    }
+    out
+}
+
 /// Put a moved row back after its server op failed.
 ///
 /// A delete has no counterpart here on purpose: the row is gone and there is
@@ -175,6 +219,16 @@ pub(crate) fn rollback_read_flag(account: &str, msg: MessageRef, read: bool) {
     };
     if let Err(e) = write::set_read(&store, msg.row_id(), read) {
         log::warn!("[store] rolling back the read flag on {msg} failed: {e:#}");
+    }
+}
+
+/// Put the `\Flagged` star back after its server op failed (#0007).
+pub(crate) fn rollback_flag(account: &str, msg: MessageRef, flagged: bool) {
+    let Some(store) = open_store(account) else {
+        return;
+    };
+    if let Err(e) = write::set_flagged(&store, msg.row_id(), flagged) {
+        log::warn!("[store] rolling back the flag on {msg} failed: {e:#}");
     }
 }
 
@@ -249,6 +303,18 @@ async fn run_imap(config: &ImapConfig, op: &ServerOp) -> Result<()> {
                 crate::imap_client::mark_unread_on_server(config, message_id, mailbox).await
             }
         }
+        ServerOp::SetFlagged {
+            message_id,
+            mailbox,
+            flagged,
+        } => {
+            let flag = crate::types::FLAG_FLAGGED;
+            if *flagged {
+                crate::imap_client::add_flag_on_server(config, message_id, mailbox, flag).await
+            } else {
+                crate::imap_client::remove_flag_on_server(config, message_id, mailbox, flag).await
+            }
+        }
     }
 }
 
@@ -265,6 +331,13 @@ async fn run_graph(config: &GraphConfig, op: &ServerOp) -> Result<()> {
         ServerOp::SetRead {
             message_id, read, ..
         } => crate::graph::mark_read_graph(config, message_id, *read).await,
+        // Graph stays seen-only (#0007): the star is parked locally, honoured
+        // by the store and the list, but never mirrored to Graph. A no-op Ok
+        // rather than an error, so the optimistic local write stands.
+        ServerOp::SetFlagged { message_id, .. } => {
+            log::debug!("[graph] flag parked locally for {message_id}; Graph is seen-only");
+            Ok(())
+        }
     }
 }
 
@@ -297,7 +370,7 @@ fn homogeneous(ops: &[ServerOp]) -> Option<Homogeneous<'_>> {
             .then_some(Homogeneous::Delete {
                 source: source_mailbox,
             }),
-        ServerOp::SetRead { .. } => None,
+        ServerOp::SetRead { .. } | ServerOp::SetFlagged { .. } => None,
     }
 }
 
@@ -305,7 +378,8 @@ fn message_id_of(op: &ServerOp) -> String {
     match op {
         ServerOp::Move { message_id, .. }
         | ServerOp::Delete { message_id, .. }
-        | ServerOp::SetRead { message_id, .. } => message_id.clone(),
+        | ServerOp::SetRead { message_id, .. }
+        | ServerOp::SetFlagged { message_id, .. } => message_id.clone(),
     }
 }
 
@@ -389,6 +463,32 @@ mod tests {
         let prepared = prepare_read_flag(&fx.store, &refs(&[id]), false, "INBOX");
         assert!(!read::find_by_id(&fx.store, id).unwrap().unwrap().is_read());
         assert!(matches!(prepared[0].op, ServerOp::SetRead { read: false, .. }));
+    }
+
+    /// The star lands on the row first and the op carries the new state and the
+    /// folder to apply it in (#0007). Flagging leaves the read bit alone.
+    #[test]
+    fn flagging_writes_the_star_and_dispatches_the_matching_server_op() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 7, "Important");
+
+        let prepared = prepare_flag(&fx.store, &refs(&[id]), true, "INBOX");
+
+        let row = read::find_by_id(&fx.store, id).unwrap().unwrap();
+        assert!(row.is_flagged());
+        assert!(!row.is_read(), "flagging must not touch the read bit");
+        assert_eq!(
+            prepared[0].op,
+            ServerOp::SetFlagged {
+                message_id: "<inbox-7@example.com>".to_string(),
+                mailbox: "INBOX".to_string(),
+                flagged: true,
+            }
+        );
+
+        let prepared = prepare_flag(&fx.store, &refs(&[id]), false, "INBOX");
+        assert!(!read::find_by_id(&fx.store, id).unwrap().unwrap().is_flagged());
+        assert!(matches!(prepared[0].op, ServerOp::SetFlagged { flagged: false, .. }));
     }
 
     /// A batch applies every row and produces one op per message, in order.
@@ -482,5 +582,6 @@ mod tests {
         assert!(prepare_move(&fx.store, &refs(&[404]), "archive", "INBOX", "Archive").is_empty());
         assert!(prepare_delete(&fx.store, &fx.blobs, &refs(&[404]), "INBOX").is_empty());
         assert!(prepare_read_flag(&fx.store, &refs(&[404]), true, "INBOX").is_empty());
+        assert!(prepare_flag(&fx.store, &refs(&[404]), true, "INBOX").is_empty());
     }
 }

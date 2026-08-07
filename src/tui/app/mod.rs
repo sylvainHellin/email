@@ -1205,6 +1205,17 @@ impl App {
         });
     }
 
+    /// Optimistically set the `\Flagged` star of one entry in both the
+    /// in-memory list and the cache slot (#0007). No-op if the message is not
+    /// in the active mailbox's list.
+    pub(crate) fn set_email_flagged(&mut self, msg: MessageRef, flagged: bool) {
+        self.with_emails_mut(|entries| {
+            if let Some(e) = entries.iter_mut().find(|e| e.msg == Some(msg)) {
+                e.flagged = flagged;
+            }
+        });
+    }
+
     /// The `MessageRef` of the cursor email, when it has a store row.
     pub fn selected_email_ref(&self) -> Option<MessageRef> {
         self.selected_email().and_then(|e| e.msg)

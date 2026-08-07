@@ -559,6 +559,16 @@ impl App {
                     self.push_action(Action::ToggleRead);
                 }
             }
+            A::ToggleFlag => {
+                self.pending_prefix = None;
+                if !self.selection.is_empty() {
+                    let msgs: Vec<MessageRef> =
+                        self.selection.iter().filter_map(|k| k.msg()).collect();
+                    self.push_action(Action::BatchToggleFlag(msgs));
+                } else {
+                    self.push_action(Action::ToggleFlag);
+                }
+            }
             A::MovePicker => {
                 self.pending_prefix = None;
                 self.open_mailbox_picker();
@@ -2168,6 +2178,7 @@ mod tests {
             read: false,
             answered: false,
             forwarded: false,
+            flagged: false,
             is_invite: false,
         }
     }

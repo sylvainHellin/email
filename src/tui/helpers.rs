@@ -558,6 +558,7 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
         read: fetched.flags.seen,
         answered: fetched.flags.answered,
         forwarded: fetched.flags.forwarded,
+        flagged: fetched.flags.flagged,
         is_invite: fetched.event.is_some(),
     }
 }

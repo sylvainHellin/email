@@ -152,6 +152,12 @@ pub struct EmailEntry {
     pub answered: bool,
     /// True when this message has been forwarded (#TKT-0051).
     pub forwarded: bool,
+    /// True when the user starred this message with `\Flagged` (#0007).
+    ///
+    /// Orthogonal to the read/answered/forwarded axis: a message can be flagged
+    /// and unread at once, so the list renders it as its own coloured marker
+    /// rather than folding it into the single status glyph.
+    pub flagged: bool,
     /// True when the message carries an iMIP payload, i.e. the store row has
     /// an `invite.ics` attachment blob (#0029, #0038 scope item 6).
     ///
@@ -372,6 +378,7 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
         read: flags.seen,
         answered: flags.answered,
         forwarded: flags.forwarded,
+        flagged: flags.flagged,
         has_attachments: row.has_attachments,
         is_invite: row.is_invite,
     }
@@ -407,6 +414,7 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
         // been answered nor forwarded, it *is* the answer.
         answered: false,
         forwarded: false,
+        flagged: false,
         has_attachments: false,
         is_invite: false,
     }
@@ -817,6 +825,14 @@ pub enum BgResult {
         new_read_state: bool,
         result: Result<String, String>,
     },
+    /// The server op of a flag/star toggle came back (#0007). Rolls both
+    /// halves back on failure, exactly as [`BgResult::ToggleRead`] does.
+    ToggleFlag {
+        account_index: usize,
+        msg: MessageRef,
+        new_flag_state: bool,
+        result: Result<String, String>,
+    },
     ServerSearch {
         result: Result<Vec<SearchHit>, String>,
     },
@@ -1194,6 +1210,11 @@ pub enum Action {
     ToggleRead,
     MarkAsRead,
     BatchToggleRead(Vec<MessageRef>),
+    /// Toggle the `\Flagged` star on the cursor message (#0007).
+    ToggleFlag,
+    /// Toggle the `\Flagged` star on the whole selection (#0007). Flagging
+    /// wins when any is unflagged, mirroring the read toggle's rule.
+    BatchToggleFlag(Vec<MessageRef>),
     /// Copy the canonical `mp://` selector of the selected entry to the system
     /// clipboard (#0050 scope item 7).
     ///

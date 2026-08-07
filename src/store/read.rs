@@ -107,6 +107,11 @@ impl MessageRow {
     pub fn is_forwarded(&self) -> bool {
         self.flags().forwarded
     }
+
+    /// True when the message carries `\Flagged`, the user's star (#0007).
+    pub fn is_flagged(&self) -> bool {
+        self.flags().flagged
+    }
 }
 
 /// The columns [`MessageRow`] needs, in the order [`row_from_sql`] reads them.
@@ -1014,6 +1019,7 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
             seen: true,
             answered: true,
             forwarded: false,
+            flagged: false,
         };
         e.has_attachments = true;
         e.attachments = vec![

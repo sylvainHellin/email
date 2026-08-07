@@ -173,6 +173,14 @@ pub fn set_read(store: &Store, id: i64, read: bool) -> Result<bool> {
     update_flags(store, id, |flags| flags.with_seen(read))
 }
 
+/// Set (or clear) `\Flagged` on a row, leaving the other bits alone (#0007).
+/// Returns true when the flags changed. The `\Flagged` star is orthogonal to
+/// the read/answered/forwarded axis, so it rides the same column through a
+/// read-modify-write rather than overwriting it.
+pub fn set_flagged(store: &Store, id: i64, flagged: bool) -> Result<bool> {
+    update_flags(store, id, |flags| flags.with_flagged(flagged))
+}
+
 /// Record that a reply to this row has gone out (#TKT-0051). Idempotent.
 pub fn set_answered(store: &Store, id: i64) -> Result<bool> {
     update_flags(store, id, |flags| MessageFlags {

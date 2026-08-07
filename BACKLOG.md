@@ -14,7 +14,6 @@ _Nothing queued; the next thing to start comes from the Next tier below._
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
-- [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature _(also owns the "list the related emails" half of #TKT-0051)_
 - [#TKT-0048 Contacts/Calendar visual polish to match overlay quality](docs/tickets/TKT-0048-views-visual-polish.md) -- feature
 
@@ -38,6 +37,7 @@ _Nothing queued; the next thing to start comes from the Next tier below._
 - [#0076 The post-send flag write opens one IMAP session per mailbox](docs/tickets/0076-post-send-flag-write-opens-a-session-per-mailbox.md) -- perf _(from the #TKT-0051 review; subsumed by #0039 if that lands first)_
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_
+- [#0079 Local filter/sort for flagged messages](docs/tickets/0079-flagged-filter.md) -- feature _(from #0007; the flag round-trip and marker shipped, the local filtered view did not)_
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
 - [#0031 iMIP cancellations/updates (CANCEL / SEQUENCE)](docs/tickets/0031-imip-cancel-update.md) -- feature
 - [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature

@@ -221,6 +221,7 @@ fn email(
         read,
         answered: false,
         forwarded: false,
+        flagged: false,
         is_invite,
     }
 }

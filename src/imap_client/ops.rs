@@ -228,6 +228,50 @@ pub async fn add_flag_on_server(
     Ok(())
 }
 
+/// Remove one flag from a message on the server, by `Message-ID` (#0007).
+///
+/// The clear half of [`add_flag_on_server`], used to unflag a message: `-FLAGS`
+/// so only the named flag is touched. A message the search does not find is not
+/// an error, same as the add: the row may have moved or been deleted elsewhere,
+/// and the next sync restates whatever the server holds either way.
+pub async fn remove_flag_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+    flag: &str,
+) -> Result<()> {
+    info!("Removing {flag} on server: Message-ID={message_id} in {mailbox}");
+    let mut session = open_imap_session(imap_config).await?;
+
+    session
+        .select(mailbox)
+        .await
+        .map_err(|e| anyhow!("Failed to select {}: {}", mailbox, e))?;
+
+    let query = message_id_search_term(message_id);
+    let uids = session
+        .uid_search(&query)
+        .await
+        .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
+
+    if uids.is_empty() {
+        session.logout().await.ok();
+        return Ok(());
+    }
+
+    let uid = *uids.iter().next().expect("uids verified non-empty");
+    session
+        .uid_store(&uid.to_string(), &format!("-FLAGS ({flag})"))
+        .await
+        .map_err(|e| anyhow!("Failed to remove the {} flag: {}", flag, e))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
+
+    session.logout().await.ok();
+    Ok(())
+}
+
 /// Mark an email as unread (remove \Seen) on the IMAP server.
 pub async fn mark_unread_on_server(
     imap_config: &ImapConfig,

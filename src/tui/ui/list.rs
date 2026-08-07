@@ -23,6 +23,12 @@ const ANSWERED_GLYPH: &str = "\u{f045a}";
 /// been forwarded (#TKT-0051).
 const FORWARDED_GLYPH: &str = "\u{f028d}";
 
+/// Nerd Font filled flag shown before the subject of a starred message
+/// (`\Flagged`, #0007). Rendered in the theme's `warning` colour so it reads
+/// as the standout marker it is, orthogonally to the status glyph (a message
+/// can be flagged and unread at once).
+const FLAG_GLYPH: &str = "\u{f024}";
+
 /// The one marker the status column shows for a message.
 ///
 /// The column is two cells wide and the axis is a set (#TKT-0051), so three
@@ -48,6 +54,32 @@ fn status_marker(email: &EmailEntry) -> Span<'static> {
     } else {
         Span::styled(" ", Style::default())
     }
+}
+
+/// The subject cell: the invite/attachment badges plus the truncated subject,
+/// with a coloured flag glyph prepended when the message is starred (#0007).
+///
+/// The flag rides its own [`Span`] so it keeps the `warning` colour on a
+/// cursor row, the same way the status marker keeps its colour; the badges and
+/// subject stay in the row's own style. When flagged, the glyph plus its space
+/// costs two columns, so the subject is truncated to what is left.
+fn subject_cell(email: &EmailEntry, width: usize) -> Cell<'static> {
+    let text = format!("{}{}", invite_and_attachment_prefix(email), email.subject);
+    match flag_span(email) {
+        Some(flag) => {
+            let body = truncate(&text, width.saturating_sub(2));
+            Cell::from(Line::from(vec![flag, Span::raw(" "), Span::raw(body)]))
+        }
+        None => Cell::from(truncate(&text, width)),
+    }
+}
+
+/// The coloured flag glyph for a starred message, or `None` for an unflagged
+/// one (#0007). Its own span so it keeps the `warning` colour on a cursor row.
+fn flag_span(email: &EmailEntry) -> Option<Span<'static>> {
+    email
+        .flagged
+        .then(|| Span::styled(FLAG_GLYPH, Style::default().fg(theme::active().warning)))
 }
 
 /// Build the subject-cell prefix: invite calendar badge (if any) followed by
@@ -196,13 +228,6 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 let is_cursor = i == app.list_index;
                 let is_in_selection = has_selection && app.is_selected(email);
                 let contact = truncate(email.display_contact(app.active_kind()), contact_width);
-                // Invite badge (calendar glyph) is distinct from the
-                // attachment paperclip; an invite may also have attachments.
-                let subject_prefix = invite_and_attachment_prefix(email);
-                let subject = truncate(
-                    &format!("{}{}", subject_prefix, email.subject),
-                    subject_width,
-                );
 
                 let style = row_style(is_cursor, is_in_selection, email.read);
 
@@ -219,7 +244,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 cells.push(Cell::from(status_marker(email)));
                 cells.push(Cell::from(email.date_display.clone()));
                 cells.push(Cell::from(contact));
-                cells.push(Cell::from(subject));
+                // Invite/attachment badges, subject, and the flag star (#0007).
+                cells.push(subject_cell(email, subject_width));
 
                 Row::new(cells).style(style)
             })
@@ -270,11 +296,6 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
             .map(|(i, email)| {
                 let is_cursor = i == app.list_index;
                 let is_in_selection = has_selection && app.is_selected(email);
-                let subject_prefix = invite_and_attachment_prefix(email);
-                let subject = truncate(
-                    &format!("{}{}", subject_prefix, email.subject),
-                    subject_width,
-                );
 
                 let style = row_style(is_cursor, is_in_selection, email.read);
 
@@ -290,7 +311,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 // Read/answered/forwarded indicator (#TKT-0051).
                 cells.push(Cell::from(status_marker(email)));
                 cells.push(Cell::from(email.date_display.clone()));
-                cells.push(Cell::from(subject));
+                // Subject with badges and the flag star (#0007).
+                cells.push(subject_cell(email, subject_width));
 
                 Row::new(cells).style(style)
             })
@@ -332,7 +354,7 @@ mod badge_tests {
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
             has_attachments: has_att, read: false, answered: false, forwarded: false,
-            is_invite,
+            flagged: false, is_invite,
         }
     }
 
@@ -372,6 +394,22 @@ mod badge_tests {
         assert_eq!(marker(true, true, true), ANSWERED_GLYPH);
         assert_eq!(marker(true, false, true), FORWARDED_GLYPH);
         assert_eq!(marker(true, false, false), " ");
+    }
+
+    /// The flag star is orthogonal to the status axis (#0007): it shows for a
+    /// starred message whether it is read or unread, in the theme's warning
+    /// colour, and is absent otherwise.
+    #[test]
+    fn the_flag_star_shows_for_a_starred_message_in_its_own_colour() {
+        let mut e = entry(false, false);
+        assert!(flag_span(&e).is_none(), "an unflagged row has no star");
+        e.flagged = true;
+        let star = flag_span(&e).expect("a flagged row shows the star");
+        assert_eq!(star.content, FLAG_GLYPH);
+        assert_eq!(star.style.fg, Some(theme::active().warning));
+        // Orthogonal to the read axis: still starred once read.
+        e.read = true;
+        assert!(flag_span(&e).is_some());
     }
 
     /// Each glyph carries its own colour slot, so a theme can tell the three

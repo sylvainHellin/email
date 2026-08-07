@@ -9,9 +9,9 @@ use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail
 use crate::timing::TimingSpan;
 use crate::types::MessageFlags;
 
-/// The second status axis as the server states it (#TKT-0051): `\Seen`,
-/// `\Answered` and the `$Forwarded` keyword, read off one `FETCH FLAGS`
-/// response.
+/// The status axes as the server states them: `\Seen`, `\Answered` and the
+/// `$Forwarded` keyword (#TKT-0051), plus `\Flagged` (#0007), read off one
+/// `FETCH FLAGS` response.
 ///
 /// A keyword arrives as [`async_imap::types::Flag::Custom`], so it goes
 /// through [`MessageFlags::parse`] rather than a match arm, which is also what
@@ -22,6 +22,7 @@ fn flags_of(msg: &async_imap::types::Fetch) -> MessageFlags {
         match flag {
             async_imap::types::Flag::Seen => out.seen = true,
             async_imap::types::Flag::Answered => out.answered = true,
+            async_imap::types::Flag::Flagged => out.flagged = true,
             async_imap::types::Flag::Custom(name) => {
                 out.forwarded |= MessageFlags::parse(&name).forwarded;
             }

@@ -67,12 +67,19 @@ pub struct MessageFlags {
     pub seen: bool,
     pub answered: bool,
     pub forwarded: bool,
+    /// The `\Flagged` system flag: the user marked this message important
+    /// (#0007). Orthogonal to the read/answered/forwarded history, since a
+    /// message can be flagged and unread at once, which is why it is a fourth
+    /// bit rather than a fourth value of a collapsed state.
+    pub flagged: bool,
 }
 
 /// The `\Seen` token, as stored and as IMAP spells it.
 pub const FLAG_SEEN: &str = "\\Seen";
 /// The `\Answered` token.
 pub const FLAG_ANSWERED: &str = "\\Answered";
+/// The `\Flagged` system flag, IMAP's star (#0007).
+pub const FLAG_FLAGGED: &str = "\\Flagged";
 /// The forwarded keyword. `$Forwarded` is the registered spelling (RFC 5788)
 /// and what Thunderbird, Apple Mail and Dovecot use; `\Forwarded` is read back
 /// as the same thing because a few servers hand it over that way, but it is
@@ -89,7 +96,7 @@ impl MessageFlags {
     }
 
     /// Read a stored (or server-sent) flag string. Unknown tokens are ignored:
-    /// the column is not the client's to curate, and `\Flagged` is #0007.
+    /// the column is not the client's to curate.
     pub fn parse(flags: &str) -> Self {
         let mut out = MessageFlags::default();
         for token in flags.split_whitespace() {
@@ -97,6 +104,8 @@ impl MessageFlags {
                 out.seen = true;
             } else if token.eq_ignore_ascii_case(FLAG_ANSWERED) {
                 out.answered = true;
+            } else if token.eq_ignore_ascii_case(FLAG_FLAGGED) {
+                out.flagged = true;
             } else if token.eq_ignore_ascii_case(FLAG_FORWARDED)
                 || token.eq_ignore_ascii_case("\\Forwarded")
             {
@@ -110,12 +119,15 @@ impl MessageFlags {
     /// so an unchanged flag set compares equal as a string and the `IFNULL(flags,
     /// '') <> ?` guard in the store keeps meaning "actually changed".
     pub fn to_flag_string(self) -> String {
-        let mut out: Vec<&str> = Vec::with_capacity(3);
+        let mut out: Vec<&str> = Vec::with_capacity(4);
         if self.seen {
             out.push(FLAG_SEEN);
         }
         if self.answered {
             out.push(FLAG_ANSWERED);
+        }
+        if self.flagged {
+            out.push(FLAG_FLAGGED);
         }
         if self.forwarded {
             out.push(FLAG_FORWARDED);
@@ -123,11 +135,17 @@ impl MessageFlags {
         out.join(" ")
     }
 
-    /// This set with the read bit replaced, the other two untouched. What the
+    /// This set with the read bit replaced, the others untouched. What the
     /// Graph path and the read/unread toggle apply, so neither can clobber a
     /// history bit it knows nothing about.
     pub fn with_seen(self, seen: bool) -> Self {
         MessageFlags { seen, ..self }
+    }
+
+    /// This set with the `\Flagged` bit replaced, the others untouched. What
+    /// the flag/star toggle applies (#0007).
+    pub fn with_flagged(self, flagged: bool) -> Self {
+        MessageFlags { flagged, ..self }
     }
 }
 
@@ -375,8 +393,9 @@ mod tests {
             seen: true,
             answered: true,
             forwarded: true,
+            flagged: true,
         };
-        assert_eq!(all.to_flag_string(), "\\Seen \\Answered $Forwarded");
+        assert_eq!(all.to_flag_string(), "\\Seen \\Answered \\Flagged $Forwarded");
         assert_eq!(MessageFlags::parse(&all.to_flag_string()), all);
         assert_eq!(MessageFlags::default().to_flag_string(), "");
         assert_eq!(MessageFlags::parse(""), MessageFlags::default());
@@ -389,15 +408,30 @@ mod tests {
         assert_eq!(MessageFlags::parse("\\Seen"), MessageFlags::seen(true));
     }
 
-    /// Flags this build does not own are not the client's to curate: `\Flagged`
-    /// is #0007 and must survive being read past, not be misread as something
+    /// Flags this build does not own are not the client's to curate: `\Draft`
+    /// and `\Recent` must survive being read past, not be misread as something
     /// else.
     #[test]
     fn unknown_flags_are_ignored_rather_than_guessed_at() {
         assert_eq!(
-            MessageFlags::parse("\\Flagged \\Draft \\Recent"),
+            MessageFlags::parse("\\Draft \\Recent"),
             MessageFlags::default()
         );
+    }
+
+    /// `\Flagged` is the star (#0007): it parses to the flagged bit, round-trips
+    /// through the stored string, and rides beside the read bit without
+    /// disturbing it.
+    #[test]
+    fn the_flagged_bit_parses_and_round_trips() {
+        assert!(MessageFlags::parse("\\Flagged").flagged);
+        let flagged = MessageFlags::default().with_flagged(true);
+        assert_eq!(flagged.to_flag_string(), "\\Flagged");
+        assert_eq!(MessageFlags::parse(&flagged.to_flag_string()), flagged);
+        let seen_flagged = MessageFlags::seen(true).with_flagged(true);
+        assert!(seen_flagged.seen && seen_flagged.flagged);
+        assert!(!seen_flagged.with_flagged(false).flagged);
+        assert!(seen_flagged.with_flagged(false).seen);
     }
 
     /// Servers disagree on the spelling of the forwarded keyword; both are
@@ -425,6 +459,7 @@ mod tests {
             seen: true,
             answered: true,
             forwarded: false,
+            flagged: false,
         };
         let unread = answered.with_seen(false);
         assert!(!unread.seen);

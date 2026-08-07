@@ -1279,6 +1279,7 @@ fn the_answered_and_forwarded_flags_reach_the_row_and_the_read_path() {
         seen: true,
         answered: true,
         forwarded: true,
+        flagged: false,
     };
     let outcome = f.ingest("inbox", 11, &message, None);
 
@@ -1300,6 +1301,7 @@ fn an_imap_pass_replaces_the_whole_flag_set() {
         seen: true,
         answered: true,
         forwarded: false,
+        flagged: false,
     };
     f.ingest("inbox", 21, &message, None);
 
@@ -1313,6 +1315,7 @@ fn an_imap_pass_replaces_the_whole_flag_set() {
                 seen: true,
                 answered: false,
                 forwarded: true,
+                flagged: false,
             },
         )],
     );
@@ -1332,6 +1335,7 @@ fn a_graph_pass_updates_the_read_bit_without_erasing_the_history_bits() {
         seen: false,
         answered: true,
         forwarded: true,
+        flagged: false,
     };
     let uid = mailypoppins::ingest::graph_uid("<graph-answered@example.com>");
     f.ingest("inbox", uid, &message, None);

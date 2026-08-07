@@ -1454,6 +1454,35 @@ pub(super) fn handle_action(
             }
         }
 
+        Action::ToggleFlag => {
+            if let Some(email) = app.selected_email() {
+                let new_flag = !email.flagged;
+                let Some(msg) = email.msg else {
+                    return Ok(());
+                };
+                let label = if new_flag { "Flagged" } else { "Unflagged" };
+                if set_flag(app, bg_tx, vec![msg], new_flag) {
+                    app.set_status(label.to_string());
+                }
+            }
+        }
+
+        Action::BatchToggleFlag(msgs) => {
+            let any_unflagged = msgs
+                .iter()
+                .any(|m| app.emails.iter().any(|e| e.msg == Some(*m) && !e.flagged));
+            let new_flag = any_unflagged;
+            let count = msgs.len();
+            if set_flag(app, bg_tx, msgs, new_flag) {
+                app.selection.clear();
+                app.set_status(if new_flag {
+                    format!("Flagged {count}")
+                } else {
+                    format!("Unflagged {count}")
+                });
+            }
+        }
+
         Action::CopyMessageRef => match selected_selector(app) {
             Some(selector) => {
                 let text = selector.to_string();
@@ -2706,6 +2735,48 @@ fn set_read_flag(
     true
 }
 
+/// Set the `\Flagged` star on one or many messages: store row first, then the
+/// server (#0007). Modelled on [`set_read_flag`]; both halves are rolled back
+/// together by the `BgResult::ToggleFlag` handler when the server refuses.
+fn set_flag(
+    app: &mut App,
+    bg_tx: &mpsc::Sender<BgResult>,
+    msgs: Vec<MessageRef>,
+    flagged: bool,
+) -> bool {
+    let server_mailbox = app.active_server_mailbox();
+    let Some(backend) = backend_for_mutation(app) else {
+        return false;
+    };
+    let Some((store, _blobs)) = store_for_mutation(app, "Flag") else {
+        return false;
+    };
+    let prepared = mutations::prepare_flag(&store, &msgs, flagged, &server_mailbox);
+    drop(store);
+    if prepared.is_empty() {
+        return false;
+    }
+
+    for prep in &prepared {
+        app.set_email_flagged(prep.msg(), flagged);
+    }
+
+    let acct_idx = app.active_account;
+    let account = app.account_config.name.clone();
+    // A flag does not block a fetch the way a move does, so it stays off
+    // `bg_mutations`, exactly like the read toggle.
+    app.bg_count += prepared.len();
+    dispatch(account, backend, prepared, bg_tx.clone(), move |prep, result| {
+        BgResult::ToggleFlag {
+            account_index: acct_idx,
+            msg: prep.msg(),
+            new_flag_state: flagged,
+            result,
+        }
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2726,6 +2797,7 @@ mod tests {
             read: false,
             answered: false,
             forwarded: false,
+            flagged: false,
             is_invite,
         }
     }
@@ -3361,6 +3433,7 @@ mod store_backed_mutations {
             read: true,
             answered: false,
             forwarded: false,
+            flagged: false,
             is_invite: false,
         }
     }
@@ -3637,6 +3710,7 @@ mod store_backed_files {
             read: true,
             answered: false,
             forwarded: false,
+            flagged: false,
             is_invite: false,
         }]);
         app.rebuild_visible();
@@ -3713,6 +3787,7 @@ mod store_backed_files {
             read: true,
             answered: false,
             forwarded: false,
+            flagged: false,
             is_invite: false,
         }]);
         app.rebuild_visible();

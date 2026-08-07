@@ -374,6 +374,30 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             }
         }
 
+        BgResult::ToggleFlag { account_index, msg, new_flag_state, result } => {
+            // Like ToggleRead, a flag does not block fetch/sync, so it never
+            // touches bg_mutations.
+            match result {
+                Ok(_) => { /* Server confirmed, local already updated optimistically */ }
+                Err(e) => {
+                    // Roll back both halves: the store row that carries the
+                    // star, and the in-memory list the user is looking at.
+                    let reverted = !new_flag_state;
+                    let account = app
+                        .accounts
+                        .get(account_index)
+                        .map(|a| a.account_config.name.clone());
+                    if let Some(account) = account {
+                        super::mutations::rollback_flag(&account, msg, reverted);
+                    }
+                    if account_index == app.active_account {
+                        app.set_email_flagged(msg, reverted);
+                    }
+                    app.push_status(format!("Flag sync failed: {e}"), StatusLevel::Warning);
+                }
+            }
+        }
+
         BgResult::MailboxLoaded { account_index, mailbox_idx, generation, entries } => {
             if !mailbox_loaded_is_current(
                 app.active_account,

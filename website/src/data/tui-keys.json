@@ -42,6 +42,7 @@
       { "key": "a", "action": "Archive" },
       { "key": "d", "action": "Delete" },
       { "key": "m", "action": "Toggle read/unread" },
+      { "key": "*", "action": "Toggle flag/star" },
       { "key": "M", "action": "Move to mailbox (fuzzy picker)" },
       { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
       { "key": "A", "action": "Approve draft" },

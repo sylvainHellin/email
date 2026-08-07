@@ -40,8 +40,8 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 34 |╰──────────────────────────────────│  a           Archive                           │                                  │
 35 |╭ View ────────────────────────────│  d           Delete                            │                                  │
 36 |│     mail  |  contacts  |  calenda│  m           Toggle read/unread                │                                  │
-37 |╰──────────────────────────────────│  M           Move to mailbox (fuzzy picker)    │──────────────────────────────────╯
-38 | HELP                              ╰─────────────────── 1-36/94 ────────────────────╯
+37 |╰──────────────────────────────────│  *           Toggle flag/star                  │──────────────────────────────────╯
+38 | HELP                              ╰─────────────────── 1-36/95 ────────────────────╯
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 02 |bold@36..44

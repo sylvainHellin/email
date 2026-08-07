@@ -30,9 +30,10 @@
 //!   missing or unparseable. The file build had a filename-derived fallback in
 //!   between; see the allow-list.
 //! - `flags`: sorted, deduplicated state tokens from the closed set
-//!   `answered`, `approved`, `draft`, `forwarded`, `seen`. `seen`, `answered`
-//!   and `forwarded` are the three bits of the second status axis
-//!   (#TKT-0051), read out of `messages.flags` (`\Seen`, `\Answered`,
+//!   `answered`, `approved`, `draft`, `flagged`, `forwarded`, `seen`. `seen`,
+//!   `answered` and `forwarded` are the three bits of the second status axis
+//!   (#TKT-0051), and `flagged` is the `\Flagged` star (#0007), all read out
+//!   of `messages.flags` (`\Seen`, `\Answered`, `\Flagged`,
 //!   `$Forwarded`). `draft` and `approved` cannot occur on a `messages`
 //!   row: drafts are local files in the `drafts` index, permanently outside
 //!   this table and outside the dump contract (see the allow-list).
@@ -193,6 +194,9 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
     }
     if axis.forwarded {
         flags.insert("forwarded".to_string());
+    }
+    if axis.flagged {
+        flags.insert("flagged".to_string());
     }
     // `draft` and `approved` were frontmatter `status:` values. Nothing writes
     // them to a `messages` row: drafts live in the `drafts` index, outside
