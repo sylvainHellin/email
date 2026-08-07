@@ -129,10 +129,10 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
 
 /// Every message in one mailbox, newest first.
 ///
-/// `mailbox` is the role or slug ingest recorded (`inbox`, `sent`, `archive`,
-/// or the slugified name of an extra mailbox), which is the same leaf
-/// `config::mailbox_dir` builds. A mailbox that was never synced returns an
-/// empty list, not an error: it is a mailbox with no mail yet.
+/// `mailbox` is the [`crate::types::MailboxRole`] key ingest recorded:
+/// `inbox`, `sent`, `archive`, or the server name of an extra mailbox. A
+/// mailbox that was never synced returns an empty list, not an error: it is a
+/// mailbox with no mail yet.
 pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<MessageRow>> {
     let columns = row_columns();
     let sql = format!(

@@ -11,7 +11,7 @@ pub use keymap::{
 pub use types::*;
 
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::store::open_store;
@@ -677,8 +677,24 @@ impl App {
         self.pending_prefix
     }
 
-    pub fn active_dir(&self) -> Option<&PathBuf> {
-        self.mailboxes.get(self.active_mailbox).map(|m| &m.dir)
+    /// The local directory of the active mailbox, which only Drafts has.
+    ///
+    /// Drafts are the one local-only thing in the product: `.md` files an
+    /// agent or `$EDITOR` writes. Every other mailbox is store rows and has no
+    /// directory to return -- the tree the sidebar used to point at was
+    /// deleted at the store cutover (#0064).
+    pub fn active_drafts_dir(&self) -> Option<PathBuf> {
+        match self.mailboxes.get(self.active_mailbox)?.kind {
+            MailboxKind::Drafts => Some(self.drafts_dir()),
+            _ => None,
+        }
+    }
+
+    /// Where this account's drafts live.
+    pub fn drafts_dir(&self) -> PathBuf {
+        self.drafts_dir
+            .clone()
+            .unwrap_or_else(|| crate::config::drafts_dir(self.account_name()))
     }
 
     pub fn active_server_mailbox(&self) -> String {
@@ -711,8 +727,6 @@ impl App {
             .filter(|m| m.server_name.is_some())
             .map(|m| SearchTarget {
                 server_name: m.server_name.clone().expect("filtered for is_some"),
-                local_dir: m.dir.clone(),
-                status: kind_to_status(m.kind),
                 label: m.label.clone(),
             })
             .collect()
@@ -731,15 +745,9 @@ impl App {
             .and_then(|m| {
                 Some(SearchTarget {
                     server_name: m.server_name.clone()?,
-                    local_dir: m.dir.clone(),
-                    status: kind_to_status(m.kind),
                     label: m.label.clone(),
                 })
             })
-    }
-
-    pub fn mailbox_index_for_dir(&self, dir: &Path) -> Option<usize> {
-        self.mailboxes.iter().position(|m| m.dir == dir)
     }
 
     pub fn find_mailbox_by_kind(&self, kind: MailboxKind) -> Option<usize> {

@@ -925,7 +925,14 @@ pub(super) fn handle_action(
             // [`crate::send::send_draft`], which owns the outbox commit, the
             // transport choice and the draft file's fate. What is counted
             // here is only how many made it.
-            let Some(dir) = app.active_dir().cloned() else {
+            // Only the Drafts mailbox has a directory to scan; from anywhere
+            // else the answer is the one the old directory walk gave, without
+            // walking a tree that has not existed since the store cutover.
+            let Some(dir) = app.active_drafts_dir() else {
+                app.set_status_level(
+                    "No approved emails found".to_string(),
+                    StatusLevel::Success,
+                );
                 return Ok(());
             };
             // A Graph account sends over Graph or not at all: an SMTP config
@@ -1006,11 +1013,7 @@ pub(super) fn handle_action(
                 .format("draft-%Y%m%d-%H%M%S")
                 .to_string();
             let file_name = format!("{name}.md");
-            let dir = app
-                .find_mailbox_by_kind(MailboxKind::Drafts)
-                .map(|i| app.mailboxes[i].dir.clone())
-                .or_else(|| app.drafts_dir.clone())
-                .unwrap_or_else(|| PathBuf::from("."));
+            let dir = app.drafts_dir();
             let path = dir.join(&file_name);
 
             if path.exists() {
@@ -1778,11 +1781,7 @@ fn send_contact_as_vcard(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     contact: &crate::contacts::Contact,
 ) -> Result<()> {
-    let dir = app
-        .find_mailbox_by_kind(MailboxKind::Drafts)
-        .map(|i| app.mailboxes[i].dir.clone())
-        .or_else(|| app.drafts_dir.clone())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = app.drafts_dir();
 
     // Write the .vcf into a sidecar dir beside the drafts so it is stable and
     // out of the mailbox listing (which only reads `*.md`).
@@ -2035,11 +2034,7 @@ fn submit_compose_wizard(
 }
 
 fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<PathBuf> {
-    let dir = app
-        .find_mailbox_by_kind(MailboxKind::Drafts)
-        .map(|i| app.mailboxes[i].dir.clone())
-        .or_else(|| app.drafts_dir.clone())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = app.drafts_dir();
     std::fs::create_dir_all(&dir)?;
 
     let default_from = app

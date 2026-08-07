@@ -13,9 +13,9 @@
 //! line, LF-terminated, compact):
 //!
 //! - `account`: account name as configured in `[[accounts]]`.
-//! - `mailbox`: the role or slugified server name (`inbox`, `drafts`, `sent`,
-//!   `archive`, or the slug of an `extra` mailbox), i.e. `messages.mailbox`,
-//!   which is the same leaf `config::mailbox_dir` builds. Never a path.
+//! - `mailbox`: the role or server name (`inbox`, `drafts`, `sent`, `archive`,
+//!   or the server name of an `extra` mailbox), i.e. `messages.mailbox` and
+//!   the mailbox segment of an `mp://` selector. Never a path.
 //! - `message_id`: `messages.message_id`, angle brackets included. See the
 //!   allow-list ([docs/dump-allow-list.md](../docs/dump-allow-list.md)): the
 //!   file build recorded `null` for mail with no `Message-ID:` header, while
@@ -105,8 +105,8 @@ pub fn collect_records(accounts: &[AccountConfig], mailbox_filter: &[String]) ->
         let selected: Vec<String> = build_mailboxes(account)
             .into_iter()
             .filter_map(|mailbox| {
-                let id = mailbox_id(&mailbox.dir);
-                mailbox_selected(&id, &mailbox.label, mailbox_filter).then_some(id)
+                mailbox_selected(&mailbox.id, &mailbox.label, mailbox_filter)
+                    .then_some(mailbox.id)
             })
             .collect();
 
@@ -155,12 +155,6 @@ fn sort_key(record: &EnvelopeRecord, row: &MessageRow) -> SortKey {
         record.subject.clone().unwrap_or_default(),
         row.uid,
     )
-}
-
-/// The mailbox identifier: the directory leaf that `config::mailbox_dir`
-/// builds (`inbox`, `sent`, or a slugified server name). A name, not a path.
-fn mailbox_id(dir: &Path) -> String {
-    dir.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 fn mailbox_selected(id: &str, label: &str, filter: &[String]) -> bool {
@@ -226,14 +220,6 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// parity: the mailbox id is the directory leaf, which is the role or the
-    /// slug the config builds, never a path.
-    #[test]
-    fn mailbox_id_is_the_directory_leaf() {
-        assert_eq!(mailbox_id(Path::new("/data/accounts/tum/inbox")), "inbox");
-        assert_eq!(mailbox_id(Path::new("/data/accounts/tum/some-folder")), "some-folder");
-    }
 
     /// parity: an empty filter selects everything; a non-empty one matches the
     /// id or the sidebar label, case-insensitively.

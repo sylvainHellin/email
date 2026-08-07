@@ -27,14 +27,17 @@ use crate::ingest::{self, IngestInput, MailboxCursor};
 use crate::parse::parse_rfc822_to_fetched_email;
 use crate::store::{BlobStore, Store};
 use crate::timing::TimingSpan;
+use crate::types::MailboxRole;
 
 /// A mailbox to sync: the configured role and the name on the server.
 ///
 /// The local directory and `.md` status the old struct carried are gone: the
-/// ingest path has no filesystem destination.
+/// ingest path has no filesystem destination. The role is a [`MailboxRole`]
+/// rather than a bare string, so `--mailbox INBOX` and the configured inbox
+/// are the same target and file their rows under one key (#0064).
 #[derive(Debug, Clone)]
 pub struct SyncTarget {
-    pub role: String,
+    pub role: MailboxRole,
     pub server_name: String,
 }
 
@@ -42,8 +45,8 @@ pub struct SyncTarget {
 /// Consumed by the contacts-index hook after a successful sync.
 #[derive(Debug, Clone)]
 pub struct FreshObservation {
-    /// Mailbox role: "inbox", "archive", "sent", or "extra".
-    pub role: String,
+    /// The mailbox the message was ingested into.
+    pub role: MailboxRole,
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
@@ -106,13 +109,13 @@ pub async fn sync_mailboxes(
     let mut result = SyncResult::default();
     // Every prune this run will apply, collected here and applied after the
     // loop: see the second pass below for why it cannot run per target.
-    let mut prunes: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut prunes: Vec<(MailboxRole, Vec<u32>)> = Vec::new();
 
     for target in targets {
         // The skip list travels with the UIDVALIDITY it was recorded under, so
         // the fetch can throw it away when the server has renumbered; carrying
         // it across a reset would skip bodies that were never downloaded.
-        let known = ingest::known_uids_with_cursor(&store, account_name, &target.role)?;
+        let known = ingest::known_uids_with_cursor(&store, account_name, target.role.as_str())?;
         let fetched =
             fetch_new_raw_on_session(&mut session, &target.server_name, Some(limit), known).await;
 
@@ -153,7 +156,7 @@ pub async fn sync_mailboxes(
                 &blobs,
                 &IngestInput {
                     account: account_name,
-                    mailbox: &target.role,
+                    mailbox: target.role.as_str(),
                     uid: message.uid as i64,
                     email: &email,
                     raw: Some(&message.raw),
@@ -167,7 +170,7 @@ pub async fn sync_mailboxes(
                     if outcome.uid_rebound {
                         result.uid_rebound += 1;
                     }
-                    if outcome.inserted && target.role.eq_ignore_ascii_case("inbox") {
+                    if outcome.inserted && target.role.is_inbox() {
                         result.new_inbox_mail.push(crate::notify::NewMailMeta::new(
                             &email.from,
                             &email.subject,
@@ -191,7 +194,7 @@ pub async fn sync_mailboxes(
         result.read_updated += ingest::apply_seen_flags(
             &store,
             account_name,
-            &target.role,
+            target.role.as_str(),
             fetched
                 .known_flags
                 .into_iter()
@@ -209,7 +212,7 @@ pub async fn sync_mailboxes(
         ingest::record_mailbox_cursor(
             &store,
             account_name,
-            &target.role,
+            target.role.as_str(),
             &MailboxCursor {
                 uidvalidity: state.uid_validity.map(|v| v as i64),
                 last_uid: highest_uid.or_else(|| state.uid_next.map(|n| n as i64 - 1)),
@@ -233,7 +236,8 @@ pub async fn sync_mailboxes(
     // locally until a later sync. Applying the prunes here means the
     // destination row already exists when the source row goes.
     for (role, vanished) in &prunes {
-        result.pruned += ingest::prune_vanished(&store, &blobs, account_name, role, vanished);
+        result.pruned +=
+            ingest::prune_vanished(&store, &blobs, account_name, role.as_str(), vanished);
     }
     span.mark("prune");
 

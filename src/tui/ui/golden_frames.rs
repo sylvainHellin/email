@@ -25,7 +25,6 @@
 //! tweak and teach the reader to approve diffs blindly.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use insta::assert_snapshot;
@@ -185,7 +184,7 @@ fn mailbox(label: &str, icon: &'static str, kind: MailboxKind) -> MailboxInfo {
     MailboxInfo {
         label: label.to_string(),
         icon,
-        dir: PathBuf::from(format!("/fixture/{}", label.to_lowercase())),
+        id: label.to_lowercase(),
         kind,
         server_name: None,
     }

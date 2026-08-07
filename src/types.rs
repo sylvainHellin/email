@@ -20,14 +20,20 @@ pub(crate) fn collapse_hyphens(input: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// The three states a draft moves through: written, approved, submitted.
+///
+/// It is a *draft* state and nothing else. The `Inbox` and `Archived` variants
+/// it used to carry described where a `.md` file sat in the mailbox tree the
+/// store cutover deleted, and no draft was ever written with one; the status a
+/// received message shows in the headers pane is derived from the mailbox it
+/// was listed from instead (`tui::app::status_for_mailbox`), which is now the
+/// only place that derivation happens (#0064).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EmailStatus {
     Draft,
     Approved,
     Sent,
-    Inbox,
-    Archived,
 }
 
 impl std::fmt::Display for EmailStatus {
@@ -36,9 +42,79 @@ impl std::fmt::Display for EmailStatus {
             EmailStatus::Draft => write!(f, "draft"),
             EmailStatus::Approved => write!(f, "approved"),
             EmailStatus::Sent => write!(f, "sent"),
-            EmailStatus::Inbox => write!(f, "inbox"),
-            EmailStatus::Archived => write!(f, "archived"),
         }
+    }
+}
+
+/// The role a mailbox plays for an account, and the key its messages carry in
+/// the `messages.mailbox` column.
+///
+/// Three roles are mapped in config and named by the product (`inbox`,
+/// `archive`, `sent`); every other configured mailbox is
+/// [`MailboxRole::Other`] and keeps its server name. The string form is
+/// canonical: it is what ingest writes, what the `mp://<account>/<mailbox>/<key>`
+/// selector carries, and what the sidebar counts group by.
+///
+/// Parsing is case-insensitive on the three named roles, which is what the
+/// half-dozen `eq_ignore_ascii_case("inbox")` comparisons this type replaced
+/// were each doing locally (#0064). `mp sync --mailbox INBOX` therefore files
+/// its rows under `inbox`, where the sidebar and the selector look for them,
+/// instead of under a second `INBOX` key nothing lists.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MailboxRole {
+    Inbox,
+    Archive,
+    Sent,
+    /// A configured mailbox with no product role, keyed by its server name.
+    ///
+    /// The name is kept verbatim, because it is the key its rows already carry
+    /// in the store; a mailbox whose server name happens to spell one of the
+    /// three roles is the one place where reading a stored key back yields the
+    /// role rather than this arm, and it costs nothing: config resolves that
+    /// name to the mapped mailbox either way.
+    Other(String),
+}
+
+impl MailboxRole {
+    /// The canonical key: what the store holds and what selectors print.
+    pub fn as_str(&self) -> &str {
+        match self {
+            MailboxRole::Inbox => "inbox",
+            MailboxRole::Archive => "archive",
+            MailboxRole::Sent => "sent",
+            MailboxRole::Other(name) => name,
+        }
+    }
+
+    pub fn is_inbox(&self) -> bool {
+        matches!(self, MailboxRole::Inbox)
+    }
+
+    pub fn is_sent(&self) -> bool {
+        matches!(self, MailboxRole::Sent)
+    }
+}
+
+impl From<&str> for MailboxRole {
+    fn from(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "inbox" => MailboxRole::Inbox,
+            "archive" => MailboxRole::Archive,
+            "sent" => MailboxRole::Sent,
+            _ => MailboxRole::Other(name.to_string()),
+        }
+    }
+}
+
+impl From<String> for MailboxRole {
+    fn from(name: String) -> Self {
+        MailboxRole::from(name.as_str())
+    }
+}
+
+impl std::fmt::Display for MailboxRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -184,13 +260,7 @@ mod tests {
 
     #[test]
     fn test_email_status_serde_roundtrip() {
-        for status in [
-            EmailStatus::Draft,
-            EmailStatus::Approved,
-            EmailStatus::Sent,
-            EmailStatus::Inbox,
-            EmailStatus::Archived,
-        ] {
+        for status in [EmailStatus::Draft, EmailStatus::Approved, EmailStatus::Sent] {
             let yaml = serde_yaml::to_string(&status).unwrap();
             let back: EmailStatus = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(back, status);
@@ -202,8 +272,42 @@ mod tests {
         assert_eq!(EmailStatus::Draft.to_string(), "draft");
         assert_eq!(EmailStatus::Approved.to_string(), "approved");
         assert_eq!(EmailStatus::Sent.to_string(), "sent");
-        assert_eq!(EmailStatus::Inbox.to_string(), "inbox");
-        assert_eq!(EmailStatus::Archived.to_string(), "archived");
+    }
+
+    /// The file-era placement states are gone from the type, so a draft that
+    /// carries one is a draft this build refuses to read rather than one it
+    /// silently reinterprets. Nothing writes them: the receive path stopped
+    /// writing `.md` at the store cutover, and no draft was ever created with
+    /// one (#0064).
+    #[test]
+    fn the_file_era_placement_states_no_longer_deserialize() {
+        for legacy in ["inbox", "archived"] {
+            let parsed: Result<EmailStatus, _> = serde_yaml::from_str(legacy);
+            assert!(parsed.is_err(), "'{legacy}' is not a draft state");
+        }
+    }
+
+    #[test]
+    fn the_named_roles_parse_in_any_case_and_print_canonically() {
+        for spelling in ["inbox", "INBOX", "Inbox"] {
+            assert_eq!(MailboxRole::from(spelling), MailboxRole::Inbox);
+        }
+        assert_eq!(MailboxRole::from("Archive"), MailboxRole::Archive);
+        assert_eq!(MailboxRole::from("SENT"), MailboxRole::Sent);
+        assert_eq!(MailboxRole::Inbox.to_string(), "inbox");
+        assert_eq!(MailboxRole::Archive.as_str(), "archive");
+        assert_eq!(MailboxRole::Sent.as_str(), "sent");
+    }
+
+    /// An unmapped mailbox keeps its server name verbatim: that name is the
+    /// store key its rows already carry, so folding its case would orphan them.
+    #[test]
+    fn an_unmapped_mailbox_keeps_its_server_name() {
+        let role = MailboxRole::from("INBOX.Archive");
+        assert_eq!(role, MailboxRole::Other("INBOX.Archive".to_string()));
+        assert_eq!(role.as_str(), "INBOX.Archive");
+        assert!(!role.is_inbox());
+        assert!(!role.is_sent());
     }
 
     #[test]

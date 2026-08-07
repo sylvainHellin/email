@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **A mailbox is identified by its role, not by a directory path (#0064).**
+  The types still described a filesystem namespace the store cutover deleted: a
+  sidebar mailbox carried a `PathBuf`, the role was a bare string compared
+  case-insensitively in half a dozen places, and `EmailStatus` carried `inbox`
+  and `archived` variants that were file placement states rather than draft
+  states. There is now one `MailboxRole` type (`inbox`, `archive`, `sent`, or
+  an unmapped mailbox holding its server name), the sidebar carries the store
+  key itself, and `status:` in a draft is one of `draft`, `approved` or `sent`
+  and nothing else. `mp sync --mailbox INBOX` files its rows under `inbox`,
+  where the sidebar and the selectors look for them, instead of under a second
+  `INBOX` key nothing lists.
+
+  One real bug falls out of the merge. The sidebar built its store key by
+  slugifying the server name of an `[[mailboxes.extra]]` mailbox while sync
+  ingested that mailbox under the server name verbatim, so an extra mailbox
+  named `Team/Reports` listed empty, counted zero, and swallowed any message
+  quick-moved into it under a key sync never reads. Both sides now use the one
+  key. For anyone with such a mailbox this changes the mailbox segment of its
+  `mp://` selectors and of `mp dump-mailbox --json` from the slug to the server
+  name, and `--mailbox <slug>` no longer selects it; the server name and the
+  sidebar label both do.
+
+  A `.md` file whose frontmatter says `status: inbox` or `status: archived` no
+  longer parses. Nothing has written one since the receive path stopped writing
+  files, and no draft was ever created with one.
 - **One send implementation behind `mp send`, `mp send-approved` and both TUI
   send keys (#0058).** Sending a draft was written out four times, each with
   its own copy of the recipient parsing, the attachment reading, the quoted

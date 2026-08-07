@@ -557,3 +557,10 @@ That begins DEFERRED, which takes the read snapshot at the first `SELECT` and th
 So the loser of a two-process race did not see the winner's row and be refused, it failed on the write, and the send path's fallback treated that failure as "the store is unavailable" and sent the message with no outbox row and no gate at all.
 `BEGIN IMMEDIATE` (`Transaction::new_unchecked(conn, TransactionBehavior::Immediate)`) takes the write lock up front, so the two enqueues serialise and the second one reads what the first committed.
 The second half of the lesson is about the fallback: an error path that downgrades to a less safe mode has to enumerate the failures it was designed for, because "everything else" will eventually include the one failure that means another process is holding the very lock the downgrade bypasses.
+
+## Two derivations of one key drift, and the one nobody reads wins
+
+The sidebar queried the store with the leaf of a `PathBuf` it built from the config (`mailbox_dir`), while the sync path handed ingest the configured name itself (#0064).
+For `inbox`, `archive` and `sent` the two agreed, so nothing looked wrong; for an `[[mailboxes.extra]]` mailbox the path builder *slugified* the server name, so rows ingested under `Team/Reports` were listed and counted under `team-reports` and the mailbox appeared permanently empty, its quick-move destination wrote rows under a key sync never uses, and `mp dump-mailbox --mailbox Team/Reports` returned nothing.
+The bug had been invisible for as long as it existed because no account here configures an extra mailbox, and the integration test that would have caught it had been written by ingesting under the slug, i.e. against the reader rather than against the writer.
+When two sides of a boundary each derive the same key, the derivation belongs to one of them and the other reads it; a fixture that feeds the reader its own convention proves nothing about the writer.

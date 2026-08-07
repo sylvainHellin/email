@@ -436,8 +436,6 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                             entry: hit.entry,
                             fetched: hit.fetched,
                             source_label: hit.source_label,
-                            source_local_dir: hit.source_local_dir,
-                            source_status: hit.source_status,
                         })
                         .collect();
                     app.server_search_index = 0;
@@ -576,14 +574,14 @@ mod tests {
             crate::tui::app::MailboxInfo {
                 label: "Inbox".into(),
                 icon: "",
-                dir: crate::config::mailbox_dir("alice", "inbox"),
+                id: "inbox".into(),
                 kind: MailboxKind::Inbox,
                 server_name: None,
             },
             crate::tui::app::MailboxInfo {
                 label: "Archive".into(),
                 icon: "",
-                dir: crate::config::mailbox_dir("alice", "archive"),
+                id: "archive".into(),
                 kind: MailboxKind::Archive,
                 server_name: None,
             },

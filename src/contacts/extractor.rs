@@ -14,6 +14,7 @@ use crate::contacts::rank::{update_from_observation, Observation, ObservationFie
 use crate::contacts::types::{Contact, ContactIndex};
 use crate::store::read::{self, MessageRow};
 use crate::store::{open_store, Store};
+use crate::types::MailboxRole;
 use anyhow::Result;
 use chrono::Utc;
 use mailparse::addrparse;
@@ -52,7 +53,7 @@ pub(crate) fn build_index_from_store(
     let self_addr = account.default_from.to_ascii_lowercase();
 
     for row in read::list_account(store, &account.name)? {
-        let role = mailbox_role(&row.mailbox);
+        let role = MailboxRole::from(row.mailbox.as_str());
         let observed_at = row
             .date_display
             .as_deref()
@@ -67,7 +68,7 @@ pub(crate) fn build_index_from_store(
                 &mut index.contacts,
                 raw,
                 field,
-                role,
+                &role,
                 &observed_at,
                 &self_addr,
             );
@@ -94,27 +95,11 @@ fn header_fields(row: &MessageRow) -> [(ObservationField, Option<&str>); 3] {
     ]
 }
 
-/// The ranking role of a `messages.mailbox` value.
-///
-/// The column holds the role name for the four mapped mailboxes and a
-/// slugified server name for anything else, so every unmapped mailbox folds
-/// into `extra` exactly as the per-directory walk did. Only `sent` changes the
-/// ranking (see `rank::update_from_observation`); the rest all count as
-/// received.
-fn mailbox_role(mailbox: &str) -> &'static str {
-    match mailbox {
-        "sent" => "sent",
-        "inbox" => "inbox",
-        "archive" => "archive",
-        _ => "extra",
-    }
-}
-
 fn process_header(
     contacts: &mut HashMap<String, Contact>,
     raw: &str,
     field: ObservationField,
-    role: &'static str,
+    role: &MailboxRole,
     observed_at: &str,
     self_addr: &str,
 ) {
@@ -133,7 +118,7 @@ fn process_header(
             let obs = Observation {
                 address: addr_lc,
                 display_name: name,
-                mailbox_role: role,
+                mailbox_role: role.clone(),
                 field,
                 observed_at: observed_at.to_string(),
             };
@@ -185,10 +170,10 @@ pub fn observe(
         let Ok(parsed) = addrparse(raw_header) else {
             continue;
         };
-        let (role, field): (&'static str, ObservationField) = match kind {
-            ObservedIn::SentTo => ("sent", ObservationField::To),
-            ObservedIn::SentCc => ("sent", ObservationField::Cc),
-            ObservedIn::Inbox => ("inbox", ObservationField::From),
+        let (role, field): (MailboxRole, ObservationField) = match kind {
+            ObservedIn::SentTo => (MailboxRole::Sent, ObservationField::To),
+            ObservedIn::SentCc => (MailboxRole::Sent, ObservationField::Cc),
+            ObservedIn::Inbox => (MailboxRole::Inbox, ObservationField::From),
         };
         for info in parsed.iter() {
             for (addr, name) in flatten_addr(info) {
@@ -199,7 +184,7 @@ pub fn observe(
                 let obs = Observation {
                     address: addr_lc,
                     display_name: name,
-                    mailbox_role: role,
+                    mailbox_role: role.clone(),
                     field,
                     observed_at: observed_at.to_string(),
                 };
@@ -375,14 +360,18 @@ mod tests {
         assert_eq!(index.account, "alice");
     }
 
-    /// Roles map verbatim for the three ranked mailboxes; a slugified server
-    /// name folds into `extra`, as the per-directory walk did.
+    /// The `messages.mailbox` value reads back as its role, and an unmapped
+    /// mailbox keeps its name; only `sent` changes the ranking, so every other
+    /// role counts as received (#0064).
     #[test]
-    fn mailbox_role_folds_unmapped_mailboxes_into_extra() {
-        assert_eq!(mailbox_role("sent"), "sent");
-        assert_eq!(mailbox_role("inbox"), "inbox");
-        assert_eq!(mailbox_role("archive"), "archive");
-        assert_eq!(mailbox_role("some-folder"), "extra");
+    fn a_stored_mailbox_value_reads_back_as_its_role() {
+        assert_eq!(MailboxRole::from("sent"), MailboxRole::Sent);
+        assert_eq!(MailboxRole::from("inbox"), MailboxRole::Inbox);
+        assert_eq!(MailboxRole::from("archive"), MailboxRole::Archive);
+        assert_eq!(
+            MailboxRole::from("some-folder"),
+            MailboxRole::Other("some-folder".to_string())
+        );
     }
 
     #[test]

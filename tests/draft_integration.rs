@@ -325,18 +325,22 @@ fn test_mark_as_draft_sent_fails() {
     assert!(result.is_err());
 }
 
+/// A file carrying one of the file-era placement statuses is refused, and now
+/// refused one step earlier: `EmailStatus` narrowed to the three draft states
+/// (#0064), so `inbox` and `archived` no longer deserialize at all. Nothing
+/// writes such a file -- the receive path stopped writing `.md` at the store
+/// cutover, and no draft was ever created with one.
 #[test]
 fn test_mark_as_draft_inbox_fails() {
     let tmp = tempdir().unwrap();
-    // write_draft expects a draft-shaped frontmatter; inbox emails are
-    // shaped slightly differently (`from:` instead of `to:`), but for
-    // mark_as_draft's status guard it's the parsed status that matters.
-    let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", "inbox");
+    for status in ["inbox", "archived"] {
+        let path = write_draft(tmp.path(), "draft.md", "alice@example.com", "Test", "Body", status);
 
-    let result = mark_as_draft(&path);
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("Only approved drafts"), "unexpected error: {err}");
+        let result = mark_as_draft(&path);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("Failed to parse frontmatter"), "unexpected error: {err}");
+    }
 }
 
 #[test]

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
+use crate::types::MailboxRole;
+
 // ---------------------------------------------------------------------------
 // Global config (loaded from ~/.config/email/config.toml)
 // ---------------------------------------------------------------------------
@@ -713,16 +715,6 @@ pub fn account_dir(account_name: &str) -> PathBuf {
     mailypoppins_data_dir().join("accounts").join(account_name)
 }
 
-/// `<account_dir>/<role_or_slug>/`. Roles (`inbox`, `archive`, `sent`,
-/// `drafts`) land verbatim; arbitrary server names get slugified.
-pub fn mailbox_dir(account_name: &str, role_or_server: &str) -> PathBuf {
-    let leaf = match role_or_server {
-        "inbox" | "archive" | "sent" | "drafts" => role_or_server.to_string(),
-        other => slugify_mailbox_name(other),
-    };
-    account_dir(account_name).join(leaf)
-}
-
 /// `<account_dir>/drafts/`
 pub fn drafts_dir(account_name: &str) -> PathBuf {
     account_dir(account_name).join("drafts")
@@ -821,25 +813,33 @@ pub fn resolve_sent_mailbox(account: &AccountConfig) -> String {
         .unwrap_or_else(|| "Sent".to_string())
 }
 
-/// Find a mailbox mapping by server name (case-insensitive match against configured mailboxes)
+/// Find a mailbox mapping by role name or server name.
+///
+/// The name is read as a [`MailboxRole`] first, so `inbox`, `INBOX` and
+/// `Inbox` all resolve to the configured inbox mapping; anything else is
+/// matched against the server names, case-insensitively.
 fn find_mailbox_mapping<'a>(account: &'a AccountConfig, mailbox: &str) -> Option<&'a MailboxMapping> {
-    // Check the three special-role mailboxes
-    if let Some(ref m) = account.mailboxes.inbox {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("inbox") {
+    let role = MailboxRole::from(mailbox);
+    let named = match role {
+        MailboxRole::Inbox => account.mailboxes.inbox.as_ref(),
+        MailboxRole::Archive => account.mailboxes.archive.as_ref(),
+        MailboxRole::Sent => account.mailboxes.sent.as_ref(),
+        MailboxRole::Other(_) => None,
+    };
+    if let Some(m) = named {
+        return Some(m);
+    }
+    // Not a role name (or the role is not configured): match server names.
+    let by_server = [
+        account.mailboxes.inbox.as_ref(),
+        account.mailboxes.archive.as_ref(),
+        account.mailboxes.sent.as_ref(),
+    ];
+    for m in by_server.into_iter().flatten() {
+        if m.server.eq_ignore_ascii_case(mailbox) {
             return Some(m);
         }
     }
-    if let Some(ref m) = account.mailboxes.archive {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("archive") {
-            return Some(m);
-        }
-    }
-    if let Some(ref m) = account.mailboxes.sent {
-        if m.server.eq_ignore_ascii_case(mailbox) || mailbox.eq_ignore_ascii_case("sent") {
-            return Some(m);
-        }
-    }
-    // Check extra mailboxes
     if let Some(ref extras) = account.mailboxes.extra {
         for m in extras {
             if m.server.eq_ignore_ascii_case(mailbox) {
@@ -850,22 +850,25 @@ fn find_mailbox_mapping<'a>(account: &'a AccountConfig, mailbox: &str) -> Option
     None
 }
 
-/// Return all configured mailboxes: (role_or_server_name, mapping)
-/// Roles: "inbox", "archive", "sent", plus extra server names.
-pub fn all_configured_mailboxes(account: &AccountConfig) -> Vec<(String, &MailboxMapping)> {
+/// Return all configured mailboxes: (role, mapping).
+///
+/// The role is the key ingest writes into `messages.mailbox` and the segment
+/// selectors carry, so an unmapped mailbox comes back as
+/// [`MailboxRole::Other`] holding its server name verbatim.
+pub fn all_configured_mailboxes(account: &AccountConfig) -> Vec<(MailboxRole, &MailboxMapping)> {
     let mut result = Vec::new();
     if let Some(ref m) = account.mailboxes.inbox {
-        result.push(("inbox".to_string(), m));
+        result.push((MailboxRole::Inbox, m));
     }
     if let Some(ref m) = account.mailboxes.archive {
-        result.push(("archive".to_string(), m));
+        result.push((MailboxRole::Archive, m));
     }
     if let Some(ref m) = account.mailboxes.sent {
-        result.push(("sent".to_string(), m));
+        result.push((MailboxRole::Sent, m));
     }
     if let Some(ref extras) = account.mailboxes.extra {
         for m in extras {
-            result.push((m.server.clone(), m));
+            result.push((MailboxRole::Other(m.server.clone()), m));
         }
     }
     result
@@ -892,23 +895,6 @@ pub fn find_account_by_from<'a>(config: &'a GlobalConfig, from: &str) -> Option<
 /// Return the first (default) account, or None if no accounts are configured.
 pub fn default_account(config: &GlobalConfig) -> Option<&AccountConfig> {
     config.accounts.first()
-}
-
-/// Slugify a mailbox name for use as a local directory name.
-/// Lowercase, replace spaces/dots/slashes with hyphens, collapse consecutive hyphens.
-pub fn slugify_mailbox_name(name: &str) -> String {
-    let slug: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    crate::types::collapse_hyphens(&slug)
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,26 +1090,6 @@ host = "imap.example.com"
     }
 
     #[test]
-    fn test_slugify_mailbox_name_spaces() {
-        assert_eq!(slugify_mailbox_name("My Folder"), "my-folder");
-    }
-
-    #[test]
-    fn test_slugify_mailbox_name_dots() {
-        assert_eq!(slugify_mailbox_name("INBOX.Archive"), "inbox-archive");
-    }
-
-    #[test]
-    fn test_slugify_mailbox_name_slashes() {
-        assert_eq!(slugify_mailbox_name("Folders/Sub"), "folders-sub");
-    }
-
-    #[test]
-    fn test_slugify_mailbox_name_consecutive_hyphens() {
-        assert_eq!(slugify_mailbox_name("a...b"), "a-b");
-    }
-
-    #[test]
     fn test_find_account_by_from_match() {
         let config = GlobalConfig {
             accounts: vec![AccountConfig {
@@ -1201,9 +1167,9 @@ host = "imap.example.com"
         };
         let all = all_configured_mailboxes(&account);
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].0, "inbox");
-        assert_eq!(all[1].0, "archive");
-        assert_eq!(all[2].0, "Spam");
+        assert_eq!(all[0].0, MailboxRole::Inbox);
+        assert_eq!(all[1].0, MailboxRole::Archive);
+        assert_eq!(all[2].0, MailboxRole::Other("Spam".to_string()));
     }
 
     #[test]
@@ -1355,14 +1321,6 @@ name = "test"
         let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
         std::env::set_var("MAILYPOPPINS_DATA_DIR", "/tmp/x");
         assert_eq!(account_dir("alice"), PathBuf::from("/tmp/x/accounts/alice"));
-        assert_eq!(
-            mailbox_dir("alice", "inbox"),
-            PathBuf::from("/tmp/x/accounts/alice/inbox")
-        );
-        assert_eq!(
-            mailbox_dir("alice", "My Folder"),
-            PathBuf::from("/tmp/x/accounts/alice/my-folder")
-        );
         assert_eq!(
             drafts_dir("alice"),
             PathBuf::from("/tmp/x/accounts/alice/drafts")

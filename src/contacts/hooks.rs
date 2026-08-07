@@ -102,8 +102,7 @@ pub fn bump_after_sync(account: &AccountConfig, observations: &[FreshObservation
         // Which ObservedIn kind to use depends on the mailbox role.
         // For "sent", the envelope `to:` is a true sent-to; cc is sent-cc.
         // For inbox/archive/extra, every address (from/to/cc) counts as received.
-        let role_lc = obs.role.to_ascii_lowercase();
-        if role_lc == "sent" {
+        if obs.role.is_sent() {
             if !obs.to.trim().is_empty() {
                 batch.push((ObservedIn::SentTo, obs.to.as_str()));
             }

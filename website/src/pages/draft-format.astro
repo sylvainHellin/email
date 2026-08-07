@@ -11,7 +11,7 @@ const frontmatterFields = [
   { command: 'cc', description: 'Carbon copy address(es). Optional.' },
   { command: 'bcc', description: 'Blind carbon copy address(es). Optional.' },
   { command: 'subject', description: 'Email subject line. Required.' },
-  { command: 'status', description: 'Workflow state: draft, approved, sent, inbox, or archived. Required.' },
+  { command: 'status', description: 'Workflow state: draft, approved, or sent. Required.' },
   { command: 'from', description: 'Sender address. Optional -- overrides default_from from config.' },
   { command: 'reply_to', description: 'Reply-to address. Optional.' },
   { command: 'attachments', description: 'List of absolute file paths to attach. Optional.' },
@@ -84,7 +84,6 @@ inbox/2024-01-01-1200_sender_subject_attachments/
 const attachmentFrontmatter = `---
 from: sender@example.com
 subject: "Document delivery"
-status: inbox
 has_attachments: true
 attachments:
   - "document.pdf"
@@ -129,9 +128,10 @@ Email body here.`;
     <section>
       <h2 id="status-workflow">Status Workflow</h2>
       <p>
-        Emails follow a strict workflow. Only approved emails can be sent -- the <code>send</code>
-        command rejects drafts that have not been approved first. Inbox emails follow a separate
-        path from inbox to archived.
+        Drafts follow a strict workflow. Only approved emails can be sent -- the <code>send</code>
+        command rejects drafts that have not been approved first. These three are the whole
+        vocabulary of <code>status:</code>; where a message sits (inbox, archive, sent) is a
+        mailbox, not a status.
       </p>
       <WorkflowDiagram />
     </section>

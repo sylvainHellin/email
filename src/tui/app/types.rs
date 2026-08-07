@@ -7,6 +7,7 @@ use chrono::NaiveDate;
 use crate::parse::FetchedEmail;
 use crate::store::read::{self, MessageRow};
 use crate::store::{drafts, open_store, Store};
+use crate::types::MailboxRole;
 
 // ---------------------------------------------------------------------------
 // MessageRef
@@ -308,27 +309,27 @@ pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> 
         .collect()
 }
 
-/// The `messages.mailbox` value for a sidebar mailbox: the leaf of its
-/// directory, which is the same role-or-slug string the sync path passes to
-/// ingest. The directory itself is no longer read; only its name is still the
-/// agreed key between config and store.
+/// The `messages.mailbox` value for a sidebar mailbox.
 pub fn mailbox_key(mb: &MailboxInfo) -> String {
-    mb.dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
+    mb.id.clone()
 }
 
-/// The `status` string the file-based build wrote into frontmatter, derived
-/// from the mailbox instead. Rendered in the headers pane as `[inbox]`,
-/// `[archived]` and so on; the same mapping [`kind_to_status`] applies.
+/// The `status` string a listed message shows, derived from the mailbox it was
+/// listed from. Rendered in the headers pane as `[inbox]`, `[archived]` and so
+/// on.
+///
+/// The one derivation there is. `EmailStatus` no longer carries the file-era
+/// placement states this returns, and the `kind_to_status` copy that mapped a
+/// `MailboxKind` to the same four strings is gone with the write-only search
+/// fields that were its only reader (#0064).
 fn status_for_mailbox(mailbox: &str) -> String {
-    match mailbox {
-        "archive" => "archived".to_string(),
-        "sent" => "sent".to_string(),
-        "drafts" => "draft".to_string(),
-        _ => "inbox".to_string(),
+    if mailbox == crate::selector::DRAFTS_MAILBOX {
+        return "draft".to_string();
+    }
+    match MailboxRole::from(mailbox) {
+        MailboxRole::Archive => "archived".to_string(),
+        MailboxRole::Sent => "sent".to_string(),
+        MailboxRole::Inbox | MailboxRole::Other(_) => "inbox".to_string(),
     }
 }
 
@@ -822,8 +823,6 @@ pub enum BgResult {
 #[derive(Debug, Clone)]
 pub struct SearchTarget {
     pub server_name: String,
-    pub local_dir: PathBuf,
-    pub status: String,
     pub label: String,
 }
 
@@ -833,8 +832,6 @@ pub struct SearchHit {
     pub entry: EmailEntry,
     pub fetched: FetchedEmail,
     pub source_label: String,
-    pub source_local_dir: PathBuf,
-    pub source_status: String,
 }
 
 /// A single server search result held in memory.
@@ -846,8 +843,6 @@ pub struct SearchResultEntry {
     pub entry: EmailEntry,
     pub fetched: FetchedEmail,
     pub source_label: String,
-    pub source_local_dir: PathBuf,
-    pub source_status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,12 +1123,20 @@ pub enum MailboxKind {
     Extra,
 }
 
-/// A mailbox entry with its metadata and resolved path.
+/// A sidebar mailbox: how it is named on screen, on the server, and in the
+/// store.
+///
+/// `id` is the store key -- the `messages.mailbox` value ingest wrote and the
+/// mailbox segment of an `mp://` selector. It replaced a `dir: PathBuf` whose
+/// leaf everything actually wanted, and whose directory had not been read
+/// since the store cutover; for an unmapped mailbox the leaf was a *slug* of
+/// the server name while ingest filed the rows under the server name itself,
+/// so such a mailbox listed empty (#0064).
 #[derive(Debug, Clone)]
 pub struct MailboxInfo {
     pub label: String,
     pub icon: &'static str,
-    pub dir: PathBuf,
+    pub id: String,
     pub kind: MailboxKind,
     pub server_name: Option<String>,
 }
@@ -1447,23 +1450,13 @@ pub struct StatusEntry {
 // Mailbox helpers (free functions)
 // ---------------------------------------------------------------------------
 
-pub fn kind_to_status(kind: MailboxKind) -> String {
-    match kind {
-        MailboxKind::Inbox | MailboxKind::Extra => "inbox".to_string(),
-        MailboxKind::Archive => "archived".to_string(),
-        MailboxKind::Sent => "sent".to_string(),
-        MailboxKind::Drafts => "draft".to_string(),
-    }
-}
-
 pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo> {
-    let name = &config.name;
     let mut result = Vec::new();
 
     result.push(MailboxInfo {
         label: "Inbox".to_string(),
         icon: "\u{f0172}",
-        dir: crate::config::mailbox_dir(name, "inbox"),
+        id: MailboxRole::Inbox.as_str().to_string(),
         kind: MailboxKind::Inbox,
         server_name: config.mailboxes.inbox.as_ref().map(|m| m.server.clone()),
     });
@@ -1471,7 +1464,7 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
     result.push(MailboxInfo {
         label: "Drafts".to_string(),
         icon: "\u{f03eb}",
-        dir: crate::config::drafts_dir(name),
+        id: crate::selector::DRAFTS_MAILBOX.to_string(),
         kind: MailboxKind::Drafts,
         server_name: None,
     });
@@ -1479,7 +1472,7 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
     result.push(MailboxInfo {
         label: "Sent".to_string(),
         icon: "\u{f046b}",
-        dir: crate::config::mailbox_dir(name, "sent"),
+        id: MailboxRole::Sent.as_str().to_string(),
         kind: MailboxKind::Sent,
         server_name: config.mailboxes.sent.as_ref().map(|m| m.server.clone()),
     });
@@ -1487,7 +1480,7 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
     result.push(MailboxInfo {
         label: "Archive".to_string(),
         icon: "\u{f013c}",
-        dir: crate::config::mailbox_dir(name, "archive"),
+        id: MailboxRole::Archive.as_str().to_string(),
         kind: MailboxKind::Archive,
         server_name: config.mailboxes.archive.as_ref().map(|m| m.server.clone()),
     });
@@ -1497,7 +1490,7 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
             result.push(MailboxInfo {
                 label: m.server.clone(),
                 icon: "\u{f0247}",
-                dir: crate::config::mailbox_dir(name, &m.server),
+                id: MailboxRole::Other(m.server.clone()).as_str().to_string(),
                 kind: MailboxKind::Extra,
                 server_name: Some(m.server.clone()),
             });
@@ -1637,11 +1630,11 @@ mod tests {
     use crate::parse::FetchedEmail;
     use crate::store::BlobStore;
 
-    fn mb(label: &str, dir: PathBuf, kind: MailboxKind) -> MailboxInfo {
+    fn mb(label: &str, id: &str, kind: MailboxKind) -> MailboxInfo {
         MailboxInfo {
             label: label.to_string(),
             icon: "",
-            dir,
+            id: id.to_string(),
             kind,
             server_name: None,
         }
@@ -1669,11 +1662,10 @@ mod tests {
             }
         }
 
-        /// Mailbox info whose directory leaf is `name`, i.e. whose
-        /// `mailbox_key` is `name`. The directory is never created: the read
-        /// path must not care whether it exists.
+        /// Mailbox info whose store key is `name`. No directory is involved
+        /// at all: the read path is one query against `messages.mailbox`.
         fn mailbox(&self, label: &str, name: &str, kind: MailboxKind) -> MailboxInfo {
-            mb(label, crate::config::mailbox_dir("alice", name), kind)
+            mb(label, name, kind)
         }
     }
 
@@ -1801,7 +1793,7 @@ mod tests {
         // And the sidebar agrees with the list it is counting.
         let mailboxes = vec![mb(
             "Drafts",
-            crate::config::drafts_dir("alice"),
+            crate::selector::DRAFTS_MAILBOX,
             MailboxKind::Drafts,
         )];
         assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
@@ -1850,7 +1842,7 @@ mod tests {
         assert_eq!(
             count_all_emails(
                 "alice",
-                &[mb("Drafts", crate::config::drafts_dir("alice"), MailboxKind::Drafts)]
+                &[mb("Drafts", crate::selector::DRAFTS_MAILBOX, MailboxKind::Drafts)]
             ),
             vec![1]
         );
@@ -1879,7 +1871,7 @@ mod tests {
 
         let mailboxes = vec![mb(
             "Drafts",
-            crate::config::drafts_dir("alice"),
+            crate::selector::DRAFTS_MAILBOX,
             MailboxKind::Drafts,
         )];
         assert_eq!(count_all_emails("alice", &mailboxes), vec![2]);
@@ -2070,7 +2062,7 @@ mod tests {
         app.account_config.name = "alice".to_string();
         app.mailboxes = vec![mb(
             "Inbox",
-            crate::config::mailbox_dir("alice", "inbox"),
+            "inbox",
             MailboxKind::Inbox,
         )];
         app.mailbox_counts = vec![0];
@@ -2171,7 +2163,7 @@ mod tests {
         app.account_config.name = "alice".to_string();
         app.mailboxes = vec![mb(
             "Drafts",
-            crate::config::drafts_dir("alice"),
+            crate::selector::DRAFTS_MAILBOX,
             MailboxKind::Drafts,
         )];
         app.mailbox_counts = vec![0];
@@ -2336,23 +2328,43 @@ mod tests {
         assert_eq!(subjects, vec!["kept"]);
     }
 
-    /// The mailbox key the store is queried with is the directory leaf, which
-    /// is the role or slug the config builds and the sync path hands to
-    /// ingest. Nothing reads the directory itself.
+    /// The key the sidebar queries the store with is the key the sync path
+    /// hands to ingest, for every mailbox including the unmapped ones.
+    ///
+    /// It used to be the leaf of a directory path, and for an unmapped mailbox
+    /// that leaf was a *slug*: an extra mailbox called `INBOX.Archive` listed
+    /// under `inbox-archive` while ingest filed its rows under
+    /// `INBOX.Archive`, so it showed empty and counted zero (#0064).
     #[test]
-    fn the_mailbox_key_is_the_directory_leaf() {
-        assert_eq!(
-            mailbox_key(&mb("Inbox", PathBuf::from("/data/accounts/tum/inbox"), MailboxKind::Inbox)),
-            "inbox"
-        );
-        assert_eq!(
-            mailbox_key(&mb("F", PathBuf::from("/data/accounts/tum/some-folder"), MailboxKind::Extra)),
-            "some-folder"
-        );
+    fn the_sidebar_key_is_the_key_ingest_writes() {
+        let mapping = |server: &str| crate::config::MailboxMapping {
+            server: server.to_string(),
+        };
+        let config = crate::config::AccountConfig {
+            name: "tum".to_string(),
+            mailboxes: crate::config::MailboxesConfig {
+                inbox: Some(mapping("INBOX")),
+                archive: Some(mapping("Archive")),
+                sent: Some(mapping("Sent")),
+                extra: Some(vec![mapping("INBOX.Archive")]),
+            },
+            ..Default::default()
+        };
+
+        let keys: Vec<String> = build_mailboxes(&config).iter().map(mailbox_key).collect();
+        assert_eq!(keys, ["inbox", "drafts", "sent", "archive", "INBOX.Archive"]);
+
+        for (role, _) in crate::config::all_configured_mailboxes(&config) {
+            assert!(
+                keys.contains(&role.as_str().to_string()),
+                "the sidebar has no slot for the rows ingest files under '{role}'"
+            );
+        }
     }
 
     /// The `status` string the headers pane shows is derived from the mailbox,
-    /// reproducing what the file build wrote into frontmatter at save time.
+    /// and that derivation lives in exactly one place now that `EmailStatus`
+    /// no longer carries the file-era placement states (#0064).
     #[test]
     fn status_is_derived_from_the_mailbox() {
         assert_eq!(status_for_mailbox("inbox"), "inbox");
@@ -2360,5 +2372,9 @@ mod tests {
         assert_eq!(status_for_mailbox("sent"), "sent");
         assert_eq!(status_for_mailbox("drafts"), "draft");
         assert_eq!(status_for_mailbox("some-folder"), "inbox");
+        // The role reading is case-insensitive, so a mailbox synced as
+        // `--mailbox INBOX` shows the inbox status, not the extra one.
+        assert_eq!(status_for_mailbox("INBOX"), "inbox");
+        assert_eq!(status_for_mailbox("Archive"), "archived");
     }
 }

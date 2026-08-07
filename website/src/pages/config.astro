@@ -184,14 +184,14 @@ username = ""               # Falls back to smtp.username`} />
       <p>
         Three special-role mailboxes are required: <code>inbox</code>, <code>archive</code>,
         and <code>sent</code>. Each has a <code>server</code> field (the IMAP folder name).
-        The local directory is always derived from the role -- <code>inbox/</code>,
-        <code>archive/</code>, <code>sent/</code>, plus <code>drafts/</code> -- under the
-        account's data directory.
+        Synced mail lives in the account's store, keyed by the role name, which is also the
+        mailbox segment of an <code>mp://</code> selector. The one directory left under the
+        account's data directory is <code>drafts/</code>.
       </p>
       <p>
         Additional mailboxes can be added with the <code>[[mailboxes.extra]]</code> array
-        syntax. They are included in sync alongside the three core mailboxes; their local
-        subdirectory name is a slugified form of the server name.
+        syntax. They are included in sync alongside the three core mailboxes, and their key is
+        the server name verbatim.
       </p>
       <ConfigExample code={`[mailboxes.inbox]
 server = "INBOX"

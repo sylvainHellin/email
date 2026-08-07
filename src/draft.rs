@@ -2958,9 +2958,8 @@ pub fn mark_as_approved(path: &Path) -> Result<String> {
 ///
 /// Useful when the user pressed `A` by mistake and wants to keep editing.
 /// Only `approved` drafts can be demoted: `draft` is a no-op (returns an
-/// `Already a draft` message), and `sent` / `inbox` / `archived` files are
-/// rejected with an error -- those have left the draft pipeline and must
-/// not be silently rewritten.
+/// `Already a draft` message), and a `sent` file is rejected with an error --
+/// it has left the draft pipeline and must not be silently rewritten.
 pub fn mark_as_draft(path: &Path) -> Result<String> {
     let draft = parse_email_draft(path)?;
 
@@ -2969,12 +2968,6 @@ pub fn mark_as_draft(path: &Path) -> Result<String> {
         EmailStatus::Approved => {}
         EmailStatus::Sent => {
             return Err(anyhow!("Cannot revert a sent email back to draft"));
-        }
-        EmailStatus::Inbox | EmailStatus::Archived => {
-            return Err(anyhow!(
-                "Only approved drafts can be marked as draft (status was {})",
-                draft.frontmatter.status
-            ));
         }
     }
 

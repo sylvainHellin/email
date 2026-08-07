@@ -2743,11 +2743,11 @@ mod tests {
         assert!(picker.filtered.is_empty());
     }
 
-    fn mb_info(label: &str, dir: &str, kind: MailboxKind, server: Option<&str>) -> super::super::MailboxInfo {
+    fn mb_info(label: &str, id: &str, kind: MailboxKind, server: Option<&str>) -> super::super::MailboxInfo {
         super::super::MailboxInfo {
             label: label.to_string(),
             icon: "",
-            dir: PathBuf::from(dir),
+            id: id.to_string(),
             kind,
             server_name: server.map(|s| s.to_string()),
         }
@@ -2756,10 +2756,10 @@ mod tests {
     fn app_with_mailboxes() -> App {
         let mut app = app_with_emails(sample());
         app.mailboxes = vec![
-            mb_info("Inbox", "/mail/inbox", MailboxKind::Inbox, Some("INBOX")),
-            mb_info("Drafts", "/mail/drafts", MailboxKind::Drafts, None),
-            mb_info("Sent", "/mail/sent", MailboxKind::Sent, Some("Sent")),
-            mb_info("Archive", "/mail/archive", MailboxKind::Archive, Some("Archive")),
+            mb_info("Inbox", "inbox", MailboxKind::Inbox, Some("INBOX")),
+            mb_info("Drafts", "drafts", MailboxKind::Drafts, None),
+            mb_info("Sent", "sent", MailboxKind::Sent, Some("Sent")),
+            mb_info("Archive", "archive", MailboxKind::Archive, Some("Archive")),
         ];
         app.active_mailbox = 0;
         app

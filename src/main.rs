@@ -948,7 +948,7 @@ async fn sync_one_account(
         user_mailboxes
             .iter()
             .map(|mb| imap_client::SyncTarget {
-                role: mb.clone(),
+                role: MailboxRole::from(mb.as_str()),
                 server_name: find_server_name_for_role(account_config, mb),
             })
             .collect()

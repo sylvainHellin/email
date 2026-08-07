@@ -143,7 +143,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 
 | File | Responsibility |
 |------|---------------|
-| `src/types.rs` | Shared types: `EmailStatus`, `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
+| `src/types.rs` | Shared types: `EmailStatus` (the three draft states), `MailboxRole` (the store's mailbox key), `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
 | `src/config.rs` | Config loading (`~/.config/email/config.toml`), secrets-backend dispatch, data dir helpers (`mailypoppins_data_dir`, `account_dir`, `store_path`, `blobs_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
 | `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). See [secrets.md](secrets.md). |
 | `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |

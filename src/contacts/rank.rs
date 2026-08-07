@@ -9,6 +9,7 @@
 //! ranking quality is poor (Tier B follow-up).
 
 use crate::contacts::types::{Contact, ContactSource};
+use crate::types::MailboxRole;
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -23,8 +24,9 @@ const FRECENCY_HALF_LIFE_DAYS: f64 = 180.0;
 pub(crate) struct Observation {
     pub address: String,
     pub display_name: String,
-    /// Absolute mailbox role: "sent", "inbox", "archive", or extra.
-    pub mailbox_role: &'static str,
+    /// The mailbox this address was seen in. Only `sent` changes the ranking;
+    /// every other role counts as received.
+    pub mailbox_role: MailboxRole,
     /// Which frontmatter field this observation came from.
     pub field: ObservationField,
     /// RFC-3339 string from frontmatter `date` if parseable, else file mtime.
@@ -53,9 +55,9 @@ pub(crate) fn update_from_observation(contacts: &mut HashMap<String, Contact>, o
         });
 
     // Bump the right counter based on which mailbox + which field.
-    match (obs.mailbox_role, obs.field) {
-        ("sent", ObservationField::To) => entry.sent_to += 1,
-        ("sent", ObservationField::Cc) => entry.sent_cc += 1,
+    match (&obs.mailbox_role, obs.field) {
+        (MailboxRole::Sent, ObservationField::To) => entry.sent_to += 1,
+        (MailboxRole::Sent, ObservationField::Cc) => entry.sent_cc += 1,
         // Anything observed in inbox/archive/extra is "received" regardless of field.
         _ => entry.received += 1,
     }

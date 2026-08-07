@@ -377,11 +377,9 @@ pub(super) async fn lib_do_multi_search(
         }
         let budget = per_mb.min(total_limit - total);
         log::info!(
-            "Server search: querying mailbox '{}' (label={}, local_dir={}, status={})",
+            "Server search: querying mailbox '{}' (label={})",
             target.server_name,
             target.label,
-            target.local_dir.display(),
-            target.status,
         );
         match fetch_emails_on_session(&mut session, &criteria, &target.server_name, Some(budget))
             .await
@@ -399,8 +397,6 @@ pub(super) async fn lib_do_multi_search(
                         entry,
                         fetched,
                         source_label: target.label.clone(),
-                        source_local_dir: target.local_dir.clone(),
-                        source_status: target.status.clone(),
                     });
                 }
             }
@@ -487,8 +483,6 @@ pub(super) async fn lib_do_multi_search_graph(
                         entry,
                         fetched,
                         source_label: target.label.clone(),
-                        source_local_dir: target.local_dir.clone(),
-                        source_status: target.status.clone(),
                     });
                 }
             }

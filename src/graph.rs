@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::config::GraphConfig;
 use crate::imap_client::{FreshObservation, SyncResult, SyncTarget};
+use crate::types::MailboxRole;
 use crate::parse::{sanitize_attachment_filename, AttachmentData, FetchedEmail};
 use crate::timing::TimingSpan;
 
@@ -1192,13 +1193,13 @@ pub async fn sync_mailboxes_graph(
 
     // Every prune this run will apply, collected here and applied after the
     // loop: see the second pass below for why it cannot run per target.
-    let mut prunes: Vec<(String, Vec<i64>)> = Vec::new();
+    let mut prunes: Vec<(MailboxRole, Vec<i64>)> = Vec::new();
     // `(enumeration complete, download truncated)` per target, which decides
     // whether the prunes above may be applied at all: see `pass_may_prune`.
     let mut coverage: Vec<(bool, bool)> = Vec::with_capacity(targets.len());
 
     for target in targets {
-        let known = crate::ingest::known_message_ids(&store, account_name, &target.role)?;
+        let known = crate::ingest::known_message_ids(&store, account_name, target.role.as_str())?;
 
         let fetch = match client
             .fetch_new_messages(&target.server_name, limit, &known)
@@ -1238,7 +1239,7 @@ pub async fn sync_mailboxes_graph(
                 &blobs,
                 &crate::ingest::IngestInput {
                     account: account_name,
-                    mailbox: &target.role,
+                    mailbox: target.role.as_str(),
                     uid,
                     email,
                     raw: None,
@@ -1247,7 +1248,7 @@ pub async fn sync_mailboxes_graph(
                 Ok(outcome) => {
                     if outcome.inserted {
                         result.saved += 1;
-                        if target.role.eq_ignore_ascii_case("inbox") {
+                        if target.role.is_inbox() {
                             result
                                 .new_inbox_mail
                                 .push(crate::notify::NewMailMeta::new(&email.from, &email.subject));
@@ -1278,7 +1279,7 @@ pub async fn sync_mailboxes_graph(
         result.read_updated += crate::ingest::apply_seen_flags(
             &store,
             account_name,
-            &target.role,
+            target.role.as_str(),
             server
                 .iter()
                 .map(|(mid, entry)| (crate::ingest::graph_uid(mid), entry.is_read)),
@@ -1300,7 +1301,7 @@ pub async fn sync_mailboxes_graph(
             crate::ingest::record_mailbox_cursor(
                 &store,
                 account_name,
-                &target.role,
+                target.role.as_str(),
                 &crate::ingest::MailboxCursor {
                     uidvalidity: None,
                     last_uid: None,
@@ -1326,9 +1327,9 @@ pub async fn sync_mailboxes_graph(
             // that identity, so it is in every vanished set until the server's
             // own copy shows up.
             let prunable =
-                crate::ingest::prunable_uids(&store, account_name, role, vanished, now);
+                crate::ingest::prunable_uids(&store, account_name, role.as_str(), vanished, now);
             result.pruned +=
-                crate::ingest::prune_vanished(&store, &blobs, account_name, role, &prunable);
+                crate::ingest::prune_vanished(&store, &blobs, account_name, role.as_str(), &prunable);
         }
     } else if !prunes.is_empty() {
         info!(
