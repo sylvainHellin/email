@@ -38,6 +38,22 @@ All notable changes to this project are documented in this file.
   `email-cli X.Y.Z`.
 
 ### Added
+- **Delete a draft (#0073).** A draft could be created, edited, approved and
+  sent, but never removed: `mp delete` only spoke the received-mail selector
+  grammar, and the TUI `d` key reported "nothing to delete" on a Drafts row.
+  `mp delete mp://<account>/drafts/<id>` now removes the draft file and its
+  index row, and `d` on a Drafts row does the same behind the usual
+  confirmation. Deleting is local-only, so there is no server round-trip; the
+  same index rescan that heals a hand-deleted file drops the row.
+
+  An approved draft is a queued send, so deleting it is refused unless you pass
+  `--force` (or demote it first with `mp mark-draft`), and a draft an active
+  outbox submission still holds is refused outright, on any flag, so a delete
+  cannot pull a send's file out from under it (#0063). `mp delete --sent`
+  clears every `status: sent` draft of an account in one call, which is the
+  upgrade path for a directory of already-sent drafts left behind by an older
+  build.
+
 - **Read a received message in your editor again (#0075).** `Enter` or `e` on
   a message in any mailbox opens it in `$EDITOR`, as Markdown with the headers
   in YAML frontmatter and the body below them. This worked before every message

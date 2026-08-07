@@ -613,6 +613,96 @@ fn refresh_drafts_after_flip(app: &mut App) {
     app.reload_current_mailbox();
 }
 
+/// Open the store and look a draft up by id for a delete: the shared prelude
+/// of the single-row and batch draft deletes. `Store::open` rather than
+/// `open_store`, for the reason the Drafts load gives: a never-synced account
+/// has no store file and still has drafts.
+fn draft_store_and_row(
+    app: &mut App,
+    id: &str,
+) -> Option<(crate::store::Store, crate::store::drafts::DraftRow)> {
+    let account = app.account_config.name.clone();
+    let store = match crate::store::Store::open(crate::config::store_path(&account)) {
+        Ok(store) => store,
+        Err(e) => {
+            app.set_status_level(
+                format!("Reading the drafts index of {account} failed: {e:#}"),
+                StatusLevel::Error,
+            );
+            return None;
+        }
+    };
+    match crate::store::drafts::find(&store, &account, id) {
+        Ok(Some(row)) => Some((store, row)),
+        Ok(None) => {
+            app.set_status_level(
+                format!("That draft is no longer in the index ({id})"),
+                StatusLevel::Error,
+            );
+            None
+        }
+        Err(e) => {
+            app.set_status_level(
+                format!("Reading the draft {id} failed: {e:#}"),
+                StatusLevel::Error,
+            );
+            None
+        }
+    }
+}
+
+/// Delete the draft under the cursor: file and index row, behind the same `d`
+/// confirmation received mail uses (#0073). Local-only, so no background op.
+///
+/// The TUI never force-deletes: an approved draft keeps its guard, and the user
+/// demotes it with the mark-draft key first, exactly as the CLI asks. An
+/// in-flight draft (#0063) is refused by the same library check the CLI runs.
+fn delete_draft(app: &mut App, id: &str) {
+    let account = app.account_config.name.clone();
+    let Some((store, row)) = draft_store_and_row(app, id) else {
+        return;
+    };
+    match crate::draft::delete_indexed_draft(&store, &account, &row, false) {
+        Ok(()) => {
+            drop(store);
+            let selector = Selector::for_draft(&account, id);
+            app.set_status(format!("Deleted {selector}"));
+            refresh_drafts_after_flip(app);
+        }
+        Err(e) => app.set_status_level(
+            format!("Delete failed: {e:#}"),
+            StatusLevel::Error,
+        ),
+    }
+}
+
+/// Delete every selected draft, counting what went and logging what was
+/// refused, the same shape as the batch status flip (#0073). A draft the guard
+/// keeps (approved, or mid-send) is one miss among N, not an abort.
+fn delete_drafts_batch(app: &mut App, ids: &[String]) {
+    let account = app.account_config.name.clone();
+    let total = ids.len();
+    let mut deleted = 0usize;
+    for id in ids {
+        let Some((store, row)) = draft_store_and_row(app, id) else {
+            continue;
+        };
+        match crate::draft::delete_indexed_draft(&store, &account, &row, false) {
+            Ok(()) => deleted += 1,
+            Err(e) => log::warn!("[drafts] not deleting {id}: {e:#}"),
+        }
+    }
+    if deleted == total {
+        app.set_status(format!("Deleted {deleted} drafts"));
+    } else {
+        app.set_status_level(
+            format!("Deleted {deleted} of {total} drafts; the rest were kept (see the log)"),
+            StatusLevel::Warning,
+        );
+    }
+    refresh_drafts_after_flip(app);
+}
+
 /// Flip the `status:` of the draft under the cursor.
 fn status_flip(app: &mut App, flip: DraftStatusFlip) {
     let why = format!(
@@ -1215,7 +1305,14 @@ pub(super) fn handle_action(
         }
 
         Action::Delete => {
-            if let Some(msg) = app.selected_email_ref() {
+            // A Drafts row has no `messages` row to prepare, so `d` on it went
+            // to `delete_msgs` and reported "nothing to delete" (#0073). Route
+            // it to the local-only draft delete instead; received mail keeps
+            // the store-mutation path.
+            let draft_id = app.selected_email().and_then(|e| e.draft_id.clone());
+            if let Some(id) = draft_id {
+                delete_draft(app, &id);
+            } else if let Some(msg) = app.selected_email_ref() {
                 delete_msgs(app, terminal, bg_tx, vec![msg], false)?;
             }
         }
@@ -1226,6 +1323,10 @@ pub(super) fn handle_action(
 
         Action::BatchDelete(msgs) => {
             delete_msgs(app, terminal, bg_tx, msgs, true)?;
+        }
+
+        Action::BatchDeleteDrafts(ids) => {
+            delete_drafts_batch(app, &ids);
         }
 
         Action::MoveToMailbox { msgs, dest_idx } => {

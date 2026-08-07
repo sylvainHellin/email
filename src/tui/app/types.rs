@@ -1179,6 +1179,11 @@ pub enum Action {
     Delete,
     BatchArchive(Vec<MessageRef>),
     BatchDelete(Vec<MessageRef>),
+    /// Delete every draft in the selection by indexed `id:` (#0073). Draft ids
+    /// rather than [`MessageRef`]s because a draft has no `messages` row, the
+    /// same reason [`Action::BatchApprove`] takes ids: deleting a draft is a
+    /// local file removal, not a store mutation.
+    BatchDeleteDrafts(Vec<String>),
     /// Quick-move emails to another mailbox (#0018). `msgs` is the
     /// selection (or the cursor email); `dest_idx` indexes
     /// `App::mailboxes`.

@@ -1157,3 +1157,37 @@ fn a_draft_key_holding_a_control_character_still_matches_its_stored_form() {
         .expect_err("the flattening must not lose the gate");
     assert!(outbox::is_already_in_flight(&refused), "{refused:#}");
 }
+
+/// The read side of the admission gate: a delete asks whether an active
+/// submission still holds a draft before pulling its file (#0073). A
+/// `pending_send` row answers yes for its own key and no for another, and a
+/// finished row does not pin the draft at all.
+#[test]
+fn active_submission_for_draft_finds_the_pending_row_and_only_it() {
+    let account = Account::new();
+    let id = enqueue_draft(&account, "<queued@example.com>", "id:note-1").unwrap();
+    let (store, _) = account.open();
+
+    let held = outbox::active_submission_for_draft(&store, ACCOUNT, &["id:note-1".to_string()])
+        .unwrap();
+    assert_eq!(held, Some((id, OutboxState::PendingSend)));
+
+    // A different draft is not held by this row.
+    assert_eq!(
+        outbox::active_submission_for_draft(&store, ACCOUNT, &["id:other".to_string()]).unwrap(),
+        None
+    );
+
+    // The path fallback form is matched too, when that is what a send enqueued.
+    let path_id = enqueue_draft(&account, "<queued2@example.com>", "path:/drafts/x.md").unwrap();
+    let (store, _) = account.open();
+    assert_eq!(
+        outbox::active_submission_for_draft(
+            &store,
+            ACCOUNT,
+            &["id:x".to_string(), "path:/drafts/x.md".to_string()]
+        )
+        .unwrap(),
+        Some((path_id, OutboxState::PendingSend))
+    );
+}

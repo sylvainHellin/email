@@ -239,14 +239,25 @@ enum Commands {
         #[arg(long)]
         mailbox: Option<String>,
     },
-    /// Delete a received email (server + local)
+    /// Delete a received email (server + local) or a local draft
+    //
+    // Kept to one doc line on purpose: a second paragraph flips clap into its
+    // long-help layout and reformats the whole subcommand's `--help`, the same
+    // footgun `Sync` guards against. The drafts vs received split and the
+    // --force/--sent rules are carried by the argument help below.
     Delete {
-        /// Received selector: mp://<account>/<mailbox>/<message-id>
-        #[arg(value_name = "SELECTOR")]
-        selector: String,
+        /// Received (mp://<acct>/<mbox>/<id>) or drafts (mp://<acct>/drafts/<id>) selector; omit with --sent
+        #[arg(value_name = "SELECTOR", required_unless_present = "sent")]
+        selector: Option<String>,
         /// Mailbox to resolve the selector in
         #[arg(long)]
         mailbox: Option<String>,
+        /// Delete an approved draft (a queued send) anyway
+        #[arg(long)]
+        force: bool,
+        /// Clear every sent draft of the account (takes no selector)
+        #[arg(long, conflicts_with_all = ["selector", "mailbox", "force"])]
+        sent: bool,
     },
     /// Open a received email's attachment in the default application
     Open {
@@ -921,6 +932,21 @@ fn resolve_draft_arg(
 ) -> Result<(mailypoppins::store::drafts::DraftRow, Selector)> {
     let query = mailypoppins::selector::parse_in(selector, Namespace::Drafts, account, None)?;
     mailypoppins::selector::resolve_draft(store, &query)
+}
+
+/// Whether a `mp delete` argument names a draft rather than received mail.
+///
+/// Dispatch is on the selector shape (#0073 scope item 1), not a second
+/// command: a fully qualified drafts selector carries the reserved `drafts`
+/// mailbox segment, and `--mailbox drafts` names it beside an elided selector.
+/// Anything else is received mail, whose namespace `resolve_received_arg`
+/// enforces.
+fn is_drafts_selector(selector: &str, mailbox: Option<&str>) -> Result<bool> {
+    if mailbox == Some(mailypoppins::selector::DRAFTS_MAILBOX) {
+        return Ok(true);
+    }
+    let parts = mailypoppins::selector::parse(selector)?;
+    Ok(parts.mailbox.as_deref() == Some(mailypoppins::selector::DRAFTS_MAILBOX))
 }
 
 /// Resolve a received selector to its message row plus the canonical selector.
@@ -1958,23 +1984,91 @@ async fn main() -> Result<()> {
             );
         }
 
-        Some(Commands::Delete { selector, mailbox }) => {
-            let store = received_store(&account_config.name)?;
-            let (row, canonical) =
-                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
-            let source_server = find_server_name_for_role(&account_config, &row.mailbox);
-
-            if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                graph::delete_message_graph(&graph_config, &row.message_id).await?;
+        Some(Commands::Delete { selector, mailbox, force, sent }) => {
+            if sent {
+                // The upgrade path (#0073): a version that did not retire a
+                // sent draft on send leaves a directory of `status: sent`
+                // files with nothing left to do to them. Clear them in one
+                // call, file and row alike.
+                let store = drafts_store(&account_config.name)?;
+                let rows = mailypoppins::store::drafts::list(
+                    &store,
+                    &account_config.name,
+                    Some("sent"),
+                )?;
+                if rows.is_empty() {
+                    println!("No sent drafts to clear on {}", account_config.name);
+                } else {
+                    let mut cleared = 0usize;
+                    for row in &rows {
+                        match mailypoppins::draft::delete_indexed_draft(
+                            &store,
+                            &account_config.name,
+                            row,
+                            false,
+                        ) {
+                            Ok(()) => cleared += 1,
+                            Err(e) => eprintln!(
+                                "{} keeping {}: {e:#}",
+                                "\u{26a0}".yellow(),
+                                Selector::for_draft(&account_config.name, &row.id)
+                            ),
+                        }
+                    }
+                    reindex_drafts(&account_config.name);
+                    println!(
+                        "{} cleared {cleared} sent draft{} on {}",
+                        "\u{2713}".green(),
+                        if cleared == 1 { "" } else { "s" },
+                        account_config.name
+                    );
+                }
             } else {
-                let imap_config = ImapConfig::load(&account_config)?;
-                imap_client::delete_email_on_server(&imap_config, &row.message_id, &source_server)
-                    .await?;
+                // `required_unless_present = "sent"` guarantees the selector.
+                let selector = selector.expect("clap requires a selector without --sent");
+                if is_drafts_selector(&selector, mailbox.as_deref())? {
+                    // Drafts are local-only: no server op, just the file and
+                    // the index row the rescan drops (#0073).
+                    let store = drafts_store(&account_config.name)?;
+                    let (row, canonical) =
+                        resolve_draft_arg(&store, &selector, &account_config.name)?;
+                    mailypoppins::draft::delete_indexed_draft(
+                        &store,
+                        &account_config.name,
+                        &row,
+                        force,
+                    )?;
+                    reindex_drafts(&account_config.name);
+                    println!("{} deleted {}", "\u{2713}".green(), canonical);
+                } else {
+                    let store = received_store(&account_config.name)?;
+                    let (row, canonical) = resolve_received_arg(
+                        &store,
+                        &selector,
+                        &account_config.name,
+                        mailbox.as_deref(),
+                    )?;
+                    let source_server =
+                        find_server_name_for_role(&account_config, &row.mailbox);
+
+                    if account_config.auth_method == AuthMethod::Graph {
+                        let graph_config = GraphConfig::load(&account_config)?;
+                        graph::delete_message_graph(&graph_config, &row.message_id).await?;
+                    } else {
+                        let imap_config = ImapConfig::load(&account_config)?;
+                        imap_client::delete_email_on_server(
+                            &imap_config,
+                            &row.message_id,
+                            &source_server,
+                        )
+                        .await?;
+                    }
+                    let blobs =
+                        mailypoppins::store::BlobStore::for_account(&account_config.name);
+                    mailypoppins::store::write::delete_row(&store, &blobs, row.id)?;
+                    println!("{} deleted {}", "\u{2713}".green(), canonical);
+                }
             }
-            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
-            mailypoppins::store::write::delete_row(&store, &blobs, row.id)?;
-            println!("{} deleted {}", "\u{2713}".green(), canonical);
         }
 
         Some(Commands::Open { selector, mailbox }) => {
@@ -2207,4 +2301,28 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_drafts_selector;
+
+    /// `mp delete` dispatches on the selector shape, not a second command
+    /// (#0073): the reserved `drafts` mailbox segment, or `--mailbox drafts`
+    /// beside an elided selector, names a draft; anything else is received.
+    #[test]
+    fn a_drafts_selector_is_recognised_by_its_mailbox_segment() {
+        assert!(is_drafts_selector("mp://tum/drafts/abc123", None).unwrap());
+        assert!(is_drafts_selector("drafts/abc123", None).unwrap());
+        // The flag names the mailbox beside an elided key.
+        assert!(is_drafts_selector("abc123", Some("drafts")).unwrap());
+    }
+
+    #[test]
+    fn a_received_selector_is_not_a_draft() {
+        assert!(!is_drafts_selector("mp://tum/INBOX/msg@example.com", None).unwrap());
+        assert!(!is_drafts_selector("mp://tum/Archive/msg@example.com", None).unwrap());
+        // A bare key with no drafts flag is a received key by default scope.
+        assert!(!is_drafts_selector("msg@example.com", None).unwrap());
+    }
 }

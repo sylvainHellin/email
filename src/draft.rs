@@ -1655,6 +1655,73 @@ pub fn settle_sent_draft(
     Ok(())
 }
 
+/// Remove a draft from disk: its `.md` file and the HTML companion a reply
+/// carries beside it (the same companion [`settle_sent_draft`] retires on
+/// send). The caller reconciles the drafts index afterwards, the rescan
+/// `mp list` already runs, so no index bookkeeping lives here.
+///
+/// Tolerant of a missing file, like the sent-draft retirement: a draft the
+/// index still lists but whose file is already gone is a clean delete, not an
+/// error.
+pub fn remove_draft_files(path: &Path) -> Result<()> {
+    let html_companion = path.with_extension("html");
+    if html_companion.exists() {
+        fs::remove_file(&html_companion).ok();
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            info!("Deleted the draft: {}", path.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e))
+            .context(format!("deleting the draft {}", path.display())),
+    }
+}
+
+/// Delete an indexed draft after the two checks a queued or in-flight send
+/// needs (#0073). Deleting a draft is local-only: no server round-trip, and the
+/// self-healing index rescan drops the row.
+///
+/// Refuses a draft an active outbox submission still holds (#0063), on any value
+/// of `force`: while the row is in `pending_send`/`sent_pending_append` the file
+/// is that send's local anchor, and removing it would not stop the send. Refuses
+/// an `approved` draft unless `force`, because approved is the queued-send state
+/// and dropping it silently loses a message `mp send-approved` would deliver.
+///
+/// On success the file and its HTML companion are gone.
+pub fn delete_indexed_draft(
+    store: &crate::store::Store,
+    account: &str,
+    row: &crate::store::drafts::DraftRow,
+    force: bool,
+) -> Result<()> {
+    let selector = crate::selector::Selector::for_draft(account, &row.id);
+    // Both key forms a send might have enqueued this draft under: the indexed
+    // `id:` (the normal case) and the `path:` fallback of a file that had no id
+    // when it was sent. See `crate::send::draft_key`.
+    let keys = [
+        format!("id:{}", row.id),
+        format!("path:{}", row.path.display()),
+    ];
+    if let Some((outbox_id, state)) =
+        crate::outbox::active_submission_for_draft(store, account, &keys)?
+    {
+        anyhow::bail!(
+            "{selector} is mid-send: outbox row {outbox_id} ({state}) still holds it. \
+             Deleting the file would not stop the send; wait for it to finish, or \
+             clear the row with `mp outbox`."
+        );
+    }
+    if row.status == "approved" && !force {
+        anyhow::bail!(
+            "{selector} is approved, a queued send; deleting it drops that send. \
+             Re-run with --force, or demote it first with `mp mark-draft`."
+        );
+    }
+    remove_draft_files(&row.path)
+}
+
 /// Resolve the drafts directory using a fallback chain:
 /// 1. If the user passed an explicit (non-default) path, use it as-is.
 /// 2. Else if config_drafts_dir is set and points to an existing directory, use that.
@@ -2398,6 +2465,68 @@ mod tests {
         );
         let result = validate_draft(&draft);
         assert!(result.is_err());
+    }
+
+    /// Delete removes the `.md` file and the HTML companion a reply carries
+    /// beside it, and the index rescan then drops the row (#0073).
+    #[test]
+    fn deleting_a_draft_removes_the_file_and_its_html_companion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(
+            &path,
+            "---\nid: aaa\nto: a@example.com\nsubject: Hi\nstatus: draft\n---\n\nBody\n",
+        )
+        .unwrap();
+        let companion = path.with_extension("html");
+        std::fs::write(&companion, "<p>quoted</p>").unwrap();
+
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        crate::store::drafts::refresh(&store, "work", &dir).unwrap();
+        let row = crate::store::drafts::find(&store, "work", "aaa").unwrap().unwrap();
+
+        delete_indexed_draft(&store, "work", &row, false).unwrap();
+        assert!(!path.exists(), "the draft file is gone");
+        assert!(!companion.exists(), "the html companion is gone");
+
+        crate::store::drafts::refresh(&store, "work", &dir).unwrap();
+        assert!(crate::store::drafts::find(&store, "work", "aaa").unwrap().is_none());
+    }
+
+    /// An approved draft is a queued send: deleting it silently drops the send,
+    /// so it is refused without --force and deleted with it (#0073).
+    #[test]
+    fn an_approved_draft_is_refused_without_force_and_deleted_with_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queued.md");
+        std::fs::write(
+            &path,
+            "---\nid: bbb\nto: a@example.com\nsubject: Hi\nstatus: approved\n---\n\nBody\n",
+        )
+        .unwrap();
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        crate::store::drafts::refresh(&store, "work", &dir).unwrap();
+        let row = crate::store::drafts::find(&store, "work", "bbb").unwrap().unwrap();
+
+        let err = delete_indexed_draft(&store, "work", &row, false).unwrap_err().to_string();
+        assert!(err.contains("approved"), "{err}");
+        assert!(path.exists(), "the refused draft is still on disk");
+
+        delete_indexed_draft(&store, "work", &row, true).unwrap();
+        assert!(!path.exists(), "--force deletes it");
+    }
+
+    /// A draft the index still lists but whose file is already gone deletes
+    /// cleanly rather than erroring (#0073), like the sent-draft retirement.
+    #[test]
+    fn removing_an_already_gone_draft_is_not_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("gone.md");
+        remove_draft_files(&missing).unwrap();
     }
 
     #[test]

@@ -25,7 +25,7 @@ Commands:
   sync            Sync mailboxes from the server into the local store
   watch           Watch a mailbox for changes using IMAP IDLE
   archive         Archive a received email (server + local)
-  delete          Delete a received email (server + local)
+  delete          Delete a received email (server + local) or a local draft
   open            Open a received email's attachment in the default application
   save            Save a received email's attachment(s) to a directory
   search          Search emails on the IMAP server
@@ -349,15 +349,17 @@ Options:
   -h, --help                   Print help
 
 $ mp delete --help
-Delete a received email (server + local)
+Delete a received email (server + local) or a local draft
 
-Usage: mp delete [OPTIONS] <SELECTOR>
+Usage: mp delete [OPTIONS] [SELECTOR]
 
 Arguments:
-  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>
+  [SELECTOR]  Received (mp://<acct>/<mbox>/<id>) or drafts (mp://<acct>/drafts/<id>) selector; omit with --sent
 
 Options:
       --mailbox <MAILBOX>      Mailbox to resolve the selector in
+      --force                  Delete an approved draft (a queued send) anyway
+      --sent                   Clear every sent draft of the account (takes no selector)
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

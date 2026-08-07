@@ -3,9 +3,26 @@ id: 0073
 title: No way to delete a draft (CLI selector rejected, TUI `d` reports "nothing to delete")
 type: bug
 priority: next
-status: open
+status: done
 created: 2026-08-07
 ---
+
+## Close-out
+
+Done, one commit. `mp delete` dispatches on the selector shape: a drafts
+selector (`mp://<account>/drafts/<id>`, or `--mailbox drafts` beside an elided
+key) deletes the draft file and its HTML companion, then the same index rescan
+`mp list` runs drops the row; anything else keeps the received-mail path
+unchanged. An `approved` draft is refused without `--force`, and a draft an
+active outbox submission still holds (`pending_send`/`sent_pending_append`) is
+refused on any flag, so a delete cannot pull a send's local anchor (#0063). The
+TUI `d` key routes a Drafts row (and a Drafts selection) to the same library
+check behind the existing confirmation, ending the "nothing to delete" line.
+`mp delete --sent` sweeps every `status: sent` draft of the account, the upgrade
+path from a build that did not retire sent drafts.
+
+All acceptance criteria met and smoke-tested on the assistant account: create,
+delete, re-delete (clean "no match" error), and the approved refuse/force pair.
 
 A draft can be created, edited, approved and sent, but never deleted.
 Neither surface offers it, and the TUI advertises a key that cannot work.

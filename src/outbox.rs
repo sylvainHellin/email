@@ -673,7 +673,27 @@ fn refuse_a_second_submission(
     // Compared flattened on both sides: the stored key went through `one_line`
     // on the way in, so a path-fallback key holding a tab or a trailing space
     // would never compare equal to its own encoding (#0063 review).
-    let flattened = one_line(key);
+    if let Some((id, state)) = find_active_submission(conn, account, &[one_line(key)])? {
+        return Err(anyhow::Error::new(AlreadyInFlight(format!(
+            "this draft is already in the outbox as row {id} ({state}); \
+             it is sent once, not twice"
+        ))));
+    }
+    Ok(())
+}
+
+/// The active outbox submission whose draft key matches any of `keys`, as its
+/// row id and state string.
+///
+/// "Active" is `pending_send` or `sent_pending_append`, the two states the
+/// admission gate (#0063) owns; a `done` or `failed` row does not hold the
+/// draft. `keys` are compared flattened on both sides, so a caller passes the
+/// key already `one_line`d.
+fn find_active_submission(
+    conn: &rusqlite::Connection,
+    account: &str,
+    keys: &[String],
+) -> Result<Option<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT id, state, envelope FROM outbox
          WHERE account = ?1 AND state IN ('pending_send', 'sent_pending_append')
@@ -692,15 +712,36 @@ fn refuse_a_second_submission(
             .as_deref()
             .map(Envelope::decode)
             .and_then(|env| env.draft_key)
-            .is_some_and(|other| one_line(&other) == flattened);
+            .map(|other| one_line(&other))
+            .is_some_and(|other| keys.contains(&other));
         if holds_the_draft {
-            return Err(anyhow::Error::new(AlreadyInFlight(format!(
-                "this draft is already in the outbox as row {id} ({state}); \
-                 it is sent once, not twice"
-            ))));
+            return Ok(Some((id, state)));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The active outbox submission still holding this draft, if any: its row id
+/// and state.
+///
+/// This is the read side of the admission gate ([`refuse_a_second_submission`]
+/// is the write side): it lets a delete refuse to pull a draft file out from
+/// under an in-flight send (#0063). `keys` is the draft's key in every form a
+/// send might have enqueued it under, `id:<id>` and its `path:<path>` fallback.
+pub fn active_submission_for_draft(
+    store: &Store,
+    account: &str,
+    keys: &[String],
+) -> Result<Option<(i64, OutboxState)>> {
+    let flattened: Vec<String> = keys.iter().map(|k| one_line(k)).collect();
+    match find_active_submission(store.conn(), account, &flattened)? {
+        Some((id, state)) => Ok(Some((
+            id,
+            OutboxState::parse(&state)
+                .expect("outbox state came from the state column's CHECK set"),
+        ))),
+        None => Ok(None),
+    }
 }
 
 /// Commit "the SMTP session is about to open" for a `pending_send` row.

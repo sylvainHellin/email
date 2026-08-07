@@ -729,9 +729,27 @@ impl App {
                             self.push_action(Action::BatchArchive(msgs));
                         }
                         ConfirmAction::Delete if !self.selection.is_empty() => {
+                            // Delete takes the messages half, as archive does:
+                            // a received message is a store mutation. A Drafts
+                            // selection holds draft ids and no `messages` row,
+                            // so once the messages half is empty the delete is
+                            // the local file removal instead (#0073), not
+                            // `prepare_delete` reporting nothing to delete. A
+                            // selection never mixes the two in practice; each
+                            // half still filters rather than assumes.
                             let msgs: Vec<MessageRef> =
-                                self.selection.drain().filter_map(|k| k.msg()).collect();
-                            self.push_action(Action::BatchDelete(msgs));
+                                self.selection.iter().filter_map(|k| k.msg()).collect();
+                            if msgs.is_empty() {
+                                let drafts: Vec<String> = self
+                                    .selection
+                                    .drain()
+                                    .filter_map(|k| k.draft().map(str::to_string))
+                                    .collect();
+                                self.push_action(Action::BatchDeleteDrafts(drafts));
+                            } else {
+                                self.selection.clear();
+                                self.push_action(Action::BatchDelete(msgs));
+                            }
                         }
                         _ => {
                             self.push_action(match dialog.action {
@@ -2443,6 +2461,28 @@ mod tests {
             Some(Action::BatchDelete(msgs)) => assert_eq!(msgs, vec![msg]),
             other => panic!("expected BatchDelete, got {other:?}"),
         }
+    }
+
+    /// `d` over a Drafts selection deletes the draft files, not store rows
+    /// (#0073): a draft has no `messages` row, so the old `BatchDelete` half
+    /// found nothing and reported "nothing to delete".
+    #[test]
+    fn delete_over_a_drafts_selection_takes_the_draft_ids() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
+        app.selection = std::collections::HashSet::from([
+            EntryKey::Draft("aaa".to_string()),
+            EntryKey::Draft("bbb".to_string()),
+        ]);
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        match app.pending_actions.pop_front() {
+            Some(Action::BatchDeleteDrafts(mut ids)) => {
+                ids.sort();
+                assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
+            }
+            other => panic!("expected BatchDeleteDrafts, got {other:?}"),
+        }
+        assert!(app.selection.is_empty(), "the selection is consumed");
     }
 
     /// `y` queues the selector copy, not the dead path copy (#0050 scope item
