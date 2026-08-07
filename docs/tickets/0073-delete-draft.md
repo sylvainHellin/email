@@ -1,5 +1,5 @@
 ---
-id: 0072
+id: 0073
 title: No way to delete a draft (CLI selector rejected, TUI `d` reports "nothing to delete")
 type: bug
 priority: next
