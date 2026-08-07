@@ -142,6 +142,7 @@ pub async fn sync_mailboxes(
         };
         let new_messages = fetched.messages;
         let state = fetched.state;
+        let pending_arrival_mark = fetched.pending_arrival_mark;
         result.skipped += fetched.skipped;
         if fetched.uidvalidity_reset {
             result.uidvalidity_resets += 1;
@@ -244,6 +245,11 @@ pub async fn sync_mailboxes(
                 exists: Some(state.exists as i64),
                 highest_modseq: None,
                 deltalink: None,
+                // What this pass owes the next one: the mark below which the
+                // gate must stay shut because an arrival the server lists is
+                // still not in the store. Written even when it is None, which
+                // is how a pass that caught up reopens the gate (#0072).
+                arrival_mark: pending_arrival_mark.map(|m| m as i64),
             },
         )?;
     }

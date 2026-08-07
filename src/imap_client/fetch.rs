@@ -126,8 +126,13 @@ pub struct StoreFetch {
     /// mailbox since the store last saw it: the `limit` window cut some off,
     /// a body did not come back, or the caller failed to ingest one. Backlog
     /// *older* than what the store already holds does not count; see
-    /// [`arrivals_missed`].
+    /// [`arrival_coverage`].
     pub download_incomplete: bool,
+    /// The arrival mark to persist for this mailbox: `Some(mark)` while an
+    /// arrival above it is still missing, `None` once every arrival is in.
+    /// Carried back in by the next fetch so the gate cannot open on a mark that
+    /// this pass's own ingest raised (#0072).
+    pub pending_arrival_mark: Option<u32>,
 }
 
 /// The UIDs the store holds that the server did not list, up to `ceiling`.
@@ -186,8 +191,35 @@ fn high_water(known: &std::collections::HashSet<i64>, ceiling: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// Whether any message that arrived since the store's high-water mark was not
-/// ingested by this pass.
+/// What one pass learned about the arrivals it was supposed to bring in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrivalCoverage {
+    /// True when at least one arrival above the mark is still not in the store
+    /// after this pass. Suspends the prune (see [`crate::ingest::pass_may_prune`]).
+    pub incomplete: bool,
+    /// The mark to carry into the next pass, or `None` when every arrival is
+    /// in and the next pass may derive its own mark from the store again.
+    pub pending_mark: Option<u32>,
+}
+
+/// The line above which every listed UID must be in the store for the pass to
+/// count as complete.
+///
+/// Without a carried mark it is the store's own high-water mark. With one it is
+/// the lower of the two, which is the whole point: a pass that ingested the top
+/// of the window raises `high_water` above the arrivals it could *not* reach,
+/// and deriving the mark afresh would put them below it and declare the pass
+/// complete (#0072 review note 1).
+fn arrival_mark(known: &std::collections::HashSet<i64>, ceiling: u32, carried: Option<u32>) -> u32 {
+    let high_water = high_water(known, ceiling);
+    match carried {
+        Some(mark) => mark.min(high_water),
+        None => high_water,
+    }
+}
+
+/// Whether any message that arrived since the mailbox's arrival mark is still
+/// not in the store after this pass, and the mark the next pass must use.
 ///
 /// "Arrival" is the load-bearing word. A quick sync downloads the last `limit`
 /// UIDs and deliberately ignores the backlog below them, so measuring coverage
@@ -195,20 +227,65 @@ fn high_water(known: &std::collections::HashSet<i64>, ceiling: u32) -> u32 {
 /// suspend the prune forever on any mailbox bigger than the window. What the
 /// prune actually depends on is that the copy of a message *moved into* this
 /// mailbox landed, and a move issues a fresh UID at the top of the folder;
-/// anything above `high_water` is such an arrival, and all of them must be in.
-fn arrivals_missed(
+/// anything above the mark is such an arrival, and all of them must be in.
+///
+/// The mark is *persisted* (`sync_cursors.arrival_mark`) rather than recomputed,
+/// because an unmet arrival outlives the pass that missed it: bulk-move 300
+/// messages into a mailbox a 100-UID window can only take the top of, and pass 2
+/// would otherwise stand on a high-water mark the 200 stragglers sit below, open
+/// the gate, and prune the source rows of copies that were never ingested. The
+/// mark therefore stays put until a pass actually reaches through it, which any
+/// full sync does; it also clears when the stragglers stop being listed (deleted
+/// on the server), so it cannot deadlock.
+fn arrival_coverage(
     listed: &[u32],
     known: &std::collections::HashSet<i64>,
     ceiling: u32,
     ingested: &[u32],
-) -> bool {
-    let mark = high_water(known, ceiling);
+    carried: Option<u32>,
+) -> ArrivalCoverage {
+    let mark = arrival_mark(known, ceiling, carried);
     let ingested: std::collections::HashSet<u32> = ingested.iter().copied().collect();
-    listed
+    let incomplete = listed
         .iter()
         .filter(|&&uid| uid > mark)
         .filter(|&&uid| !known.contains(&(uid as i64)))
-        .any(|uid| !ingested.contains(uid))
+        .any(|uid| !ingested.contains(uid));
+    ArrivalCoverage {
+        incomplete,
+        pending_mark: incomplete.then_some(mark),
+    }
+}
+
+/// Whether the `UID SEARCH ALL` listing is the whole mailbox.
+///
+/// A listing shorter than the `EXISTS` the same SELECT announced is a partial
+/// answer, and a partial answer reads exactly like a mass deletion. Two
+/// independent server statements have to agree before anything is pruned, which
+/// is what bounds the blast radius of the diff to something a single malformed
+/// response cannot widen.
+///
+/// A listing *longer* than `EXISTS` is not a contradiction worth acting on:
+/// messages can arrive between the two responses, and every extra UID can only
+/// keep a row alive.
+fn enumeration_complete(listed_len: usize, exists: u32) -> bool {
+    listed_len >= exists as usize
+}
+
+/// The prune's top clamp, and the line that separates a server UID from a
+/// locally written placeholder.
+///
+/// `UIDNEXT` is what SELECT promised and is preferred over `max(listed)`
+/// because it does not drop when the newest message is the one that was
+/// deleted. A server that withholds it leaves the highest UID it did list;
+/// a server that withholds both leaves 0, which prunes nothing at all.
+///
+/// `listed` must be sorted ascending, as it is at every call site.
+fn ceiling(uid_next: Option<u32>, listed: &[u32]) -> u32 {
+    uid_next
+        .map(|n| n.saturating_sub(1))
+        .or_else(|| listed.last().copied())
+        .unwrap_or(0)
 }
 
 /// Two-pass fetch for the store ingest path.
@@ -247,7 +324,15 @@ pub async fn fetch_new_raw_on_session(
     };
 
     let stored_uidvalidity = known.uidvalidity;
+    let stored_arrival_mark = known.arrival_mark;
     let (known_uids, uidvalidity_reset) = known.resolve(state.uid_validity);
+    // A mark is a UID, so a renumbering makes it meaningless: drop it with the
+    // skip list it travelled with.
+    let carried_mark = if uidvalidity_reset {
+        None
+    } else {
+        stored_arrival_mark
+    };
     if uidvalidity_reset {
         warn!(
             "UIDVALIDITY for '{}' changed from {:?} to {:?}: refetching the whole window, \
@@ -264,17 +349,8 @@ pub async fn fetch_new_raw_on_session(
     let mut listed: Vec<u32> = uids.into_iter().collect();
     listed.sort_unstable();
 
-    // The prune's top clamp, and the line that separates a server UID from a
-    // locally written placeholder. `UIDNEXT` is what SELECT promised; a server
-    // that withholds it leaves the highest UID it did list.
-    let ceiling = state
-        .uid_next
-        .map(|n| n.saturating_sub(1))
-        .or_else(|| listed.last().copied())
-        .unwrap_or(0);
-    // A listing shorter than the EXISTS the same SELECT announced is a partial
-    // answer, and a partial answer reads exactly like a mass deletion.
-    let enumeration_complete = listed.len() >= state.exists as usize;
+    let ceiling = ceiling(state.uid_next, &listed);
+    let enumeration_complete = enumeration_complete(listed.len(), state.exists);
     if !enumeration_complete {
         warn!(
             "'{}' listed {} UID(s) but announced EXISTS {}: treating the enumeration as short, \
@@ -297,15 +373,23 @@ pub async fn fetch_new_raw_on_session(
         );
     }
 
-    let empty = |state: MailboxState| StoreFetch {
-        messages: Vec::new(),
-        skipped: 0,
-        known_flags: Vec::new(),
-        state,
-        vanished: vanished.clone(),
-        uidvalidity_reset,
-        enumeration_complete,
-        download_incomplete: false,
+    // A pass that downloads nothing still has to answer the coverage question:
+    // `mp sync -n 0` computes a whole vanished set and returns through here, so
+    // hardcoding "complete" would force the gate open on a prune-only pass
+    // (#0072 review note 3). An empty listing has no arrivals and stays open.
+    let empty = |state: MailboxState| {
+        let coverage = arrival_coverage(&listed, &known_uids, ceiling, &[], carried_mark);
+        StoreFetch {
+            messages: Vec::new(),
+            skipped: 0,
+            known_flags: Vec::new(),
+            state,
+            vanished: vanished.clone(),
+            uidvalidity_reset,
+            enumeration_complete,
+            download_incomplete: coverage.incomplete,
+            pending_arrival_mark: coverage.pending_mark,
+        }
     };
 
     if listed.is_empty() {
@@ -346,6 +430,7 @@ pub async fn fetch_new_raw_on_session(
     let skipped = known_flags.len();
 
     if new_uids.is_empty() {
+        let coverage = arrival_coverage(&listed, &known_uids, ceiling, &[], carried_mark);
         return Ok(StoreFetch {
             messages: Vec::new(),
             skipped,
@@ -354,7 +439,8 @@ pub async fn fetch_new_raw_on_session(
             vanished,
             uidvalidity_reset,
             enumeration_complete,
-            download_incomplete: arrivals_missed(&listed, &known_uids, ceiling, &[]),
+            download_incomplete: coverage.incomplete,
+            pending_arrival_mark: coverage.pending_mark,
         });
     }
     info!(
@@ -387,6 +473,7 @@ pub async fn fetch_new_raw_on_session(
     }
 
     let downloaded: Vec<u32> = out.iter().map(|m| m.uid).collect();
+    let coverage = arrival_coverage(&listed, &known_uids, ceiling, &downloaded, carried_mark);
     Ok(StoreFetch {
         messages: out,
         skipped,
@@ -395,7 +482,8 @@ pub async fn fetch_new_raw_on_session(
         vanished,
         uidvalidity_reset,
         enumeration_complete,
-        download_incomplete: arrivals_missed(&listed, &known_uids, ceiling, &downloaded),
+        download_incomplete: coverage.incomplete,
+        pending_arrival_mark: coverage.pending_mark,
     })
 }
 
@@ -480,7 +568,9 @@ mod tests {
     fn old_backlog_the_window_skipped_is_not_a_missed_arrival() {
         let known = HashSet::from([50, 51]);
         let listed: Vec<u32> = (1..=51).collect();
-        assert!(!arrivals_missed(&listed, &known, 51, &[]));
+        let coverage = arrival_coverage(&listed, &known, 51, &[], None);
+        assert!(!coverage.incomplete);
+        assert_eq!(coverage.pending_mark, None);
     }
 
     /// A message that arrived above the mark and was not downloaded is: the
@@ -488,8 +578,8 @@ mod tests {
     #[test]
     fn an_arrival_the_window_cut_off_is_a_missed_arrival() {
         let known = HashSet::from([50]);
-        assert!(arrivals_missed(&[50, 51, 52], &known, 52, &[52]));
-        assert!(!arrivals_missed(&[50, 51, 52], &known, 52, &[51, 52]));
+        assert!(arrival_coverage(&[50, 51, 52], &known, 52, &[52], None).incomplete);
+        assert!(!arrival_coverage(&[50, 51, 52], &known, 52, &[51, 52], None).incomplete);
     }
 
     /// A first sync of a mailbox bigger than the window has no mark to stand
@@ -498,6 +588,137 @@ mod tests {
     #[test]
     fn a_first_sync_of_a_capped_mailbox_is_incomplete() {
         let known = HashSet::new();
-        assert!(arrivals_missed(&[1, 2, 3], &known, 3, &[2, 3]));
+        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[2, 3], None).incomplete);
+    }
+
+    /// A pass that comes up short leaves the mark it stood on behind, so the
+    /// next one can be held to the same line.
+    #[test]
+    fn a_short_pass_hands_its_mark_to_the_next_one() {
+        let known = HashSet::from([50]);
+        let coverage = arrival_coverage(&[50, 51, 52], &known, 52, &[52], None);
+        assert!(coverage.incomplete);
+        assert_eq!(coverage.pending_mark, Some(50));
+    }
+
+    /// #0072 review note 1, the two-pass bulk move: 300 messages land in a
+    /// mailbox whose quick sync only takes the top 100.
+    ///
+    /// Pass 1 defers, which the shipped gate already did. Pass 2 is where it
+    /// used to fail: its own ingest raised `max(known)` to 400, which put the
+    /// 200 stragglers *below* a freshly derived mark and opened the gate on
+    /// rows whose copies were never fetched. The carried mark is what keeps it
+    /// shut.
+    #[test]
+    fn the_pass_after_a_bulk_move_still_defers_while_arrivals_are_missing() {
+        let listed: Vec<u32> = (1..=400).collect();
+        let window: Vec<u32> = (301..=400).collect();
+
+        // Pass 1: the store holds 1..=100, the move added 101..=400.
+        let known_before: HashSet<i64> = (1..=100).collect();
+        let pass1 = arrival_coverage(&listed, &known_before, 400, &window, None);
+        assert!(
+            pass1.incomplete,
+            "pass 1 could not reach 101..=300 and must defer"
+        );
+        assert_eq!(pass1.pending_mark, Some(100));
+
+        // Pass 2: the store now also holds what pass 1 downloaded, and the
+        // window has nothing new in it.
+        let mut known_after = known_before.clone();
+        known_after.extend((301..=400).map(i64::from));
+        let derived = arrival_coverage(&listed, &known_after, 400, &[], None);
+        assert!(
+            !derived.incomplete,
+            "the pre-fix behaviour this test exists to forbid: a mark of 400 sees no arrival"
+        );
+        let carried = arrival_coverage(&listed, &known_after, 400, &[], pass1.pending_mark);
+        assert!(
+            carried.incomplete,
+            "101..=300 are still not in the store, so pass 2 must defer too"
+        );
+        assert_eq!(carried.pending_mark, Some(100));
+
+        // A full sync brings the stragglers in and the gate opens.
+        let everything: Vec<u32> = (101..=300).collect();
+        let opened = arrival_coverage(&listed, &known_after, 400, &everything, carried.pending_mark);
+        assert!(!opened.incomplete);
+        assert_eq!(opened.pending_mark, None, "the mark clears once it is met");
+    }
+
+    /// The other way out of a carried mark: the arrivals that were never
+    /// fetched are deleted on the server, so nothing owes the store anything
+    /// and the gate opens without a full sync. The mark cannot deadlock.
+    #[test]
+    fn a_carried_mark_clears_when_the_missing_arrivals_stop_being_listed() {
+        let known: HashSet<i64> = HashSet::from([1, 2, 3]);
+        let coverage = arrival_coverage(&[1, 2, 3], &known, 10, &[], Some(1));
+        assert!(!coverage.incomplete);
+        assert_eq!(coverage.pending_mark, None);
+    }
+
+    /// A carried mark never rises with the store: it is the lower of the two,
+    /// which is the whole mechanism.
+    #[test]
+    fn the_carried_mark_wins_over_a_higher_high_water() {
+        let known: HashSet<i64> = HashSet::from([10, 90]);
+        assert_eq!(arrival_mark(&known, 100, Some(10)), 10);
+        assert_eq!(arrival_mark(&known, 100, None), 90);
+        // A stale mark above the store's own high-water mark cannot loosen it.
+        assert_eq!(arrival_mark(&known, 100, Some(95)), 90);
+    }
+
+    /// `mp sync -n 0` computes a full vanished set and downloads nothing. It
+    /// must not report itself complete when the mailbox holds rows the store
+    /// has never seen (#0072 review note 3).
+    #[test]
+    fn a_pass_that_downloads_nothing_is_not_complete() {
+        let known: HashSet<i64> = HashSet::from([1, 2]);
+        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[], None).incomplete);
+    }
+
+    /// ...and stays complete when the mailbox is genuinely empty, which is the
+    /// one case the empty-listing return has to keep prunable.
+    #[test]
+    fn an_empty_listing_is_a_complete_pass() {
+        let known: HashSet<i64> = HashSet::from([1, 2]);
+        let coverage = arrival_coverage(&[], &known, 2, &[], None);
+        assert!(!coverage.incomplete);
+        assert_eq!(coverage.pending_mark, None);
+    }
+
+    /// The enumeration gate: `UID SEARCH ALL` must account for every message
+    /// `SELECT` announced before a single row is pruned.
+    #[test]
+    fn a_listing_shorter_than_exists_is_an_incomplete_enumeration() {
+        assert!(!enumeration_complete(3, 4));
+        assert!(enumeration_complete(4, 4));
+        // A message that arrived between the two responses is not a short
+        // answer, and can only keep rows alive.
+        assert!(enumeration_complete(5, 4));
+    }
+
+    /// `EXISTS 0` with an empty listing is the one case where a complete
+    /// enumeration prunes a whole mailbox, so it is pinned deliberately.
+    #[test]
+    fn an_empty_mailbox_enumerates_completely() {
+        assert!(enumeration_complete(0, 0));
+    }
+
+    /// The ceiling comes from `UIDNEXT`, which does not drop when the newest
+    /// message is the one that was deleted.
+    #[test]
+    fn the_ceiling_is_uidnext_minus_one() {
+        assert_eq!(ceiling(Some(84), &[1, 2, 3]), 83);
+    }
+
+    /// A server that withholds `UIDNEXT` leaves the highest UID it did list,
+    /// and one that lists neither leaves 0, which prunes nothing and makes
+    /// every listed UID a placeholder rather than a prune candidate.
+    #[test]
+    fn the_ceiling_falls_back_to_the_listing_then_to_zero() {
+        assert_eq!(ceiling(None, &[1, 2, 9]), 9);
+        assert_eq!(ceiling(None, &[]), 0);
+        assert_eq!(ceiling(Some(0), &[1, 2, 9]), 0);
     }
 }

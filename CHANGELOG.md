@@ -70,6 +70,32 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A bulk move no longer loses its messages one sync after the gate deferred
+  it, and store schema v5 (#0072 review).** The prune gate held a pass back
+  when a message that had arrived above the mailbox's high-water mark was not
+  ingested, and recomputed that mark from the store on every pass, so it
+  protected exactly one. Move 300 messages into a mailbox whose quick sync
+  downloads the last 100 UIDs: the first pass defers correctly, the second one
+  stands on a mark its own ingest has just raised to the top of the folder,
+  finds the 200 copies it never fetched sitting *below* it, declares itself
+  complete and prunes the source rows of messages the store holds no copy of
+  and a positional window will never go back for. The mark is now persisted in
+  the sync cursor (`sync_cursors.arrival_mark`, hence the schema bump) and the
+  next pass is held to the lower of carried and derived. It clears the moment a
+  pass reaches through it, which any full sync does, and also when the missing
+  messages stop being listed at all, so it cannot deadlock. `mp sync -n 0`,
+  which computes a full removal set and downloads nothing, no longer reports
+  itself as complete coverage and forces the gate open. As always there is no
+  migrator: an existing store is dropped and rebuilt empty on first open, the
+  outbox is carried across, and the next sync refills it from the server.
+
+  One behaviour worth knowing rather than fixing rides along, now written down
+  in the ticket, in `docs/lessons-learned.md` and on the site's FAQ: on Gmail,
+  archiving removes the `INBOX` label and the copy in All Mail keeps its
+  original low UID, so it is not an arrival, no gate can wait for it, and while
+  the inbox row is pruned on the next quick sync the archived copy is re-filed
+  only by a full sync. On servers that implement a move as copy-and-expunge
+  (Exchange, Dovecot) one pass does both halves.
 - **A message archived in another client now leaves the local inbox on the
   next sync (#0072).** The prune diffed the store's UIDs against the download
   window only, the last `--limit` UIDs the fetch had read, so a message the

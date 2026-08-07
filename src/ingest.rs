@@ -568,6 +568,11 @@ pub struct MailboxCursor {
     /// Graph `deltaLink` (unused until the delta fetch lands, see
     /// `TODO(#0037-4b-or-0038)` in `src/graph.rs`).
     pub deltalink: Option<String>,
+    /// The IMAP arrival mark (#0072): the UID above which this mailbox still
+    /// owes the store an arrival, so the prune gate stays shut until a pass
+    /// reaches through it. `None` means nothing is owed. Always `None` on the
+    /// Graph path, whose coverage is by-id rather than positional.
+    pub arrival_mark: Option<i64>,
 }
 
 /// Record what ingest knows about a mailbox: the `mailboxes` row the read path
@@ -597,20 +602,22 @@ pub fn record_mailbox_cursor(
 
     conn.execute(
         "INSERT INTO sync_cursors
-            (account, mailbox, uidvalidity, last_uid, highest_modseq, deltalink)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (account, mailbox, uidvalidity, last_uid, highest_modseq, deltalink, arrival_mark)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (account, mailbox) DO UPDATE SET
             uidvalidity = excluded.uidvalidity,
             last_uid = excluded.last_uid,
             highest_modseq = excluded.highest_modseq,
-            deltalink = excluded.deltalink",
+            deltalink = excluded.deltalink,
+            arrival_mark = excluded.arrival_mark",
         rusqlite::params![
             account,
             mailbox,
             cursor.uidvalidity,
             cursor.last_uid,
             cursor.highest_modseq,
-            cursor.deltalink
+            cursor.deltalink,
+            cursor.arrival_mark
         ],
     )
     .context("recording the sync cursor")?;
@@ -626,7 +633,8 @@ pub fn load_mailbox_cursor(
     let cursor = store
         .conn()
         .query_row(
-            "SELECT uidvalidity, last_uid, highest_modseq, deltalink FROM sync_cursors
+            "SELECT uidvalidity, last_uid, highest_modseq, deltalink, arrival_mark
+             FROM sync_cursors
              WHERE account = ?1 AND mailbox = ?2",
             [account, mailbox],
             |row| {
@@ -637,6 +645,7 @@ pub fn load_mailbox_cursor(
                     exists: None,
                     highest_modseq: row.get(2)?,
                     deltalink: row.get(3)?,
+                    arrival_mark: row.get(4)?,
                 })
             },
         )
@@ -913,6 +922,12 @@ pub struct KnownUids {
     /// UIDVALIDITY recorded by the fetch that last wrote those rows, when the
     /// store has a cursor for the mailbox at all.
     pub uidvalidity: Option<i64>,
+    /// The arrival mark a previous pass left behind: a UID above which some
+    /// message the server lists is still not in the store, so the prune stays
+    /// suspended until a pass reaches through it (#0072). `None` when the last
+    /// pass brought every arrival in. Meaningless across a UIDVALIDITY change,
+    /// like the UID set it travels with.
+    pub arrival_mark: Option<u32>,
 }
 
 impl KnownUids {
@@ -943,9 +958,14 @@ impl KnownUids {
 /// Everything a fetch needs to decide what to skip: the stored UIDs and the
 /// UIDVALIDITY they were recorded under.
 pub fn known_uids_with_cursor(store: &Store, account: &str, mailbox: &str) -> Result<KnownUids> {
+    let cursor = load_mailbox_cursor(store, account, mailbox)?;
     Ok(KnownUids {
         uids: known_uids(store, account, mailbox)?,
-        uidvalidity: load_mailbox_cursor(store, account, mailbox)?.and_then(|c| c.uidvalidity),
+        uidvalidity: cursor.as_ref().and_then(|c| c.uidvalidity),
+        arrival_mark: cursor
+            .as_ref()
+            .and_then(|c| c.arrival_mark)
+            .and_then(|m| u32::try_from(m).ok()),
     })
 }
 

@@ -46,7 +46,7 @@ Before the old file is deleted its unfinished rows (`pending_send`, `sent_pendin
 A row that cannot be carried, because its bytes are gone from the blob store or its columns are unreadable, is named in a `store-rebuild-<timestamp>.txt` note written next to the store; nothing about a submitted message is discarded silently.
 The same pass then sweeps the blob tree, deleting every file the rebuilt store holds no refcount row for, so a rebuild cannot leave the blob directory full of orphans that nothing reclaims.
 
-Schema v4 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
+Schema v5 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
 
 - `messages` is one row per message per mailbox, with a synthetic `id` and `UNIQUE (account, mailbox, uid)` as the real identity.
 The same message in two mailboxes is two rows.
@@ -57,6 +57,7 @@ Refcounts live in the database so a reference can be taken in the same transacti
 Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, and nothing needs to be, because a store that loses its index is dropped.
 - `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (Graph, NULL until #0042).
 The two were one column until #0054, which stored a UID where a modseq was read back.
+`arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
 - `outbox` carries the durable send state machine described below.
 - `drafts` is the derived index over the drafts directory.
 - `pending_ops` is shape only so far: the durable mutation queue is #0039.
@@ -165,7 +166,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/timing.rs` | `TimingSpan`, which emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
 | **`src/store/`** | |
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
-| `schema.rs` | Schema v4 SQL, version stamping, required-table validation, and the identity notes |
+| `schema.rs` | Schema v5 SQL, version stamping, required-table validation, and the identity notes |
 | `read.rs` | Listings, counts, Message-ID lookup, body and HTML loading, `materialise_attachments` |
 | `write.rs` | The optimistic local half of a flag, move or delete |
 | `drafts.rs` | The derived index over `<account_dir>/drafts/` |

@@ -49,3 +49,25 @@ No QRESYNC (option (a)) because `async-imap` exposes no `VANISHED` channel here 
 
 Shipped 2026-08-07.
 Live: the same repro that left uid 1 in the inbox now reports `1 no longer in this mailbox` and the row is gone.
+
+## Follow-up from the review of 4aca3c7
+
+The arrival gate held for exactly one pass and then permitted the loss it exists to prevent.
+It derived its mark from `max(known)` on every pass, so a bulk move of 300 messages into a mailbox whose quick sync takes the top 100 deferred correctly on pass 1 and then, on pass 2, stood on a high-water mark that its own ingest had raised above the 200 copies it never fetched: the gate opened, the source rows were pruned, and the positional window would never have gone back for the destination copies.
+The mark is now persisted (`sync_cursors.arrival_mark`, schema v5) and carried into the next pass, which is held to the lower of the two.
+It clears when a pass reaches through it, which any full sync does, and also when the missing arrivals stop being listed, so it cannot deadlock.
+
+Two smaller holes closed with it.
+`mp sync -n 0` computed a full vanished set and returned through the empty-window path, which reported the pass complete by construction: a prune-only pass with the gate forced open.
+It now answers the coverage question like every other return.
+And the two bounds on the deletion blast radius, `enumeration_complete` and the `ceiling` derivation, were inline in a function that needs a server to run; they are pure functions with unit tests now, including `EXISTS 0` and a server that reports no `UIDNEXT`.
+
+### Gmail label semantics: the archived copy is re-filed by a full sync, not the next one
+
+On a server where a move issues a fresh UID at the top of the destination folder (Exchange, Dovecot), one pass sees both halves: the source row is pruned and the destination copy is ingested by the same sync.
+Gmail does not move anything.
+Archiving removes the `INBOX` label, and the copy in `[Gmail]/All Mail` keeps the low UID it has had since it arrived, so it is not an arrival, the gate does not hold the pass back for it, and a capped quick sync will not fetch it: its UID sits far below the bottom of the archive window.
+The result is correct but asymmetric.
+The inbox row goes, which is the removal this ticket is about, and the archive copy is re-filed the next time the archive mailbox is synced in full (`S` in the TUI, `mp sync -n <huge>`).
+Measured on the guinea pig account: All Mail uid 1 against a window bottom of 234.
+This is the intended behaviour, not a deferral the gate can improve: a positional window cannot drain a backlog, which is what #0041 (CONDSTORE/QRESYNC) would change by making the pull a delta rather than a window.

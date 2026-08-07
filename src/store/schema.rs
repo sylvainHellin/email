@@ -25,8 +25,9 @@ use rusqlite::Connection;
 /// `highest_modseq` into `last_uid`, `sync_cursors` and `pending_ops` gain the
 /// `account` column the rest of the schema carries, `pending_ops` gains
 /// `updated`, and the two write-only columns (`messages.mtime`,
-/// `mailboxes.unread_count`) come out.
-pub const SCHEMA_VERSION: i64 = 4;
+/// `mailboxes.unread_count`) come out. v5 adds `sync_cursors.arrival_mark`, the
+/// one piece of sync state a pass has to hand to the next one (#0072).
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -124,6 +125,15 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   usable (`snippet()`, `highlight()` and selecting a column value all fail),
 ///   and there is nothing to rebuild from, because a store that loses its index
 ///   is dropped and refilled by the next sync.
+/// - `sync_cursors.arrival_mark` is the only column here a *later* pass reads
+///   back: the UID above which the mailbox still owes the store a message the
+///   server lists (a bulk move whose destination copies did not fit the
+///   download window). Recomputing it from the stored UIDs cannot work, since
+///   ingesting the top of the window raises that high-water mark above the
+///   stragglers and declares the pass complete, which is exactly the loss the
+///   prune gate exists to prevent (#0072). NULL means nothing is owed. Written
+///   by the IMAP pull only; the Graph pull downloads by id, not by position,
+///   and leaves it NULL.
 /// - `sync_cursors` keeps the two resume points apart, because they are not
 ///   the same number: `last_uid` is the highest UID the recording fetch saw,
 ///   while `highest_modseq` is a CONDSTORE modification sequence. Both are
@@ -247,6 +257,10 @@ CREATE TABLE sync_cursors (
     highest_modseq INTEGER,
     -- Graph deltaLink; NULL until #0042.
     deltalink      TEXT,
+    -- IMAP arrival mark (#0072): the UID above which this mailbox still owes
+    -- the store an arrival, which keeps the prune gate shut. NULL when it does
+    -- not, and on the Graph path.
+    arrival_mark   INTEGER,
     PRIMARY KEY (account, mailbox)
 );
 

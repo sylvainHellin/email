@@ -577,5 +577,21 @@ When a safety clamp is derived from a partial input, check whether the complete 
 
 Gating the IMAP prune on the same condition as Graph's, every message found was downloaded, would have suspended it permanently: a quick sync's window is the last 100 UIDs of a mailbox that can hold 8000, so every capped pass reports a backlog it never intended to fetch and the gate never opens (#0072).
 Graph gets away with the strict form because it downloads by id, so its backlog drains one window per pass; IMAP's window is positional and the backlog under it is skipped by design.
-What the prune actually depends on is narrower: an inbox row may go because another mailbox ingested the copy the message moved to, and a move issues a fresh UID at the *top* of the destination, so the flag to compute is whether every UID above the mailbox's local high-water mark landed ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrivals_missed`).
+What the prune actually depends on is narrower: an inbox row may go because another mailbox ingested the copy the message moved to, and a move issues a fresh UID at the *top* of the destination, so the flag to compute is whether every UID above the mailbox's arrival mark landed ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrival_coverage`).
 When two backends share a safety gate, share the predicate and let each compute its own inputs; the flag's name travels, its derivation does not.
+
+## A watermark recomputed from the store each pass measures the wrong thing after the first one
+
+The IMAP prune gate held a pass back when a UID above the mailbox's high-water mark had not been ingested, and derived that mark afresh from `max(known)` every pass (#0072 review).
+It therefore protected exactly one pass: bulk-move 300 messages into a mailbox whose quick sync downloads the top 100, and pass 1 defers correctly, while pass 2 stands on a mark its *own* ingest has just raised to the top of the folder, finds the 200 copies it never fetched sitting below it, calls itself complete, and prunes the source rows of messages that have no local copy at all and that a positional window will never go back for.
+A gate whose input is recomputed from the state the gate's own action changes is a one-shot gate.
+The mark is now persisted per mailbox (`sync_cursors.arrival_mark`) and the next pass is held to the lower of carried and derived, which is the only form that survives its own success ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrival_coverage`).
+Two exits keep it from becoming a deadlock: a pass that reaches through the mark clears it, and so does one where the missing arrivals stopped being listed.
+
+## Gmail archives by removing a label, so the copy is not an arrival and no gate can wait for it
+
+Pruning a row because the message moved rests on the destination mailbox ingesting the copy, and on servers that implement a move as `COPY` + `EXPUNGE` (Exchange, Dovecot) that copy arrives with a fresh UID at the top of the destination folder, where the same pass fetches it.
+Gmail moves nothing: archiving removes the `INBOX` label and the copy in `[Gmail]/All Mail` keeps the UID it was given when it first arrived, which is usually far below the bottom of a capped window (measured: uid 1 against a window bottom of 234).
+The arrival gate cannot help, because by its own definition, correctly, that copy is not an arrival.
+The behaviour is therefore correct but asymmetric: the inbox row is pruned on the next quick sync and the archived copy is re-filed only by a full sync of the archive mailbox.
+Anything written for users about removals converging "on the next sync" has to say so ([website/src/pages/faq.astro](../website/src/pages/faq.astro)).

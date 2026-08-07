@@ -1295,6 +1295,9 @@ pub async fn sync_mailboxes_graph(
                     exists: Some(server.len() as i64),
                     highest_modseq: None,
                     deltalink: None,
+                    // IMAP-only: the Graph pull downloads by id, so it has no
+                    // positional window that can leave an arrival behind.
+                    arrival_mark: None,
                 },
             )?;
         }

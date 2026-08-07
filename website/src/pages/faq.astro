@@ -116,6 +116,14 @@ import AccordionItem from '../components/AccordionItem.astro';
             removed from the local store whatever its age, and a mailbox cleaned up in another
             client converges on the next sync.
           </p>
+          <p>
+            A message that was <em>moved</em> converges as soon as the sync has read the copy in
+            its destination. On servers that issue a new identifier on a move (Exchange, Dovecot)
+            that is the same pass. On Gmail, archiving only removes the Inbox label and the copy
+            in All Mail keeps its original, old identifier, so a capped sync will not see it
+            again: the inbox row goes and the archived copy is re-filed by the next full sync
+            (<code>S</code> in the TUI).
+          </p>
         </AccordionItem>
 
         <AccordionItem question="Can I use mailypoppins with multiple accounts?">

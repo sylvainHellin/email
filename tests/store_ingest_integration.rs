@@ -618,6 +618,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
             exists: Some(2),
             highest_modseq: None,
             deltalink: None,
+            arrival_mark: None,
         },
     )
     .unwrap();
@@ -667,6 +668,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
             exists: Some(2),
             highest_modseq: None,
             deltalink: None,
+            arrival_mark: None,
         },
     )
     .unwrap();
@@ -686,6 +688,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
     let (skip, reset) = email::ingest::KnownUids {
         uids: HashSet::from([7]),
         uidvalidity: None,
+        arrival_mark: None,
     }
     .resolve(Some(42));
     assert!(!reset);
@@ -731,6 +734,7 @@ fn mailbox_cursors_round_trip() {
         exists: Some(56),
         highest_modseq: Some(7),
         deltalink: None,
+        arrival_mark: None,
     };
     email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor).unwrap();
 
@@ -807,6 +811,50 @@ fn mailbox_cursors_round_trip() {
         email::ingest::load_mailbox_cursor(&f.store, "acct", "inbox").unwrap().unwrap().uidvalidity,
         Some(43),
         "writing another account's cursor leaves the first account's row alone"
+    );
+}
+
+/// The arrival mark is the one cursor field a later pass reads back (#0072):
+/// it survives the round trip, reaches the next fetch through
+/// `known_uids_with_cursor`, and clears when a pass records `None`.
+#[test]
+fn the_arrival_mark_survives_the_cursor_round_trip() {
+    let f = Fixture::new();
+    f.ingest_raw("inbox", 400, &plain("top of the window"));
+    let cursor = |arrival_mark| email::ingest::MailboxCursor {
+        uidvalidity: Some(7),
+        last_uid: Some(400),
+        uidnext: Some(401),
+        exists: Some(400),
+        highest_modseq: None,
+        deltalink: None,
+        arrival_mark,
+    };
+
+    // A pass that came up short leaves its mark behind.
+    email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(Some(100))).unwrap();
+    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    assert_eq!(
+        known.arrival_mark,
+        Some(100),
+        "the next fetch must be held to the mark the short pass stood on"
+    );
+
+    // A pass that caught up clears it, which is what reopens the gate.
+    email::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(None)).unwrap();
+    assert_eq!(
+        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+            .unwrap()
+            .arrival_mark,
+        None
+    );
+
+    // A mailbox that has never synced owes nothing.
+    assert_eq!(
+        email::ingest::known_uids_with_cursor(&f.store, "acct", "archive")
+            .unwrap()
+            .arrival_mark,
+        None
     );
 }
 
@@ -1063,6 +1111,7 @@ fn a_uidvalidity_reset_prunes_nothing() {
             exists: Some(3),
             highest_modseq: None,
             deltalink: None,
+            arrival_mark: None,
         },
     )
     .unwrap();
