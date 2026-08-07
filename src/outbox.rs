@@ -456,6 +456,27 @@ pub fn is_already_in_flight(err: &anyhow::Error) -> bool {
     err.chain().any(|c| c.is::<AlreadyInFlight>())
 }
 
+/// True when an error is the store being held by another writer.
+///
+/// The distinction the send path needs (#0063 review): a store that will not
+/// open is a store that cannot answer "is this draft already in flight", and
+/// the send may proceed without a durable record. A *busy* store is one that
+/// can answer and has not been asked yet, so proceeding would drive past an
+/// admission gate another process is holding. That one is retryable, not a
+/// licence to send.
+pub fn is_store_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
 /// What the SMTP conversation did, from the state machine's point of view.
 ///
 /// The distinction that matters is not "worked / did not work" but "does the
@@ -594,9 +615,13 @@ pub fn enqueue(
     span.mark("blob_written");
 
     let now = unix_now();
+    // IMMEDIATE, not the default DEFERRED: this transaction reads to decide
+    // whether it may write, and under WAL a deferred read taken before a
+    // competing enqueue commits turns the INSERT into `SQLITE_BUSY_SNAPSHOT`.
+    // The loser of that race must see the winner's row and be refused by the
+    // gate, not fail on the write (#0063 review).
     let tx = store
-        .conn()
-        .unchecked_transaction()
+        .immediate_transaction()
         .context("opening the outbox enqueue transaction")?;
     // Again inside the transaction, where a concurrent enqueue that has
     // already committed is visible.
@@ -645,6 +670,10 @@ fn refuse_a_second_submission(
     let Some(key) = envelope.draft_key.as_deref() else {
         return Ok(());
     };
+    // Compared flattened on both sides: the stored key went through `one_line`
+    // on the way in, so a path-fallback key holding a tab or a trailing space
+    // would never compare equal to its own encoding (#0063 review).
+    let flattened = one_line(key);
     let mut stmt = conn.prepare(
         "SELECT id, state, envelope FROM outbox
          WHERE account = ?1 AND state IN ('pending_send', 'sent_pending_append')
@@ -663,7 +692,7 @@ fn refuse_a_second_submission(
             .as_deref()
             .map(Envelope::decode)
             .and_then(|env| env.draft_key)
-            .is_some_and(|other| other == key);
+            .is_some_and(|other| one_line(&other) == flattened);
         if holds_the_draft {
             return Err(anyhow::Error::new(AlreadyInFlight(format!(
                 "this draft is already in the outbox as row {id} ({state}); \

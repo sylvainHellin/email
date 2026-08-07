@@ -549,3 +549,11 @@ The send path classified an SMTP failure as clean or ambiguous with `!(err.is_re
 It is not: `Kind::Response` is a reply that could not be *parsed*, while a 5xx refusal is `Kind::Permanent` and a 4xx is `Kind::Transient`, so every hard rejection fell through to the ambiguous branch and parked a row that the server had explicitly and finally refused.
 The predicates that mean what they say are `is_permanent()` and `is_transient()`, and there is no public predicate at all for the distinction that would matter most, a TCP connect failure (`Kind::Connection`, nothing was sent) against an i/o error on an established stream (`Kind::Network`, the 250 may have been lost): both are only reachable as "none of the above".
 When an error type's predicates are named after its internal variants, read the variants before writing the boolean.
+
+## A WAL transaction that reads before it writes must begin IMMEDIATE
+
+The outbox admission gate reads the open rows to decide whether it may insert one, inside a transaction opened with `rusqlite`'s `unchecked_transaction()` (#0063 review).
+That begins DEFERRED, which takes the read snapshot at the first `SELECT` and the write lock at the first `INSERT`, and under WAL a writer that commits in between invalidates the snapshot: the insert fails with `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` does not retry because the transaction has already read stale data and can only be rolled back.
+So the loser of a two-process race did not see the winner's row and be refused, it failed on the write, and the send path's fallback treated that failure as "the store is unavailable" and sent the message with no outbox row and no gate at all.
+`BEGIN IMMEDIATE` (`Transaction::new_unchecked(conn, TransactionBehavior::Immediate)`) takes the write lock up front, so the two enqueues serialise and the second one reads what the first committed.
+The second half of the lesson is about the fallback: an error path that downgrades to a less safe mode has to enumerate the failures it was designed for, because "everything else" will eventually include the one failure that means another process is holding the very lock the downgrade bypasses.

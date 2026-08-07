@@ -170,6 +170,21 @@ impl Store {
         &self.path
     }
 
+    /// Begin a write transaction that takes the write lock up front.
+    ///
+    /// rusqlite's `unchecked_transaction` begins DEFERRED, which takes the
+    /// write lock at the first write. Under WAL that is fine for a transaction
+    /// that only writes, and wrong for one that *reads to decide whether to
+    /// write*: the read pins a snapshot, and if another writer commits before
+    /// the upgrade, the write fails with `SQLITE_BUSY_SNAPSHOT` however long
+    /// the busy timeout is. Beginning IMMEDIATE serialises those transactions
+    /// against each other instead, so the second one reads what the first one
+    /// committed (the outbox admission gate, #0063).
+    pub fn immediate_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+            .context("beginning an immediate transaction")
+    }
+
     /// The schema version stamped in `meta`. Always [`SCHEMA_VERSION`] for a
     /// store that just came back from [`Store::open`].
     pub fn schema_version(&self) -> Result<Option<i64>> {
@@ -594,6 +609,37 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, BUSY_TIMEOUT_MS as i64);
+    }
+
+    /// The point of the IMMEDIATE begin: the write lock is held from the
+    /// first statement, so a second writer is told so up front rather than at
+    /// its first write, where under WAL it would be an unretryable
+    /// `SQLITE_BUSY_SNAPSHOT` (#0063 review). The second store's busy timeout
+    /// is dropped to keep the test instant.
+    #[test]
+    fn an_immediate_transaction_holds_the_write_lock_from_the_start() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        second
+            .conn()
+            .busy_timeout(Duration::from_millis(20))
+            .unwrap();
+
+        let held = first.immediate_transaction().unwrap();
+        let err = second
+            .immediate_transaction()
+            .expect_err("the second writer cannot begin while the first holds the lock");
+        assert!(
+            crate::outbox::is_store_busy(&err),
+            "a held write lock reads as busy, not as a store that will not open: {err:#}"
+        );
+
+        held.rollback().unwrap();
+        second
+            .immediate_transaction()
+            .expect("the lock is released with the transaction");
     }
 
     #[test]

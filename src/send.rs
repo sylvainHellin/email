@@ -443,20 +443,49 @@ mod tests {
     #[test]
     fn one_draft_admits_one_send_at_a_time() {
         let key = "id:only-once";
-        let first = SendAdmission::claim(key).expect("the first send is admitted");
+        let first = SendAdmission::claim("work", key).expect("the first send is admitted");
         assert!(
-            SendAdmission::claim(key).is_none(),
+            SendAdmission::claim("work", key).is_none(),
             "a second send of the same draft is refused while the first runs"
         );
         assert!(
-            SendAdmission::claim("id:another").is_some(),
+            SendAdmission::claim("work", "id:another").is_some(),
             "a different draft is not blocked"
+        );
+        assert!(
+            SendAdmission::claim("personal", key).is_some(),
+            "the same id on another account is another message, not a duplicate"
         );
         drop(first);
         assert!(
-            SendAdmission::claim(key).is_some(),
+            SendAdmission::claim("work", key).is_some(),
             "the slot is released however the send returned"
         );
+    }
+
+    /// The `from:` that reaches SMTP is the one the build validated. An
+    /// unquoted comma in the display name parses nowhere, so a draft carrying
+    /// one used to enqueue and then fail every submission it would ever get
+    /// (#0063 review).
+    #[test]
+    fn a_from_with_a_comma_in_the_display_name_survives_the_build() {
+        let mut draft = draft_with(Some("comma-from"), "/drafts/comma.md");
+        draft.frontmatter.from = Some("Doe, Jane <jane@example.com>".to_string());
+        let built = build_draft_message(
+            &draft,
+            "fallback@example.com",
+            &EmailSettings::default(),
+            None,
+            None,
+        )
+        .expect("the build accepts a display name it can quote");
+        assert_eq!(built.from, "\"Doe, Jane\" <jane@example.com>");
+        // What `submit` does with it before it opens a connection.
+        let mailbox: Mailbox = built
+            .from
+            .parse()
+            .expect("the stored from address parses on the submission path");
+        assert_eq!(mailbox.email.to_string(), "jane@example.com");
     }
 
     // -----------------------------------------------------------------------
@@ -1195,6 +1224,13 @@ pub async fn send_durably(
         // The admission gate is the one queue refusal that must stop the send:
         // sending anyway is precisely the double delivery it exists to prevent.
         Err(e) if crate::outbox::is_already_in_flight(&e) => return Err(e),
+        // A busy store is the gate not having been consulted yet, not a gate
+        // that cannot exist: another process is writing this very outbox, and
+        // sending anyway would walk straight past its admission gate. Told to
+        // the user as the retryable condition it is (#0063 review).
+        Err(e) if crate::outbox::is_store_busy(&e) => {
+            return Err(e.context("the outbox is busy with another send; try again"));
+        }
         Err(e) => {
             // A store that will not open must not stop the user sending mail;
             // it only costs the durability of this one submission.
@@ -1263,6 +1299,10 @@ where
     let durable = match DurableSend::begin(account, built) {
         Ok(d) => Some(d),
         Err(e) if crate::outbox::is_already_in_flight(&e) => return Err(e),
+        // As in `send_durably`: busy is retryable, not a bypass.
+        Err(e) if crate::outbox::is_store_busy(&e) => {
+            return Err(e.context("the outbox is busy with another send; try again"));
+        }
         Err(e) => {
             error!("[outbox] could not queue the message durably: {e:#}");
             None
@@ -1367,20 +1407,24 @@ pub fn draft_key(draft: &EmailDraft) -> String {
 /// can be sent twice with nothing durable committed yet by either. This is a
 /// plain set because the whole question is "is one already running", and the
 /// answer has to be given without touching the disk.
-static SENDING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+///
+/// Keyed by account as well as draft, like the durable half
+/// ([`crate::outbox::enqueue`] scopes its query to one account): two accounts
+/// each holding a hand-written draft with the same frontmatter `id:` are two
+/// messages, and refusing the second would be a false positive.
+static SENDING: std::sync::LazyLock<std::sync::Mutex<HashSet<(String, String)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 /// One draft's slot in [`SENDING`], released when the send returns however it
 /// returns.
-struct SendAdmission(String);
+struct SendAdmission((String, String));
 
 impl SendAdmission {
-    /// `None` when a send for this draft is already running.
-    fn claim(key: &str) -> Option<Self> {
+    /// `None` when a send for this draft is already running on this account.
+    fn claim(account: &str, key: &str) -> Option<Self> {
+        let slot = (account.to_string(), key.to_string());
         let mut sending = SENDING.lock().unwrap_or_else(|e| e.into_inner());
-        sending
-            .insert(key.to_string())
-            .then(|| SendAdmission(key.to_string()))
+        sending.insert(slot.clone()).then(|| SendAdmission(slot))
     }
 }
 
@@ -1474,7 +1518,7 @@ fn draft_attachments(draft: &EmailDraft) -> Result<Vec<(String, Vec<u8>, String)
 /// rather than one per draft).
 pub async fn send_draft(draft: &EmailDraft, ctx: &SendContext) -> Result<SentDraft> {
     let key = draft_key(draft);
-    let _admission = SendAdmission::claim(&key).ok_or_else(|| {
+    let _admission = SendAdmission::claim(&ctx.account.name, &key).ok_or_else(|| {
         anyhow::Error::new(crate::outbox::AlreadyInFlight(
             "this draft is already being sent; it is sent once, not twice".to_string(),
         ))
@@ -1858,7 +1902,12 @@ pub fn build_draft_message(
         .as_deref()
         .unwrap_or(default_from);
 
-    let from_mailbox: Mailbox = normalize_address_for_smtp(from_address)
+    // Normalised once and carried on the built message: what is validated
+    // here is what `submit` parses to derive `MAIL FROM`, so a `from:` like
+    // `Doe, Jane <j@x.com>` cannot pass the build and then fail every
+    // submission forever (#0063 review).
+    let normalized_from = normalize_address_for_smtp(from_address);
+    let from_mailbox: Mailbox = normalized_from
         .parse()
         .context("Invalid 'from' email address")?;
 
@@ -2040,7 +2089,7 @@ pub fn build_draft_message(
         message_id: message_id_of(&raw_message),
         raw: raw_message,
         recipients,
-        from: from_address.to_string(),
+        from: normalized_from,
         draft_key: Some(draft_key(draft)),
     })
 }

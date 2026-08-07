@@ -1011,6 +1011,12 @@ fn a_recipient_with_no_verdict_parks_the_row_and_a_retry_skips_the_delivered() {
 /// The crash window per-recipient recording opens: the verdicts are committed
 /// and the state transition is not. The marker is still set, so the row is
 /// parked rather than re-sent, and what was delivered is still known.
+///
+/// What this pins is the recovery, not `record_per_recipient`'s commit
+/// ordering: the interleaving is written out by hand here rather than driven
+/// through the recorder. Merging the verdict write and the state transition
+/// into one transaction would leave this test green, and in the safer
+/// direction, because it closes the window this test stands in.
 #[test]
 fn a_crash_between_the_verdicts_and_the_transition_parks_the_row() {
     let account = Account::new();
@@ -1135,4 +1141,19 @@ fn a_second_submission_of_the_same_draft_is_refused_while_the_first_is_open() {
         .unwrap();
     enqueue_draft(&account, "<third-build@example.com>", "id:note-1")
         .expect("a failed row is a human's problem, not a lock");
+}
+
+/// The gate compares a key that has been through the envelope encoding with
+/// one that has not, so both sides have to be flattened the same way. A draft
+/// with no frontmatter `id:` is keyed by its path, and a path may hold a tab,
+/// a newline or a trailing space (#0063 review).
+#[test]
+fn a_draft_key_holding_a_control_character_still_matches_its_stored_form() {
+    let account = Account::new();
+    let key = "path:/drafts/odd\tname \n.md";
+    enqueue_draft(&account, "<first-build@example.com>", key).unwrap();
+
+    let refused = enqueue_draft(&account, "<second-build@example.com>", key)
+        .expect_err("the flattening must not lose the gate");
+    assert!(outbox::is_already_in_flight(&refused), "{refused:#}");
 }

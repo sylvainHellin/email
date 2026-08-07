@@ -67,3 +67,27 @@ Both send paths now record such a failure as the clean pre-submission one it is,
 
 What is *not* closed: `lettre` does not let a caller tell a TCP connect failure (clean, nothing was sent) from an i/o error on an established connection (ambiguous), so both still park the row in `failed` for a human, as they did before this ticket.
 Sending while the SMTP server is unreachable therefore still needs `mp outbox retry` rather than resolving itself.
+
+## Review follow-up (2026-08-07)
+
+The review of the shipped commit passed and left four findings, all fixed in one follow-up:
+
+- `build_draft_message` validated the normalised `from:` and then stored the raw one, so a `from: Doe, Jane <j@x.com>` enqueued cleanly and failed every submission it would ever get at the pre-submission step; the admission gate then refused each re-send of that draft and `retry` refuses a `pending_send` row, leaving `mp outbox discard` as the only exit.
+  The built message now carries the normalised address, which is the one `submit` parses.
+- The enqueue transaction began DEFERRED while reading to decide whether it may write, so under WAL the loser of a two-process race hit `SQLITE_BUSY_SNAPSHOT` at the INSERT.
+  That error landed in the non-durable fallback and the message was sent with no outbox row and no gate.
+  The transaction now begins IMMEDIATE (`Store::immediate_transaction`), and the fallback is narrowed: a busy store is reported to the user as retryable, and only a store that will not open at all still buys a non-durable send.
+- The durable gate compared the decoded draft key, flattened by the envelope encoding, against the raw in-memory one, so a path-fallback key holding a tab or a trailing space never matched and the gate silently missed.
+  Both sides are flattened now.
+- The in-process gate was keyed by draft alone, so two accounts each holding a hand-written draft with the same frontmatter `id:` refused each other's send.
+  It is keyed by account and draft, like the durable half.
+
+Four further properties were judged worth writing down rather than changing:
+
+- Downgrading to a binary older than this ticket skips the `delivered:` lines it does not know about and resubmits the whole recipient list, so a downgrade between a partial send and its resume can deliver twice.
+  Upgrading back restores the recorded set; the lines survive the older binary untouched.
+- `synchronous = NORMAL` (a #0037 property, unchanged here) means the marker and the verdicts survive a process crash, not an OS or power crash.
+  A power cut inside the SMTP session can therefore still lose the marker that would have parked the row.
+- The retryable bucket has no attempt cap: a `Kind::Client` condition that is permanent in practice keeps the row retrying at the 900s backoff ceiling for as long as the user leaves it there.
+  It stays visible in `mp outbox list` throughout, and discarding it is the human's call.
+- `mp outbox retry` still refuses a `pending_send` row by design, which is what makes the `from:` bug above a dead end rather than an inconvenience; with the normalisation fixed, no known path enqueues a row that cannot be submitted.

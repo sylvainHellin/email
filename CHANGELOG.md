@@ -79,6 +79,21 @@ All notable changes to this project are documented in this file.
   inside the conversation and parked a message that had provably never been
   sent. Both send paths now record that failure as the clean pre-submission one
   it is, which clears the marker and leaves the row submittable.
+- **A `from:` with a comma in the display name no longer dead-ends a draft, and
+  a busy outbox no longer lets a send past the gate (#0063 review).** Three
+  fixes from the review of the above. A draft whose `from:` reads
+  `Doe, Jane <jane@example.com>` was checked in its quoted form and then queued
+  in its raw one, so it enqueued cleanly and then failed every submission it
+  would ever get; because the queued row holds the gate and `mp outbox retry`
+  refuses a row that has not been submitted, `mp outbox discard` was the only
+  way out. The address that is checked is now the address that is queued.
+  Second, two processes sending at the same moment could collide on the outbox
+  in a way SQLite reports as a busy database, and that error was treated as "no
+  store available", which sent the message with no outbox row and no duplicate
+  gate at all; a busy outbox is now reported as a retryable error and only a
+  store that will not open buys a send without a record. Third, two accounts
+  each holding a hand-written draft with the same `id:` no longer refuse each
+  other's send.
 - **A store rebuild no longer discards queued mail or orphans its blob files
   (#0066).** `Store::open` answers an unusable store file, a schema version that
   moved, a failed `integrity_check`, a file that will not open as a database, by
