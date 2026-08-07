@@ -1998,6 +1998,7 @@ dependencies = [
  "insta",
  "keyring",
  "lettre",
+ "libc",
  "log",
  "machine-uid",
  "mailparse",

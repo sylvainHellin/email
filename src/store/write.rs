@@ -49,7 +49,11 @@ use crate::types::MessageFlags;
 /// Carries the `Message-ID` because that is how every server op names the
 /// message, and the `(mailbox, uid)` pair because that is what a rollback has
 /// to put back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so the durable `pending_ops` queue can persist a move's
+/// rollback coordinates in its row payload and restore them if the server op
+/// fails after a crash (#0039).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MutatedRow {
     pub id: i64,
     pub message_id: String,
