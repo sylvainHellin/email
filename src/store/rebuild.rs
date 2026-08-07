@@ -20,10 +20,23 @@
 //! 3. It writes a `store-rebuild-<timestamp>.txt` note next to the store when
 //!    outbox rows were involved, so a discarded submission is never silent.
 //!
+//! The read is row by row on purpose. The file reaching this module has
+//! usually failed an `integrity_check`, and a damaged page ends a SQLite scan
+//! for good: `Rows::advance` resets the statement on a step error, so every
+//! later `next()` says "no more rows" and a single scan would lose the whole
+//! tail without noticing. So the salvage lists the rowids first and reads one
+//! row per query, which costs one row per damaged page instead of all of
+//! them, and whatever the listing itself could not reach is counted against
+//! `COUNT(*)` and named in the note (#0066 review follow-up).
+//!
 //! The sweep assumes the rebuild is the only thing touching the account
 //! directory: a blob written by a concurrent ingest whose row has not
 //! committed yet would be swept as an orphan. The cost is a refetch, which is
-//! the same cost the rebuild itself pays.
+//! the same cost the rebuild itself pays. It walks `<account_dir>/blobs/` only
+//! when that is a real directory: a symlinked blob root is left alone, both
+//! because deleting through it would reach files the rebuild has no business
+//! touching and because a user pointing `blobs/` at another disk deserves
+//! their tree back intact.
 //!
 //! Nothing here is allowed to fail an open. A store that cannot be salvaged is
 //! still a store; every error below is logged and stepped over.
@@ -34,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use log::{info, warn};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row};
 use walkdir::WalkDir;
 
@@ -46,6 +60,12 @@ const CARRIED_STATES: &[&str] = &["pending_send", "sent_pending_append", "failed
 /// Where an unreadable state lands. A row whose state cannot be trusted must
 /// not be re-submitted, and `failed` is the state that means "a human decides".
 const UNREADABLE_STATE: &str = "failed";
+
+/// How many outbox rows one salvage will read. A real outbox holds a handful
+/// of rows at a time; a foreign or corrupt database that happens to have a
+/// table named `outbox` can hold anything, and both the salvage and the note
+/// file it feeds are held in memory.
+const SALVAGE_LIMIT: usize = 10_000;
 
 /// One `outbox` row read out of the file that is about to be deleted.
 ///
@@ -64,6 +84,13 @@ pub(super) struct SalvagedRow {
     created: Option<i64>,
     updated: Option<i64>,
     submission_started_at: Option<i64>,
+    /// Set when the exactly-once marker column was there but held something
+    /// that is not a timestamp. Absent and NULL are not this: they are the
+    /// honest "the transport was never entered", which is what `None` above
+    /// means to [`crate::outbox::sweep_pending_sends`]. Anything else is a
+    /// value that was written and cannot be read, so whether the message
+    /// reached SMTP is unknown and the row must be parked, never re-sent.
+    marker_unreadable: bool,
     envelope: Option<String>,
 }
 
@@ -76,6 +103,18 @@ impl SalvagedRow {
             self.state.as_deref().unwrap_or("unreadable state")
         )
     }
+}
+
+/// What the pre-drop read got out of the old file.
+#[derive(Debug, Default)]
+pub(super) struct Salvage {
+    /// The unfinished rows, ready to be written into the fresh store.
+    pub rows: Vec<SalvagedRow>,
+    /// What the read itself could not get, in the shape
+    /// [`RebuildReport::lost`] carries: a damaged page that ended the scan, a
+    /// row that would not come back, a table too big to read in full. These
+    /// travel into the note file alongside the rows that could not be written.
+    pub lost: Vec<(String, String)>,
 }
 
 /// What a rebuild did, beyond creating an empty file.
@@ -102,49 +141,284 @@ fn blobs_root(store_path: &Path) -> Option<PathBuf> {
 /// name and a column that is absent or holds the wrong type yields `None`
 /// rather than failing the row, because a partially readable submission is
 /// still worth showing to a human.
-pub(super) fn salvage_outbox(path: &Path) -> Vec<SalvagedRow> {
+pub(super) fn salvage_outbox(path: &Path) -> Salvage {
+    let mut salvage = Salvage::default();
     let conn = match Connection::open(path) {
         Ok(conn) => conn,
         Err(e) => {
             warn!("[store] no outbox salvage from {}: {e}", path.display());
-            return Vec::new();
+            return salvage;
         }
     };
 
-    let mut stmt = match conn.prepare("SELECT * FROM outbox") {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            // The common case by far: the file is not one of ours, or is too
-            // damaged to read a table list from.
-            info!("[store] no outbox to salvage from {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-    let rows = match stmt.query_map([], |row| Ok(read_salvaged_row(row))) {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("[store] outbox salvage from {} failed: {e}", path.display());
-            return Vec::new();
-        }
-    };
+    if let Err(e) = conn.prepare("SELECT * FROM outbox") {
+        // The common case by far: the file is not one of ours, or is too
+        // damaged to read a table list from.
+        info!("[store] no outbox to salvage from {}: {e}", path.display());
+        return salvage;
+    }
 
-    let mut out = Vec::new();
-    for row in rows {
-        match row {
-            Ok(row) => {
-                // A finished row owes nothing and is not worth carrying.
-                if row.state.as_deref() == Some("done") {
-                    continue;
-                }
-                out.push(row);
+    // What the old file says it holds, so a read that stops early can say how
+    // much it never reached. Both can fail on a damaged file, which is why
+    // both are optional and why neither gates the salvage.
+    let claimed: Option<i64> = conn
+        .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+        .ok();
+    let last_rowid: Option<i64> = conn
+        .query_row("SELECT MAX(rowid) FROM outbox", [], |r| r.get(0))
+        .ok()
+        .flatten();
+
+    match list_rowids(&conn) {
+        Ok((ids, stopped)) => {
+            let listed = ids.len();
+            let past = ids.last().copied().map(|id| id + 1).unwrap_or(1);
+            read_rows_by_id(&conn, ids, true, &mut salvage);
+            if let Some(e) = stopped {
+                // The listing walks a btree like anything else, so it stops at
+                // the damaged page too. Every later row is still addressable
+                // by position: each read seeks from the root, so it reaches
+                // whatever the damage does not actually sit on. Positions that
+                // hold no row answer "no rows" and cost nothing.
+                let budget = SALVAGE_LIMIT.saturating_sub(listed);
+                let probed = probe_past(&conn, past, last_rowid, budget, &mut salvage);
+                salvage.lost.push((
+                    "<the outbox could not be read to the end>".to_string(),
+                    gap_reason(&e, listed, &probed, claimed, last_rowid),
+                ));
+            } else if listed >= SALVAGE_LIMIT {
+                salvage.lost.push((
+                    "<the outbox was too large to read in full>".to_string(),
+                    truncation_reason(listed, claimed),
+                ));
             }
-            Err(e) => warn!("[store] skipped an unreadable outbox row: {e}"),
+        }
+        Err(e) => {
+            // No usable rowids: an `outbox` that is a view, or WITHOUT ROWID.
+            // Not a shape this store ever had, so fall back to the plain scan
+            // and accept that a damaged page costs the tail rather than a row.
+            info!(
+                "[store] outbox rowids unavailable in {}: {e}",
+                path.display()
+            );
+            scan_rows(&conn, claimed, &mut salvage);
         }
     }
-    out
+    salvage
+}
+
+/// The rowids of the old `outbox`, with the error that ended the listing early
+/// if one did.
+///
+/// The listing reads a btree like any other query, so it can hit the damaged
+/// page too; a partial list is a normal outcome here, not a failure. `Err` is
+/// only for a table that has no rowids to list at all.
+fn list_rowids(conn: &Connection) -> Result<(Vec<i64>, Option<String>), rusqlite::Error> {
+    // Deliberately unordered: `ORDER BY rowid` forces the table btree, while
+    // the planner is free to satisfy this from the smaller `outbox_state`
+    // index, which a page damaged in the table itself leaves intact.
+    let mut stmt = conn.prepare(&format!("SELECT rowid FROM outbox LIMIT {SALVAGE_LIMIT}"))?;
+    let mut rows = stmt.query([])?;
+    let mut ids = Vec::new();
+    let stopped = loop {
+        match rows.next() {
+            Ok(Some(row)) => match row.get::<_, i64>(0) {
+                Ok(id) => ids.push(id),
+                Err(e) => break Some(e.to_string()),
+            },
+            Ok(None) => break None,
+            Err(e) => break Some(e.to_string()),
+        }
+    };
+    ids.sort_unstable();
+    Ok((ids, stopped))
+}
+
+/// Read one row per query, so a damaged page costs that row and no other.
+///
+/// Returns how many positions answered with a row and how many refused to be
+/// read. `name_each` says whether a refusal is named in the note one by one:
+/// true for a position the file itself listed (a row was there and is gone),
+/// false for a position only guessed at past a damaged page, where a refusal
+/// says nothing about whether a row was ever there and is counted instead.
+fn read_rows_by_id(
+    conn: &Connection,
+    ids: impl IntoIterator<Item = i64>,
+    name_each: bool,
+    salvage: &mut Salvage,
+) -> (usize, usize) {
+    let mut stmt = match conn.prepare("SELECT * FROM outbox WHERE rowid = ?1") {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            salvage.lost.push((
+                "<the outbox could not be read row by row>".to_string(),
+                format!("the old file refused the read: {e}"),
+            ));
+            return (0, 0);
+        }
+    };
+    let (mut read, mut refused) = (0usize, 0usize);
+    for id in ids {
+        match stmt.query_row([id], |row| Ok(read_salvaged_row(row))) {
+            // A finished row owes nothing and is not worth carrying.
+            Ok(row) => {
+                read += 1;
+                if row.state.as_deref() != Some("done") {
+                    salvage.rows.push(row);
+                }
+            }
+            // Gone between the listing and the read, or never there at all.
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                refused += 1;
+                if name_each {
+                    warn!("[store] outbox row {id} could not be read out of the old file: {e}");
+                    salvage.lost.push((
+                        format!("<the row at position {id}>"),
+                        format!("it could not be read out of the old file: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+    (read, refused)
+}
+
+/// What reading position by position past a damaged page got back.
+#[derive(Debug, Default)]
+struct Probed {
+    /// Positions that answered with a row.
+    recovered: usize,
+    /// Positions that refused to be read. A row may or may not have been there.
+    refused: usize,
+    /// The last position tried, when there was one.
+    upto: Option<i64>,
+}
+
+/// Read the rows past the point where the listing stopped, one position at a
+/// time, bounded by what the table says its last position is and by whatever
+/// is left of the salvage budget.
+fn probe_past(
+    conn: &Connection,
+    from: i64,
+    last_rowid: Option<i64>,
+    budget: usize,
+    salvage: &mut Salvage,
+) -> Probed {
+    let Some(last_rowid) = last_rowid else {
+        // Without a last position there is no bounded range to walk.
+        return Probed::default();
+    };
+    if budget == 0 || last_rowid < from {
+        return Probed::default();
+    }
+    let upto = last_rowid.min(from.saturating_add(budget as i64 - 1));
+    let (recovered, refused) = read_rows_by_id(conn, from..=upto, false, salvage);
+    Probed {
+        recovered,
+        refused,
+        upto: Some(upto),
+    }
+}
+
+/// The fallback read for a table with no rowids to address rows by.
+///
+/// One scan, so the first damaged page ends it; what that costs is counted
+/// against `COUNT(*)` and named rather than dropped quietly.
+fn scan_rows(conn: &Connection, claimed: Option<i64>, salvage: &mut Salvage) {
+    let mut stmt = match conn.prepare(&format!("SELECT * FROM outbox LIMIT {SALVAGE_LIMIT}")) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            warn!("[store] outbox salvage failed: {e}");
+            return;
+        }
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("[store] outbox salvage failed: {e}");
+            return;
+        }
+    };
+    let mut read = 0usize;
+    let stopped = loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                read += 1;
+                let row = read_salvaged_row(row);
+                if row.state.as_deref() != Some("done") {
+                    salvage.rows.push(row);
+                }
+            }
+            Ok(None) => break None,
+            Err(e) => break Some(e.to_string()),
+        }
+    };
+    if let Some(e) = stopped {
+        salvage.lost.push((
+            "<the outbox could not be read to the end>".to_string(),
+            gap_reason(&e, read, &Probed::default(), claimed, None),
+        ));
+    } else if read >= SALVAGE_LIMIT {
+        salvage.lost.push((
+            "<the outbox was too large to read in full>".to_string(),
+            truncation_reason(read, claimed),
+        ));
+    }
+}
+
+/// Say what a read that stopped early left behind, as precisely as the old
+/// file still allows.
+fn gap_reason(
+    error: &str,
+    reached: usize,
+    probed: &Probed,
+    claimed: Option<i64>,
+    last_rowid: Option<i64>,
+) -> String {
+    let mut reason = format!("the old file stopped listing rows after {reached} of them ({error})");
+    match probed.upto {
+        Some(upto) => reason.push_str(&format!(
+            "; reading position by position up to {upto} recovered {} more row(s) and left {} \
+             position(s) unreadable",
+            probed.recovered, probed.refused
+        )),
+        None => reason.push_str("; everything past that point is gone"),
+    }
+    let read = reached + probed.recovered;
+    if let Some(claimed) = claimed {
+        let missing = (claimed - read as i64).max(0);
+        reason.push_str(&format!(
+            "; the table said it held {claimed} row(s), so about {missing} were never read"
+        ));
+    } else if let Some(last) = last_rowid {
+        reason.push_str(&format!(
+            "; the table runs to position {last}, so how many rows that leaves unread could not \
+             be established exactly"
+        ));
+    } else {
+        reason.push_str("; how many rows that leaves unread could not be established");
+    }
+    reason
+}
+
+/// Say that the salvage stopped at its own bound rather than at the end.
+fn truncation_reason(read: usize, claimed: Option<i64>) -> String {
+    match claimed {
+        Some(claimed) if claimed > read as i64 => format!(
+            "the table held {claimed} row(s) and a salvage reads at most {SALVAGE_LIMIT}, so \
+             {} of them were left in the deleted file",
+            claimed - read as i64
+        ),
+        _ => format!(
+            "a salvage reads at most {SALVAGE_LIMIT} row(s), and the table had at least that many, \
+             so any beyond them were left in the deleted file"
+        ),
+    }
 }
 
 fn read_salvaged_row(row: &Row<'_>) -> SalvagedRow {
+    let (marker, marker_unreadable) = read_marker(row);
     SalvagedRow {
         account: opt_string(row, "account"),
         target_mailbox: opt_string(row, "target_mailbox"),
@@ -156,7 +430,8 @@ fn read_salvaged_row(row: &Row<'_>) -> SalvagedRow {
         appended_uid: opt_i64(row, "appended_uid"),
         created: opt_i64(row, "created"),
         updated: opt_i64(row, "updated"),
-        submission_started_at: opt_i64(row, "submission_started_at"),
+        submission_started_at: marker,
+        marker_unreadable,
         envelope: opt_string(row, "envelope"),
     }
 }
@@ -184,15 +459,43 @@ fn opt_i64(row: &Row<'_>, name: &str) -> Option<i64> {
     row.get::<_, Option<i64>>(name).ok().flatten()
 }
 
+/// The exactly-once marker, and whether it was there but unreadable.
+///
+/// `submission_started_at` is the one column where "could not read it" and
+/// "it was empty" must not be the same answer: an empty marker tells
+/// [`crate::outbox::sweep_pending_sends`] the transport was never entered, so
+/// it hands the row back to SMTP. Hence the three-way read:
+///
+/// - no such column: the old file predates the marker (it was added mid-v2),
+///   so it never recorded one for any row and there is nothing to distinguish
+///   a mid-submission row from a queued one. Carried as empty, which is what
+///   the code that wrote the file already assumed.
+/// - NULL: the marker is genuinely empty. Carried as empty.
+/// - anything else: something was written here and cannot be read as a
+///   timestamp. The row is parked as `failed` by [`carried_state`], because a
+///   message that may already have been submitted is never re-sent.
+fn read_marker(row: &Row<'_>) -> (Option<i64>, bool) {
+    match row.get_ref("submission_started_at") {
+        Err(_) => (None, false),
+        Ok(ValueRef::Null) => (None, false),
+        Ok(ValueRef::Integer(v)) => (Some(v), false),
+        Ok(_) => (None, true),
+    }
+}
+
 /// Restore the salvaged rows into the fresh store and sweep the blob tree.
 ///
 /// Returns what happened so the caller can log it and write the note file.
-pub(super) fn finish(conn: &Connection, path: &Path, salvaged: Vec<SalvagedRow>) -> RebuildReport {
-    let mut report = RebuildReport::default();
+pub(super) fn finish(conn: &Connection, path: &Path, salvaged: Salvage) -> RebuildReport {
+    // Whatever the read itself could not get is already a loss with a reason.
+    let mut report = RebuildReport {
+        lost: salvaged.lost,
+        ..Default::default()
+    };
     let Some(root) = blobs_root(path) else {
         // Unreachable for any real store path, and still not a place where a
         // submission may vanish without being named.
-        for row in &salvaged {
+        for row in &salvaged.rows {
             report.lost.push((
                 row.describe(),
                 "the store path has no directory to hold a blob store".to_string(),
@@ -202,7 +505,7 @@ pub(super) fn finish(conn: &Connection, path: &Path, salvaged: Vec<SalvagedRow>)
     };
     let blobs = BlobStore::new(root);
 
-    for row in salvaged {
+    for row in salvaged.rows {
         match restore_row(conn, &blobs, &row) {
             Ok(()) => report.carried.push(row.describe()),
             Err(reason) => report.lost.push((row.describe(), reason)),
@@ -247,18 +550,7 @@ fn restore_row(conn: &Connection, blobs: &BlobStore, row: &SalvagedRow) -> Resul
         .map_err(|_| "the raw bytes are no longer in the blob store".to_string())?
         .len();
 
-    // An unknown state cannot be re-submitted safely, so it is parked for a
-    // human rather than guessed at.
-    let (state, last_error) = match row.state.as_deref() {
-        Some(state) if CARRIED_STATES.contains(&state) => (state.to_string(), row.last_error.clone()),
-        other => (
-            UNREADABLE_STATE.to_string(),
-            Some(format!(
-                "carried across a store rebuild from an unreadable state ({})",
-                other.unwrap_or("none")
-            )),
-        ),
-    };
+    let (state, last_error) = carried_state(row);
 
     let now = now_unix();
     let tx = conn
@@ -293,6 +585,43 @@ fn restore_row(conn: &Connection, blobs: &BlobStore, row: &SalvagedRow) -> Resul
     Ok(())
 }
 
+/// The state a salvaged row lands in, and the note left on it.
+///
+/// Two things make a row unsafe to hand back to the send path: a state that is
+/// not one of the schema's, and an exactly-once marker that was written and
+/// cannot be read. Either parks the row as `failed`, the state that means "a
+/// human decides", rather than as something a driver would re-submit.
+fn carried_state(row: &SalvagedRow) -> (String, Option<String>) {
+    let mut reasons: Vec<String> = Vec::new();
+    let state = match row.state.as_deref() {
+        Some(state) if CARRIED_STATES.contains(&state) => state.to_string(),
+        other => {
+            reasons.push(format!(
+                "its state was unreadable ({})",
+                other.unwrap_or("none")
+            ));
+            UNREADABLE_STATE.to_string()
+        }
+    };
+    if row.marker_unreadable {
+        reasons.push(
+            "its submission marker was there but is not a timestamp, so whether the message \
+             reached the mail server is unknown"
+                .to_string(),
+        );
+    }
+    if reasons.is_empty() {
+        return (state, row.last_error.clone());
+    }
+    (
+        UNREADABLE_STATE.to_string(),
+        Some(format!(
+            "carried across a store rebuild and parked for a human: {}",
+            reasons.join("; ")
+        )),
+    )
+}
+
 /// Delete every file under the blob root that the store holds no refcount row
 /// for, then prune the fan-out directories that emptied.
 ///
@@ -301,7 +630,22 @@ fn restore_row(conn: &Connection, blobs: &BlobStore, row: &SalvagedRow) -> Resul
 /// directory both go the way of the orphans.
 fn sweep_orphan_blobs(conn: &Connection, blobs: &BlobStore) -> Result<(u64, u64)> {
     let root = blobs.root();
-    if !root.is_dir() {
+    // Deliberately `symlink_metadata`: `is_dir` and `WalkDir` both resolve a
+    // symlinked root even with `follow_links(false)`, so a `blobs/` pointing
+    // at the account directory would have the sweep delete the store file it
+    // was just rebuilt into. A blob root on another disk is a layout this
+    // never created and has no business emptying either.
+    let Ok(meta) = fs::symlink_metadata(root) else {
+        return Ok((0, 0));
+    };
+    if meta.file_type().is_symlink() {
+        warn!(
+            "[store] {} is a symlink, so the blob sweep was skipped; nothing under it was touched",
+            root.display()
+        );
+        return Ok((0, 0));
+    }
+    if !meta.is_dir() {
         return Ok((0, 0));
     }
 
@@ -359,9 +703,11 @@ pub(super) fn write_notice(path: &Path, reason: &str, report: &RebuildReport) ->
     }
     let dir = path.parent()?;
     let now = chrono::Utc::now();
+    // Millisecond granularity so two rebuilds of the same account in one
+    // second leave two notes rather than one overwriting the other.
     let notice = dir.join(format!(
         "store-rebuild-{}.txt",
-        now.format("%Y%m%dT%H%M%SZ")
+        now.format("%Y%m%dT%H%M%S%.3fZ")
     ));
 
     let mut text = format!(
@@ -692,8 +1038,168 @@ mod tests {
         assert_eq!(state, "pending_send");
         assert_eq!(attempts, 1);
         assert_eq!(envelope, None, "a column the old file never had is empty");
+        // An outbox that predates the marker column recorded one for no row,
+        // so nothing in it distinguishes a queued submission from one that was
+        // inside an SMTP session. Carried as empty, which is the assumption
+        // the code that wrote that file already made; the alternative parks
+        // every queued mail of every pre-marker store on a path every such
+        // store takes exactly once. A marker that is *there* and unreadable is
+        // the other case, and parks: see the test below.
         assert_eq!(marker, None, "and so is the exactly-once marker");
         assert!(blobs.contains(&hash), "its bytes survive the sweep");
+    }
+
+    /// A marker column holding something that is not a timestamp: the row may
+    /// have been inside an SMTP session, and nothing can tell. TEXT and REAL
+    /// are the two shapes a damaged page or an older writer can leave there.
+    #[test]
+    fn a_marker_that_is_not_a_timestamp_parks_the_row_instead_of_re_sending_it() {
+        let (_dir, path, blobs) = account_dir();
+        let text_hash = blobs.write(b"raw with a text marker").unwrap();
+        let real_hash = blobs.write(b"raw with a real marker").unwrap();
+        let null_hash = blobs.write(b"raw with no marker at all").unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     id         INTEGER PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL,
+                     submission_started_at
+                 );",
+            )
+            .unwrap();
+            let insert = |id: &str, hash: &BlobHash, marker: &dyn rusqlite::ToSql| {
+                conn.execute(
+                    "INSERT INTO outbox (account, message_id, raw_blob, state,
+                                         submission_started_at)
+                     VALUES ('alice', ?1, ?2, 'pending_send', ?3)",
+                    rusqlite::params![id, hash.as_str(), marker],
+                )
+                .unwrap();
+            };
+            insert("<text@example.com>", &text_hash, &"300");
+            insert("<real@example.com>", &real_hash, &300.5f64);
+            insert("<null@example.com>", &null_hash, &rusqlite::types::Null);
+        }
+
+        let store = Store::open(&path).unwrap();
+        let row = |id: &str| -> (String, Option<String>, Option<i64>) {
+            store
+                .conn()
+                .query_row(
+                    "SELECT state, last_error, submission_started_at FROM outbox
+                     WHERE message_id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+
+        for id in ["<text@example.com>", "<real@example.com>"] {
+            let (state, last_error, marker) = row(id);
+            assert_eq!(
+                state, "failed",
+                "{id}: a marker that cannot be read may mean the message was already submitted"
+            );
+            assert!(
+                last_error.unwrap().contains("submission marker"),
+                "{id}: the row says why a human has to decide"
+            );
+            assert_eq!(marker, None, "{id}: nothing readable to carry");
+        }
+
+        let (state, last_error, marker) = row("<null@example.com>");
+        assert_eq!(
+            state, "pending_send",
+            "a genuinely empty marker still means the transport was never entered"
+        );
+        assert_eq!(last_error, None);
+        assert_eq!(marker, None);
+    }
+
+    /// `blobs/` pointing somewhere else: the sweep must not delete through it.
+    /// Probed on the review of #0066 with `blobs -> .`, which deleted the
+    /// freshly rebuilt store file from under its own open handle.
+    #[test]
+    fn a_symlinked_blob_root_is_left_alone_rather_than_swept_through() {
+        let dir = tempdir().unwrap();
+        let account = dir.path().join("account");
+        fs::create_dir_all(&account).unwrap();
+        let path = account.join("store.sqlite3");
+
+        // Somewhere else entirely, holding a file no rebuild may touch.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("precious.txt"), b"not the store's to delete").unwrap();
+
+        {
+            let store = Store::open(&path).unwrap();
+            drop(store);
+        }
+        std::os::unix::fs::symlink(&elsewhere, account.join("blobs")).unwrap();
+        stamp_a_wrong_version(&path);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(schema::SCHEMA_VERSION));
+        assert!(
+            elsewhere.join("precious.txt").exists(),
+            "a symlinked blob root is not the rebuild's to empty"
+        );
+        assert!(path.exists(), "and the rebuilt store file survives its own sweep");
+    }
+
+    /// A file that is not ours but happens to hold a table named `outbox`, in
+    /// numbers no real outbox reaches: the salvage stops at its own bound and
+    /// says so rather than reading gigabytes into a note file.
+    #[test]
+    fn an_outbox_too_large_to_read_in_full_says_so() {
+        let (dir, path, _blobs) = account_dir();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     id         INTEGER PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO outbox (account, message_id, raw_blob, state)
+                         VALUES ('alice', ?1, 'nothing', 'done')",
+                    )
+                    .unwrap();
+                for i in 0..(SALVAGE_LIMIT + 1) {
+                    stmt.execute([format!("<{i}@example.com>")]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(schema::SCHEMA_VERSION));
+        let notice = notice_file(dir.path()).expect("a truncated salvage is not a silent one");
+        let text = fs::read_to_string(notice).unwrap();
+        assert!(text.contains("too large to read in full"), "{text}");
+        assert!(
+            text.contains(&(SALVAGE_LIMIT + 1).to_string()),
+            "the note counts what the table held: {text}"
+        );
+        assert!(
+            text.len() < 4096,
+            "the note stays a note, not a dump: {} bytes",
+            text.len()
+        );
     }
 
     #[test]
@@ -733,6 +1239,143 @@ mod tests {
         assert!(
             last_error.unwrap().contains("almost_sent"),
             "the note on the row says where it came from"
+        );
+    }
+
+    /// A table with no positions to address rows by. Not a shape this store
+    /// ever had, so the scan the salvage falls back to is allowed to be the
+    /// weaker read; it still has to carry what it can reach.
+    #[test]
+    fn an_outbox_with_no_rowids_falls_back_to_a_plain_scan() {
+        let (_dir, path, blobs) = account_dir();
+        let hash = blobs.write(b"raw from a rowidless table").unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL PRIMARY KEY,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO outbox (account, message_id, raw_blob, state)
+                 VALUES ('alice', '<rowidless@example.com>', ?1, 'pending_send')",
+                [hash.as_str()],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let (message_id, state): (String, String) = store
+            .conn()
+            .query_row("SELECT message_id, state FROM outbox", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(message_id, "<rowidless@example.com>");
+        assert_eq!(state, "pending_send");
+        assert!(blobs.contains(&hash), "its bytes survive the sweep");
+    }
+
+    /// The case the row-by-row read exists for: a page in the middle of the
+    /// file is gone. A single `SELECT * FROM outbox` ends for good at the
+    /// damaged page (`Rows::advance` resets the statement on a step error), so
+    /// before the #0066 review follow-up everything past it vanished with the
+    /// note reporting nothing discarded at all.
+    #[test]
+    fn a_damaged_page_costs_rows_but_is_never_silent_about_them() {
+        const ROWS: usize = 400;
+        let (dir, path, blobs) = account_dir();
+        {
+            // Small pages, so 4 KB of damage lands squarely in the middle of
+            // the table rather than taking the whole file with it. Built by
+            // hand because `page_size` can only be set before the first table
+            // and the store opens WAL.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size = 512;
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     id             INTEGER PRIMARY KEY,
+                     account        TEXT NOT NULL,
+                     target_mailbox TEXT,
+                     message_id     TEXT NOT NULL,
+                     raw_blob       TEXT NOT NULL,
+                     state          TEXT NOT NULL,
+                     attempts       INTEGER NOT NULL DEFAULT 0,
+                     last_error     TEXT,
+                     appended_uid   INTEGER,
+                     created        INTEGER,
+                     updated        INTEGER,
+                     submission_started_at INTEGER,
+                     envelope       TEXT
+                 );
+                 CREATE INDEX outbox_state ON outbox (state);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
+                [schema::SCHEMA_VERSION.to_string()],
+            )
+            .unwrap();
+            for i in 0..ROWS {
+                let hash = blobs.write(format!("raw message {i}").as_bytes()).unwrap();
+                conn.execute(
+                    "INSERT INTO outbox (account, message_id, raw_blob, state, created, updated)
+                     VALUES ('alice', ?1, ?2, 'pending_send', 100, 200)",
+                    rusqlite::params![format!("<{i}@example.com>"), hash.as_str()],
+                )
+                .unwrap();
+            }
+        }
+
+        // Zero 4 KB in the middle of the file, page-aligned, well clear of the
+        // header and the schema on page 1.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let len = fs::metadata(&path).unwrap().len();
+            assert!(len > 16 * 1024, "the probe needs a file with a middle");
+            let at = (len / 2) / 512 * 512;
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(at)).unwrap();
+            file.write_all(&[0u8; 4096]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let carried: usize = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap() as usize;
+        let notice = notice_file(dir.path()).expect("a rebuild that lost submissions writes a note");
+        let text = fs::read_to_string(notice).unwrap();
+
+        assert!(
+            carried < ROWS,
+            "the probe is only meaningful if the damage cost something"
+        );
+        assert!(
+            text.contains("Discarded, because they could not be carried"),
+            "the loss must be named, not counted as zero: {text}"
+        );
+        assert!(
+            text.contains("stopped listing rows after"),
+            "the note has to say the read did not reach the end: {text}"
+        );
+        assert!(
+            text.contains("unreadable") || text.contains("never read"),
+            "and has to quantify what that cost: {text}"
+        );
+        // The whole point of reading by position: one damaged page costs the
+        // rows it holds, not every row behind it. A single scan stopped dead
+        // at the damage and carried 196 of these 400 when this was measured.
+        assert!(
+            carried > ROWS / 2,
+            "a damaged page must not cost the tail of the table: carried {carried} of {ROWS}"
         );
     }
 

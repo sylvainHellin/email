@@ -526,3 +526,11 @@ And any content-addressed store whose refcounts live in the disposable file leak
 Adding a rationale paragraph under the `///` line of a `Commands::Sync` field (#0071 review) flipped `mp sync --help` from clap's short help to its long help: every option grew a hanging description block, `--help` started advertising `(see a summary with '-h')`, and `tests/cli_help_snapshot.rs` failed with a 27-line diff for a change that touched no user-visible behaviour.
 clap treats the first doc-comment line as `about` and everything after the blank line as `long_about`, and the presence of a long help on any argument switches that command's `--help` to the long format.
 Explanatory prose that is not meant for the user belongs in a plain `//` comment above the `#[arg(...)]`.
+
+## A SQLite scan does not skip a damaged page, it ends at one
+
+Salvaging an outbox out of a store that failed `integrity_check` looked like a per-row concern: read the rows, log the ones that will not come back, carry the rest (#0066).
+It is not, because `rusqlite`'s `Rows::advance` calls `reset()` on a step error and `reset` takes the statement, so after the first `SQLITE_CORRUPT` every later `next()` returns `Ok(None)`.
+The loop's error arm runs once and the iterator then reports a clean end of table: 204 of 400 rows disappeared while the code counted zero discards and logged one skipped row.
+An `Err` inside an iteration is the end of that iteration unless the API says otherwise, and a loop that treats it as "skip one, continue" silently truncates.
+Reading a damaged table means addressing rows individually (`SELECT ... WHERE rowid = ?`, one query each, each seeking from the btree root), and counting what was reached against `COUNT(*)` or `MAX(rowid)` so the gap can be named instead of assumed to be zero ([src/store/rebuild.rs](../src/store/rebuild.rs)).

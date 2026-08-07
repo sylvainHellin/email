@@ -71,6 +71,23 @@ All notable changes to this project are documented in this file.
   note next to the store and in the log line the rebuild already emitted, which
   now counts what was carried, what was discarded and how many blob files were
   swept.
+
+  The review of that change found the salvage reading the old outbox in one
+  scan, which a damaged page ends for good: SQLite resets the statement on a
+  step error, so every later read answers "no more rows" and the whole tail of
+  the table disappeared with the note reporting nothing discarded (196 of 400
+  rows carried, 204 unnamed, on the probe). The salvage now reads row by row,
+  addressing each row by position and continuing past the point where the
+  listing itself stopped, so a damaged page costs the rows it holds rather than
+  every row behind it (372 of the same 400), and whatever is still unreachable
+  is counted and named in the note. A submission marker that was written but
+  cannot be read as a timestamp now parks its row as `failed` instead of
+  salvaging as empty, which the send path would have read as "never submitted"
+  and handed back to SMTP. The blob sweep no longer walks a symlinked `blobs/`
+  root, where it could have deleted the store file it had just rebuilt. A
+  salvage reads at most 10 000 rows and says so when it stops there, and the
+  note file's timestamp carries milliseconds so two rebuilds in one second
+  leave two notes.
 - **A failed sync is now visible without reading the log, per account and per
   exit code (#0071).** #0068's account-level `error!` line put the failure in
   the log file; it was still invisible on screen, because the outcome of a sync

@@ -28,11 +28,16 @@
 //!   carried. A row that cannot be carried (its bytes are gone from the blob
 //!   store, its columns are unreadable) is named in a
 //!   `store-rebuild-<timestamp>.txt` note written next to the store, never
-//!   dropped silently.
+//!   dropped silently, and so is a stretch of the old file that would not be
+//!   read at all. A row whose exactly-once marker was written but cannot be
+//!   read is carried as `failed`: a message that may already have reached a
+//!   mail server is parked for a human, never re-submitted.
 //! - Blob *files* whose refcount row did not survive are deleted by the same
 //!   pass, so a rebuild cannot leave the blob directory full of orphans that
 //!   nothing reclaims. The blobs the carried outbox rows point at are what the
-//!   sweep keeps.
+//!   sweep keeps. It walks `<account_dir>/blobs/` only when that is a real
+//!   directory; a symlinked blob root is left untouched rather than deleted
+//!   through.
 //!
 //! This module knows nothing about IMAP, MIME or Markdown. It owns the file,
 //! the pragmas and the schema; everything above it speaks SQL.
@@ -92,7 +97,7 @@ impl Store {
         // Set when the existing file had to go, to the reason it had to go.
         // The salvaged outbox rows travel with it: they are read before the
         // deletion and replayed after the new file exists.
-        let mut dropped: Option<(String, Vec<rebuild::SalvagedRow>)> = None;
+        let mut dropped: Option<(String, rebuild::Salvage)> = None;
 
         if path.exists() {
             match open_validated(&path) {
