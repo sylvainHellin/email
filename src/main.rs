@@ -900,18 +900,51 @@ fn received_store(account: &str) -> Result<Store> {
 /// draft-facing command before it reads the table: a draft an agent wrote a
 /// second ago is in the index by the time the command lists or resolves it.
 fn drafts_store(account: &str) -> Result<Store> {
+    Ok(drafts_store_reporting(account)?.0)
+}
+
+/// [`drafts_store`], additionally handing back the files the refresh skipped
+/// for a parse failure, so `mp list` can name them after its listing instead
+/// of letting a broken draft vanish from the output (#0080).
+fn drafts_store_reporting(
+    account: &str,
+) -> Result<(Store, Vec<mailypoppins::store::drafts::SkippedDraft>)> {
     let store = Store::open(mailypoppins::config::store_path(account))
         .with_context(|| format!("opening the store of {account}"))?;
     let dir = mailypoppins::config::drafts_dir(account);
-    let (_, collisions) = mailypoppins::store::drafts::refresh_reporting(&store, account, &dir)
-        .with_context(|| format!("refreshing the drafts index of {account}"))?;
+    let (_, collisions, skipped) =
+        mailypoppins::store::drafts::refresh_reporting(&store, account, &dir)
+            .with_context(|| format!("refreshing the drafts index of {account}"))?;
     // Two files claiming one id means one of them is unaddressable. The index
     // cannot decide which the user meant, so it says so rather than dropping
     // the loser in silence.
     for collision in &collisions {
         eprintln!("{} {collision}", "⚠".yellow());
     }
-    Ok(store)
+    Ok((store, skipped))
+}
+
+/// Print the warning block `mp list` shows after its listing when the refresh
+/// skipped one or more drafts for a parse failure (#0080).
+///
+/// A skipped file is a draft the index cannot see: no `id:`, no row, absent
+/// from the listing above. Naming it here, with its one-line parse error, is
+/// what turns "my draft disappeared" into a fixable line. The exit code stays
+/// 0: the listing itself succeeded, and the broken file is a warning about the
+/// directory, not a failure of the command.
+fn print_skipped_drafts(skipped: &[mailypoppins::store::drafts::SkippedDraft]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let n = skipped.len();
+    let noun = if n == 1 { "draft" } else { "drafts" };
+    eprintln!(
+        "\n{} {n} {noun} skipped (frontmatter would not parse; fix the YAML to list them):",
+        "⚠".yellow()
+    );
+    for skip in skipped {
+        eprintln!("  {} - {}", skip.path.display().to_string().yellow(), skip.error);
+    }
 }
 
 /// Re-index the drafts directory after a command wrote a draft, so the next
@@ -1613,14 +1646,19 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::List { status }) => {
-            let store = drafts_store(&account_config.name)?;
+            let (store, skipped) = drafts_store_reporting(&account_config.name)?;
             let rows = mailypoppins::store::drafts::list(
                 &store,
                 &account_config.name,
                 status.map(DraftStatusFilter::as_str),
             )?;
-            if rows.is_empty() {
+            if rows.is_empty() && skipped.is_empty() {
                 println!("No drafts for {}", account_config.name);
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("No listable drafts for {}", account_config.name);
+                print_skipped_drafts(&skipped);
                 return Ok(());
             }
 
@@ -1653,6 +1691,7 @@ async fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" | ");
             println!("Total: {} | {}", rows.len(), summary);
+            print_skipped_drafts(&skipped);
         }
 
         Some(Commands::Validate { selector }) => {

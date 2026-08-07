@@ -1,0 +1,54 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |╭ Mail ──────────────────────────────────╮╭ Headers ───────────────────────────────────────────────────────────────────╮
+01 |│  󰅲 Inbox  5                            ││ From:                                                                      │
+02 |│> 󰏫 Drafts  2                           ││ To:                                                                        │
+03 |│  󰑫 Sent 41                             ││ Subj: 2026-07-30-reply-to-anna.md                                          │
+04 |│  󰄼 Archive 128                         ││ Date: 2026-07-30  [error]                                                  │
+05 |│                                        ││                                                                            │
+06 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
+07 |╭ Drafts ────────────────────────────────╮╭ Body ──────────────────────────────────────────────────────────────────────╮
+08 |│   DATE       SUBJECT                   ││This draft could not be parsed, so it is not listed.                        │
+09 |│   2026-07-30  2026-07-30-reply-to-an… ││                                                                            │
+10 |│   2026-07-29 Re: Statusbericht KW31    ││/home/u/.local/share/mailypoppins/work/drafts/2026-07-30-reply-to-anna.md   │
+11 |│                                        ││                                                                            │
+12 |│                                        ││Parse error:                                                                │
+13 |│                                        ││Failed to parse frontmatter: attachments[0]: invalid type: string "/x"      │
+14 |│                                        ││                                                                            │
+15 |│                                        ││Press Enter/e to open the raw file in $EDITOR and fix its frontmatter.      │
+16 |│                                        ││                                                                            │
+17 |│                                        ││                                                                            │
+18 |│                                        ││                                                                            │
+19 |│                                        ││                                                                            │
+20 |│                                        ││                                                                            │
+21 |│                                        ││                                                                            │
+22 |│                                        ││                                                                            │
+23 |│                                        ││                                                                            │
+24 |│                                        ││                                                                            │
+25 |│                                        ││                                                                            │
+26 |│                                        ││                                                                            │
+27 |│                                        ││                                                                            │
+28 |╰────────────────────────────────────────╯│                                                                            │
+29 |╭ Activity ──────────────────────────────╮│                                                                            │
+30 |│  No activity yet                       ││                                                                            │
+31 |│                                        ││                                                                            │
+32 |│                                        ││                                                                            │
+33 |│                                        ││                                                                            │
+34 |╰────────────────────────────────────────╯│                                                                            │
+35 |╭ View ──────────────────────────────────╮│                                                                            │
+36 |│     mail  |  contacts  |  calendar     ││                                                                            │
+37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
+38 | MAIL   j/k Navigate emails  v Toggle selection  Enter / e Open in editor (mail read-only)  r / R Reply / Reply-all  a A
+39 | ? help                                                                                                      Drafts 1/2
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+01 |bold@43..50
+02 |bold@43..48
+03 |bold@43..50
+04 |bold@43..50
+09 |bg:surface+fg:selection+bold@1..41
+36 |bold@5..11
+38 |bold@0..6 bg:surface@6..8 bg:surface+bold@8..11 bg:surface@11..29 bg:surface+bold@29..30 bg:surface@30..49 bg:surface+bold@49..58 bg:surface@58..92 bg:surface+bold@92..97 bg:surface@97..117 bg:surface+bold@117..118 bg:surface@118..120
+39 |bg:surface@0..120

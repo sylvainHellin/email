@@ -691,3 +691,16 @@ Any column added to `row_columns` has to be chased into every query that concate
 The selector parser already lets an `mp://<account>/…` segment override `-A`/the default, but every command in `main.rs` opened its store from the pre-chosen `account_config` *before* parsing, so a cross-account selector was resolved against the wrong account's index; the miss then formatted the scope from the query's own account (`tum/drafts`), naming the account the caller asked for while having searched a different one.
 The error looked correct because it echoed the selector, which is exactly what made the bug hard to see: the fix is to resolve the account from the selector first (`account_for_selector`) and only then open the store and, for received mail, load the server credentials.
 Where a command binds its transport before the selector is parsed (`mp send`, `mp invite`), a cross-account selector cannot be honoured cheaply, so it fails loudly with "selector names account X but this command is bound to Y" rather than acting on the wrong account.
+
+## A skipped draft is invisible, so the scan has to hand the skip back as data, not a log line
+
+The drafts index catches an unparseable `.md` file and keeps refreshing the rest (one bad file must not hide the other twenty), but the original catch was `Err(e) => log::warn!(...)`, which dropped the file with no row and no signpost: the draft vanished from the TUI Drafts list and `mp list` while sitting on disk ([#0080](tickets/0080-surface-parse-skipped-drafts.md), the "my draft disappeared" report).
+The fix is the same shape the id-collision case already used: `refresh_reporting` returns the skipped files (path plus a one-line parse error) beside the collisions, so a caller can put the broken file back in front of the user instead of the log swallowing it.
+`mp list` prints them after its listing and the TUI shows each as an error row.
+The row is carried on a typed `EmailEntry::skip` field rather than the `(msg: None, draft_id: None)` pair, because that pair already means "server-search hit" everywhere in the action layer; overloading it would have let a skip row reach the wrong handler, so the third kind of row is its own field.
+
+## A cursor-highlighted row hides its own foreground colour in a golden frame
+
+The golden-frame style legend records `fg:error` now, and a parse-skipped draft row is drawn in it, but the drafts frame parks the cursor on that row so the preview can show the parse error, and the table's `row_highlight_style` (bg:surface + fg:selection) wins on the cursor row.
+So the error colour does not appear in that row's style run at all; it is proven instead by the calendar frame, where a cancelled event's `cancelled` label is the same `fg:error` off the cursor, and by a `list_row_style` unit test.
+When a frame needs to prove a row's own foreground, the cursor has to sit somewhere else, because the highlight is a full restyle, not an overlay.

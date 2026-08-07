@@ -58,6 +58,19 @@ All notable changes to this project are documented in this file.
   `email-cli X.Y.Z`.
 
 ### Fixed
+- **A draft whose frontmatter will not parse no longer vanishes silently
+  (#0080).** A YAML mistake in `$EDITOR`, such as an `attachments:` list item
+  written `-"/path"` without the dash-space, made the whole frontmatter
+  unparseable; the drafts index skipped the file with only a log line, so the
+  draft dropped out of the TUI Drafts list and `mp list` while sitting on
+  disk. The skip is now surfaced. `mp list` prints a warning block after its
+  listing naming each skipped file and its parse error (exit code unchanged),
+  and the TUI shows the file in the Drafts list as an unopenable error row: a
+  warning glyph, the filename, the theme's error colour, and the parse error
+  in the preview pane. `Enter`/`e` on that row opens the raw file in `$EDITOR`
+  so the YAML can be fixed, `d` deletes it, and send/approve decline cleanly.
+  A bare or empty `attachments:` key was already tolerated and still is; no
+  other malformation is auto-repaired.
 - **A cross-account `mp://` selector now resolves against the account it names
   (#0073 follow-up).** Commands opened the store for `-A`/the default account
   before parsing the selector, so `mp delete mp://tum/drafts/<id>` under a

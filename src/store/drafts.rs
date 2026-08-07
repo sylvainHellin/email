@@ -81,6 +81,29 @@ impl fmt::Display for IdCollision {
     }
 }
 
+/// A draft file the scan could not parse, kept so the skip is visible instead
+/// of silent.
+///
+/// A `.md` file whose frontmatter will not deserialize (a mistyped YAML list,
+/// a frontmatter block that parses to null) has no `id:` to index under and no
+/// row to list, so before this it left the index and the file simply vanished
+/// from `mp list` and the TUI Drafts view while sitting on disk: the user's
+/// draft "disappeared" (#0080). The scan reports it instead, carrying the path
+/// and a one-line parse error so the CLI and the TUI can put the broken file
+/// back in front of the user, unopenable but named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedDraft {
+    pub path: PathBuf,
+    /// The parse failure, folded to a single line for a list or a status bar.
+    pub error: String,
+}
+
+impl fmt::Display for SkippedDraft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
 /// Rebuild the whole index for one account from `dir`.
 ///
 /// Deliberately a full rebuild rather than a diff: the directory holds tens of
@@ -91,24 +114,31 @@ impl fmt::Display for IdCollision {
 ///
 /// A file with no `id:` gets one assigned and written back before it is
 /// indexed, so the selector it is listed under is the one in the file. A file
-/// that cannot be parsed is skipped with a log line rather than failing the
-/// refresh: one malformed draft must not hide the other twenty.
+/// that cannot be parsed is skipped rather than failing the refresh: one
+/// malformed draft must not hide the other twenty. The skip is reported
+/// (see [`refresh_reporting`]) instead of only logged, so the broken file is
+/// still surfaced (#0080).
 ///
 /// Collisions are reported rather than swallowed; see [`refresh_reporting`].
 pub fn refresh(store: &Store, account: &str, dir: &Path) -> Result<Vec<DraftRow>> {
     Ok(refresh_reporting(store, account, dir)?.0)
 }
 
-/// [`refresh`], additionally handing back the id collisions it found, for the
-/// callers that can put them in front of the user instead of only in the log.
+/// [`refresh`], additionally handing back the id collisions and the parse-
+/// skipped files it found, for the callers that can put them in front of the
+/// user instead of only in the log.
 pub fn refresh_reporting(
     store: &Store,
     account: &str,
     dir: &Path,
-) -> Result<(Vec<DraftRow>, Vec<IdCollision>)> {
-    let (rows, collisions) = dedupe_by_id(scan(dir));
+) -> Result<(Vec<DraftRow>, Vec<IdCollision>, Vec<SkippedDraft>)> {
+    let (parsed, skipped) = scan(dir);
+    let (rows, collisions) = dedupe_by_id(parsed);
     for collision in &collisions {
         log::warn!("[drafts] {collision}");
+    }
+    for skip in &skipped {
+        log::warn!("[drafts] skipping {skip}");
     }
     let conn = store.conn();
     let tx_guard = conn.unchecked_transaction()?;
@@ -142,7 +172,7 @@ pub fn refresh_reporting(
         }
     }
     tx_guard.commit()?;
-    Ok((rows, collisions))
+    Ok((rows, collisions, skipped))
 }
 
 /// Keep one row per id and report the rest.
@@ -297,8 +327,13 @@ pub fn fingerprint(dir: &Path) -> u64 {
 }
 
 /// Read every draft in `dir`, assigning an id to any file that lacks one.
-fn scan(dir: &Path) -> Vec<DraftRow> {
+///
+/// Returns the parsed rows and, beside them, the files that would not parse:
+/// the skip is data now, not just a log line, so a caller can list the broken
+/// file rather than let it vanish (#0080).
+fn scan(dir: &Path) -> (Vec<DraftRow>, Vec<SkippedDraft>) {
     let mut rows = Vec::new();
+    let mut skipped = Vec::new();
     for entry in WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if !is_draft_file(path) {
@@ -306,11 +341,24 @@ fn scan(dir: &Path) -> Vec<DraftRow> {
         }
         match row_for(path) {
             Ok(row) => rows.push(row),
-            Err(e) => log::warn!("[drafts] skipping {}: {e:#}", path.display()),
+            Err(e) => skipped.push(SkippedDraft {
+                path: path.to_path_buf(),
+                error: concise_error(&e),
+            }),
         }
     }
     rows.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.id.cmp(&b.id)));
-    rows
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    (rows, skipped)
+}
+
+/// Fold an anyhow error chain to a single line for a list row or a status bar.
+///
+/// `{e:#}` joins the context and its source with `: `, then any embedded
+/// newlines (a `serde_yaml` message can carry one) are flattened to spaces so
+/// the whole reason fits on one line.
+fn concise_error(e: &anyhow::Error) -> String {
+    format!("{e:#}").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn is_draft_file(path: &Path) -> bool {
@@ -457,7 +505,7 @@ mod tests {
         let one = write_draft(&dir, "one.md", "id: shared\n");
         let two = write_draft(&dir, "two.md", "id: shared\n");
 
-        let (rows, collisions) = refresh_reporting(&store, "work", &dir).unwrap();
+        let (rows, collisions, _skipped) = refresh_reporting(&store, "work", &dir).unwrap();
         assert_eq!(rows.len(), 1, "one id is one row");
         assert_eq!(list(&store, "work", None).unwrap().len(), 1);
         let indexed = find(&store, "work", "shared").unwrap().unwrap().path;
@@ -473,7 +521,7 @@ mod tests {
         assert!(message.contains(&two.display().to_string()), "{message}");
 
         // Deterministic: the same directory indexes the same way every time.
-        let (again, _) = refresh_reporting(&store, "work", &dir).unwrap();
+        let (again, _, _) = refresh_reporting(&store, "work", &dir).unwrap();
         assert_eq!(again[0].path, indexed);
     }
 
@@ -594,10 +642,45 @@ mod tests {
         )
         .unwrap();
 
-        let rows = refresh(&store, "work", &dir).unwrap();
+        let (rows, _collisions, skipped) = refresh_reporting(&store, "work", &dir).unwrap();
         assert_eq!(rows.len(), 1, "only the readable draft is indexed");
         assert_eq!(rows[0].id, "aaa");
         assert!(find(&store, "work", "bbb").unwrap().is_none());
+
+        // The broken file is not dropped: it is reported so a lister can put it
+        // back in front of the user (#0080).
+        assert_eq!(skipped.len(), 1, "the unparseable draft is reported");
+        assert_eq!(skipped[0].path, dir.join("broken.md"));
+        assert!(!skipped[0].error.is_empty(), "the skip carries a parse error");
+        assert!(!skipped[0].error.contains('\n'), "the error is one line");
+    }
+
+    /// A frontmatter block that deserializes to null (`invalid type: null`)
+    /// and a mistyped attachments list are both reported as skips rather than
+    /// dropped, which is the "my draft disappeared" report this ticket answers
+    /// (#0080). The scan never fails the whole refresh over one of them.
+    #[test]
+    fn parse_skipped_drafts_are_reported_with_their_paths() {
+        let (tmp, store) = store();
+        let dir = tmp.path().join("drafts");
+        write_draft(&dir, "good.md", "id: aaa\n");
+        // Whole frontmatter parses to null.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("null.md"), "---\n---\n\nBody\n").unwrap();
+        // A mistyped attachments list item (no dash-space).
+        fs::write(
+            dir.join("attach.md"),
+            "---\nid: ccc\nstatus: draft\nattachments:\n-\"/x\"\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let (rows, _collisions, skipped) = refresh_reporting(&store, "work", &dir).unwrap();
+        assert_eq!(rows.len(), 1, "the readable draft still indexes");
+        assert_eq!(skipped.len(), 2, "both broken files are reported");
+        let paths: Vec<_> = skipped.iter().map(|s| s.path.clone()).collect();
+        assert!(paths.contains(&dir.join("null.md")));
+        assert!(paths.contains(&dir.join("attach.md")));
+        assert!(skipped.iter().all(|s| !s.error.is_empty()));
     }
 
     #[test]

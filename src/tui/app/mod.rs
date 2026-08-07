@@ -964,6 +964,20 @@ impl App {
     /// wrapper the message body goes through, so the pane renders both the
     /// same way.
     pub(crate) fn refresh_preview_body(&mut self) {
+        // A parse-skipped draft (#0080) has no body to load: it is the file
+        // the index could not read. The preview shows the filename and the
+        // one-line parse error instead, so the pane says why the row is an
+        // error rather than sitting blank. Its `key()` is `None`, so this is
+        // handled before the memo, refreshing the cheap string each frame.
+        if let Some(skip) = self.selected_email().and_then(|e| e.skip.clone()) {
+            let text = format!(
+                "This draft could not be parsed, so it is not listed.\n\n{}\n\nParse error:\n{}\n\nPress Enter/e to open the raw file in $EDITOR and fix its frontmatter.",
+                skip.path.display(),
+                skip.error,
+            );
+            self.preview_body.fill(None, text);
+            return;
+        }
         let key = self.preview_body_key();
         if self.preview_body.holds(&key) {
             return;

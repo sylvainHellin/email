@@ -45,7 +45,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 01 |bg:surface+fg:selection+bold@1..41 bold@43..61
-02 |strike@1..17 strike@18..26 bold@43..49
+02 |strike@1..17 strike@18..26 fg:error@29..38 bold@43..49
 03 |bold@43..50
 04 |bold@43..54
 05 |bold@43..54 fg:selection@54..62

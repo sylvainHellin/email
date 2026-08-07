@@ -124,6 +124,9 @@ fn cell_tags(style: ratatui::style::Style) -> String {
     if style.fg == Some(theme.selection) {
         tags.push("fg:selection");
     }
+    if style.fg == Some(theme.error) {
+        tags.push("fg:error");
+    }
     if style.add_modifier.contains(Modifier::BOLD) {
         tags.push("bold");
     }
@@ -210,6 +213,7 @@ fn email(
     EmailEntry {
         msg: Some(MessageRef::new(row)),
         draft_id: None,
+        skip: None,
         from: from.to_string(),
         to: "sylvain@example.org".to_string(),
         cc: None,
@@ -440,6 +444,65 @@ fn contacts_fixture() -> App {
     app
 }
 
+/// The frozen Drafts view: the Drafts mailbox active with one parse-skipped
+/// draft leading the list as an unopenable error row (#0080), the cursor on
+/// it, and one readable draft below. The error row carries the warning glyph
+/// and the filename in the theme's `error` colour, and the preview pane shows
+/// the parse error and how to fix it.
+fn drafts_fixture() -> App {
+    let mut app = mail_fixture();
+    app.active_mailbox = 1;
+    app.sidebar_index = 1;
+
+    let skip = EmailEntry {
+        msg: None,
+        draft_id: None,
+        skip: Some(crate::store::drafts::SkippedDraft {
+            path: std::path::PathBuf::from(
+                "/home/u/.local/share/mailypoppins/work/drafts/2026-07-30-reply-to-anna.md",
+            ),
+            error: "Failed to parse frontmatter: attachments[0]: invalid type: string \"/x\""
+                .to_string(),
+        }),
+        from: String::new(),
+        to: String::new(),
+        cc: None,
+        subject: "2026-07-30-reply-to-anna.md".to_string(),
+        status: "error".to_string(),
+        date_display: "2026-07-30".to_string(),
+        date_sort: "2026-07-30T00:00:00".to_string(),
+        read: true,
+        answered: false,
+        forwarded: false,
+        flagged: false,
+        has_attachments: false,
+        is_invite: false,
+    };
+    let draft = EmailEntry {
+        msg: None,
+        draft_id: Some("draft-1".to_string()),
+        skip: None,
+        from: String::new(),
+        to: "anna.weber@example.com".to_string(),
+        cc: None,
+        subject: "Re: Statusbericht KW31".to_string(),
+        status: "draft".to_string(),
+        date_display: "2026-07-29".to_string(),
+        date_sort: "2026-07-29T09:00:00".to_string(),
+        read: true,
+        answered: false,
+        forwarded: false,
+        flagged: false,
+        has_attachments: false,
+        is_invite: false,
+    };
+    app.emails = Arc::new(vec![skip, draft]);
+    app.email_cache = vec![None, Some(Arc::clone(&app.emails)), None, None];
+    app.rebuild_visible();
+    app.list_index = 0;
+    app
+}
+
 // ---------------------------------------------------------------------------
 // Golden frames
 // ---------------------------------------------------------------------------
@@ -516,6 +579,15 @@ fn golden_contacts_view() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The Drafts view with a parse-skipped draft as an error row (#0080): the
+/// warning glyph and filename in the error colour lead the list where the
+/// draft would sit, and the preview names the parse failure and the fix.
+#[test]
+fn golden_drafts_view_with_a_parse_skip() {
+    let mut app = drafts_fixture();
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The help overlay floating over the dimmed mail view. Rendered straight
 /// through `ui::view` with `Overlay::Help` set, exactly as the event loop
 /// leaves the state after `?`; no event loop is needed.
@@ -536,6 +608,7 @@ fn frames_are_reproducible() {
         mail_fixture as fn() -> App,
         calendar_fixture as fn() -> App,
         contacts_fixture as fn() -> App,
+        drafts_fixture as fn() -> App,
     ] {
         let first = frame_snapshot(&mut build(), WIDTH, HEIGHT);
         let second = frame_snapshot(&mut build(), WIDTH, HEIGHT);

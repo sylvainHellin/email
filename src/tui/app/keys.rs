@@ -2295,6 +2295,7 @@ mod tests {
         EmailEntry {
             msg: Some(ref_for(subject)),
             draft_id: None,
+            skip: None,
             from: from.to_string(),
             to: "me@example.com".to_string(),
             cc: None,
@@ -2504,6 +2505,7 @@ mod tests {
         EmailEntry {
             msg: None,
             draft_id: Some(id.to_string()),
+            skip: None,
             subject: subject.to_string(),
             status: "draft".to_string(),
             read: true,

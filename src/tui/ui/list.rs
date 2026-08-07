@@ -29,6 +29,11 @@ const FORWARDED_GLYPH: &str = "\u{f028d}";
 /// can be flagged and unread at once).
 const FLAG_GLYPH: &str = "\u{f024}";
 
+/// Nerd Font warning triangle shown before the filename of a draft the index
+/// could not parse (#0080). The whole row is drawn in the theme's `error`
+/// colour; the glyph names it as the broken file it is at a glance.
+const SKIP_GLYPH: &str = "\u{f071}";
+
 /// The one marker the status column shows for a message.
 ///
 /// The column is two cells wide and the axis is a set (#TKT-0051), so three
@@ -86,6 +91,13 @@ fn flag_span(email: &EmailEntry) -> Option<Span<'static>> {
 /// the attachment paperclip (if any). Both, one, or neither may apply.
 fn invite_and_attachment_prefix(email: &EmailEntry) -> String {
     let mut prefix = String::new();
+    if email.skip.is_some() {
+        // A parse-skipped draft carries neither invite nor attachment badge;
+        // the warning triangle stands in for both and names the error row.
+        prefix.push_str(SKIP_GLYPH);
+        prefix.push(' ');
+        return prefix;
+    }
     if email.is_invite {
         prefix.push_str(INVITE_GLYPH);
         prefix.push(' ');
@@ -94,6 +106,19 @@ fn invite_and_attachment_prefix(email: &EmailEntry) -> String {
         prefix.push_str("\u{f0c6} ");
     }
     prefix
+}
+
+/// The style one list row is drawn in, error rows included.
+///
+/// A parse-skipped draft (#0080) is drawn in the theme's `error` colour so it
+/// reads as the broken file it is; the cursor fill still wins on the selected
+/// row, applied by the table's `row_highlight_style`, so the user can see
+/// which row the keys act on. Every other row defers to [`row_style`].
+fn list_row_style(email: &EmailEntry, is_cursor: bool, is_in_selection: bool) -> Style {
+    if email.skip.is_some() {
+        return Style::default().fg(theme::active().error);
+    }
+    row_style(is_cursor, is_in_selection, email.read)
 }
 
 /// Style for one list row.
@@ -229,7 +254,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 let is_in_selection = has_selection && app.is_selected(email);
                 let contact = truncate(email.display_contact(app.active_kind()), contact_width);
 
-                let style = row_style(is_cursor, is_in_selection, email.read);
+                let style = list_row_style(email, is_cursor, is_in_selection);
 
                 let mut cells = Vec::new();
                 if has_selection {
@@ -297,7 +322,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                 let is_cursor = i == app.list_index;
                 let is_in_selection = has_selection && app.is_selected(email);
 
-                let style = row_style(is_cursor, is_in_selection, email.read);
+                let style = list_row_style(email, is_cursor, is_in_selection);
 
                 let mut cells = Vec::new();
                 if has_selection {
@@ -350,6 +375,7 @@ mod badge_tests {
         EmailEntry {
             msg: Some(crate::tui::app::MessageRef::new(1)),
             draft_id: None,
+            skip: None,
             from: "a".into(), to: "b".into(), cc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
@@ -375,6 +401,29 @@ mod badge_tests {
         let p = invite_and_attachment_prefix(&entry(true, false));
         assert!(p.starts_with(INVITE_GLYPH));
         assert!(!p.contains('\u{f0c6}'));
+    }
+
+    /// A parse-skipped draft (#0080) is drawn as an error row: the warning
+    /// glyph stands in for the invite/attachment badges, and the row takes the
+    /// theme's `error` colour whenever it is not the cursor row (the cursor
+    /// fill wins by design). The badges never show beside the warning glyph.
+    #[test]
+    fn a_parse_skipped_draft_renders_as_an_error_row() {
+        crate::tui::theme::init(crate::tui::theme::DEFAULT_THEME_NAME);
+        let mut e = entry(true, true);
+        e.msg = None;
+        e.skip = Some(crate::store::drafts::SkippedDraft {
+            path: std::path::PathBuf::from("/d/broken.md"),
+            error: "boom".into(),
+        });
+
+        let prefix = invite_and_attachment_prefix(&e);
+        assert!(prefix.starts_with(SKIP_GLYPH), "prefix={prefix:?}");
+        assert!(!prefix.contains(INVITE_GLYPH), "no invite badge on an error row");
+        assert!(!prefix.contains('\u{f0c6}'), "no paperclip on an error row");
+
+        let off_cursor = list_row_style(&e, false, false);
+        assert_eq!(off_cursor.fg, Some(theme::active().error));
     }
 
     /// The status column shows one glyph for a set of three (#TKT-0051), and

@@ -676,6 +676,24 @@ fn delete_draft(app: &mut App, id: &str) {
     }
 }
 
+/// Delete a parse-skipped draft by its path (#0080).
+///
+/// A skipped file has no index row and no `id:`, so the guard [`delete_draft`]
+/// runs (approved, mid-send) cannot apply and there is nothing to resolve: the
+/// file the error row names is removed straight from disk, and the drafts
+/// refresh drops the row it stood for.
+fn delete_skip_file(app: &mut App, path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            app.set_status(format!("Deleted {}", path.display()));
+            refresh_drafts_after_flip(app);
+        }
+        Err(e) => {
+            app.set_status_level(format!("Delete failed: {e:#}"), StatusLevel::Error);
+        }
+    }
+}
+
 /// Delete every selected draft, counting what went and logging what was
 /// refused, the same shape as the batch status flip (#0073). A draft the guard
 /// keeps (approved, or mid-send) is one miss among N, not an abort.
@@ -1002,6 +1020,14 @@ pub(super) fn handle_action(
             if let Some(msg) = app.selected_email_ref() {
                 return open_readonly_view(app, terminal, msg.row_id());
             }
+            // A parse-skipped draft (#0080) has no index row to resolve, so it
+            // opens its raw file writable: the whole point of the error row is
+            // to let the user reach the broken YAML and fix it. The index
+            // refresh on the way out then lists it as a normal draft.
+            if let Some(skip) = app.selected_email().and_then(|e| e.skip.clone()) {
+                edit_new_draft(app, terminal, &skip.path, "Returned from editor".to_string())?;
+                return Ok(());
+            }
             let Some((_id, path)) = cursor_draft(app, "Open in $EDITOR needs a message or a draft")
             else {
                 return Ok(());
@@ -1309,8 +1335,16 @@ pub(super) fn handle_action(
             // to `delete_msgs` and reported "nothing to delete" (#0073). Route
             // it to the local-only draft delete instead; received mail keeps
             // the store-mutation path.
+            let skip_path = app
+                .selected_email()
+                .and_then(|e| e.skip.as_ref().map(|s| s.path.clone()));
             let draft_id = app.selected_email().and_then(|e| e.draft_id.clone());
-            if let Some(id) = draft_id {
+            if let Some(path) = skip_path {
+                // A parse-skipped draft has no index row, so it is deleted by
+                // its path: the file the user can see is the file that goes
+                // (#0080).
+                delete_skip_file(app, &path);
+            } else if let Some(id) = draft_id {
                 delete_draft(app, &id);
             } else if let Some(msg) = app.selected_email_ref() {
                 delete_msgs(app, terminal, bg_tx, vec![msg], false)?;
@@ -2786,6 +2820,7 @@ mod tests {
         EmailEntry {
             msg: Some(MessageRef::new(id)),
             draft_id: None,
+            skip: None,
             from: "Sender <s@example.com>".to_string(),
             to: "me@example.com".to_string(),
             cc: None,
@@ -3422,6 +3457,7 @@ mod store_backed_mutations {
         EmailEntry {
             msg: None,
             draft_id: Some(id.to_string()),
+            skip: None,
             from: String::new(),
             to: "alice@example.com".to_string(),
             cc: None,
@@ -3699,6 +3735,7 @@ mod store_backed_files {
         app.emails = std::sync::Arc::new(vec![EmailEntry {
             msg: Some(MessageRef::new(row.id)),
             draft_id: None,
+            skip: None,
             from: row.from.clone().unwrap_or_default(),
             to: row.to.clone().unwrap_or_default(),
             cc: None,
@@ -3776,6 +3813,7 @@ mod store_backed_files {
         app.emails = std::sync::Arc::new(vec![EmailEntry {
             msg: None,
             draft_id: Some("some-draft".to_string()),
+            skip: None,
             from: String::new(),
             to: "alice@example.com".to_string(),
             cc: None,

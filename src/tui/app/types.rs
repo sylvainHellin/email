@@ -134,6 +134,15 @@ pub struct EmailEntry {
     /// draft's canonical selector is `mp://<account>/drafts/<id>` and never
     /// goes through the store.
     pub draft_id: Option<String>,
+    /// Set when this row is a draft file the index could not parse (#0080).
+    ///
+    /// Such a file has no `id:` to index under, so `msg` and `draft_id` are
+    /// both `None` and it would otherwise be a keyless nobody. This carries
+    /// its path and the one-line parse error instead, so the Drafts list can
+    /// show it as an unopenable error row where the user expects the draft to
+    /// be, rather than let the file vanish. It is mutually exclusive with both
+    /// `msg` and `draft_id`: a row is a message, a parsed draft, or a skip.
+    pub skip: Option<crate::store::drafts::SkippedDraft>,
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
@@ -252,7 +261,15 @@ pub fn load_emails(account: &str, mailbox: &str) -> Vec<EmailEntry> {
 /// *partial* send, or one with no durable record, keeps it, marked `sent` and
 /// addressable.
 fn load_drafts(account: &str) -> Vec<EmailEntry> {
-    indexed_drafts(account).into_iter().map(entry_from_draft).collect()
+    let (rows, skipped) = indexed_drafts(account);
+    // The unparseable files lead the list: they are the ones the user is
+    // hunting for ("my draft disappeared"), and they have no date to sort by,
+    // so pinning them to the top is both honest and useful (#0080).
+    skipped
+        .into_iter()
+        .map(entry_from_skip)
+        .chain(rows.into_iter().map(entry_from_draft))
+        .collect()
 }
 
 /// The indexed drafts of one account: the single answer the Drafts list and
@@ -263,23 +280,30 @@ fn load_drafts(account: &str) -> Vec<EmailEntry> {
 /// never synced has no store *file* and still has drafts, and a count that
 /// opened differently or skipped the refresh would contradict the list it
 /// labels.
-fn indexed_drafts(account: &str) -> Vec<drafts::DraftRow> {
+fn indexed_drafts(account: &str) -> (Vec<drafts::DraftRow>, Vec<drafts::SkippedDraft>) {
     let store = match Store::open(crate::config::store_path(account)) {
         Ok(store) => store,
         Err(e) => {
             log::warn!("[drafts] could not open the store for {account}: {e:#}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
     let dir = crate::config::drafts_dir(account);
-    if let Err(e) = drafts::refresh(&store, account, &dir) {
-        log::warn!("[drafts] refreshing the index of {account} failed: {e:#}");
-    }
+    // The reporting refresh hands back the files it skipped for a parse
+    // failure, so the Drafts list can show them as error rows instead of
+    // silently dropping them (#0080).
+    let skipped = match drafts::refresh_reporting(&store, account, &dir) {
+        Ok((_, _, skipped)) => skipped,
+        Err(e) => {
+            log::warn!("[drafts] refreshing the index of {account} failed: {e:#}");
+            Vec::new()
+        }
+    };
     match drafts::list(&store, account, None) {
-        Ok(rows) => rows,
+        Ok(rows) => (rows, skipped),
         Err(e) => {
             log::warn!("[drafts] listing the index of {account} failed: {e:#}");
-            Vec::new()
+            (Vec::new(), skipped)
         }
     }
 }
@@ -309,7 +333,13 @@ pub fn count_all_emails(account: &str, mailboxes: &[MailboxInfo]) -> Vec<usize> 
     // The count is the length of the list, from the same [`indexed_drafts`]
     // call the mailbox load makes, so the sidebar cannot disagree with the
     // mailbox it labels.
-    let draft_count = || indexed_drafts(account).len();
+    // The count is the length of the Drafts list, which now includes the
+    // parse-skipped error rows, so the sidebar badge matches the list even
+    // when some files would not parse (#0080).
+    let draft_count = || {
+        let (rows, skipped) = indexed_drafts(account);
+        rows.len() + skipped.len()
+    };
 
     mailboxes
         .iter()
@@ -365,6 +395,7 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     EmailEntry {
         msg: Some(MessageRef::new(row.id)),
         draft_id: None,
+        skip: None,
         from: extract_display_name(row.from.as_deref().unwrap_or_default()),
         to: extract_display_name(row.to.as_deref().unwrap_or_default()),
         cc: row.cc,
@@ -399,6 +430,7 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
     EmailEntry {
         msg: None,
         draft_id: Some(row.id),
+        skip: None,
         from: String::new(),
         to: extract_display_name(row.to.as_deref().unwrap_or_default()),
         cc: row.cc,
@@ -412,6 +444,42 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
         read: true,
         // The second axis is a property of received mail: a draft has neither
         // been answered nor forwarded, it *is* the answer.
+        answered: false,
+        forwarded: false,
+        flagged: false,
+        has_attachments: false,
+        is_invite: false,
+    }
+}
+
+/// Map one parse-skipped draft into an unopenable error row (#0080).
+///
+/// The file has no `id:` and no index row, so `msg` and `draft_id` are both
+/// `None` and its identity is the `skip` field. The subject is the filename
+/// (what the user sees in the directory), and the full parse error rides on
+/// the `skip` for the preview pane and the row's error styling. `read` is true
+/// so the list does not render it bold as if it were unread mail; the error
+/// colour is what marks it, decided by [`crate::tui::ui::list`].
+fn entry_from_skip(skip: crate::store::drafts::SkippedDraft) -> EmailEntry {
+    let (date_display, date_sort) = resolve_date(&None, &None, &skip.path);
+    let filename = skip
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    EmailEntry {
+        msg: None,
+        draft_id: None,
+        skip: Some(skip),
+        from: String::new(),
+        to: String::new(),
+        cc: None,
+        subject: filename,
+        status: "error".to_string(),
+        date_display,
+        date_sort,
+        read: true,
         answered: false,
         forwarded: false,
         flagged: false,
