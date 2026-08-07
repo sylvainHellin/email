@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **The Contacts and Calendar views got a visual-polish pass (#TKT-0048).**
+  They now share the Mail list's cursor-row convention (a raised surface fill
+  carrying the selection foreground, in place of the solid green highlight each
+  view had invented) and, in the widest layout, own the full frame the way Mail
+  does: the ranked list fills the left column and the detail pane the right
+  one. The mailbox sidebar and the blank left-middle slot that used to sit
+  beside these views off the Mail view are gone; the view switcher stays pinned
+  bottom-left. Purely cosmetic, no key bindings or data changed.
+
 - **IMAP sync fetches its mailboxes in parallel now (#0005).** A sync used to
   SELECT each mailbox in turn on one connection, paying the round-trip latency
   once per mailbox; it now opens one connection per mailbox and overlaps them,

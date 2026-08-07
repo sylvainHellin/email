@@ -401,6 +401,45 @@ fn calendar_fixture() -> App {
     app
 }
 
+/// The frozen Contacts view: a small ranked index with the cursor on the top
+/// contact, so the frame carries the list column, the shared cursor-row fill
+/// and the detail pane at once (#TKT-0048).
+fn contacts_fixture() -> App {
+    use crate::contacts::{Contact, ContactIndex, ContactSource};
+
+    let mut app = mail_fixture();
+    app.view = View::Contacts;
+
+    let contact = |address: &str, name: &str, sent_to: u32, sent_cc: u32, received: u32| Contact {
+        address: address.to_string(),
+        display_name: name.to_string(),
+        sent_to,
+        sent_cc,
+        received,
+        first_seen: "2026-01-04T08:00:00+00:00".into(),
+        last_seen: "2026-07-28T09:00:00+00:00".into(),
+        source: ContactSource::Local,
+    };
+
+    let mut contacts = std::collections::HashMap::new();
+    for c in [
+        contact("planung@example.org", "Planung M\u{fc}ller", 12, 3, 20),
+        contact("anna.weber@example.com", "Anna Weber", 6, 1, 9),
+        contact("buchhaltung@example.org", "Buchhaltung", 2, 0, 4),
+    ] {
+        contacts.insert(c.address.clone(), c);
+    }
+    app.contacts_view.index = Some(ContactIndex {
+        account: "fixture".into(),
+        contacts,
+        built_at: "2026-07-28T09:00:00+00:00".into(),
+    });
+    app.contacts_view.loaded = true;
+    app.recompute_contact_matches();
+    app.contacts_view.list_index = 0;
+    app
+}
+
 // ---------------------------------------------------------------------------
 // Golden frames
 // ---------------------------------------------------------------------------
@@ -469,6 +508,14 @@ fn golden_calendar_view() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The Contacts view: the ranked list owning the left column, the shared
+/// cursor-row fill, and the detail pane on the right (#TKT-0048).
+#[test]
+fn golden_contacts_view() {
+    let mut app = contacts_fixture();
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The help overlay floating over the dimmed mail view. Rendered straight
 /// through `ui::view` with `Overlay::Help` set, exactly as the event loop
 /// leaves the state after `?`; no event loop is needed.
@@ -488,6 +535,7 @@ fn frames_are_reproducible() {
     for build in [
         mail_fixture as fn() -> App,
         calendar_fixture as fn() -> App,
+        contacts_fixture as fn() -> App,
     ] {
         let first = frame_snapshot(&mut build(), WIDTH, HEIGHT);
         let second = frame_snapshot(&mut build(), WIDTH, HEIGHT);

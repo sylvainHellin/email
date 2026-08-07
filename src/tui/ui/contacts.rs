@@ -20,7 +20,9 @@ use super::util::truncate;
 const DETAIL_MIN_WIDTH: u16 = 56;
 
 /// Render the whole Contacts view into `area`. Splits into list + detail when
-/// wide enough; list-only otherwise.
+/// wide enough; list-only otherwise. Used by the single-area tiers (medium and
+/// narrow); the wide tier drives the two columns directly via
+/// [`render_contacts_split`].
 pub(super) fn render_contacts(app: &App, frame: &mut Frame, area: Rect) {
     if area.width >= DETAIL_MIN_WIDTH {
         let cols = Layout::default()
@@ -32,6 +34,20 @@ pub(super) fn render_contacts(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         render_list(app, frame, area);
     }
+}
+
+/// Wide-tier entry point: the ranked list owns the left column and the detail
+/// pane the right one, so the view fills the frame the way the Mail list +
+/// preview do, instead of leaving the old blank left-middle slot beside a
+/// cramped detail pane (#TKT-0048).
+pub(super) fn render_contacts_split(
+    app: &App,
+    frame: &mut Frame,
+    list_area: Rect,
+    detail_area: Rect,
+) {
+    render_list(app, frame, list_area);
+    render_detail(app, frame, detail_area);
 }
 
 /// The list column: a title, a fuzzy-search input line, then the ranked
@@ -131,12 +147,7 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
     let mut state = TableState::default();
     state.select(Some(cv.list_index));
     let table = Table::new(table_rows, [Constraint::Percentage(100)])
-        .row_highlight_style(
-            Style::default()
-                .bg(theme::active().selection)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▸ ")
+        .row_highlight_style(cursor_row_style())
         .style(Style::default().bg(theme::active().bg));
     frame.render_stateful_widget(table, list_area, &mut state);
 }
@@ -208,6 +219,16 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(theme::active().bg)),
         inner,
     );
+}
+
+/// The cursor-row highlight, matching the Mail list convention (#TKT-0048): a
+/// raised `surface` fill carrying the `selection` foreground, rather than the
+/// former solid `selection` background the views each invented on their own.
+fn cursor_row_style() -> Style {
+    Style::default()
+        .bg(theme::active().surface)
+        .fg(theme::active().selection)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Trim an RFC-3339 timestamp down to its `YYYY-MM-DD` date, or pass through

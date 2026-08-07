@@ -3,15 +3,15 @@ source: src/tui/ui/golden_frames.rs
 expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 ---
 == text 120x40 (trailing spaces trimmed) ==
-00 |╭ Calendar (3 upcoming) ─────────────────╮╭ Event ─────────────────────────────────────────────────────────────────────╮
-01 |│2026-08-03 09:00 Baustel…   accepted    ││Baustellenübergabe                                                          │
-02 |│2026-08-04 10:00 Abgesag…   cancelled   ││When: 2026-08-03T07:00:00+02:00                                             │
-03 |│2026-08-06 15:00 PhD Kol…   organizer   ││Where: Raum 2.14                                                            │
-04 |│                                        ││Organizer: planung@example.org                                              │
-05 |│                                        ││Your RSVP: Accepted                                                         │
-06 |│                                        ││RSVP is emailed to the organizer; not synced to Exchange (no Graph in v1).  │
-07 |│                                        ││Press V to respond.                                                         │
-08 |│                                        ││                                                                            │
+00 |╭ Contacts (3) ──────────────────────────╮╭ Details ───────────────────────────────────────────────────────────────────╮
+01 |│/ type / to search                      ││Planung Müller                                                              │
+02 |│Planung Müller <planung@example.org>    ││                                                                            │
+03 |│Anna Weber <anna.weber@example.com>     ││Email      planung@example.org                                              │
+04 |│Buchhaltung <buchhaltung@example.org>   ││Interactionssent-to 12, cc 3, received 20                                   │
+05 |│                                        ││First seen 2026-01-04                                                       │
+06 |│                                        ││Last seen  2026-07-28                                                       │
+07 |│                                        ││                                                                            │
+08 |│                                        ││Enter compose · v vCard · r refresh                                         │
 09 |│                                        ││                                                                            │
 10 |│                                        ││                                                                            │
 11 |│                                        ││                                                                            │
@@ -34,21 +34,18 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 28 |│                                        ││                                                                            │
 29 |│                                        ││                                                                            │
 30 |│                                        ││                                                                            │
-31 |│Only events that arrived by email are   ││                                                                            │
-32 |│shown; Outlook-created events need Graph││                                                                            │
-33 |│sync (#0036).                           ││                                                                            │
+31 |│                                        ││                                                                            │
+32 |│                                        ││                                                                            │
+33 |│                                        ││                                                                            │
 34 |╰────────────────────────────────────────╯│                                                                            │
 35 |╭ View ──────────────────────────────────╮│                                                                            │
 36 |│     mail  |  contacts  |  calendar     ││                                                                            │
 37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
-38 | CALENDAR   j/k Navigate events  Enter / e Open the invite email in $EDITOR  V RSVP to invitation (Accept/Tentative/Decl
+38 | CONTACTS   j/k Navigate contacts  / Fuzzy search  Enter / n Compose to contact  v Send contact as vCard  c Copy email a
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
-01 |bg:surface+fg:selection+bold@1..41 bold@43..61
-02 |strike@1..17 strike@18..26 bold@43..49
-03 |bold@43..50
-04 |bold@43..54
-05 |bold@43..54 fg:selection@54..62
-36 |bold@27..37
-38 |bold@0..10 bg:surface@10..12 bg:surface+bold@12..15 bg:surface@15..33 bg:surface+bold@33..42 bg:surface@42..77 bg:surface+bold@77..78 bg:surface@78..120
+01 |bold@43..57
+02 |bg:surface+fg:selection+bold@1..41
+36 |bold@14..24
+38 |bold@0..10 bg:surface@10..12 bg:surface+bold@12..15 bg:surface@15..35 bg:surface+bold@35..36 bg:surface@36..51 bg:surface+bold@51..60 bg:surface@60..81 bg:surface+bold@81..82 bg:surface@82..106 bg:surface+bold@106..107 bg:surface@107..120
 39 |bg:surface@0..120

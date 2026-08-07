@@ -35,7 +35,9 @@ const OUTLOOK_CAVEAT: &str =
     "Only events that arrived by email are shown; Outlook-created events need Graph sync (#0036).";
 
 /// Render the whole Calendar view into `area`. Splits into agenda + detail when
-/// wide enough; agenda-only otherwise.
+/// wide enough; agenda-only otherwise. Used by the single-area tiers (medium
+/// and narrow); the wide tier drives the two columns directly via
+/// [`render_calendar_split`].
 pub(super) fn render_calendar(app: &App, frame: &mut Frame, area: Rect) {
     if area.width >= DETAIL_MIN_WIDTH {
         let cols = Layout::default()
@@ -47,6 +49,20 @@ pub(super) fn render_calendar(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         render_list(app, frame, area);
     }
+}
+
+/// Wide-tier entry point: the agenda owns the left column and the event card
+/// the right one, so the view fills the frame the way the Mail list + preview
+/// do, instead of leaving the old blank left-middle slot beside a cramped
+/// event card (#TKT-0048).
+pub(super) fn render_calendar_split(
+    app: &App,
+    frame: &mut Frame,
+    list_area: Rect,
+    detail_area: Rect,
+) {
+    render_list(app, frame, list_area);
+    render_detail(app, frame, detail_area);
 }
 
 /// The agenda column: the event rows with the cursor highlighted, plus the
@@ -152,12 +168,7 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
             Constraint::Length(STATUS_WIDTH as u16),
         ],
     )
-    .row_highlight_style(
-        Style::default()
-            .bg(theme::active().selection)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("\u{25b8} ")
+    .row_highlight_style(cursor_row_style())
     .style(Style::default().bg(theme::active().bg));
     frame.render_stateful_widget(table, list_area, &mut state);
 }
@@ -205,6 +216,16 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             .style(Style::default().bg(theme::active().bg)),
         inner,
     );
+}
+
+/// The cursor-row highlight, matching the Mail list convention (#TKT-0048): a
+/// raised `surface` fill carrying the `selection` foreground, rather than the
+/// former solid `selection` background the views each invented on their own.
+fn cursor_row_style() -> Style {
+    Style::default()
+        .bg(theme::active().surface)
+        .fg(theme::active().selection)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Rows the caveat needs at `width`, clamped so it can never take more than

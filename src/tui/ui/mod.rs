@@ -105,52 +105,52 @@ pub fn view(app: &mut App, frame: &mut Frame) {
         let left_col = columns[0];
         let right_col = columns[1];
 
-        // Two border rows, one per mailbox, one spare, plus whatever the
-        // #0071 sync-failure block needs when there is a failure to show.
-        // The headers pane on the right is sized from the same number, which
-        // is what keeps the two panes aligned.
-        let sidebar_height =
-            (app.mailboxes.len() as u16) + 3 + sidebar::sync_health_rows(app);
-        let left = split_left_column(app, left_col, sidebar_height);
-
-        sidebar::render_sidebar(app, frame, left.sidebar);
-        // Middle slot: the email list in Mail view; empty in the other views
-        // (their content occupies the right column instead).
         if app.view == View::Mail {
+            // Two border rows, one per mailbox, one spare, plus whatever the
+            // #0071 sync-failure block needs when there is a failure to show.
+            // The headers pane on the right is sized from the same number,
+            // which is what keeps the two panes aligned.
+            let sidebar_height =
+                (app.mailboxes.len() as u16) + 3 + sidebar::sync_health_rows(app);
+            let left = split_left_column(app, left_col, sidebar_height);
+
+            sidebar::render_sidebar(app, frame, left.sidebar);
             list::render_email_list(app, frame, left.middle);
-        }
-        if let Some(activity) = left.activity {
-            sidebar::render_activity_log(app, frame, activity);
-        }
-        views::render_view_switcher(app, frame, left.switcher);
+            if let Some(activity) = left.activity {
+                sidebar::render_activity_log(app, frame, activity);
+            }
+            views::render_view_switcher(app, frame, left.switcher);
 
-        // Right column: the mail preview panes, the Contacts view, or the
-        // Calendar agenda.
-        if app.view == View::Mail {
             let right_panels = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(sidebar_height), Constraint::Min(0)])
                 .split(right_col);
             headers::render_headers(app, frame, right_panels[0]);
             preview::render_body(app, frame, right_panels[1]);
-        } else if app.view == View::Contacts {
-            contacts::render_contacts(app, frame, right_col);
         } else {
-            calendar::render_calendar(app, frame, right_col);
+            // Off Mail the mailbox sidebar carries nothing the view can act on,
+            // and it used to sit above a blank left-middle slot (#TKT-0048).
+            // Give the whole left column to the view's list and the right
+            // column to its detail pane, mirroring the Mail list + preview
+            // split, with only the view switcher pinned below.
+            let left_rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(views::SWITCHER_HEIGHT)])
+                .split(left_col);
+            if app.view == View::Contacts {
+                contacts::render_contacts_split(app, frame, left_rows[0], right_col);
+            } else {
+                calendar::render_calendar_split(app, frame, left_rows[0], right_col);
+            }
+            views::render_view_switcher(app, frame, left_rows[1]);
         }
-    } else if show_sidebar {
+    } else if show_sidebar && app.view == View::Mail {
         let sidebar_height =
             (app.mailboxes.len() as u16) + 2 + sidebar::sync_health_rows(app);
         let left = split_left_column(app, main_area, sidebar_height);
 
         sidebar::render_sidebar(app, frame, left.sidebar);
-        if app.view == View::Mail {
-            list::render_email_list(app, frame, left.middle);
-        } else if app.view == View::Contacts {
-            contacts::render_contacts(app, frame, left.middle);
-        } else {
-            calendar::render_calendar(app, frame, left.middle);
-        }
+        list::render_email_list(app, frame, left.middle);
         if let Some(activity) = left.activity {
             sidebar::render_activity_log(app, frame, activity);
         }
@@ -158,8 +158,11 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     } else if app.view == View::Mail {
         list::render_email_list(app, frame, main_area);
     } else {
-        // Narrowest tier: the active view's content fills the frame, switcher
-        // pinned below.
+        // Non-Mail without a right column (medium and narrow tiers): the mailbox
+        // sidebar is Mail-only chrome, so the active view's content fills the
+        // frame with the switcher pinned below (#TKT-0048). `render_contacts` /
+        // `render_calendar` split themselves into list + detail when the single
+        // area is wide enough, and show the list alone otherwise.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
