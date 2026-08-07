@@ -43,19 +43,56 @@
 //! - `done`: the message is in the Sent mailbox (or the account does not want a
 //!   local APPEND at all, see [`crate::config::appends_to_sent`]).
 //!
+//! ## One verdict per recipient
+//!
+//! SMTP here is one conversation per recipient ([`crate::send::submit`]), so
+//! "the message was accepted" is not a fact about the message: a submission can
+//! end with one recipient holding it, one refused for good and one still to
+//! try. That is what [`SubmitOutcome::PerRecipient`] carries and what the
+//! [`Envelope`] records, next to the addresses themselves (#0063). The four
+//! states above still describe the row, and the verdicts decide which one it
+//! moves to:
+//!
+//! - a recipient with no verdict parks the row in `failed`, whatever the
+//!   others did;
+//! - a recipient that can still be tried keeps the row in `pending_send`, one
+//!   attempt older, and the next pass attempts only the recipients that are
+//!   still outstanding;
+//! - once nothing is outstanding the row goes on to `sent_pending_append` (or
+//!   straight to `done`) if anybody took the message, and to `failed` if the
+//!   server refused them all.
+//!
+//! A message that reached some of its recipients and not others keeps a note in
+//! `last_error` for good, which is what keeps the row in
+//! [`unfinished_rows`] after it is `done`: an operator has to be told which
+//! recipient never got it, and there is nowhere else to tell them.
+//!
 //! ## Exactly once
 //!
-//! SMTP runs at most once per row: [`record_submission`] is the only writer that
-//! leaves `pending_send`, the marker turns "we may have submitted" into a
-//! committed fact, and the driver only submits rows still in that state with no
-//! marker. [`retry`] re-arms a `failed` row for a human who has established
-//! that the message did not arrive; it clears the marker, so the row is again a
-//! single-attempt row rather than a second attempt on top of an unknown first.
+//! SMTP runs at most once per row *and recipient*: [`record_submission`] is the
+//! only writer that leaves `pending_send`, the marker turns "we may have
+//! submitted" into a committed fact, the driver only submits rows still in that
+//! state with no marker, and a resubmission attempts
+//! [`Envelope::outstanding`] rather than the whole address list, so a recipient
+//! that answered 250 is never spoken to twice. [`retry`] re-arms a `failed` row
+//! for a human who has established that the message did not arrive; it clears
+//! the marker, so the row is again a single-attempt row rather than a second
+//! attempt on top of an unknown first, and it inherits the same delivered set.
 //! The APPEND is idempotent by construction instead: a retry (`attempts > 0`)
 //! first runs `UID SEARCH HEADER MESSAGE-ID` in the Sent mailbox and skips the
 //! APPEND on a hit, because the previous attempt may have been ambiguous in the
 //! same way SMTP can be. `APPENDUID` is the definitive acknowledgement and its
 //! UID is stored on the row.
+//!
+//! ## The admission gate
+//!
+//! Nothing above helps if the same message is queued twice, and a draft is one
+//! message however many times send is pressed: every build mints a fresh
+//! `Message-ID`, so a second submission looks unrelated to this state machine
+//! and to the Sent dedup search. The envelope therefore carries the draft it
+//! was built from, and [`enqueue`] refuses a draft that already has a row the
+//! outbox owns ([`AlreadyInFlight`]). The in-process half of the gate lives
+//! with the caller that races with itself, [`crate::send::send_draft`].
 //!
 //! ## Blob refcounting
 //!
@@ -163,29 +200,68 @@ pub struct OutboxRow {
     pub envelope: Option<Envelope>,
 }
 
-/// The SMTP envelope a resumed submission needs.
+/// The SMTP envelope a resumed submission needs, and what became of each
+/// recipient in it.
 ///
 /// Stored on the row rather than recovered from the message bytes because the
 /// two are not the same thing: lettre drops the `Bcc` header when it builds the
 /// message (that is what makes a Bcc blind), so a submission rebuilt from
 /// headers alone would silently lose every blind recipient. The envelope is
 /// the sender's own record of who the message is going to.
+///
+/// It is also the sender's record of who already has it (#0063). SMTP is one
+/// conversation per recipient here (see [`crate::send::submit`]), so a
+/// submission can end with some recipients holding the message and others not,
+/// and the row has to survive a restart knowing which is which: `delivered` is
+/// what a retry must skip, `rejected` is what the user has to be told about.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Envelope {
     /// Envelope sender, as the `MAIL FROM` address is derived from it.
     pub from: String,
     /// Every recipient with its header role, in the order they were built.
     pub recipients: Vec<(String, crate::send::RecipientRole)>,
+    /// The recipients whose own `RCPT TO`/`DATA` ended in a 250. Never
+    /// submitted again, by any path, which is what keeps a retry from
+    /// delivering twice.
+    pub delivered: Vec<String>,
+    /// The recipients the server refused for good, with the reason it gave.
+    /// Never submitted again either: a 5xx does not become a 250 by waiting.
+    pub rejected: Vec<(String, String)>,
+    /// The draft this submission was built from, when it came from one. The
+    /// durable half of the admission gate: a second send of the same draft
+    /// finds this row instead of enqueuing a second copy (#0063).
+    pub draft_key: Option<String>,
+}
+
+/// Two recipient strings that name the same recipient.
+///
+/// Compared as written rather than by parsed address: the strings in
+/// `recipients` are the ones the send path attempted, so the verdicts come
+/// back in exactly that spelling. Case and surrounding space are the only
+/// slack allowed.
+fn same_recipient(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Flatten a value into one line, so it cannot forge an encoding line break.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 impl Envelope {
     /// One `role:address` per line, `from` first.
     ///
-    /// A hand-rolled encoding rather than JSON because the shape is two fields
-    /// of plain text and an address can hold neither a newline nor a colon
-    /// before its role prefix.
+    /// A hand-rolled encoding rather than JSON because the shape is a handful
+    /// of fields of plain text and an address can hold neither a newline nor a
+    /// colon before its role prefix. The per-recipient verdicts are further
+    /// lines of the same shape, so a file written by an older build decodes as
+    /// "nothing recorded yet", which is the truth about it.
     pub fn encode(&self) -> String {
-        let mut out = format!("from:{}", self.from);
+        let mut out = format!("from:{}", one_line(&self.from));
         for (addr, role) in &self.recipients {
             out.push('\n');
             out.push_str(match role {
@@ -193,7 +269,21 @@ impl Envelope {
                 crate::send::RecipientRole::Cc => "cc:",
                 crate::send::RecipientRole::Bcc => "bcc:",
             });
-            out.push_str(addr);
+            out.push_str(&one_line(addr));
+        }
+        for addr in &self.delivered {
+            out.push_str("\ndelivered:");
+            out.push_str(&one_line(addr));
+        }
+        for (addr, reason) in &self.rejected {
+            out.push_str("\nrejected:");
+            out.push_str(&one_line(addr));
+            out.push('\t');
+            out.push_str(&one_line(reason));
+        }
+        if let Some(key) = &self.draft_key {
+            out.push_str("\ndraft:");
+            out.push_str(&one_line(key));
         }
         out
     }
@@ -213,6 +303,12 @@ impl Envelope {
                 "to" => env.recipients.push((addr.to_string(), RecipientRole::To)),
                 "cc" => env.recipients.push((addr.to_string(), RecipientRole::Cc)),
                 "bcc" => env.recipients.push((addr.to_string(), RecipientRole::Bcc)),
+                "delivered" => env.delivered.push(addr.to_string()),
+                "rejected" => {
+                    let (addr, reason) = addr.split_once('\t').unwrap_or((addr, ""));
+                    env.rejected.push((addr.to_string(), reason.to_string()));
+                }
+                "draft" => env.draft_key = Some(addr.to_string()),
                 _ => {}
             }
         }
@@ -223,6 +319,141 @@ impl Envelope {
     pub fn is_submittable(&self) -> bool {
         !self.from.is_empty() && !self.recipients.is_empty()
     }
+
+    pub fn is_delivered(&self, addr: &str) -> bool {
+        self.delivered.iter().any(|a| same_recipient(a, addr))
+    }
+
+    pub fn is_rejected(&self, addr: &str) -> bool {
+        self.rejected.iter().any(|(a, _)| same_recipient(a, addr))
+    }
+
+    /// The recipients that have neither taken the message nor been refused it.
+    /// Exactly what a resubmission may attempt, and nothing else.
+    pub fn outstanding(&self) -> Vec<(String, crate::send::RecipientRole)> {
+        self.recipients
+            .iter()
+            .filter(|(addr, _)| !self.is_delivered(addr) && !self.is_rejected(addr))
+            .cloned()
+            .collect()
+    }
+
+    /// Record a 250. Idempotent, and it wins over an earlier rejection: a
+    /// recipient that has the message must never be attempted again whatever
+    /// else was said about it.
+    pub fn record_delivered(&mut self, addr: &str) {
+        self.rejected.retain(|(a, _)| !same_recipient(a, addr));
+        if !self.is_delivered(addr) {
+            self.delivered.push(addr.to_string());
+        }
+    }
+
+    /// Record a refusal that will not change on a retry. Ignored for a
+    /// recipient that already took the message.
+    pub fn record_rejected(&mut self, addr: &str, reason: &str) {
+        if self.is_delivered(addr) || self.is_rejected(addr) {
+            return;
+        }
+        self.rejected.push((addr.to_string(), reason.to_string()));
+    }
+
+    /// The line a message that reached some but not all of its recipients
+    /// carries for the rest of its life, in `last_error` and therefore in
+    /// `mp outbox list`. `None` when nobody was refused.
+    pub fn partial_note(&self) -> Option<String> {
+        if self.rejected.is_empty() {
+            return None;
+        }
+        let refused = self
+            .rejected
+            .iter()
+            .map(|(addr, reason)| {
+                if reason.is_empty() {
+                    addr.clone()
+                } else {
+                    format!("{addr} ({reason})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "delivered to {} of {} recipient(s); never delivered to {refused}",
+            self.delivered.len(),
+            self.recipients.len().max(self.delivered.len() + self.rejected.len()),
+        ))
+    }
+}
+
+/// What one submission pass did to each recipient it attempted (#0063).
+///
+/// The four buckets are the four answers the state machine can act on, and
+/// every recipient of the pass lands in exactly one of them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecipientVerdicts {
+    /// A 250 of its own. Terminal for that recipient.
+    pub delivered: Vec<String>,
+    /// A refusal that will not change (a 5xx, an address the transport cannot
+    /// even form an envelope from). Terminal for that recipient.
+    pub rejected: Vec<(String, String)>,
+    /// A refusal that may well change (a 4xx, no connection, no credentials).
+    /// The recipient stays outstanding and is attempted again under backoff.
+    pub retryable: Vec<(String, String)>,
+    /// No verdict came back, so the recipient may or may not hold the message.
+    /// Parks the whole row for a human, and is never attempted automatically.
+    pub ambiguous: Vec<(String, String)>,
+}
+
+impl RecipientVerdicts {
+    /// One line naming what happened, for `last_error`.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        let list = |what: &str, rs: &[(String, String)]| {
+            let detail = rs
+                .iter()
+                .map(|(addr, reason)| format!("{addr}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("{what} {detail}")
+        };
+        if !self.delivered.is_empty() {
+            parts.push(format!("delivered to {}", self.delivered.join(", ")));
+        }
+        if !self.rejected.is_empty() {
+            parts.push(list("refused for", &self.rejected));
+        }
+        if !self.retryable.is_empty() {
+            parts.push(list("not yet delivered to", &self.retryable));
+        }
+        if !self.ambiguous.is_empty() {
+            parts.push(list("no verdict for", &self.ambiguous));
+        }
+        if parts.is_empty() {
+            "no recipients were attempted".to_string()
+        } else {
+            parts.join(" | ")
+        }
+    }
+}
+
+/// Refusal marker: this draft already has a submission the outbox owns, so a
+/// second one would be a second copy in the recipient's mailbox (#0063).
+///
+/// Carried as an error rather than as a silent no-op because the caller has a
+/// user in front of it who pressed send and is owed an answer.
+#[derive(Debug)]
+pub struct AlreadyInFlight(pub String);
+
+impl std::fmt::Display for AlreadyInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AlreadyInFlight {}
+
+/// True when an error is the admission gate refusing a duplicate send.
+pub fn is_already_in_flight(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<AlreadyInFlight>())
 }
 
 /// What the SMTP conversation did, from the state machine's point of view.
@@ -240,9 +471,13 @@ pub enum SubmitOutcome {
     /// envelope. Nothing was delivered, so the row stays submittable.
     CleanPreSubmission(String),
     /// The failure leaves it unknown whether the server accepted the message:
-    /// a dropped connection, a timeout, a partial per-recipient result. The row
-    /// goes to `failed` for a human.
+    /// a dropped connection, a timeout. The row goes to `failed` for a human.
     Ambiguous(String),
+    /// One verdict per recipient, from a transport that talks to them one at a
+    /// time (#0063). The row transition is derived from the whole set, and the
+    /// verdicts themselves are committed to the envelope so a later pass knows
+    /// who already has the message.
+    PerRecipient(RecipientVerdicts),
 }
 
 /// What the APPEND attempt did.
@@ -339,6 +574,10 @@ pub fn backoff_secs(attempts: i64) -> i64 {
 ///
 /// `target_mailbox` is `None` when the account saves no local copy; the row
 /// then goes straight from `pending_send` to `done` on a 250.
+///
+/// An envelope that names a draft is admitted at most once at a time (#0063):
+/// if that draft already has a row the outbox owns, this refuses with
+/// [`AlreadyInFlight`] instead of queuing a second copy of the same message.
 pub fn enqueue(
     store: &Store,
     blobs: &BlobStore,
@@ -349,6 +588,8 @@ pub fn enqueue(
     envelope: &Envelope,
 ) -> Result<i64> {
     let mut span = TimingSpan::with_context("outbox_enqueue", format!("{} bytes", raw.len()));
+    // Before the blob is written, so a refused send leaves nothing behind.
+    refuse_a_second_submission(store.conn(), account, envelope)?;
     let hash = blobs.write(raw)?;
     span.mark("blob_written");
 
@@ -357,6 +598,9 @@ pub fn enqueue(
         .conn()
         .unchecked_transaction()
         .context("opening the outbox enqueue transaction")?;
+    // Again inside the transaction, where a concurrent enqueue that has
+    // already committed is visible.
+    refuse_a_second_submission(&tx, account, envelope)?;
     tx.execute(
         "INSERT INTO outbox (
             account, target_mailbox, message_id, raw_blob, state, attempts,
@@ -379,6 +623,55 @@ pub fn enqueue(
 
     info!("[outbox] queued {message_id} as row {id} for {account}");
     Ok(id)
+}
+
+/// The durable half of the admission gate (#0063).
+///
+/// A draft is one message however many times the user presses send: the TUI
+/// can reach [`crate::send::send_draft`] twice for the same draft (the cursor
+/// send and the approved batch it is also in), and a draft whose file could
+/// not be retired after a send is still sitting there to be sent again. Every
+/// build mints a fresh `Message-ID`, so neither the outbox nor the Sent dedup
+/// search would see the second one as the same message; the draft key is what
+/// does.
+///
+/// Only rows the outbox still owns count. A `failed` row is a human's problem
+/// and a `done` row is finished, so neither blocks a deliberate re-send.
+fn refuse_a_second_submission(
+    conn: &rusqlite::Connection,
+    account: &str,
+    envelope: &Envelope,
+) -> Result<()> {
+    let Some(key) = envelope.draft_key.as_deref() else {
+        return Ok(());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, state, envelope FROM outbox
+         WHERE account = ?1 AND state IN ('pending_send', 'sent_pending_append')
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map([account], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, state, encoded) = row?;
+        let holds_the_draft = encoded
+            .as_deref()
+            .map(Envelope::decode)
+            .and_then(|env| env.draft_key)
+            .is_some_and(|other| other == key);
+        if holds_the_draft {
+            return Err(anyhow::Error::new(AlreadyInFlight(format!(
+                "this draft is already in the outbox as row {id} ({state}); \
+                 it is sent once, not twice"
+            ))));
+        }
+    }
+    Ok(())
 }
 
 /// Commit "the SMTP session is about to open" for a `pending_send` row.
@@ -480,6 +773,118 @@ pub fn record_submission(
             );
             Ok(OutboxState::Failed)
         }
+        SubmitOutcome::PerRecipient(verdicts) => {
+            record_per_recipient(store, blobs, row, verdicts, now)
+        }
+    }
+}
+
+/// Fold one pass's per-recipient verdicts into the row (#0063).
+///
+/// The verdicts go into the envelope first, on their own commit: whatever the
+/// row's state becomes, who holds the message is a fact about the world and
+/// the next pass must not re-derive it. The crash window this leaves (verdicts
+/// committed, state not) is the same one that has always sat between the 250
+/// and its record, and it resolves the same way: the marker is still set, so
+/// [`sweep_pending_sends`] parks the row for a human rather than re-sending.
+///
+/// The state then follows from what is left outstanding:
+///
+/// - a recipient with no verdict at all parks the row in `failed`, because a
+///   message that may have been delivered is never re-sent automatically;
+/// - recipients that can still be retried keep the row in `pending_send`, one
+///   attempt older, so the backoff applies and only they are attempted again;
+/// - otherwise every recipient is settled: the row goes on towards `done` when
+///   at least one took the message, and to `failed` when the server refused
+///   them all.
+fn record_per_recipient(
+    store: &Store,
+    blobs: &BlobStore,
+    mut row: OutboxRow,
+    verdicts: &RecipientVerdicts,
+    now: i64,
+) -> Result<OutboxState> {
+    let mut envelope = row.envelope.clone().unwrap_or_default();
+    for addr in &verdicts.delivered {
+        envelope.record_delivered(addr);
+    }
+    for (addr, reason) in &verdicts.rejected {
+        envelope.record_rejected(addr, reason);
+    }
+    store
+        .conn()
+        .execute(
+            "UPDATE outbox SET envelope = ?2, updated = ?3 WHERE id = ?1",
+            rusqlite::params![row.id, envelope.encode(), now],
+        )
+        .context("recording the per-recipient verdicts")?;
+    row.envelope = Some(envelope.clone());
+
+    let summary = verdicts.summary();
+    if !verdicts.ambiguous.is_empty() {
+        store
+            .conn()
+            .execute(
+                "UPDATE outbox SET state = 'failed', last_error = ?2, updated = ?3
+                 WHERE id = ?1",
+                rusqlite::params![row.id, summary, now],
+            )
+            .context("marking the outbox row failed")?;
+        warn!(
+            "[outbox] row {} ({}) has a recipient with no verdict and will not be re-sent: {summary}",
+            row.id, row.message_id
+        );
+        return Ok(OutboxState::Failed);
+    }
+
+    if !envelope.outstanding().is_empty() {
+        // Same shape as a clean pre-submission failure, and for the same
+        // reason: nothing was accepted for these recipients, so the marker
+        // goes back to NULL and the row stays decidable.
+        store
+            .conn()
+            .execute(
+                "UPDATE outbox SET attempts = attempts + 1, last_error = ?2, updated = ?3,
+                 submission_started_at = NULL WHERE id = ?1",
+                rusqlite::params![row.id, summary, now],
+            )
+            .context("recording a partly undelivered submission")?;
+        return Ok(OutboxState::PendingSend);
+    }
+
+    if envelope.delivered.is_empty() {
+        store
+            .conn()
+            .execute(
+                "UPDATE outbox SET state = 'failed', last_error = ?2, updated = ?3
+                 WHERE id = ?1",
+                rusqlite::params![row.id, summary, now],
+            )
+            .context("marking the outbox row failed")?;
+        warn!(
+            "[outbox] row {} ({}) was refused by every recipient: {summary}",
+            row.id, row.message_id
+        );
+        return Ok(OutboxState::Failed);
+    }
+
+    // At least one recipient holds the message, and nothing is outstanding:
+    // the Sent copy is owed exactly as it is after a clean 250. What the
+    // partial case adds is the note, which survives into `done` so the row
+    // stays listed until a human has seen who did not get it.
+    if row.target_mailbox.is_none() {
+        finish_done(store, blobs, &row, None, now)?;
+        Ok(OutboxState::Done)
+    } else {
+        store
+            .conn()
+            .execute(
+                "UPDATE outbox SET state = 'sent_pending_append', last_error = ?2,
+                 updated = ?3 WHERE id = ?1",
+                rusqlite::params![row.id, envelope.partial_note(), now],
+            )
+            .context("marking the outbox row sent_pending_append")?;
+        Ok(OutboxState::SentPendingAppend)
     }
 }
 
@@ -571,14 +976,18 @@ fn finish_done(
         ),
     }
 
+    // `done` clears the error it took to get here, with one exception: a
+    // message some recipients never got keeps that note for good, because it
+    // is the only place the user is ever told (#0063).
+    let note = row.envelope.as_ref().and_then(Envelope::partial_note);
     let tx = store
         .conn()
         .unchecked_transaction()
         .context("opening the outbox completion transaction")?;
     tx.execute(
-        "UPDATE outbox SET state = 'done', last_error = NULL, appended_uid = ?2, updated = ?3
+        "UPDATE outbox SET state = 'done', last_error = ?4, appended_uid = ?2, updated = ?3
          WHERE id = ?1",
-        rusqlite::params![row.id, uid, now],
+        rusqlite::params![row.id, uid, now, note],
     )
     .context("marking the outbox row done")?;
     blobs.release(&tx, &row.raw_blob)?;
@@ -634,12 +1043,16 @@ pub fn open_rows(store: &Store, account: &str) -> Result<Vec<OutboxRow>> {
     )
 }
 
-/// Every row that is not `done`, oldest first: what `mp outbox list` shows.
+/// Every row that still has something to say, oldest first: what
+/// `mp outbox list` shows.
 ///
 /// `done` rows are the boring majority and say nothing an operator can act on,
-/// so they are left out rather than paged over.
+/// so they are left out rather than paged over. The exception is a `done` row
+/// that kept a note (#0063): a message one of its recipients never got is
+/// exactly what an operator has to be told, and there is nowhere else to tell
+/// them, so it stays listed until it is discarded.
 pub fn unfinished_rows(store: &Store, account: &str) -> Result<Vec<OutboxRow>> {
-    rows_in_states(store, account, "state <> 'done'")
+    rows_in_states(store, account, "(state <> 'done' OR last_error IS NOT NULL)")
 }
 
 fn rows_in_states(store: &Store, account: &str, predicate: &str) -> Result<Vec<OutboxRow>> {
@@ -745,26 +1158,36 @@ pub fn retry(store: &Store, id: i64) -> Result<()> {
 pub struct OutboxCounts {
     pub open: usize,
     pub failed: usize,
+    /// Rows that are `done` and still carry a note: the message went out, but
+    /// not to every recipient it was addressed to (#0063). Parked in the sense
+    /// that only a human can close them, by reading the row and discarding it.
+    pub partial: usize,
 }
 
 impl OutboxCounts {
     pub fn total(self) -> usize {
-        self.open + self.failed
+        self.open + self.failed + self.partial
     }
 }
 
 pub fn counts(store: &Store, account: &str) -> Result<OutboxCounts> {
-    let mut stmt = store
-        .conn()
-        .prepare("SELECT state, COUNT(*) FROM outbox WHERE account = ?1 GROUP BY state")?;
+    let mut stmt = store.conn().prepare(
+        "SELECT state, last_error IS NOT NULL, COUNT(*) FROM outbox
+         WHERE account = ?1 GROUP BY state, last_error IS NOT NULL",
+    )?;
     let rows = stmt.query_map([account], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
     let mut counts = OutboxCounts::default();
     for row in rows {
-        let (state, n) = row?;
+        let (state, noted, n) = row?;
         match OutboxState::parse(&state) {
             Some(OutboxState::Failed) => counts.failed += n as usize,
+            Some(OutboxState::Done) if noted => counts.partial += n as usize,
             Some(s) if s.is_open() => counts.open += n as usize,
             _ => {}
         }

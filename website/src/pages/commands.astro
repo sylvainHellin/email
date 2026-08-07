@@ -24,7 +24,7 @@ const draftCommands = [
   { command: 'mp invite accept|tentative|decline <selector>', description: 'RSVP to a received invitation (iMIP REPLY)' },
   { command: 'mp calendar rebuild [--account NAME]', description: 'Report the attendee RSVPs resolved against your sent invites' },
   { command: 'mp send-approved [--all-accounts] [-y]', description: 'Send every approved draft of the account' },
-  { command: 'mp outbox list', description: 'Show queued, retrying and failed submissions' },
+  { command: 'mp outbox list', description: 'Show queued, retrying, failed and partly delivered submissions' },
   { command: 'mp outbox retry <id>', description: 'Send a failed submission again' },
   { command: 'mp outbox discard <id>', description: 'Drop a submission and release its bytes' },
   { command: 'mp reply <selector> [--all]', description: 'Create a reply draft and print its selector' },

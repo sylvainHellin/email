@@ -1825,7 +1825,11 @@ mod tests {
                     role: crate::send::RecipientRole::To,
                     success: ok,
                     error: None,
-                    ambiguous: false,
+                    verdict: if ok {
+                        crate::send::RecipientVerdict::Delivered
+                    } else {
+                        crate::send::RecipientVerdict::Rejected
+                    },
                 }],
             },
             state: Some(crate::outbox::OutboxState::Done),

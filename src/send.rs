@@ -35,16 +35,41 @@ impl std::fmt::Display for RecipientRole {
     }
 }
 
+/// What the transport said about one recipient (#0063).
+///
+/// SMTP is one conversation per recipient here, so this is a verdict about
+/// that recipient and not about the message: the four values are what the
+/// outbox needs to decide whether that recipient may be attempted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientVerdict {
+    /// 250. The recipient has the message and is never attempted again.
+    Delivered,
+    /// A 5xx, or an address no envelope can be built from. Refused for good.
+    Rejected,
+    /// A 4xx, no connection, no credentials: nothing was accepted and the next
+    /// pass may well succeed.
+    Retryable,
+    /// No verdict came back, so the recipient may or may not hold the message.
+    Unknown,
+}
+
 #[derive(Debug)]
 pub struct RecipientResult {
     pub address: String,
     pub role: RecipientRole,
     pub success: bool,
     pub error: Option<String>,
+    /// What the transport said about this recipient, which is what the outbox
+    /// records durably; see [`SendResult::submit_outcome`].
+    pub verdict: RecipientVerdict,
+}
+
+impl RecipientResult {
     /// True when the failure leaves it unknown whether the server accepted the
-    /// message (a dropped connection, a timeout). Drives the outbox's
-    /// never-auto-re-send rule; see [`SendResult::submit_outcome`].
-    pub ambiguous: bool,
+    /// message. Drives the outbox's never-auto-re-send rule.
+    pub fn ambiguous(&self) -> bool {
+        self.verdict == RecipientVerdict::Unknown
+    }
 }
 
 #[derive(Debug)]
@@ -69,56 +94,53 @@ impl SendResult {
         self.results.iter().filter(|r| !r.success).collect()
     }
 
-    /// How the durable outbox must read this result (#0037 item 5).
+    /// How the durable outbox must read this result (#0037 item 5, #0063).
     ///
-    /// One 250 is enough to call the message submitted: the per-recipient loop
-    /// sends the same bytes in separate envelopes, so a partial result still
-    /// means the server holds the message and the Sent copy is owed. With no
-    /// acceptance at all the question becomes whether a copy might exist
-    /// anyway, which is exactly [`RecipientResult::ambiguous`].
+    /// One verdict per recipient, because that is what the per-recipient loop
+    /// in [`submit`] actually produced: the same bytes go out in separate
+    /// envelopes, so "the message was accepted" is not a fact about the
+    /// message but about each recipient in turn. The outbox folds the set into
+    /// a row state and, more to the point, remembers who took it, so a retry
+    /// never delivers twice.
     pub fn submit_outcome(&self) -> crate::outbox::SubmitOutcome {
-        use crate::outbox::SubmitOutcome;
-        if self.any_succeeded() {
-            return SubmitOutcome::Accepted;
+        let mut verdicts = crate::outbox::RecipientVerdicts::default();
+        for r in &self.results {
+            let reason = r.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            match r.verdict {
+                RecipientVerdict::Delivered => verdicts.delivered.push(r.address.clone()),
+                RecipientVerdict::Rejected => verdicts.rejected.push((r.address.clone(), reason)),
+                RecipientVerdict::Retryable => verdicts.retryable.push((r.address.clone(), reason)),
+                RecipientVerdict::Unknown => verdicts.ambiguous.push((r.address.clone(), reason)),
+            }
         }
-        let detail = self
-            .failed()
-            .iter()
-            .map(|r| {
-                format!(
-                    "{}: {}",
-                    r.address,
-                    r.error.as_deref().unwrap_or("unknown error")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let detail = if detail.is_empty() {
-            "no recipients were attempted".to_string()
-        } else {
-            detail
-        };
-        if self.results.iter().any(|r| r.ambiguous) {
-            SubmitOutcome::Ambiguous(detail)
-        } else {
-            SubmitOutcome::CleanPreSubmission(detail)
-        }
+        crate::outbox::SubmitOutcome::PerRecipient(verdicts)
     }
 }
 
-/// Whether an SMTP failure leaves it unknown that the message was not
-/// accepted.
+/// What one recipient's SMTP failure means for that recipient (#0063).
 ///
-/// A response error is the server saying no in words, and a client-side error
-/// (bad address, TLS setup, no connection) happens before any bytes could be
-/// accepted: both are clean. A timeout or a connection that dies mid-
-/// conversation is not, because the 250 may simply have been lost on the way
-/// back.
-fn smtp_failure_is_ambiguous(err: &lettre::transport::smtp::Error) -> bool {
+/// The question is never "did it work" but "may this recipient be attempted
+/// again", and SMTP answers it in three ways:
+///
+/// - a 5xx is the server refusing in words, and it will refuse again: the
+///   recipient is rejected for good and the user has to be told;
+/// - a 4xx, a client-side error (no credentials, no usable mechanism) or a TLS
+///   failure all happen before any bytes could be accepted, and all of them
+///   can be gone by the next attempt: retryable;
+/// - anything else is a timeout or a connection that died somewhere in the
+///   conversation, where the 250 may simply have been lost on the way back:
+///   unknown, and never attempted again automatically.
+fn smtp_failure_verdict(err: &lettre::transport::smtp::Error) -> RecipientVerdict {
     if err.is_timeout() {
-        return true;
+        return RecipientVerdict::Unknown;
     }
-    !(err.is_response() || err.is_client() || err.is_tls())
+    if err.is_permanent() {
+        return RecipientVerdict::Rejected;
+    }
+    if err.is_transient() || err.is_client() || err.is_tls() {
+        return RecipientVerdict::Retryable;
+    }
+    RecipientVerdict::Unknown
 }
 
 pub fn markdown_to_html(
@@ -278,7 +300,7 @@ mod tests {
                 role: RecipientRole::To,
                 success: true,
                 error: None,
-                ambiguous: false,
+                verdict: RecipientVerdict::Delivered,
             });
         }
         for addr in failures {
@@ -287,7 +309,7 @@ mod tests {
                 role: RecipientRole::To,
                 success: false,
                 error: Some("SMTP error".to_string()),
-                ambiguous: false,
+                verdict: RecipientVerdict::Rejected,
             });
         }
         SendResult { results }
@@ -325,6 +347,116 @@ mod tests {
         let r = SendResult { results: vec![] };
         assert!(r.all_succeeded()); // vacuously true
         assert!(!r.any_succeeded());
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-recipient verdicts and the admission gate (#0063)
+    // -----------------------------------------------------------------------
+
+    fn recipient(address: &str, verdict: RecipientVerdict) -> RecipientResult {
+        RecipientResult {
+            address: address.to_string(),
+            role: RecipientRole::To,
+            success: verdict == RecipientVerdict::Delivered,
+            error: (verdict != RecipientVerdict::Delivered).then(|| "why".to_string()),
+            verdict,
+        }
+    }
+
+    /// The outbox is handed one verdict per recipient, in the four buckets it
+    /// acts on; nothing collapses a mixed result into "accepted".
+    #[test]
+    fn submit_outcome_hands_the_outbox_one_verdict_per_recipient() {
+        let result = SendResult {
+            results: vec![
+                recipient("took-it@x.com", RecipientVerdict::Delivered),
+                recipient("refused@x.com", RecipientVerdict::Rejected),
+                recipient("later@x.com", RecipientVerdict::Retryable),
+                recipient("silent@x.com", RecipientVerdict::Unknown),
+            ],
+        };
+        let crate::outbox::SubmitOutcome::PerRecipient(verdicts) = result.submit_outcome() else {
+            panic!("an SMTP result is always per recipient");
+        };
+        assert_eq!(verdicts.delivered, vec!["took-it@x.com".to_string()]);
+        assert_eq!(verdicts.rejected[0].0, "refused@x.com");
+        assert_eq!(verdicts.retryable[0].0, "later@x.com");
+        assert_eq!(verdicts.ambiguous[0].0, "silent@x.com");
+        assert!(result.results[3].ambiguous());
+    }
+
+    /// The status line of a send that reached some recipients says so, rather
+    /// than reporting the outbox row's state as an unqualified success.
+    #[test]
+    fn a_partial_send_says_so_in_its_status_line() {
+        let report = SendReport {
+            send_result: SendResult {
+                results: vec![
+                    recipient("took-it@x.com", RecipientVerdict::Delivered),
+                    recipient("refused@x.com", RecipientVerdict::Rejected),
+                ],
+            },
+            state: Some(crate::outbox::OutboxState::Done),
+            row_id: Some(1),
+        };
+        assert_eq!(report.status_line(), "partly delivered, see `mp outbox list`");
+    }
+
+    fn draft_with(id: Option<&str>, path: &str) -> EmailDraft {
+        EmailDraft {
+            path: std::path::PathBuf::from(path),
+            frontmatter: crate::types::EmailFrontmatter {
+                id: id.map(|s| s.to_string()),
+                date: None,
+                to: Some("bob@example.com".to_string()),
+                cc: None,
+                bcc: None,
+                subject: "Hello".to_string(),
+                status: EmailStatus::Approved,
+                from: None,
+                reply_to: None,
+                attachments: None,
+                sent_at: None,
+                sent_via: None,
+                message_id: None,
+                event: None,
+            },
+            body_markdown: String::new(),
+        }
+    }
+
+    /// The key is the frontmatter id when there is one, because that is what
+    /// survives the rename a send performs.
+    #[test]
+    fn a_draft_is_keyed_by_its_id_and_falls_back_to_its_path() {
+        let with_id = draft_with(Some("2026-08-06-note"), "/drafts/note.md");
+        assert_eq!(draft_key(&with_id), "id:2026-08-06-note");
+        let renamed = draft_with(Some("2026-08-06-note"), "/drafts/renamed.md");
+        assert_eq!(draft_key(&renamed), draft_key(&with_id));
+        let anonymous = draft_with(None, "/drafts/agent-wrote-this.md");
+        assert_eq!(draft_key(&anonymous), "path:/drafts/agent-wrote-this.md");
+    }
+
+    /// The cheap half of the admission gate: two threads reaching `send_draft`
+    /// for one draft, which is what the TUI does when the cursor draft is also
+    /// in the approved batch.
+    #[test]
+    fn one_draft_admits_one_send_at_a_time() {
+        let key = "id:only-once";
+        let first = SendAdmission::claim(key).expect("the first send is admitted");
+        assert!(
+            SendAdmission::claim(key).is_none(),
+            "a second send of the same draft is refused while the first runs"
+        );
+        assert!(
+            SendAdmission::claim("id:another").is_some(),
+            "a different draft is not blocked"
+        );
+        drop(first);
+        assert!(
+            SendAdmission::claim(key).is_some(),
+            "the slot is released however the send returned"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -842,6 +974,9 @@ pub fn build_reply_message(
         raw: raw_message,
         recipients: vec![(organizer.to_string(), RecipientRole::To)],
         from: from.to_string(),
+        // An RSVP is built from an invitation, not from a draft file, and
+        // there is no second copy of it to press send on.
+        draft_key: None,
     })
 }
 
@@ -943,6 +1078,11 @@ impl SendReport {
     /// the TUI status bar.
     pub fn status_line(&self) -> String {
         use crate::outbox::OutboxState;
+        // A message some recipients never got is the one thing worth saying
+        // before where the copy is (#0063): the outbox row keeps the detail.
+        if !self.send_result.failed().is_empty() && self.send_result.any_succeeded() {
+            return "partly delivered, see `mp outbox list`".to_string();
+        }
         match self.state {
             Some(OutboxState::Done) => "sent + saved".to_string(),
             Some(OutboxState::SentPendingAppend) => "sent + append pending".to_string(),
@@ -991,6 +1131,8 @@ impl DurableSend {
             &crate::outbox::Envelope {
                 from: built.from.clone(),
                 recipients: built.recipients.clone(),
+                draft_key: built.draft_key.clone(),
+                ..Default::default()
             },
         )?;
         Ok(Self {
@@ -1050,6 +1192,9 @@ pub async fn send_durably(
 ) -> Result<SendReport> {
     let durable = match DurableSend::begin(account, built) {
         Ok(d) => Some(d),
+        // The admission gate is the one queue refusal that must stop the send:
+        // sending anyway is precisely the double delivery it exists to prevent.
+        Err(e) if crate::outbox::is_already_in_flight(&e) => return Err(e),
         Err(e) => {
             // A store that will not open must not stop the user sending mail;
             // it only costs the durability of this one submission.
@@ -1061,7 +1206,25 @@ pub async fn send_durably(
     if let Some(durable) = durable.as_ref() {
         durable.mark_started();
     }
-    let send_result = submit(built, smtp_config).await?;
+    let send_result = match submit(built, smtp_config).await {
+        Ok(result) => result,
+        Err(e) => {
+            // The marker is already committed and nothing entered the
+            // transport: everything `submit` can fail on (the envelope sender,
+            // the transport itself) happens before the first connection. Left
+            // as it is, the next resume would read the marker as "died inside
+            // the SMTP session" and park a message that was never sent, so the
+            // failure is recorded as the clean one it is, which puts the
+            // marker back to NULL (#0063).
+            if let Some(durable) = durable.as_ref() {
+                let clean = crate::outbox::SubmitOutcome::CleanPreSubmission(format!("{e:#}"));
+                if let Err(e) = durable.record(&clean) {
+                    error!("[outbox] could not record a pre-submission failure: {e:#}");
+                }
+            }
+            return Err(e);
+        }
+    };
 
     let Some(durable) = durable else {
         return Ok(SendReport {
@@ -1099,6 +1262,7 @@ where
 {
     let durable = match DurableSend::begin(account, built) {
         Ok(d) => Some(d),
+        Err(e) if crate::outbox::is_already_in_flight(&e) => return Err(e),
         Err(e) => {
             error!("[outbox] could not queue the message durably: {e:#}");
             None
@@ -1122,7 +1286,11 @@ where
                 role: *role,
                 success: submitted.is_ok(),
                 error: submitted.as_ref().err().map(|e| format!("{e:#}")),
-                ambiguous: matches!(outcome, crate::outbox::SubmitOutcome::Ambiguous(_)),
+                verdict: match &outcome {
+                    crate::outbox::SubmitOutcome::Accepted => RecipientVerdict::Delivered,
+                    crate::outbox::SubmitOutcome::Ambiguous(_) => RecipientVerdict::Unknown,
+                    _ => RecipientVerdict::Retryable,
+                },
             })
             .collect(),
     };
@@ -1174,6 +1342,52 @@ impl SendContext {
             (None, Some(smtp)) => Ok(&smtp.default_from),
             (None, None) => Err(anyhow!("SMTP not configured")),
         }
+    }
+}
+
+/// The key one draft is admitted under (#0063).
+///
+/// The frontmatter `id` when there is one, because it survives the rename a
+/// send performs and is the same key the drafts index and every
+/// `mp://<account>/drafts/<key>` selector use. A file that has none (an
+/// agent-written draft the index has not seen yet) falls back to its path,
+/// which is the only other thing two sends of the same draft share.
+pub fn draft_key(draft: &EmailDraft) -> String {
+    match draft.frontmatter.id.as_deref() {
+        Some(id) if !id.trim().is_empty() => format!("id:{}", id.trim()),
+        _ => format!("path:{}", draft.path.display()),
+    }
+}
+
+/// The drafts a send is running for in this process.
+///
+/// The cheap half of the admission gate (#0063): the TUI reaches
+/// [`send_draft`] on a background thread per send, and an approved draft under
+/// the cursor is by definition also in the approved batch, so the same draft
+/// can be sent twice with nothing durable committed yet by either. This is a
+/// plain set because the whole question is "is one already running", and the
+/// answer has to be given without touching the disk.
+static SENDING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// One draft's slot in [`SENDING`], released when the send returns however it
+/// returns.
+struct SendAdmission(String);
+
+impl SendAdmission {
+    /// `None` when a send for this draft is already running.
+    fn claim(key: &str) -> Option<Self> {
+        let mut sending = SENDING.lock().unwrap_or_else(|e| e.into_inner());
+        sending
+            .insert(key.to_string())
+            .then(|| SendAdmission(key.to_string()))
+    }
+}
+
+impl Drop for SendAdmission {
+    fn drop(&mut self) {
+        let mut sending = SENDING.lock().unwrap_or_else(|e| e.into_inner());
+        sending.remove(&self.0);
     }
 }
 
@@ -1259,6 +1473,12 @@ fn draft_attachments(draft: &EmailDraft) -> Result<Vec<(String, Vec<u8>, String)
 /// drafts-index refresh (a send-approved run pays for one refresh at the end
 /// rather than one per draft).
 pub async fn send_draft(draft: &EmailDraft, ctx: &SendContext) -> Result<SentDraft> {
+    let key = draft_key(draft);
+    let _admission = SendAdmission::claim(&key).ok_or_else(|| {
+        anyhow::Error::new(crate::outbox::AlreadyInFlight(
+            "this draft is already being sent; it is sent once, not twice".to_string(),
+        ))
+    })?;
     let built = build_draft_message(
         draft,
         ctx.default_from()?,
@@ -1513,19 +1733,53 @@ async fn resubmit_row(
         )?;
         return Ok(crate::outbox::OutboxState::Failed);
     };
+    // Only the recipients that have neither taken the message nor been refused
+    // it: a recipient that answered 250 on an earlier pass must not see the
+    // message a second time (#0063).
+    let outstanding = envelope.outstanding();
+    if outstanding.is_empty() {
+        // Every recipient is settled, so there is nothing left to submit and
+        // the row only needs the transition it did not get.
+        return crate::outbox::record_submission(
+            store,
+            blobs,
+            row.id,
+            &crate::outbox::SubmitOutcome::PerRecipient(crate::outbox::RecipientVerdicts::default()),
+        );
+    }
     let raw = blobs
         .read(&row.raw_blob)
         .with_context(|| format!("reading the queued message of outbox row {}", row.id))?;
     let built = BuiltMessage {
         raw,
         message_id: row.message_id.clone(),
-        recipients: envelope.recipients,
+        recipients: outstanding,
         from: envelope.from,
+        draft_key: envelope.draft_key,
     };
 
-    info!("[outbox] resubmitting row {} ({})", row.id, row.message_id);
+    info!(
+        "[outbox] resubmitting row {} ({}) to {} recipient(s)",
+        row.id,
+        row.message_id,
+        built.recipients.len()
+    );
     crate::outbox::mark_submission_started(store, row.id)?;
-    let result = submit(&built, smtp_config).await?;
+    let result = match submit(&built, smtp_config).await {
+        Ok(result) => result,
+        Err(e) => {
+            // Provably before the transport, as in `send_durably`: record it
+            // as clean so the marker goes back to NULL and the row stays
+            // submittable instead of being swept into `failed`.
+            crate::outbox::record_submission(
+                store,
+                blobs,
+                row.id,
+                &crate::outbox::SubmitOutcome::CleanPreSubmission(format!("{e:#}")),
+            )?;
+            return Err(e);
+        }
+    };
     crate::outbox::record_submission(store, blobs, row.id, &result.submit_outcome())
 }
 
@@ -1546,6 +1800,9 @@ pub struct BuiltMessage {
     pub recipients: Vec<(String, RecipientRole)>,
     /// The envelope sender.
     pub from: String,
+    /// The draft these bytes were built from, when they were built from one.
+    /// The outbox admits one submission per draft at a time (#0063).
+    pub draft_key: Option<String>,
 }
 
 /// The `Message-ID` of a built message.
@@ -1784,6 +2041,7 @@ pub fn build_draft_message(
         raw: raw_message,
         recipients,
         from: from_address.to_string(),
+        draft_key: Some(draft_key(draft)),
     })
 }
 
@@ -1815,7 +2073,9 @@ pub async fn submit(built: &BuiltMessage, smtp_config: &SmtpConfig) -> Result<Se
                     role: *role,
                     success: false,
                     error: Some(err_msg),
-                    ambiguous: false,
+                    // Nothing about waiting turns an unparseable address into
+                    // a deliverable one.
+                    verdict: RecipientVerdict::Rejected,
                 });
                 continue;
             }
@@ -1831,7 +2091,7 @@ pub async fn submit(built: &BuiltMessage, smtp_config: &SmtpConfig) -> Result<Se
                     role: *role,
                     success: false,
                     error: Some(err_msg),
-                    ambiguous: false,
+                    verdict: RecipientVerdict::Rejected,
                 });
                 continue;
             }
@@ -1845,7 +2105,7 @@ pub async fn submit(built: &BuiltMessage, smtp_config: &SmtpConfig) -> Result<Se
                     role: *role,
                     success: true,
                     error: None,
-                    ambiguous: false,
+                    verdict: RecipientVerdict::Delivered,
                 });
             }
             Err(e) => {
@@ -1855,7 +2115,7 @@ pub async fn submit(built: &BuiltMessage, smtp_config: &SmtpConfig) -> Result<Se
                     address: addr.clone(),
                     role: *role,
                     success: false,
-                    ambiguous: smtp_failure_is_ambiguous(&e),
+                    verdict: smtp_failure_verdict(&e),
                     error: Some(err_msg),
                 });
             }

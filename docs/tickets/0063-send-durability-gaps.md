@@ -10,6 +10,8 @@ created: 2026-08-06
 From the architecture review synthesis, Tier 3: [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06_architecture-review-synthesis.md).
 Effort: M each.
 Partly parked 2026-08-06: the Graph backend is parked, so scope item 3 (resumable Graph `pending_send` rows) waits with it; the partial-recipient and double-submit halves are SMTP-side and stay active.
+Shipped 2026-08-07: scope items 1, 2 and 4 and the double-submit admission gate, on the SMTP path.
+What is left of this ticket is scope item 3 alone, parked with the backend, which is why the ticket stays open and is listed under Parked (Graph).
 See [BACKLOG](../../BACKLOG.md).
 
 Two holes the durable outbox of [#0037](0037-sqlite-store-engine-skeleton.md) left open.
@@ -35,11 +37,33 @@ Both lose a delivery quietly, which is the failure mode the outbox exists to pre
 2. Retry the failed recipients only, with the existing backoff, and reach a terminal state that the user can see.
 3. Give the Graph path a resumable representation: either store the structured payload alongside the RFC822 bytes, or reconstruct the Graph message from the stored bytes at resume time.
    Decide which and record the choice here.
+   **Parked** with the Graph backend (2026-08-07): the decision is deliberately not taken here, because it is a decision about a transport nothing runs today and the answer depends on what the woken backend looks like.
 4. Keep the exactly-once marker semantics intact; a retry must not deliver twice to a recipient that already got a 250.
 
 ## Acceptance criteria
 
-- A send where one of two recipients is rejected leaves an outbox row that names the rejected recipient and reaches a terminal state without manual intervention.
-- No recipient receives the message twice across a retry.
-- A Graph account with a `pending_send` row left by a crash resumes automatically on the next run, or fails with an explicit, actionable reason.
-- Tests cover the partial-failure and the Graph-resume path offline.
+- A send where one of two recipients is rejected leaves an outbox row that names the rejected recipient and reaches a terminal state without manual intervention. **Met.**
+- No recipient receives the message twice across a retry. **Met**, by `Envelope::outstanding()` being the only thing a resubmission attempts.
+- A Graph account with a `pending_send` row left by a crash resumes automatically on the next run, or fails with an explicit, actionable reason. **Parked** with the Graph backend; the row still stays visible with the explicit log line `resubmit_pending` writes.
+- Tests cover the partial-failure and the Graph-resume path offline. **Half met**: the partial-failure, retry, recovery and admission-gate paths are covered in `tests/outbox_integration.rs`; the Graph-resume path waits with scope item 3.
+
+## What shipped
+
+The verdicts are per recipient, and they are durable.
+`Envelope` (the row's `envelope` column, no schema change) now carries `delivered:` and `rejected:` lines beside the addresses, `SubmitOutcome::PerRecipient` carries one verdict per recipient from the SMTP loop, and `record_submission` folds the set into the row: a recipient with no verdict parks it in `failed`, a recipient that can still be tried keeps it in `pending_send` under the existing backoff, and once nothing is outstanding it goes on to `done` if anybody took it and to `failed` if the server refused them all.
+A resubmission attempts `Envelope::outstanding()` rather than the whole address list, so a recipient that answered 250 is never spoken to twice, including across an operator `mp outbox retry`.
+A 5xx is now a rejection of that recipient rather than an ambiguous whole-row failure, which is what makes the partial case reach a terminal state on its own.
+
+A message that reached some recipients and not others keeps a note in `last_error` for good.
+That note is what keeps the row listed by `mp outbox list` after it is `done` (shown as `partial`, with the refused addresses named) and counted in `OutboxCounts::partial`, which the TUI badge renders as `OUTBOX n (1 partial)`.
+Discarding the row is how a human closes it.
+
+The admission gate is two halves, as the evidence above describes.
+The envelope carries the draft key (frontmatter `id`, or the path for a draft that has none), `outbox::enqueue` refuses a draft that already has a `pending_send` or `sent_pending_append` row with `AlreadyInFlight`, and `send_draft` holds a process-wide slot per draft for the length of the send, so the TUI's cursor send and the approved batch it is also in cannot both submit it.
+A `failed` or `done` row does not hold the gate: a deliberate re-send after a human has looked is the user's business.
+
+One related hole closed on the way: `send_durably` marked the row as entering submission and then let a pre-transport error out of `submit` (an unparseable envelope sender, a transport that would not build) propagate with the marker still set, so the next resume read that marker as "died inside the SMTP session" and parked a message that had never been sent.
+Both send paths now record such a failure as the clean pre-submission one it is, which puts the marker back to NULL.
+
+What is *not* closed: `lettre` does not let a caller tell a TCP connect failure (clean, nothing was sent) from an i/o error on an established connection (ambiguous), so both still park the row in `failed` for a human, as they did before this ticket.
+Sending while the SMTP server is unreachable therefore still needs `mp outbox retry` rather than resolving itself.

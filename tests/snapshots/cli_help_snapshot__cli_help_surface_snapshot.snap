@@ -599,7 +599,7 @@ Inspect and unblock the durable send queue
 Usage: mp outbox [OPTIONS] <COMMAND>
 
 Commands:
-  list     List every queued, retrying or failed submission for the account
+  list     List every queued, retrying, failed or partly delivered submission
   retry    Send a failed submission again (only after checking it did not arrive)
   discard  Drop a submission and release the message bytes it holds
   help     Print this message or the help of the given subcommand(s)
@@ -611,7 +611,7 @@ Options:
   -h, --help                   Print help
 
 $ mp outbox list --help
-List every queued, retrying or failed submission for the account
+List every queued, retrying, failed or partly delivered submission
 
 Usage: mp outbox list [OPTIONS]
 

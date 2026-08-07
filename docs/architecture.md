@@ -103,6 +103,14 @@ The APPEND to the server's Sent mailbox is retried until acknowledged, and a ret
 Accounts whose server files its own Sent copy (Gmail, Graph, Proton) skip the APPEND entirely.
 A fully sent draft with a durable record behind it is removed from `drafts/`; anything less keeps its file.
 
+Because SMTP runs once per recipient, a submission has one verdict per recipient rather than one verdict (#0063).
+The verdicts are committed to the row's `envelope` column: `delivered` is what a retry skips, `rejected` is what the user is told about, and what is in neither is what the next pass attempts.
+A recipient that answered 250 is therefore never spoken to twice, whatever else the pass did, and a 5xx stops that recipient instead of being retried forever.
+A row with a recipient that gave no verdict at all is parked in `failed` as before; a row that reached some recipients and was refused by others reaches `done` and keeps a note in `last_error`, which is what keeps it listed by `mp outbox list` and counted in the TUI's outbox badge until it is discarded.
+
+One draft is one submission at a time.
+Every build mints a fresh `Message-ID`, so a second send of the same draft would look like an unrelated message to both the outbox and the Sent dedup search; the envelope therefore carries the draft key, `outbox::enqueue` refuses a draft that already has an open row, and `send_draft` holds a process-wide slot per draft so the TUI's cursor send and approved batch cannot both submit it.
+
 ## Sync backends
 
 Two transports, one ingest path and one `SyncResult` shape: IMAP/SMTP for password and OAuth2 XOAUTH2 accounts, Microsoft Graph REST for tenants that block IMAP/SMTP (see [auth.md](auth.md)).

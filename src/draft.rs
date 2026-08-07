@@ -2732,7 +2732,11 @@ mod tests {
             role: crate::send::RecipientRole::To,
             success,
             error: (!success).then(|| "550 no such mailbox".to_string()),
-            ambiguous: false,
+            verdict: if success {
+                crate::send::RecipientVerdict::Delivered
+            } else {
+                crate::send::RecipientVerdict::Rejected
+            },
         }
     }
 

@@ -344,12 +344,13 @@ enum Commands {
 /// Operator commands for the durable outbox (#0037).
 ///
 /// The outbox drives itself: queued messages are submitted and their Sent copy
-/// appended on the next startup or sync. These are for the one case it cannot
+/// appended on the next startup or sync. These are for the two cases it cannot
 /// decide alone, a submission that died without a verdict and may or may not
-/// have been delivered.
+/// have been delivered, and one that a recipient was refused (#0063), which
+/// nothing but a human can close.
 #[derive(Subcommand)]
 enum OutboxAction {
-    /// List every queued, retrying or failed submission for the account
+    /// List every queued, retrying, failed or partly delivered submission
     List,
     /// Send a failed submission again (only after checking it did not arrive)
     Retry {
@@ -538,10 +539,18 @@ async fn cmd_outbox(
                 return Ok(());
             }
             for row in &rows {
-                let state = match row.state {
-                    OutboxState::Failed => row.state.to_string().red(),
-                    OutboxState::PendingSend => row.state.to_string().yellow(),
-                    _ => row.state.to_string().normal(),
+                // A `done` row is only listed when it kept a note, which is
+                // what a partial delivery leaves behind (#0063); calling that
+                // `done` would bury the recipient who never got it.
+                let partial = row.state == OutboxState::Done;
+                let state = if partial {
+                    "partial".to_string().yellow()
+                } else {
+                    match row.state {
+                        OutboxState::Failed => row.state.to_string().red(),
+                        OutboxState::PendingSend => row.state.to_string().yellow(),
+                        _ => row.state.to_string().normal(),
+                    }
                 };
                 println!(
                     "  {:>4}  {:<20} {}  {}",
@@ -556,16 +565,35 @@ async fn cmd_outbox(
                 if row.state == OutboxState::PendingSend && row.submission_started_at.is_none() {
                     println!("        {}", "never submitted; the next sync sends it".dimmed());
                 }
+                if let Some(envelope) = row.envelope.as_ref() {
+                    for (addr, reason) in &envelope.rejected {
+                        println!("        {} {addr} ({reason})", "never delivered to:".red());
+                    }
+                    let waiting = envelope.outstanding();
+                    if !waiting.is_empty() && row.state != OutboxState::Done {
+                        println!(
+                            "        {} {}",
+                            "still to deliver to:".dimmed(),
+                            waiting
+                                .iter()
+                                .map(|(addr, _)| addr.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
                 if let Some(err) = row.last_error.as_deref() {
-                    println!("        {} {err}", "last error:".dimmed());
+                    let label = if partial { "outcome:" } else { "last error:" };
+                    println!("        {} {err}", label.dimmed());
                 }
             }
             let counts = outbox::counts(&store, &account_config.name)?;
             println!(
-                "  {} {} working, {} failed",
+                "  {} {} working, {} failed, {} partly delivered",
                 "\u{21bb}".dimmed(),
                 counts.open,
-                counts.failed
+                counts.failed,
+                counts.partial
             );
         }
         OutboxAction::Retry { id } => {

@@ -45,6 +45,40 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A recipient the server refused is now recorded, retried and reported,
+  instead of vanishing with the status line (#0063).** SMTP runs once per
+  recipient here, so a submission has one verdict per recipient; the outbox took
+  the first 250 as "accepted" and threw the rest away, which meant a message one
+  of its two recipients never got was filed as a clean success and nothing ever
+  retried or named the recipient who was refused. Each verdict is now committed
+  to the row's envelope: who took it, who was refused for good and why. A retry
+  attempts only the recipients that are in neither list, so a recipient that
+  answered 250 is never spoken to twice, including across `mp outbox retry`; a
+  5xx stops that recipient rather than being retried forever; a recipient that
+  gave no verdict at all still parks the whole row for a human. A message that
+  went out to some of its recipients and not to the others reaches `done` and
+  keeps the note, so it stays in `mp outbox list` as `partial` with the refused
+  addresses named, and in the TUI's badge as `OUTBOX 1 (1 partial)`, until it is
+  discarded. No schema change: the verdicts ride in the existing `envelope`
+  column, and a row queued by an older build reads as "nothing recorded yet".
+- **One draft is one submission, however many times send is pressed (#0063).**
+  The TUI could send the same draft twice, because the cursor send and an
+  approved batch it is by definition also in each reach the send path on their
+  own thread, and every build mints a fresh `Message-ID`, so the second run
+  looked like an unrelated message to both the outbox and the Sent dedup search
+  a retry uses. The outbox row now carries the draft it was built from and
+  refuses a draft that already has a row it owns; the send path holds a
+  process-wide slot per draft for the length of the send. A `failed` or `done`
+  row does not hold the gate, so a deliberate re-send after a human has looked
+  still works.
+- **A send that failed before the transport no longer parks itself as "may have
+  been delivered" (#0063).** The exactly-once marker is committed immediately
+  before the SMTP session opens, but an error raised on the way in (an
+  unparseable envelope sender, a transport that would not build) propagated with
+  the marker still set, so the next resume read it as a submission that died
+  inside the conversation and parked a message that had provably never been
+  sent. Both send paths now record that failure as the clean pre-submission one
+  it is, which clears the marker and leaves the row submittable.
 - **A store rebuild no longer discards queued mail or orphans its blob files
   (#0066).** `Store::open` answers an unusable store file, a schema version that
   moved, a failed `integrity_check`, a file that will not open as a database, by

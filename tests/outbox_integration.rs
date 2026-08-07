@@ -16,7 +16,7 @@ use email::config::{
     SmtpSettings,
 };
 use email::outbox::{
-    self, Envelope, OutboxState, SentMailbox, SubmitOutcome,
+    self, Envelope, OutboxState, RecipientVerdicts, SentMailbox, SubmitOutcome,
 };
 use email::send::RecipientRole;
 use email::store::{BlobStore, Store};
@@ -170,6 +170,7 @@ fn envelope() -> Envelope {
             ("bob@example.com".into(), RecipientRole::To),
             ("blind@example.com".into(), RecipientRole::Bcc),
         ],
+        ..Default::default()
     }
 }
 
@@ -780,4 +781,358 @@ name = "default"
         SaveToSent::Auto,
         "an unset flag defaults to auto"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Partial recipient verdicts (#0063)
+// ---------------------------------------------------------------------------
+
+/// The two recipients of [`envelope`], as a submission that reached one of
+/// them and was refused for good by the other.
+fn one_of_two(delivered: &str, rejected: &str, reason: &str) -> SubmitOutcome {
+    SubmitOutcome::PerRecipient(RecipientVerdicts {
+        delivered: vec![delivered.to_string()],
+        rejected: vec![(rejected.to_string(), reason.to_string())],
+        ..Default::default()
+    })
+}
+
+fn envelope_of(account: &Account, id: i64) -> Envelope {
+    let (store, _) = account.open();
+    outbox::load(&store, id)
+        .unwrap()
+        .unwrap()
+        .envelope
+        .expect("every queued row carries its envelope")
+}
+
+/// The acceptance criterion: one of two recipients is rejected, and the row
+/// reaches a terminal state that still names the one who never got it.
+#[tokio::test]
+async fn a_rejected_recipient_is_named_on_the_row_and_survives_a_restart() {
+    let account = Account::new();
+    let mid = "<one-of-two@example.com>";
+    let id = enqueue(&account, mid, Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
+
+    let state = outbox::record_submission(
+        &store,
+        &blobs,
+        id,
+        &one_of_two("bob@example.com", "blind@example.com", "550 no such mailbox"),
+    )
+    .unwrap();
+
+    // One recipient holds the message, so the Sent copy is owed exactly as
+    // after a clean 250; nothing is outstanding, so nothing is retried.
+    assert_eq!(state, OutboxState::SentPendingAppend);
+    let mut sent = FakeSent::new();
+    outbox::drain(&store, &blobs, ACCOUNT, &mut sent, outbox::unix_now())
+        .await
+        .unwrap();
+    assert_eq!(state_of(&account, id), OutboxState::Done);
+    assert_eq!(sent.copies(mid), 1);
+
+    // ---- restart: everything below is read out of the file. ----
+    let (store, _) = account.open();
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    let envelope = row.envelope.clone().unwrap();
+    assert_eq!(envelope.delivered, vec!["bob@example.com".to_string()]);
+    assert_eq!(
+        envelope.rejected,
+        vec![(
+            "blind@example.com".to_string(),
+            "550 no such mailbox".to_string()
+        )]
+    );
+    assert!(
+        envelope.outstanding().is_empty(),
+        "a settled row has nothing left to attempt"
+    );
+
+    // A `done` row is normally silent; this one keeps its note, so it is still
+    // listed and still counted as something a human has to close.
+    let note = row.last_error.expect("a partial delivery keeps its note");
+    assert!(note.contains("blind@example.com"), "{note}");
+    let listed = outbox::unfinished_rows(&store, ACCOUNT).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    let counts = outbox::counts(&store, ACCOUNT).unwrap();
+    assert_eq!(counts.partial, 1);
+    assert_eq!(counts.open, 0);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.total(), 1);
+}
+
+/// A recipient that can still be delivered to keeps the row submittable, and
+/// the one that already answered 250 is not attempted again.
+#[test]
+fn only_the_undelivered_recipients_are_retried() {
+    let account = Account::new();
+    let id = enqueue(&account, "<retry-the-rest@example.com>", Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
+
+    let state = outbox::record_submission(
+        &store,
+        &blobs,
+        id,
+        &SubmitOutcome::PerRecipient(RecipientVerdicts {
+            delivered: vec!["bob@example.com".to_string()],
+            retryable: vec![(
+                "blind@example.com".to_string(),
+                "451 try again later".to_string(),
+            )],
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(state, OutboxState::PendingSend);
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    assert_eq!(row.attempts, 1, "the backoff counter moved");
+    assert_eq!(
+        row.submission_started_at, None,
+        "nothing was accepted for the outstanding recipient, so the row stays decidable"
+    );
+    let envelope = row.envelope.unwrap();
+    assert_eq!(
+        envelope.outstanding(),
+        vec![("blind@example.com".to_string(), RecipientRole::Bcc)],
+        "the delivered recipient is never submitted again"
+    );
+
+    // The resume hands it back, and the second pass settles it.
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert_eq!(sweep.resubmittable.len(), 1);
+    outbox::mark_submission_started(&store, id).unwrap();
+    let state = outbox::record_submission(
+        &store,
+        &blobs,
+        id,
+        &SubmitOutcome::PerRecipient(RecipientVerdicts {
+            delivered: vec!["blind@example.com".to_string()],
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    assert_eq!(state, OutboxState::SentPendingAppend);
+    let envelope = envelope_of(&account, id);
+    assert_eq!(
+        envelope.delivered,
+        vec![
+            "bob@example.com".to_string(),
+            "blind@example.com".to_string()
+        ],
+        "each recipient took the message exactly once"
+    );
+    assert_eq!(
+        envelope.partial_note(),
+        None,
+        "everybody got it in the end, so there is nothing to report"
+    );
+}
+
+/// Nothing was delivered and nothing will be: the row stops, visibly, without
+/// a human having to notice it looping.
+#[test]
+fn a_message_every_recipient_refused_reaches_a_terminal_state() {
+    let account = Account::new();
+    let id = enqueue(&account, "<all-refused@example.com>", Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
+
+    let state = outbox::record_submission(
+        &store,
+        &blobs,
+        id,
+        &SubmitOutcome::PerRecipient(RecipientVerdicts {
+            rejected: vec![
+                ("bob@example.com".to_string(), "550 unknown".to_string()),
+                ("blind@example.com".to_string(), "550 unknown".to_string()),
+            ],
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(state, OutboxState::Failed);
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert!(
+        sweep.resubmittable.is_empty() && sweep.stranded.is_empty(),
+        "a terminal row is not swept again"
+    );
+    let row = outbox::load(&store, id).unwrap().unwrap();
+    assert!(row.last_error.unwrap().contains("bob@example.com"));
+}
+
+/// One recipient took the message, another never answered: the unknown one is
+/// what decides, so the row parks for a human. What it took is recorded, so
+/// the retry a human orders does not deliver twice.
+#[test]
+fn a_recipient_with_no_verdict_parks_the_row_and_a_retry_skips_the_delivered() {
+    let account = Account::new();
+    let id = enqueue(&account, "<no-verdict@example.com>", Some(SENT));
+    let (store, blobs) = account.open();
+    outbox::mark_submission_started(&store, id).unwrap();
+
+    let state = outbox::record_submission(
+        &store,
+        &blobs,
+        id,
+        &SubmitOutcome::PerRecipient(RecipientVerdicts {
+            delivered: vec!["bob@example.com".to_string()],
+            ambiguous: vec![(
+                "blind@example.com".to_string(),
+                "connection reset after DATA".to_string(),
+            )],
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(state, OutboxState::Failed);
+    assert!(outbox::sweep_pending_sends(&store, ACCOUNT)
+        .unwrap()
+        .resubmittable
+        .is_empty());
+
+    // The human decides the blind recipient never got it and retries.
+    outbox::retry(&store, id).unwrap();
+    let envelope = envelope_of(&account, id);
+    assert_eq!(
+        envelope.outstanding(),
+        vec![("blind@example.com".to_string(), RecipientRole::Bcc)],
+        "the recipient that answered 250 is never in a retry"
+    );
+}
+
+/// The crash window per-recipient recording opens: the verdicts are committed
+/// and the state transition is not. The marker is still set, so the row is
+/// parked rather than re-sent, and what was delivered is still known.
+#[test]
+fn a_crash_between_the_verdicts_and_the_transition_parks_the_row() {
+    let account = Account::new();
+    let id = enqueue(&account, "<crash-mid-record@example.com>", Some(SENT));
+    {
+        let (store, _) = account.open();
+        outbox::mark_submission_started(&store, id).unwrap();
+        // What `record_submission` commits first, on its own.
+        let mut envelope = envelope_of(&account, id);
+        envelope.record_delivered("bob@example.com");
+        store
+            .conn()
+            .execute(
+                "UPDATE outbox SET envelope = ?2 WHERE id = ?1",
+                rusqlite::params![id, envelope.encode()],
+            )
+            .unwrap();
+    }
+
+    // ---- kill -9 here. ----
+    let (store, _) = account.open();
+    let sweep = outbox::sweep_pending_sends(&store, ACCOUNT).unwrap();
+    assert_eq!(sweep.stranded, vec![id]);
+    assert_eq!(state_of(&account, id), OutboxState::Failed);
+    let envelope = envelope_of(&account, id);
+    assert!(envelope.is_delivered("bob@example.com"));
+    outbox::retry(&store, id).unwrap();
+    assert_eq!(
+        envelope_of(&account, id).outstanding(),
+        vec![("blind@example.com".to_string(), RecipientRole::Bcc)],
+        "even the re-armed row knows who already has it"
+    );
+}
+
+/// The envelope encoding is what all of this survives a restart in, so it has
+/// to round-trip, and a file written before #0063 has to read as "nothing
+/// recorded yet" rather than fail.
+#[test]
+fn the_envelope_encoding_carries_the_verdicts_and_stays_backwards_readable() {
+    let mut envelope = Envelope {
+        from: "alice@example.com".into(),
+        recipients: vec![
+            ("\"Doe, Jane\" <jane@example.com>".into(), RecipientRole::To),
+            ("blind@example.com".into(), RecipientRole::Bcc),
+        ],
+        draft_key: Some("id:2026-08-06-note".into()),
+        ..Default::default()
+    };
+    envelope.record_delivered("\"Doe, Jane\" <jane@example.com>");
+    envelope.record_rejected("blind@example.com", "550 no\nsuch\tmailbox");
+
+    let decoded = Envelope::decode(&envelope.encode());
+    assert_eq!(decoded.from, envelope.from);
+    assert_eq!(decoded.recipients, envelope.recipients);
+    assert_eq!(decoded.draft_key, envelope.draft_key);
+    assert_eq!(
+        decoded.delivered,
+        vec!["\"Doe, Jane\" <jane@example.com>".to_string()]
+    );
+    assert_eq!(
+        decoded.rejected,
+        vec![(
+            "blind@example.com".to_string(),
+            "550 no such mailbox".to_string()
+        )],
+        "a reason cannot smuggle a line break into the encoding"
+    );
+
+    let old = Envelope::decode("from:alice@example.com\nto:bob@example.com");
+    assert!(old.delivered.is_empty() && old.rejected.is_empty() && old.draft_key.is_none());
+    assert_eq!(
+        old.outstanding(),
+        vec![("bob@example.com".to_string(), RecipientRole::To)],
+        "a row queued before the verdicts existed is entirely outstanding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The admission gate (#0063)
+// ---------------------------------------------------------------------------
+
+/// Queue a submission the way a draft send does: keyed on the draft.
+fn enqueue_draft(account: &Account, message_id: &str, draft: &str) -> anyhow::Result<i64> {
+    let (store, blobs) = account.open();
+    outbox::enqueue(
+        &store,
+        &blobs,
+        ACCOUNT,
+        Some(SENT),
+        message_id,
+        &raw(message_id),
+        &Envelope {
+            draft_key: Some(draft.to_string()),
+            ..envelope()
+        },
+    )
+}
+
+/// One draft is one message however many times send is pressed: every build
+/// mints a fresh Message-ID, so the draft key is the only thing the second
+/// submission shares with the first.
+#[test]
+fn a_second_submission_of_the_same_draft_is_refused_while_the_first_is_open() {
+    let account = Account::new();
+    let first = enqueue_draft(&account, "<first-build@example.com>", "id:note-1").unwrap();
+
+    let refused = enqueue_draft(&account, "<second-build@example.com>", "id:note-1")
+        .expect_err("the same draft must not be queued twice");
+    assert!(outbox::is_already_in_flight(&refused), "{refused:#}");
+    assert!(refused.to_string().contains(&first.to_string()));
+
+    // A different draft is not affected.
+    enqueue_draft(&account, "<other-draft@example.com>", "id:note-2").unwrap();
+
+    // Nor is a submission that names no draft at all (an RSVP reply).
+    enqueue(&account, "<rsvp@example.com>", Some(SENT));
+
+    // Once the first row is out of the outbox's hands, a deliberate re-send is
+    // the user's business again.
+    let (store, blobs) = account.open();
+    outbox::record_submission(&store, &blobs, first, &SubmitOutcome::Ambiguous("lost".into()))
+        .unwrap();
+    enqueue_draft(&account, "<third-build@example.com>", "id:note-1")
+        .expect("a failed row is a human's problem, not a lock");
 }

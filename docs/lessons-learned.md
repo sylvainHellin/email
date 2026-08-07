@@ -534,3 +534,10 @@ It is not, because `rusqlite`'s `Rows::advance` calls `reset()` on a step error 
 The loop's error arm runs once and the iterator then reports a clean end of table: 204 of 400 rows disappeared while the code counted zero discards and logged one skipped row.
 An `Err` inside an iteration is the end of that iteration unless the API says otherwise, and a loop that treats it as "skip one, continue" silently truncates.
 Reading a damaged table means addressing rows individually (`SELECT ... WHERE rowid = ?`, one query each, each seeking from the btree root), and counting what was reached against `COUNT(*)` or `MAX(rowid)` so the gap can be named instead of assumed to be zero ([src/store/rebuild.rs](../src/store/rebuild.rs)).
+
+## `lettre`'s `is_response()` does not mean "the server responded with an error"
+
+The send path classified an SMTP failure as clean or ambiguous with `!(err.is_response() || err.is_client() || err.is_tls())`, on the reading that a response error is the server saying no in words (#0063).
+It is not: `Kind::Response` is a reply that could not be *parsed*, while a 5xx refusal is `Kind::Permanent` and a 4xx is `Kind::Transient`, so every hard rejection fell through to the ambiguous branch and parked a row that the server had explicitly and finally refused.
+The predicates that mean what they say are `is_permanent()` and `is_transient()`, and there is no public predicate at all for the distinction that would matter most, a TCP connect failure (`Kind::Connection`, nothing was sent) against an i/o error on an established stream (`Kind::Network`, the 250 may have been lost): both are only reachable as "none of the above".
+When an error type's predicates are named after its internal variants, read the variants before writing the boolean.

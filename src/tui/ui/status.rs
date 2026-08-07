@@ -124,10 +124,21 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         .fold(crate::outbox::OutboxCounts::default(), |mut acc, a| {
             acc.open += a.outbox.open;
             acc.failed += a.outbox.failed;
+            acc.partial += a.outbox.partial;
             acc
         });
-    let outbox_text = if outbox.failed > 0 {
-        format!("OUTBOX {} ({} failed) | ", outbox.total(), outbox.failed)
+    // `partial` is a message that went out to some of its recipients and never
+    // to the rest (#0063): nothing will move it on, so it is named here until
+    // the row is discarded.
+    let mut stuck = Vec::new();
+    if outbox.failed > 0 {
+        stuck.push(format!("{} failed", outbox.failed));
+    }
+    if outbox.partial > 0 {
+        stuck.push(format!("{} partial", outbox.partial));
+    }
+    let outbox_text = if !stuck.is_empty() {
+        format!("OUTBOX {} ({}) | ", outbox.total(), stuck.join(", "))
     } else if outbox.open > 0 {
         format!("OUTBOX {} | ", outbox.open)
     } else {
