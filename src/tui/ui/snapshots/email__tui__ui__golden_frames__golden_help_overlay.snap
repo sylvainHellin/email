@@ -33,7 +33,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 27 |│                                  │  v           Toggle selection                  │                                  │
 28 |╰──────────────────────────────────│  Ctrl+a      Select all visible                │                                  │
 29 |╭ Activity ────────────────────────│  Esc         Clear selection                   │                                  │
-30 |│  No activity yet                 │  Enter / e   Open in editor                    │                                  │
+30 |│  No activity yet                 │  Enter / e   Open in editor (mail read-only)   │                                  │
 31 |│                                  │  r / R       Reply / Reply-all                 │                                  │
 32 |│                                  │  w           Forward                           │                                  │
 33 |│                                  │  c           Edit recipients (Drafts only)     │                                  │

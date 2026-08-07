@@ -545,6 +545,97 @@ fn blob_text(blobs: &BlobStore, id: i64, hash: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// The Markdown rendition (#0075)
+// ---------------------------------------------------------------------------
+
+/// The frontmatter of a message rendered back to Markdown.
+///
+/// The key names and their order are the file era's: this is what ingest
+/// wrote at the head of every received `.md` before #0037 deleted the files,
+/// and it is what [`crate::types::InboxFrontmatter`] still deserialises. Three
+/// keys differ. `answered` and `forwarded` are new, because the axis they
+/// belong to did not exist when the files did (#TKT-0051), and `mailbox`
+/// replaces the file era's `status:`, which named the directory a message sat
+/// in and is now the store's mailbox key.
+#[derive(Debug, serde::Serialize)]
+struct ViewFrontmatter {
+    from: String,
+    to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cc: Option<String>,
+    subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+    mailbox: String,
+    read: bool,
+    answered: bool,
+    forwarded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachments: Option<Vec<String>>,
+}
+
+/// A stored header value with the empty string read as absent.
+///
+/// The rule `mp dump-mailbox` applies to the same columns: ingest writes
+/// whatever the parser produced, and an absent header arrives as an empty
+/// string rather than as SQL `NULL`, while the file era could only ever write
+/// the key or omit it.
+fn present(value: Option<&str>) -> Option<String> {
+    value.filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// One stored message rendered as Markdown with YAML frontmatter (#0075).
+///
+/// A rendition, like the browser `.html` and the invite `.ics` the TUI already
+/// materialises: the store is the source of truth and nothing reads this back.
+/// That is what lets it be handed to `$EDITOR` as a read-only file rather than
+/// as something a user could save into.
+///
+/// The body is the stored plain text, which is either the sender's own
+/// `text/plain` or the `html_to_plain` of their markup, exactly as the preview
+/// pane shows it. An evicted body renders as an empty one, for the same reason
+/// [`load_body`] degrades rather than fails.
+pub fn render_markdown(store: &Store, blobs: &BlobStore, row: &MessageRow) -> String {
+    let flags = row.flags();
+    let attachments: Vec<String> = attachments_for(store, row.id)
+        .unwrap_or_else(|e| {
+            warn!("[store] attachments of message {}: {e:#}", row.id);
+            Vec::new()
+        })
+        .into_iter()
+        .map(|att| att.name)
+        .collect();
+
+    let frontmatter = ViewFrontmatter {
+        from: row.from.clone().unwrap_or_default(),
+        to: row.to.clone().unwrap_or_default(),
+        cc: present(row.cc.as_deref()),
+        subject: row.subject.clone().unwrap_or_default(),
+        date: present(row.date_display.as_deref()),
+        message_id: present(Some(row.message_id.as_str())),
+        mailbox: row.mailbox.clone(),
+        read: flags.seen,
+        answered: flags.answered,
+        forwarded: flags.forwarded,
+        attachments: (!attachments.is_empty()).then_some(attachments),
+    };
+    // A struct of owned strings and bools has no serialization failure mode;
+    // `dump::to_ndjson` leans on the same fact.
+    let yaml = serde_yaml::to_string(&frontmatter).expect("the view frontmatter serializes");
+
+    // serde_yaml 0.9 emits no document markers, so the fences are added here,
+    // which is what the file-era writer did too.
+    let body = load_body(store, blobs, row.id).unwrap_or_default();
+    let mut out = format!("---\n{yaml}---\n\n{body}");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,5 +1000,91 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
         let rows = list_mailbox(&fx.store, "alice", "inbox").unwrap();
         assert!(rows[0].is_read(), "the \\Seen row must read back as read");
         assert!(!rows[1].is_read());
+    }
+
+    /// The rendition is frontmatter then body, with the whole second status
+    /// axis in the header and the attachment names where the file era listed
+    /// them (#0075).
+    #[test]
+    fn a_row_renders_back_to_markdown_with_frontmatter() {
+        let fx = fixture();
+        let mut e = email("Quarterly report", "Mon, 01 Jan 2024 09:00:00 +0000");
+        e.cc = Some("carol@example.com".into());
+        e.flags = crate::types::MessageFlags {
+            seen: true,
+            answered: true,
+            forwarded: false,
+        };
+        e.has_attachments = true;
+        e.attachments = vec![
+            crate::parse::AttachmentData {
+                filename: "report.pdf".into(),
+                content: b"%PDF-1.4".to_vec(),
+                content_id: None,
+            },
+            // The iMIP sidecar is stored as an attachment blob but was never a
+            // user-facing attachment, so it must not appear in the list.
+            crate::parse::AttachmentData {
+                filename: CALENDAR_SIDECAR_NAME.to_string(),
+                content: b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_vec(),
+                content_id: None,
+            },
+        ];
+        let id = ingest(&fx, "archive", 7, &e);
+        let row = find_by_id(&fx.store, id).unwrap().unwrap();
+
+        let rendered = render_markdown(&fx.store, &fx.blobs, &row);
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "---\n",
+                "from: Ada Lovelace <ada@example.com>\n",
+                "to: b@example.com\n",
+                "cc: carol@example.com\n",
+                "subject: Quarterly report\n",
+                "date: Mon, 01 Jan 2024 09:00:00 +0000\n",
+                "message_id: <Quarterly report@example.com>\n",
+                "mailbox: archive\n",
+                "read: true\n",
+                "answered: true\n",
+                "forwarded: false\n",
+                "attachments:\n",
+                "- report.pdf\n",
+                "---\n",
+                "\n",
+                "body of Quarterly report\n",
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// Format parity with the file era: what is rendered is what the pre-store
+    /// build wrote, so the type that still parses those files parses this
+    /// (#0075). A message with no cc, no attachments and no flags omits the
+    /// keys it has nothing to say about, exactly as `serde_yaml` did then.
+    #[test]
+    fn the_rendition_parses_as_the_file_era_frontmatter() {
+        let fx = fixture();
+        let id = ingest(&fx, "inbox", 1, &email("Bare", "Mon, 01 Jan 2024 09:00:00 +0000"));
+        let row = find_by_id(&fx.store, id).unwrap().unwrap();
+
+        let rendered = render_markdown(&fx.store, &fx.blobs, &row);
+        let (front, body) = rendered
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("---\n")
+            .unwrap();
+        let parsed: crate::types::InboxFrontmatter = serde_yaml::from_str(front).unwrap();
+
+        assert_eq!(parsed.from, "Ada Lovelace <ada@example.com>");
+        assert_eq!(parsed.to, "b@example.com");
+        assert_eq!(parsed.cc, None);
+        assert_eq!(parsed.subject, "Bare");
+        assert_eq!(parsed.date.as_deref(), Some("Mon, 01 Jan 2024 09:00:00 +0000"));
+        assert_eq!(parsed.message_id.as_deref(), Some("<Bare@example.com>"));
+        assert_eq!(parsed.attachments, None);
+        assert_eq!(parsed.read, Some(false));
+        assert_eq!(body, "\nbody of Bare\n");
     }
 }

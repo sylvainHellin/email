@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Read a received message in your editor again (#0075).** `Enter` or `e` on
+  a message in any mailbox opens it in `$EDITOR`, as Markdown with the headers
+  in YAML frontmatter and the body below them. This worked before every message
+  moved into the store; the files went, and nothing replaced what they were good
+  for, which is searching, folding, and copying out of a long thread with the
+  tools you already have rather than through a preview pane.
+
+  The copy is read-only and temporary. It is rendered from the store when you
+  press the key, written mode 0444 so the editor opens the buffer read-only, and
+  deleted when the editor exits. Nothing reads it back, so an edit forced past
+  the read-only buffer reaches nothing, and the status line says so on the way
+  out. The frontmatter carries `from`, `to`, `cc`, `subject`, `date`,
+  `message_id`, the mailbox, the attachment names, and the whole second status
+  axis (`read`, `answered`, `forwarded`).
+
+  `Enter` and `e` on a Drafts row still open the draft file for editing, as
+  before. In the IMAP search overlay the same key opens any hit that is already
+  in the local store.
+
 - **A second status axis: read, answered, forwarded (#TKT-0051).** A message
   used to have one bit of history, read or unread. It now carries three, and
   they are independent: the list's marker column shows a dot for unread, a

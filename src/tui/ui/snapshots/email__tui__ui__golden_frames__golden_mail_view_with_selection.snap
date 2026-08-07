@@ -41,7 +41,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 35 |╭ View ──────────────────────────────────╮│                                                                            │
 36 |│     mail  |  contacts  |  calendar     ││                                                                            │
 37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
-38 | 2 SELECTED   j/k Navigate emails  v Toggle selection  Enter / e Open in editor  r / R Reply / Reply-all  a Archive  d D
+38 | 2 SELECTED   j/k Navigate emails  v Toggle selection  Enter / e Open in editor (mail read-only)  r / R Reply / Reply-al
 39 | ? help                                                                                    2 sel | 2 unread | Inbox 2/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 01 |bold@43..50
@@ -52,5 +52,5 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 10 |bg:surface+fg:selection+bold@1..41 bg:surface@71..77
 11 |fg:selection+bold@1..4 bold@4..5 fg:selection+bold@5..41
 36 |bold@5..11
-38 |bold@0..12 bg:surface@12..14 bg:surface+bold@14..17 bg:surface@17..35 bg:surface+bold@35..36 bg:surface@36..55 bg:surface+bold@55..64 bg:surface@64..81 bg:surface+bold@81..86 bg:surface@86..106 bg:surface+bold@106..107 bg:surface@107..117 bg:surface+bold@117..118 bg:surface@118..120
+38 |bold@0..12 bg:surface@12..14 bg:surface+bold@14..17 bg:surface@17..35 bg:surface+bold@35..36 bg:surface@36..55 bg:surface+bold@55..64 bg:surface@64..98 bg:surface+bold@98..103 bg:surface@103..120
 39 |bg:surface@0..120

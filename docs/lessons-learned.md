@@ -630,3 +630,18 @@ Before bumping `SCHEMA_VERSION`, check whether the new state is something the se
 Measured live on a Gmail account (#TKT-0051): `UID STORE +FLAGS ($Forwarded)` is accepted, survives, and comes back from `FETCH FLAGS` as `async_imap::types::Flag::Custom("$Forwarded")` rather than as any system flag.
 `\Answered` round-trips as `Flag::Answered`, which is what a reply sent from any other client sets, so the answered state syncs both directions without anything mailypoppins-specific on the wire.
 Read keyword matching case-insensitively and accept `\Forwarded` as well: the keyword is registered as `$Forwarded` (RFC 5788) but not every server spells it the same way, and only one spelling should ever be written.
+
+## A capability deleted by a rewrite leaves no failing test behind it
+
+Every received message was a `.md` file until the store cutover ([#0037](tickets/0037-sqlite-store-engine-skeleton.md)), and `$EDITOR` on a list row opened that file.
+The cutover deleted the files, the `EditCurrent` arm was rewritten to decline on a received row, and a comment was added saying the decline was permanent "because nothing is coming that would make it work" ([src/tui/actions.rs](../src/tui/actions.rs), `Action::EditCurrent`).
+Nothing was broken by that in the sense a test can see: the store was truth, the preview pane still rendered the message, and the decline was honest about the file.
+What was lost was the affordance, and it stayed lost for months because a rewrite that removes a mechanism removes the thing that would have complained about it ([#0075](tickets/0075-open-received-mail-in-editor.md)).
+The rendition was ten lines away the whole time: the same flow already materialised the browser `.html` and the invite `.ics` out of the store on demand, so the message itself was the one artifact with no rendition.
+When a rewrite makes a mechanism impossible, write down what the mechanism was for, not that it is gone; the second is a fact about the code and the first is the thing that still has to be answered.
+
+## A 0444 rendition has to be removed before it is rewritten
+
+The read-only message view is written mode 0444 so `$EDITOR` opens the buffer read-only, and it lands in the per-row materialisation directory keyed by row id, so opening the same message twice targets the same path.
+The second write then fails on the mode the first one set, and `fs::write` truncating an existing file gives no way around it.
+Remove the file first and treat `NotFound` as success ([src/tui/actions.rs](../src/tui/actions.rs), `write_readonly`); the rendition is rebuilt from the store on every open, so there is nothing to preserve, and a stale copy surviving a rebuild would be worse than the failure.

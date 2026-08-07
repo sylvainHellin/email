@@ -223,6 +223,119 @@ pub(super) fn html_rendition(app: &mut App, html: &str, stem: &str) -> Option<Pa
     }
 }
 
+/// The name the read-only view carries, which is the title the editor puts on
+/// the buffer (#0075).
+///
+/// The subject, so the window says which message is on screen; the row id when
+/// there is no subject to slug. Uniqueness is not this name's job -- the
+/// directory it lands in is already keyed by the row -- so two messages
+/// sharing a subject cannot collide.
+fn readonly_view_name(subject: &str, row_id: i64) -> String {
+    let slug = slugify_subject_for_filename(subject);
+    if slug.is_empty() {
+        format!("message-{row_id}.md")
+    } else {
+        format!("{slug}.md")
+    }
+}
+
+/// Write `contents` where the user cannot save over it (#0075).
+///
+/// 0444, so `$EDITOR` opens the buffer read-only and says so, rather than
+/// letting someone believe an edit reaches the message. The mode is a signal,
+/// not the guarantee: the guarantee is that nothing reads the file back, and
+/// the file is gone when the editor exits.
+///
+/// A previous view of the same row left a file that mode also makes
+/// unwritable, so it is removed rather than truncated -- the rendition is
+/// rebuilt from the store on every open, and a stale one must not survive.
+fn write_readonly(path: &Path, contents: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("clearing {}: {e}", path.display()),
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("making {} read-only", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The read-only Markdown view of a stored row, or `None` with the status line
+/// saying why there is none (#0075).
+///
+/// It lands beside the browser rendition and the invite source, under the
+/// private per-row directory `parse::materialisation_dir` validates, and it is
+/// deliberately nowhere the drafts index or the reconciler walks: the store is
+/// the source of truth and this file is scratch.
+pub(super) fn readonly_view_for_row(app: &mut App, row_id: i64) -> Option<PathBuf> {
+    // The store connection is scoped to the read, the way the event source
+    // scopes its own: `$EDITOR` owns the terminal for as long as the user
+    // wants it, and holding SQLite open across that is pointless.
+    let rendered = {
+        let (store, blobs) = store_for_mutation(app, "Open")?;
+        match crate::store::read::find_by_id(&store, row_id) {
+            Ok(Some(row)) => {
+                let name = readonly_view_name(row.subject.as_deref().unwrap_or_default(), row.id);
+                Some((crate::store::read::render_markdown(&store, &blobs, &row), name))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                app.set_status_level(format!("Open failed: {e:#}"), StatusLevel::Error);
+                return None;
+            }
+        }
+    };
+    let Some((markdown, name)) = rendered else {
+        app.set_status_level(
+            "Open failed: that message is no longer in the store".to_string(),
+            StatusLevel::Error,
+        );
+        return None;
+    };
+    let written = render_temp_file(&row_id.to_string(), &name)
+        .and_then(|path| write_readonly(&path, &markdown).map(|()| path));
+    match written {
+        Ok(path) => Some(path),
+        Err(e) => {
+            app.set_status_level(format!("Open failed: {e:#}"), StatusLevel::Error);
+            None
+        }
+    }
+}
+
+/// Hand the read-only view of a stored row to `$EDITOR` and discard it on the
+/// way back (#0075).
+///
+/// Same suspend / launch / resume dance as the draft flow and the event
+/// source; what differs is the end, where the file is removed. Nothing read it
+/// back, so an edit forced past the read-only buffer reaches nothing, and the
+/// status line says so.
+fn open_readonly_view(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    row_id: i64,
+) -> Result<()> {
+    let Some(path) = readonly_view_for_row(app, row_id) else {
+        return Ok(());
+    };
+    suspend_terminal(terminal)?;
+    let result = edit_file(&path);
+    resume_terminal(terminal)?;
+    let _ = std::fs::remove_file(&path);
+    match result {
+        Ok(()) => app.set_status(
+            "Returned from the read-only copy (edits do not reach the message)".to_string(),
+        ),
+        Err(e) => app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error),
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Drafts written from a source message (#0052 scope items 1, 2 and 11)
 // ---------------------------------------------------------------------------
@@ -748,21 +861,26 @@ pub(super) fn handle_action(
 ) -> Result<()> {
     match action {
         Action::EditCurrent => {
-            // `mp edit <selector>` done in-process (#0052 scope item 7): the
-            // draft is resolved through the index and handed to `$EDITOR`,
-            // with the index refreshed on the way back so the list shows what
-            // the user just typed.
+            // One key, two things to open, because the row under the cursor is
+            // one of two things.
             //
-            // A received row has no file to open. The pre-nuke build handed
-            // `$EDITOR` the message's `.md`; after #0037 there is no such
-            // file, and `mp edit` takes draft selectors only, so there is no
-            // CLI behaviour to mirror and nothing honest to open. It declines
-            // permanently rather than with the #0052 line, because nothing is
-            // coming that would make it work.
-            let Some((_id, path)) = cursor_draft(
-                app,
-                "Open in $EDITOR needs a draft; received mail is a store row, not a file",
-            ) else {
+            // A received row is materialised out of the store as Markdown and
+            // opened read-only (#0075): the pre-nuke build handed `$EDITOR`
+            // the message's own `.md`, and #0037 deleted the files without
+            // replacing what they were good for -- searching, folding and
+            // yanking a long message in a real editor rather than in a pane.
+            // The store stays truth, so the copy is 0444 and discarded on the
+            // way back.
+            //
+            // A drafts row is `mp edit <selector>` done in-process (#0052
+            // scope item 7): resolved through the index and handed to
+            // `$EDITOR` writable, with the index refreshed afterwards so the
+            // list shows what the user just typed.
+            if let Some(msg) = app.selected_email_ref() {
+                return open_readonly_view(app, terminal, msg.row_id());
+            }
+            let Some((_id, path)) = cursor_draft(app, "Open in $EDITOR needs a message or a draft")
+            else {
                 return Ok(());
             };
             edit_new_draft(app, terminal, &path, "Returned from editor".to_string())?;
@@ -2128,8 +2246,9 @@ fn slugify_subject_for_filename(subject: &str) -> String {
 /// All of them run off the store for a hit that resolved to a row, and off the
 /// fetch the overlay is already rendering for one that did not, with two
 /// exceptions. Archive needs a local row to move and says so when there is
-/// none. Open needs a file that no longer exists at all, and declines the way
-/// `Action::EditCurrent` declines on a received row.
+/// none. Open needs a stored row to render, because the read-only view is a
+/// materialisation of the store (#0075) and a hit that never synced has no row
+/// to materialise.
 fn handle_search_result_action(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2138,18 +2257,23 @@ fn handle_search_result_action(
 ) -> Result<()> {
     match action {
         Action::SearchResultOpen => {
-            // The file build saved the hit as a `.md` and opened that in
-            // `$EDITOR`; after #0037 nothing saves a hit to a file, and
-            // `mp edit` takes draft selectors only, so there is no CLI
-            // behaviour to port and nothing honest to open. It declines
-            // permanently, for the same reason `Action::EditCurrent` declines
-            // on a received row, and the overlay is already showing the
-            // headers and the body that editor window used to hold.
-            app.set_status_level(
-                "Open in $EDITOR needs a draft; a search hit is a message on the server, not a file"
-                    .to_string(),
-                StatusLevel::Warning,
-            );
+            // A hit that resolved is opened exactly as the list opens it: the
+            // read-only Markdown rendition of its row. One that did not is a
+            // message on the server this account has never ingested, so there
+            // is nothing to render, and the overlay is already showing the
+            // headers and the body that editor window would hold.
+            let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+                return Ok(());
+            };
+            let Some(msg) = hit.entry.msg else {
+                app.set_status_level(
+                    "Open in $EDITOR needs a stored message; this hit is not in the local store"
+                        .to_string(),
+                    StatusLevel::Warning,
+                );
+                return Ok(());
+            };
+            open_readonly_view(app, terminal, msg.row_id())?;
         }
 
         Action::SearchResultOpenInBrowser => {
@@ -3306,8 +3430,11 @@ mod store_backed_mutations {
         assert_eq!(fx.resolve(&sel_two).status, "approved");
     }
 
-    /// `$EDITOR` opens the file the index holds for the row under the cursor,
-    /// and a received row has none to open.
+    /// `$EDITOR` opens the file the index holds for the row under the cursor.
+    ///
+    /// A received row never reaches this resolver: it is materialised out of
+    /// the store instead (#0075, covered in `store_backed_files`), and the
+    /// decline below is what is left for an entry that is neither.
     #[test]
     fn edit_current_resolves_the_cursor_draft_through_the_index() {
         let fx = Fixture::new();
@@ -3320,19 +3447,16 @@ mod store_backed_mutations {
             "the cursor's draft resolves to the file the index holds"
         );
 
-        // On a received row there is no file to open, and no CLI behaviour to
-        // mirror: `mp edit` takes draft selectors only. The decline is
-        // permanent, so it does not carry the #0052 line.
         let mut app = App::default_for_tests();
         app.account_config.name = "alice".to_string();
         app.emails = std::sync::Arc::new(vec![received_entry()]);
         app.rebuild_visible();
         assert_eq!(
-            cursor_draft(&mut app, "Open in $EDITOR needs a draft"),
+            cursor_draft(&mut app, "Open in $EDITOR needs a message or a draft"),
             None
         );
         let status = app.status_message.clone().unwrap();
-        assert_eq!(status, "Open in $EDITOR needs a draft");
+        assert_eq!(status, "Open in $EDITOR needs a message or a draft");
         assert!(!status.contains("#0052"), "{status}");
     }
 }
@@ -3549,6 +3673,80 @@ mod store_backed_files {
         let html = fetched.html_body.clone().unwrap();
         let page = html_rendition(&mut app, &html, "search-7").unwrap();
         assert_eq!(std::fs::read_to_string(&page).unwrap(), "<p>Rich body</p>");
+    }
+
+    /// `e` on a received row writes the store's own rendition of the message
+    /// where the browser rendition and the invite source go, names it after
+    /// the subject so the editor's buffer title is recognisable, and makes it
+    /// unwritable (#0075).
+    #[test]
+    fn the_read_only_view_lands_beside_the_other_renditions() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("Quarterly Report: Q3");
+        email.has_attachments = true;
+        email.attachments = vec![attachment("report.pdf", b"%PDF-1.4")];
+        let row = fx.ingest(&email);
+        let mut app = app_on_row(&row);
+
+        let path = readonly_view_for_row(&mut app, row.id).unwrap();
+
+        assert_eq!(
+            path,
+            std::env::temp_dir()
+                .join(format!("mailypoppins-{}", row.id))
+                .join("render")
+                .join("quarterly-report-q3.md"),
+            "the subject names the buffer, under the per-row render directory"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("---\n"), "{content}");
+        assert!(content.contains("subject: 'Quarterly Report: Q3'\n"), "{content}");
+        assert!(content.contains("mailbox: inbox\n"), "{content}");
+        assert!(content.contains("read: true\n"), "{content}");
+        assert!(content.contains("answered: false\n"), "{content}");
+        assert!(content.contains("forwarded: false\n"), "{content}");
+        assert!(content.contains("- report.pdf\n"), "{content}");
+        assert!(content.ends_with("Original body\n"), "{content}");
+
+        // 0444: the editor opens the buffer read-only and says so, instead of
+        // letting anyone believe a save reaches the message.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o444, "{mode:o}");
+        }
+
+        // A second open of the same row rebuilds the file rather than failing
+        // on the mode the first one left, and the copy is scratch: removing it
+        // is what the action does when the editor exits.
+        let again = readonly_view_for_row(&mut app, row.id).unwrap();
+        assert_eq!(again, path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A message with no subject still gets a name a human can read, and one
+    /// with no store row is a status line rather than an empty buffer.
+    #[test]
+    fn the_read_only_view_names_a_subjectless_message_by_its_row() {
+        let fx = Fixture::new();
+        let mut email = fixture_email("placeholder");
+        email.subject = String::new();
+        let row = fx.ingest(&email);
+        let mut app = app_on_row(&row);
+
+        let path = readonly_view_for_row(&mut app, row.id).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("message-{}.md", row.id)
+        );
+
+        assert_eq!(readonly_view_for_row(&mut app, row.id + 999), None);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Open failed: that message is no longer in the store")
+        );
     }
 
     /// The agenda's Open-source reads the invite's own ics blob off the row

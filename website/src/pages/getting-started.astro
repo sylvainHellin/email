@@ -108,11 +108,18 @@ cargo install --path .`}
       <ul class="key-list">
         <li><code>j</code> / <code>k</code> to move up and down the email list</li>
         <li><code>1</code>-<code>9</code> to jump to a mailbox by index</li>
-        <li><code>Enter</code> or <code>e</code> to open an email in your <code>$EDITOR</code></li>
+        <li><code>Enter</code> or <code>e</code> to open the selected row in your <code>$EDITOR</code>: a draft opens for editing, a received message opens as a read-only Markdown copy</li>
         <li><code>/</code> to filter, <code>\</code> to search (includes body text)</li>
         <li><code>?</code> for the full help overlay</li>
         <li><code>q</code> to quit</li>
       </ul>
+      <p>
+        The read-only copy is rendered from the local store on the spot, with the headers
+        as YAML frontmatter and the body below them, and it is deleted again when you leave
+        the editor. It is there for searching, folding and copying a long message with the
+        tools you already know. Edits go nowhere: the store is the source of truth, and
+        nothing reads the copy back.
+      </p>
       <p>
         The marker column on the left of the list carries one glyph per message: a dot
         for unread, a reply arrow once you have answered it, a forward arrow once you
