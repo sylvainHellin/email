@@ -195,10 +195,25 @@ pub struct ImapSettings {
     pub username: String,
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// How many mailboxes a single sync fetches in parallel, each on its own
+    /// IMAP connection (#0005). A sync SELECTs one mailbox per connection, so
+    /// N mailboxes on one session cost N round-trips serially; N connections
+    /// overlap the latency. Kept conservative because servers throttle
+    /// concurrent connections, Gmail especially. Clamped to [1, 8] at load;
+    /// 1 restores the old single-session behaviour.
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: usize,
 }
 
 fn default_imap_port() -> u16 {
     993
+}
+
+/// The default per-account fetch fan-out. Four covers the usual inbox +
+/// archive + sent (+ one extra) without opening more connections than a
+/// throttling server tolerates.
+fn default_fetch_concurrency() -> usize {
+    4
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -399,6 +414,9 @@ pub struct ImapConfig {
     pub password: String,
     pub accept_invalid_certs: bool,
     pub auth_method: AuthMethod,
+    /// Parallel mailbox fetches per sync, clamped to [1, 8]. See
+    /// [`ImapSettings::fetch_concurrency`].
+    pub fetch_concurrency: usize,
 }
 
 /// Runtime config for Graph API accounts (no SMTP/IMAP needed).
@@ -846,6 +864,7 @@ impl ImapConfig {
             password,
             accept_invalid_certs: account.imap.accept_invalid_certs,
             auth_method: account.auth_method.clone(),
+            fetch_concurrency: account.imap.fetch_concurrency.clamp(1, 8),
         })
     }
 }

@@ -48,6 +48,7 @@ default_from = "your.name@example.com"
 host = "imap.example.com"   # Falls back to smtp.host if omitted
 port = 993
 username = ""               # Falls back to smtp.username if omitted
+fetch_concurrency = 4       # Mailboxes fetched in parallel per sync (1-8)
 # Password falls back to SMTP password if not set separately
 
 [mailboxes.inbox]
@@ -147,14 +148,22 @@ default_from = "your.name@example.com"`} />
       <!-- [imap] -->
       <h3 id="imap-section">[imap]</h3>
       <p>
-        IMAP settings for fetching, syncing, and watching mailboxes. All three fields
-        fall back to their SMTP counterparts if omitted, so you only need to specify
-        them when the IMAP server differs from SMTP.
+        IMAP settings for fetching, syncing, and watching mailboxes. <code>host</code>,
+        <code>port</code> and <code>username</code> fall back to their SMTP counterparts
+        if omitted, so you only need to specify them when the IMAP server differs from SMTP.
+      </p>
+      <p>
+        <code>fetch_concurrency</code> is how many mailboxes a single sync fetches in
+        parallel, each on its own connection (default <code>4</code>, clamped to the
+        range 1-8). A sync opens one connection per mailbox and overlaps their latency,
+        so more mailboxes finish in about the time of one. Lower it toward <code>1</code>
+        if a server throttles concurrent connections.
       </p>
       <ConfigExample code={`[imap]
 host = "imap.example.com"   # Falls back to smtp.host
 port = 993
-username = ""               # Falls back to smtp.username`} />
+username = ""               # Falls back to smtp.username
+fetch_concurrency = 4       # Parallel mailbox fetches per sync (1-8)`} />
 
       <!-- Where data lives -->
       <h3 id="data-dir-section">Data directory (not configurable)</h3>

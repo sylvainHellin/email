@@ -325,6 +325,7 @@ pub fn cmd_config_init() -> Result<()> {
         } else {
             crate::config::AuthMethod::Password
         },
+        fetch_concurrency: 1,
     };
 
     let imap_config_for_list = imap_config.clone();
@@ -702,6 +703,7 @@ pub fn cmd_config_add_account() -> Result<()> {
         } else {
             crate::config::AuthMethod::Password
         },
+        fetch_concurrency: 1,
     };
     let imap_config_for_list = imap_config.clone();
     let server_mailboxes = match run_async_blocking(async move { list_mailboxes(&imap_config_for_list).await }) {

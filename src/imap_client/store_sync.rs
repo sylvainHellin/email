@@ -107,8 +107,6 @@ pub async fn sync_mailboxes(
 
     let store = Store::open_account(account_name)?;
     let blobs = BlobStore::for_account(account_name);
-    let mut session = open_imap_session(imap_config).await?;
-    span.mark("session_open");
 
     let mut result = SyncResult::default();
     // Every prune this run will apply, collected here and applied after the
@@ -119,14 +117,51 @@ pub async fn sync_mailboxes(
     // Graph backend; the shared gate is `ingest::pass_may_prune`.
     let mut coverage: Vec<(bool, bool)> = Vec::with_capacity(targets.len());
 
+    // Phase 1: read the store's skip list for every target, serially. These
+    // are single-reader queries and cheap; holding them all in hand lets the
+    // network fetch below run without touching the store (single-writer
+    // discipline: nothing concurrent reads or writes SQLite).
+    //
+    // The skip list travels with the UIDVALIDITY it was recorded under, so the
+    // fetch can throw it away when the server has renumbered; carrying it
+    // across a reset would skip bodies that were never downloaded.
+    let mut knowns = Vec::with_capacity(targets.len());
     for target in targets {
-        // The skip list travels with the UIDVALIDITY it was recorded under, so
-        // the fetch can throw it away when the server has renumbered; carrying
-        // it across a reset would skip bodies that were never downloaded.
-        let known = ingest::known_uids_with_cursor(&store, account_name, target.role.as_str())?;
-        let fetched =
-            fetch_new_raw_on_session(&mut session, &target.server_name, Some(limit), known).await;
+        knowns.push(ingest::known_uids_with_cursor(
+            &store,
+            account_name,
+            target.role.as_str(),
+        )?);
+    }
 
+    // Phase 2: fetch every mailbox in parallel, one IMAP session each (#0005).
+    // IMAP allows one SELECTed mailbox per connection, so the old single
+    // session paid `N * latency` for N mailboxes; N connections overlap that
+    // latency. `buffered` caps how many run at once (servers throttle) and,
+    // crucially, yields results in target order however the fetches finish, so
+    // the ordered ingest below is unaffected by completion order.
+    let concurrency = imap_config.fetch_concurrency.clamp(1, 8);
+    let fetched_results: Vec<Result<super::fetch::StoreFetch>> = {
+        use futures::stream::StreamExt;
+        futures::stream::iter(targets.iter().zip(knowns).map(|(target, known)| async move {
+            let mut session = open_imap_session(imap_config).await?;
+            let out =
+                fetch_new_raw_on_session(&mut session, &target.server_name, Some(limit), known)
+                    .await;
+            session.logout().await.ok();
+            out
+        }))
+        .buffered(concurrency)
+        .collect()
+        .await
+    };
+    span.mark("fetch");
+
+    // Phase 3: ingest serially, in target order. Every store write happens
+    // here on one thread, so per-mailbox transaction boundaries cannot
+    // interleave and the prune ordering (inbox before archive before sent)
+    // holds exactly as it did on the single-session path.
+    for (target, fetched) in targets.iter().zip(fetched_results) {
         let fetched = match fetched {
             Ok(v) => v,
             Err(e) => {
@@ -296,9 +331,6 @@ pub async fn sync_mailboxes(
     }
     span.mark("prune");
 
-    session.logout().await.ok();
-    span.mark("logout");
-
     Ok(result)
 }
 
@@ -323,4 +355,53 @@ pub async fn list_mailboxes(imap_config: &ImapConfig) -> Result<Vec<String>> {
 
     session.logout().await.ok();
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A future that returns `Poll::Pending` `n` times before resolving to its
+    /// value, rescheduling itself each time. Used to make the parallel fetches
+    /// finish in a deliberately scrambled order.
+    struct ReadyAfter {
+        remaining: usize,
+        value: usize,
+    }
+
+    impl Future for ReadyAfter {
+        type Output = usize;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+            if self.remaining == 0 {
+                Poll::Ready(self.value)
+            } else {
+                self.remaining -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// The load-bearing property of the #0005 parallel fetch: `buffered` yields
+    /// results in *input* (target) order regardless of which fetch finishes
+    /// first, so the serial ingest phase still processes inbox before archive
+    /// before sent, and the #0072 prune ordering is untouched. Swapping in
+    /// `buffer_unordered` would return `4,3,2,1,0` here and break that.
+    #[test]
+    fn buffered_fetch_yields_in_target_order_however_the_fetches_finish() {
+        use futures::stream::StreamExt;
+        let out: Vec<usize> = futures::executor::block_on(async {
+            futures::stream::iter((0..5usize).map(|i| ReadyAfter {
+                // input 0 stalls longest, input 4 finishes first
+                remaining: (5 - i) * 2,
+                value: i,
+            }))
+            .buffered(5)
+            .collect()
+            .await
+        });
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    }
 }

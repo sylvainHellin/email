@@ -118,6 +118,7 @@ pub async fn cmd_oauth2_login(account_name: Option<&str>) -> Result<()> {
             password: cache.access_token.clone(),
             accept_invalid_certs: account.imap.accept_invalid_certs,
             auth_method: AuthMethod::OAuth2,
+            fetch_concurrency: 1,
         };
 
         match async {

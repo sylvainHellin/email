@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **IMAP sync fetches its mailboxes in parallel now (#0005).** A sync used to
+  SELECT each mailbox in turn on one connection, paying the round-trip latency
+  once per mailbox; it now opens one connection per mailbox and overlaps them,
+  turning `N * latency` into roughly one. On a warm three-mailbox account this
+  cut `mp sync` from about 1.9s to 0.7s (Gmail) and 2.5s to 1.3s (Exchange).
+  The fan-out is capped by a new per-account setting, `[accounts.imap]
+  fetch_concurrency` (default 4, range 1-8); set it to 1 to restore the old
+  single-connection behaviour if a server throttles. Only the network fetch
+  runs in parallel, ingest still writes to the store serially in mailbox order,
+  so nothing about the prune or flag behaviour changes.
+
 - **The config directory is now `~/.config/mailypoppins/` (#0022).** It was
   `~/.config/email/`, which was the last user-visible place the old name
   survived. Your existing directory is moved for you, once, the next time you

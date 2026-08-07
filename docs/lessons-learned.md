@@ -664,3 +664,11 @@ Remove the file first and treat `NotFound` as success ([src/tui/actions.rs](../s
 A backslash is an escape inside a double-quoted YAML scalar, so `<a\b@x>` is read back mangled as `<a\u{8}@x>` and `<a\qb@x>` is not a valid escape at all: it fails the scan, which fails the *whole draft's* parse, and the reply then disappears from the drafts index with only a log line behind it (the silent-skip mode #0064 named).
 Wherever a header value is interpolated into a quoted scalar rather than serialised, both `"` and `\` have to be handled, and the same holds one layer out for an IMAP quoted string, which escapes exactly those two characters (RFC 3501 section 4.3).
 Dropping the value beats escaping it when the value only exists to be looked up again, and a `Message-ID` carrying either character is not one a server issued.
+
+## Parallel network fetch is safe only if it never touches the store
+
+Sync got a per-mailbox parallel fetch ([#0005](tickets/0005-parallel-imap-fetch-per-mailbox.md)), and the temptation is to parallelise the whole loop, fetch and ingest together.
+That loop carries the #0072 prune gate, the arrival marks and the deferred second prune pass, all of which depend on ingest happening serially in target order: inbox before archive before sent, so a message archived elsewhere has its destination row before its source row is pruned.
+The change that keeps every one of those invariants is to split the loop into three phases and make only the middle one concurrent: read each mailbox's skip list from the store serially, fetch every mailbox in parallel with no store access at all, then ingest serially in target order exactly as before.
+The concurrency runs on `futures::stream::buffered`, not `buffer_unordered`, because `buffered` yields its results in input order however the fetches finish, so the serial ingest still sees its mailboxes in target order and the SQLite single-writer discipline is never in question.
+The load-bearing property is that swap, and it is one identifier, so it is pinned by a test that stalls the first future longest and asserts the output still comes back in order.

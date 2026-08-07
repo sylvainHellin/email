@@ -125,7 +125,8 @@ TUI actions branch on `app.is_graph()`.
 ### IMAP
 
 The orchestrator is `src/imap_client/store_sync.rs`.
-One session for the whole sync.
+IMAP allows one SELECTed mailbox per connection, so the mailboxes are fetched in parallel, each on its own session, up to `imap.fetch_concurrency` at once (default 4, clamped to [1, 8]); #0005.
+The store reads that seed each fetch happen serially first, the network fetches overlap, and ingest runs serially in target order afterwards, so `buffered` (which preserves input order) keeps the #0072 prune ordering and the single-writer SQLite discipline intact.
 Per mailbox, `UID SEARCH ALL` gives the UID list, the last `limit` UIDs are the window, pass 1 fetches `(UID FLAGS)` over the whole window and pass 2 downloads `BODY.PEEK[]` only for UIDs the store does not hold.
 The store answers "which UIDs do I hold" with one query, so there is no local scan and no dedup pass.
 IMAP supports implicit TLS (port 993) and STARTTLS (any other port, for example 1143 for Proton Bridge); the `ImapStream` wrapper injects a fake greeting for STARTTLS because `async_imap` expects one.
