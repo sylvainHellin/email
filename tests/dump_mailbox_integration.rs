@@ -42,7 +42,7 @@ fn email(from: &str, to: &str, subject: &str, date: &str) -> FetchedEmail {
         has_attachments: false,
         message_id: None,
         attachments: Vec::new(),
-        is_read: false,
+        flags: Default::default(),
         calendar_ics: None,
         event: None,
     }
@@ -111,7 +111,7 @@ default_from = "beta@example.com"
     );
     bericht.cc = Some("\"Prof. Petzold\" <petzold@example.com>".to_string());
     bericht.message_id = Some("<f7ef260c@example.com>".to_string());
-    bericht.is_read = true;
+    bericht.flags = email::types::MessageFlags::seen(true);
     bericht.has_attachments = true;
     bericht.attachments = vec![
         AttachmentData {
@@ -201,7 +201,7 @@ default_from = "beta@example.com"
         "Sun, 28 Jun 2026 07:00:00 +0000",
     );
     weekly.message_id = Some("<weekly-1@example.com>".to_string());
-    weekly.is_read = true;
+    weekly.flags = email::types::MessageFlags::seen(true);
     ingest(&data, "alpha", "Team/Reports", 1, &weekly);
 
     // Second account, so account ordering is exercised.
@@ -212,7 +212,7 @@ default_from = "beta@example.com"
         "Fri, 1 May 2026 05:00:00 +0000",
     );
     old.message_id = Some("<old-1@example.com>".to_string());
-    old.is_read = true;
+    old.flags = email::types::MessageFlags::seen(true);
     ingest(&data, "beta", "archive", 1, &old);
 
     // Drafts contribute nothing: they have no `messages` rows until #0050
@@ -316,6 +316,47 @@ fn dump_mailbox_honours_account_and_mailbox_selectors() {
         &["-A", "alpha", "dump-mailbox", "--json", "--mailbox", "sent", "--mailbox", "drafts"],
     );
     assert_eq!(two.lines().count(), 1, "drafts have no rows until #0050");
+}
+
+/// The second status axis reaches the dump (#TKT-0051), which is where a
+/// scripted check reads it: `answered` and `forwarded` sit beside `seen` in
+/// the same sorted token set.
+///
+/// Outside the parity record above, which was captured from a build that had
+/// no such axis: the flags are set through the same store API the post-send
+/// hook uses, on the fixture the other tests dump unchanged.
+#[test]
+fn dump_mailbox_reports_the_answered_and_forwarded_flags() {
+    let tmp = fixture_tree();
+    let account_dir = tmp.path().join("data").join("accounts").join("alpha");
+    let store = Store::open(account_dir.join("store.sqlite3")).expect("store");
+    let answered = email::store::read::find_by_message_id(&store, "alpha", "<f7ef260c@example.com>")
+        .expect("lookup")
+        .remove(0);
+    email::store::write::set_answered(&store, answered.id).expect("set answered");
+    let forwarded = email::store::read::find_by_message_id(&store, "alpha", "<weekly-1@example.com>")
+        .expect("lookup")
+        .remove(0);
+    email::store::write::set_forwarded(&store, forwarded.id).expect("set forwarded");
+    drop(store);
+
+    let out = dump(&tmp, &["-A", "alpha", "dump-mailbox", "--json"]);
+    let answered_line = out
+        .lines()
+        .find(|l| l.contains("<f7ef260c@example.com>"))
+        .expect("the answered message is dumped");
+    assert!(
+        answered_line.contains(r#""flags":["answered","seen"]"#),
+        "{answered_line}"
+    );
+    let forwarded_line = out
+        .lines()
+        .find(|l| l.contains("<weekly-1@example.com>"))
+        .expect("the forwarded message is dumped");
+    assert!(
+        forwarded_line.contains(r#""flags":["forwarded","seen"]"#),
+        "{forwarded_line}"
+    );
 }
 
 /// parity: the output format is pinned by a required flag, so a future default

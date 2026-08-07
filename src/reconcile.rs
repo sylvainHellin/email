@@ -338,7 +338,7 @@ pub(crate) mod tests {
                 has_attachments: false,
                 message_id: Some(format!("<{mailbox}-{uid}@example.com>")),
                 attachments: Vec::new(),
-                is_read: false,
+                flags: Default::default(),
                 calendar_ics: ics.map(|s| s.as_bytes().to_vec()),
                 event: None,
             };

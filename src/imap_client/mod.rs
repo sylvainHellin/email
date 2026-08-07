@@ -12,7 +12,8 @@ pub use fetch::{
     MailboxState,
 };
 pub use ops::{
-    delete_email_on_server, mark_read_on_server, mark_unread_on_server, move_email_on_server,
+    add_flag_on_server, delete_email_on_server, mark_read_on_server, mark_unread_on_server,
+    move_email_on_server,
 };
 pub use sent::ImapSentMailbox;
 pub use search::{

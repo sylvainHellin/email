@@ -2148,6 +2148,8 @@ mod tests {
             date_sort: "2026-07-01T00:00:00".to_string(),
             has_attachments: false,
             read: false,
+            answered: false,
+            forwarded: false,
             is_invite: false,
         }
     }
@@ -2322,6 +2324,8 @@ mod tests {
             subject: subject.to_string(),
             status: "draft".to_string(),
             read: true,
+            answered: false,
+            forwarded: false,
             ..entry(subject, "me")
         }
     }

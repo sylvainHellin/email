@@ -18,6 +18,7 @@ fn source(from: &str, to: &str, subject: &str, body: &str) -> SourceMessage {
         to: to.to_string(),
         cc: None,
         subject: subject.to_string(),
+        message_id: Some("<source@example.com>".to_string()),
         date: Some("Mon, 01 Jan 2024 12:00:00 +0000".to_string()),
         body: body.to_string(),
         attachments: Vec::new(),
@@ -60,6 +61,68 @@ fn test_create_reply_draft() {
     assert!(content.contains("{{SIGNATURE}}"));
     assert!(content.contains("> Original body"));
     assert!(content.contains("alice@example.com wrote:"));
+}
+
+/// A reply names the message it answers, and the value survives the parse
+/// (#TKT-0051). This is what the post-send hook reads to put `\Answered` on
+/// the source; a draft that never goes out therefore claims nothing.
+#[test]
+fn a_reply_draft_records_the_message_it_answers() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    assert!(content.contains("in_reply_to: \"<source@example.com>\""));
+    assert!(!content.contains("forwarded_from:"));
+
+    let draft = parse_email_draft(&draft_path).unwrap();
+    assert_eq!(
+        draft.frontmatter.in_reply_to.as_deref(),
+        Some("<source@example.com>")
+    );
+    assert_eq!(draft.frontmatter.forwarded_from, None);
+}
+
+/// The forward half of the same record (#TKT-0051).
+#[test]
+fn a_forward_draft_records_the_message_it_forwards() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let source = source("alice@example.com", "me@example.com", "Hello", "Forward me");
+    let draft_path =
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+
+    let draft = parse_email_draft(&draft_path).unwrap();
+    assert_eq!(
+        draft.frontmatter.forwarded_from.as_deref(),
+        Some("<source@example.com>")
+    );
+    assert_eq!(draft.frontmatter.in_reply_to, None);
+}
+
+/// A source with no `Message-ID` (a server-search hit that carried none)
+/// writes no key at all rather than an empty one, and the draft still parses.
+#[test]
+fn a_source_without_a_message_id_leaves_the_key_out() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let mut source = source("alice@example.com", "me@example.com", "Hello", "Body");
+    source.message_id = None;
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    assert!(!content.contains("in_reply_to:"));
+    assert_eq!(
+        parse_email_draft(&draft_path).unwrap().frontmatter.in_reply_to,
+        None
+    );
 }
 
 #[test]
@@ -562,6 +625,8 @@ fn test_validate_draft_missing_attachment_warning() {
             sent_at: None,
             sent_via: None,
             message_id: None,
+            in_reply_to: None,
+            forwarded_from: None,
             event: None,
         },
         body_markdown: "Body".to_string(),
@@ -594,6 +659,8 @@ fn test_validate_draft_existing_attachment_no_warning() {
             sent_at: None,
             sent_via: None,
             message_id: None,
+            in_reply_to: None,
+            forwarded_from: None,
             event: None,
         },
         body_markdown: "Body".to_string(),

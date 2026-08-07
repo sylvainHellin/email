@@ -72,6 +72,7 @@ use crate::parse::FetchedEmail;
 use crate::store::blobs::BlobHash;
 use crate::store::{BlobStore, Store};
 use crate::timing::TimingSpan;
+use crate::types::MessageFlags;
 
 /// How many characters of the body are kept in the `snippet` column.
 const SNIPPET_CHARS: usize = 200;
@@ -270,7 +271,7 @@ fn ingest_in_tx(
 
     let date_sort = date_sort_for(&email.date);
     let snippet = snippet_for(&email.body_text);
-    let flags = if email.is_read { "\\Seen" } else { "" };
+    let flags = email.flags.to_flag_string();
     let body_blob = refs
         .iter()
         .find(|r| r.kind == KIND_BODY)
@@ -672,19 +673,38 @@ pub fn known_message_ids(
     Ok(out)
 }
 
-/// Apply the server's `\Seen` state to a row that is already in the store.
+/// Apply the server's flags to a row that is already in the store (#TKT-0051).
 ///
-/// Returns true when the stored flags actually changed. The server is truth
-/// here, so there is no cutoff guard: a local flag change becomes a
-/// `pending_ops` entry (#0039) rather than a file the sync must not clobber.
-pub fn apply_seen_flag(
+/// `resolve` is handed the flags the row carries now and returns the ones it
+/// should carry: which of the three bits a backend is entitled to answer for
+/// is the caller's business, not this function's. IMAP fetches the whole
+/// `FLAGS` set and replaces it; Graph only knows `isRead` and merges that one
+/// bit in, so its passes cannot erase an `\Answered` it was never told about.
+///
+/// Returns true when the stored string actually changed, and false for a UID
+/// the store does not hold. The server is truth here, so there is no cutoff
+/// guard: a local flag change becomes a `pending_ops` entry (#0039) rather
+/// than a file the sync must not clobber.
+pub fn apply_flag(
     store: &Store,
     account: &str,
     mailbox: &str,
     uid: i64,
-    is_read: bool,
+    resolve: impl FnOnce(MessageFlags) -> MessageFlags,
 ) -> Result<bool> {
-    let flags = if is_read { "\\Seen" } else { "" };
+    let current: Option<Option<String>> = store
+        .conn()
+        .query_row(
+            "SELECT flags FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            rusqlite::params![account, mailbox, uid],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading a row's flags")?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let flags = resolve(MessageFlags::parse(current.as_deref().unwrap_or_default())).to_flag_string();
     let changed = store
         .conn()
         .execute(
@@ -692,45 +712,83 @@ pub fn apply_seen_flag(
              WHERE account = ?1 AND mailbox = ?2 AND uid = ?3 AND IFNULL(flags, '') <> ?4",
             rusqlite::params![account, mailbox, uid, flags],
         )
-        .context("applying a server read flag")?;
+        .context("applying server flags")?;
     Ok(changed > 0)
 }
 
-/// Apply a whole mailbox's worth of server `\Seen` states in one transaction,
-/// returning how many rows actually changed.
+/// Apply a whole mailbox's worth of server flag sets in one transaction,
+/// returning how many rows actually changed. The IMAP entry point: the server
+/// listed every flag it holds, so what it listed is what the row carries.
 ///
 /// Every sync pass hands over the flags of every message the server listed, so
 /// this is O(mailbox) `UPDATE`s per pass. In autocommit each one is its own
-/// fsync; one transaction makes the pass a single commit. Both backends go
-/// through here.
+/// fsync; one transaction makes the pass a single commit.
 ///
 /// Best-effort in the same sense as [`prune_vanished`]: a row that refuses to
 /// update is logged and the rest still go. A commit that fails loses the whole
 /// pass's flag updates, which the next sync recomputes from the server, so it
 /// is logged and reported as zero rather than returned as an error.
+pub fn apply_flags(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    flags: impl IntoIterator<Item = (i64, MessageFlags)>,
+) -> usize {
+    apply_flag_updates(
+        store,
+        account,
+        mailbox,
+        flags.into_iter().map(|(uid, server)| (uid, move |_| server)),
+    )
+}
+
+/// Apply a whole mailbox's worth of server `\Seen` states in one transaction,
+/// leaving the history bits (#TKT-0051) alone. The Graph entry point: Graph
+/// answers `isRead` and nothing else, so a pass that wrote the whole flag set
+/// would erase every `\Answered` and `$Forwarded` the store holds.
 pub fn apply_seen_flags(
     store: &Store,
     account: &str,
     mailbox: &str,
     flags: impl IntoIterator<Item = (i64, bool)>,
 ) -> usize {
+    apply_flag_updates(
+        store,
+        account,
+        mailbox,
+        flags
+            .into_iter()
+            .map(|(uid, seen)| (uid, move |have: MessageFlags| have.with_seen(seen))),
+    )
+}
+
+/// The shared transaction both entry points above run in.
+fn apply_flag_updates<F>(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    updates: impl IntoIterator<Item = (i64, F)>,
+) -> usize
+where
+    F: FnOnce(MessageFlags) -> MessageFlags,
+{
     let tx = match store.conn().unchecked_transaction() {
         Ok(tx) => tx,
         Err(e) => {
-            warn!("Failed to open the read-flag transaction for '{mailbox}': {e:#}");
+            warn!("Failed to open the flag transaction for '{mailbox}': {e:#}");
             return 0;
         }
     };
     let mut updated = 0;
-    for (uid, is_read) in flags {
-        match apply_seen_flag(store, account, mailbox, uid, is_read) {
+    for (uid, resolve) in updates {
+        match apply_flag(store, account, mailbox, uid, resolve) {
             Ok(true) => updated += 1,
             Ok(false) => {}
-            Err(e) => warn!("Failed to apply the read flag for UID {uid}: {e:#}"),
+            Err(e) => warn!("Failed to apply the flags of UID {uid}: {e:#}"),
         }
     }
     if let Err(e) = tx.commit() {
-        warn!("Failed to commit the read flags for '{mailbox}': {e:#}");
+        warn!("Failed to commit the flags for '{mailbox}': {e:#}");
         return 0;
     }
     updated
@@ -1022,7 +1080,7 @@ mod tests {
             has_attachments: false,
             message_id: None,
             attachments: Vec::new(),
-            is_read: false,
+            flags: MessageFlags::default(),
             calendar_ics: None,
             event: None,
         }

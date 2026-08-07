@@ -419,10 +419,92 @@ mod tests {
                 sent_at: None,
                 sent_via: None,
                 message_id: None,
+                in_reply_to: None,
+                forwarded_from: None,
                 event: None,
             },
             body_markdown: String::new(),
         }
+    }
+
+    /// The second status axis is written from the draft that caused it: a
+    /// reply names its source in `in_reply_to:`, a forward in
+    /// `forwarded_from:`, and an ordinary draft names nothing (#TKT-0051).
+    #[test]
+    fn only_a_reply_or_a_forward_has_a_source_to_flag() {
+        let mut reply = draft_with(None, "/drafts/r.md");
+        reply.frontmatter.in_reply_to = Some("<src@example.com>".to_string());
+        assert_eq!(source_to_flag(&reply), Some(("<src@example.com>", true)));
+
+        let mut forward = draft_with(None, "/drafts/f.md");
+        forward.frontmatter.forwarded_from = Some(" <src@example.com> ".to_string());
+        assert_eq!(source_to_flag(&forward), Some(("<src@example.com>", false)));
+
+        assert_eq!(source_to_flag(&draft_with(None, "/drafts/plain.md")), None);
+
+        let mut blank = draft_with(None, "/drafts/blank.md");
+        blank.frontmatter.in_reply_to = Some("   ".to_string());
+        assert_eq!(source_to_flag(&blank), None);
+    }
+
+    /// The local half of the post-send hook flags *every* copy of the source,
+    /// because one message is one row per mailbox and the archived copy is as
+    /// likely to be the one on screen (#TKT-0051).
+    #[test]
+    fn sending_a_reply_flags_every_local_copy_of_its_source() {
+        let fx = crate::reconcile::tests::fixture();
+        let inbox = fx.ingest_plain("inbox", 7, "Question");
+        // The same Message-ID filed in a second mailbox: `ingest_plain` keys
+        // its id on `(mailbox, uid)`, so the archive copy is ingested under the
+        // inbox row's identity by hand.
+        fx.store
+            .conn()
+            .execute(
+                "INSERT INTO messages (account, mailbox, uid, message_id, subject)
+                 SELECT account, 'archive', 99, message_id, subject FROM messages WHERE id = ?1",
+                [inbox],
+            )
+            .unwrap();
+
+        let message_id = crate::store::read::find_by_id(&fx.store, inbox)
+            .unwrap()
+            .unwrap()
+            .message_id;
+        let flagged = mark_source_locally(&fx.store, "alice", &message_id, true);
+        assert_eq!(flagged.len(), 2, "both copies are found by Message-ID");
+        for row in crate::store::read::find_by_message_id(&fx.store, "alice", &message_id).unwrap() {
+            assert!(row.is_answered(), "{} was not flagged", row.mailbox);
+            assert!(!row.is_forwarded());
+        }
+    }
+
+    /// A forward sets the other bit, and neither write disturbs the read bit
+    /// the row already carried.
+    #[test]
+    fn forwarding_sets_the_forwarded_bit_and_leaves_the_read_bit_alone() {
+        let fx = crate::reconcile::tests::fixture();
+        let id = fx.ingest_plain("inbox", 3, "Passing this on");
+        crate::store::write::set_read(&fx.store, id, true).unwrap();
+
+        let message_id = crate::store::read::find_by_id(&fx.store, id)
+            .unwrap()
+            .unwrap()
+            .message_id;
+        mark_source_locally(&fx.store, "alice", &message_id, false);
+
+        let row = crate::store::read::find_by_id(&fx.store, id).unwrap().unwrap();
+        assert!(row.is_forwarded());
+        assert!(!row.is_answered());
+        assert!(row.is_read(), "the read bit survives a history write");
+    }
+
+    /// A source the store does not hold flags nothing and says so, which is
+    /// what keeps the hook silent for a reply to a message that has since been
+    /// deleted.
+    #[test]
+    fn a_source_the_store_does_not_hold_flags_nothing() {
+        let fx = crate::reconcile::tests::fixture();
+        assert!(mark_source_locally(&fx.store, "alice", "<gone@example.com>", true).is_empty());
     }
 
     /// The key is the frontmatter id when there is one, because that is what
@@ -1622,11 +1704,130 @@ pub async fn send_draft(draft: &EmailDraft, ctx: &SendContext) -> Result<SentDra
         // so the correspondent is worth remembering whether or not the file
         // could be retired.
         crate::contacts::hooks::bump_after_send(&ctx.account, draft);
+        mark_source_after_send(draft, ctx).await;
     }
     Ok(SentDraft {
         report,
         settle_error,
     })
+}
+
+/// The source a sent draft has something to say about, and which bit it sets:
+/// `true` for `\Answered`, `false` for `$Forwarded` (#TKT-0051).
+///
+/// A draft carries at most one of the two keys, because it was built as a
+/// reply or as a forward and never as both; a reply wins if a hand-edited
+/// draft names both, since answering is the stronger statement.
+fn source_to_flag(draft: &EmailDraft) -> Option<(&str, bool)> {
+    let (message_id, answered) = match (
+        draft.frontmatter.in_reply_to.as_deref(),
+        draft.frontmatter.forwarded_from.as_deref(),
+    ) {
+        (Some(id), _) => (id.trim(), true),
+        (None, Some(id)) => (id.trim(), false),
+        (None, None) => return None,
+    };
+    (!message_id.is_empty()).then_some((message_id, answered))
+}
+
+/// Flag every local copy of the source and hand back the rows that were found.
+///
+/// Every copy, because the same message is one row per mailbox and the user is
+/// as likely to be looking at the archived one as at the inbox one. A row that
+/// refuses the write is logged and the rest still go: this runs after a
+/// message has already left, and nothing here may turn a successful send into
+/// a failure.
+fn mark_source_locally(
+    store: &crate::store::Store,
+    account: &str,
+    message_id: &str,
+    answered: bool,
+) -> Vec<crate::store::read::MessageRow> {
+    let rows = match crate::store::read::find_by_message_id(store, account, message_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("[send] could not look {message_id} up to flag it: {e:#}");
+            return Vec::new();
+        }
+    };
+    for row in &rows {
+        let written = if answered {
+            crate::store::write::set_answered(store, row.id)
+        } else {
+            crate::store::write::set_forwarded(store, row.id)
+        };
+        if let Err(e) = written {
+            warn!("[send] could not flag message row {}: {e:#}", row.id);
+        }
+    }
+    rows
+}
+
+/// The second status axis, written after the message actually went out
+/// (#TKT-0051).
+///
+/// A reply draft carries `in_reply_to:` and a forward carries
+/// `forwarded_from:`, both the source's `Message-ID`; this is the one reader
+/// of either. The order is local first, server second, because the local write
+/// is what the list redraws from and the server op is the half that can fail.
+///
+/// Best effort throughout: nothing here may fail a send that already
+/// succeeded, and nothing here is retried. The self-heal is the sync itself,
+/// which restates every flag the server holds over the whole window, so a
+/// `UID STORE` that never landed is corrected on the next pass rather than
+/// leaving the store claiming something the server denies.
+///
+/// The Graph path writes locally and stops: Graph exposes the answered state
+/// only through extended MAPI properties, and the backend is parked (#0042,
+/// #0055). Its flag merge (`ingest::apply_seen_flags`) is what keeps a Graph
+/// sync from erasing what is written here.
+async fn mark_source_after_send(draft: &EmailDraft, ctx: &SendContext) {
+    let Some((message_id, answered)) = source_to_flag(draft) else {
+        return;
+    };
+
+    let store = match crate::store::Store::open_account(&ctx.account.name) {
+        Ok(store) => store,
+        Err(e) => {
+            warn!("[send] could not open the store to flag {message_id}: {e:#}");
+            return;
+        }
+    };
+    let rows = mark_source_locally(&store, &ctx.account.name, message_id, answered);
+    drop(store);
+    if rows.is_empty() {
+        debug!("[send] nothing local to flag for {message_id}");
+        return;
+    }
+
+    if ctx.graph.is_some() {
+        return;
+    }
+    let imap_config = match crate::config::ImapConfig::load(&ctx.account) {
+        Ok(config) => config,
+        Err(e) => {
+            debug!("[send] no IMAP config to flag {message_id} on the server: {e:#}");
+            return;
+        }
+    };
+    let flag = if answered {
+        crate::types::FLAG_ANSWERED
+    } else {
+        crate::types::FLAG_FORWARDED
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    for row in &rows {
+        let server_mailbox = crate::config::find_server_name_for_role(&ctx.account, &row.mailbox);
+        if !seen.insert(server_mailbox.clone()) {
+            continue;
+        }
+        if let Err(e) =
+            crate::imap_client::add_flag_on_server(&imap_config, message_id, &server_mailbox, flag)
+                .await
+        {
+            warn!("[send] could not set {flag} on {message_id} in {server_mailbox}: {e:#}");
+        }
+    }
 }
 
 /// Run every outstanding APPEND for one account, best effort.

@@ -219,6 +219,8 @@ fn email(
         date_sort: format!("{date}T09:00:00"),
         has_attachments,
         read,
+        answered: false,
+        forwarded: false,
         is_invite,
     }
 }
@@ -425,6 +427,30 @@ fn golden_mail_view_with_selection() {
     // are separate signals and must stay separable in the legend.
     app.list_index = 1;
     app.prime_preview_body(BODY_ROW_2);
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The mail view with the second status axis on screen (#TKT-0051): the same
+/// fixture with one answered row and one forwarded row, so the marker column
+/// carries all four of its states at once (unread, answered, forwarded,
+/// read).
+///
+/// Captured separately from the default frame, which stays the read/unread
+/// picture users see most, and which is what the pre-nuke parity capture was
+/// recorded against.
+#[test]
+fn golden_mail_view_with_the_status_axis() {
+    let mut app = mail_fixture();
+    let mut emails = (*app.emails).clone();
+    emails[1].answered = true;
+    emails[3].forwarded = true;
+    // Answered outranks forwarded on one row, which is the only precedence
+    // rule a frame can show.
+    emails[4].answered = true;
+    emails[4].forwarded = true;
+    app.emails = Arc::new(emails);
+    app.email_cache = vec![Some(Arc::clone(&app.emails)), None, None, None];
+    app.rebuild_visible();
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 

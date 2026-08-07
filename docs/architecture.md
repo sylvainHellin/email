@@ -50,6 +50,8 @@ Schema v5 lives in `src/store/schema.rs`, which carries the identity notes in fu
 
 - `messages` is one row per message per mailbox, with a synthetic `id` and `UNIQUE (account, mailbox, uid)` as the real identity.
 The same message in two mailboxes is two rows.
+Its `flags` column holds the IMAP flag string, which is where the second status axis lives (#TKT-0051): `\Seen`, `\Answered` and the `$Forwarded` keyword, parsed into `types::MessageFlags`.
+Three independent bits rather than one state, and no schema change, because the column was already there and every sync pass restates it for the whole window.
 The `messages_message_id` index is deliberately non-unique: it serves threading, idempotent re-ingest, cross-mailbox copy detection and selector resolution.
 - `blobs` is the refcount index for the content-addressed blob store, and `message_blobs` is the per-message list of `body`, `html`, `raw` and `attachment` references.
 Refcounts live in the database so a reference can be taken in the same transaction as the row that carries the hash.
@@ -95,6 +97,9 @@ Neither ordering survives a crash between the halves; the durable queue that wou
 
 `send::send_draft(&EmailDraft, &SendContext) -> SentDraft` is the one orchestration behind `mp send`, `mp send-approved` and both TUI send keys: it builds the bytes, commits the outbox row, submits over SMTP or Graph depending on which the context names, and retires the draft file.
 Callers keep only what differs between them, the confirmation prompt, the wording of the result and the exit code.
+
+A reply or forward draft names its source in `in_reply_to:` / `forwarded_from:`, and `send::mark_source_after_send` is the one reader: after a successful submission it flags every local copy of that source `\Answered` or `$Forwarded` and then issues `UID STORE +FLAGS` per mailbox (#TKT-0051).
+Local first, server second, best effort throughout: nothing there may fail a send that already went out, and a `UID STORE` that never landed is corrected by the next sync rather than retried.
 
 `src/send.rs` builds the message, then `DurableSend::begin` commits the raw bytes as a blob and a `pending_send` outbox row *before* SMTP opens.
 Submission is per recipient: each recipient gets an individual envelope while the visible To and Cc headers are preserved for all, which gives per-recipient success and failure tracking.
@@ -144,7 +149,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 
 | File | Responsibility |
 |------|---------------|
-| `src/types.rs` | Shared types: `EmailStatus` (the three draft states), `MailboxRole` (the store's mailbox key), `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
+| `src/types.rs` | Shared types: `EmailStatus` (the three draft states), `MessageFlags` (the received-mail status axis: seen, answered, forwarded), `MailboxRole` (the store's mailbox key), `EmailFrontmatter`, `EmailDraft`, `EventFrontmatter`, `collapse_hyphens` |
 | `src/config.rs` | Config loading (`~/.config/email/config.toml`), secrets-backend dispatch, data dir helpers (`mailypoppins_data_dir`, `account_dir`, `store_path`, `blobs_dir`, `drafts_dir`, `tokens_dir`, `logs_dir`, `contacts_cache_path`), legacy-config rejection, logging init |
 | `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). See [secrets.md](secrets.md). |
 | `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |
@@ -239,8 +244,9 @@ Resolution is one indexed lookup; an ambiguous key lists every candidate and ask
 These exist for measured reasons; do not regress them without re-measuring.
 
 - **Pass 1 covers the full window.**
-The `\Seen` flags it collects are the only server-to-local read-status channel, so any "probe fewer UIDs first and bail early" optimisation silently breaks read/unread sync.
+The flags it collects are the only server-to-local channel for the whole status axis (`\Seen`, `\Answered`, `$Forwarded`), so any "probe fewer UIDs first and bail early" optimisation silently breaks read/unread sync and the answered/forwarded state with it.
 This happened once already (#0004).
+IMAP states the whole flag set and is truth for all three bits (`ingest::apply_flags`); Graph knows only `isRead` and merges that one bit in (`ingest::apply_seen_flags`), so a Graph pass cannot erase an `\Answered` no Graph call can restate.
 - **The prune is clamped to the window's UID range.**
 `UID SEARCH ALL` returns the whole mailbox but the window is only its newest `limit` UIDs, so only a known UID *between* the window's lowest and highest is provably gone from the server.
 Negative UIDs (the local-move sentinel) and hash-sized UIDs (an APPEND with no `APPENDUID`) fall outside by construction.
@@ -293,7 +299,7 @@ The OS keyring service name (when the keyring backend is opted into) remains `em
 
 ## Testing
 
-- **811 tests**: 691 unit and 120 integration, run by `cargo test`.
+- **920 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).

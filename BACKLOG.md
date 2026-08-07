@@ -9,7 +9,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 > Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056, #0057, #0058 and #0064 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0071; #0065, #0066, #0068 and #0071 have shipped.
 
 - [#0022 consistent naming](docs/tickets/0022-consistent-naming.md) -- refactor
-- [#TKT-0051 email status](docs/tickets/TKT-0051-email-status.md) -- feature _(its prerequisite #0064 has shipped: `EmailStatus` is narrowed to the three draft states)_
 
 ## Next
 
@@ -18,7 +17,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0073 No way to delete a draft (CLI selector rejected, TUI `d` reports "nothing to delete")](docs/tickets/0073-delete-draft.md) -- bug
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
-- [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
+- [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature _(also owns the "list the related emails" half of #TKT-0051)_
 - [#TKT-0048 Contacts/Calendar visual polish to match overlay quality](docs/tickets/TKT-0048-views-visual-polish.md) -- feature
 
 ## Later

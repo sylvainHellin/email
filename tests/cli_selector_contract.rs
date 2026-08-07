@@ -104,7 +104,7 @@ impl Fixture {
             has_attachments: false,
             message_id: Some(format!("<{message_id}>")),
             attachments: Vec::new(),
-            is_read: false,
+            flags: Default::default(),
             calendar_ics: None,
             event: None,
         };

@@ -46,6 +46,7 @@ use rusqlite::OptionalExtension;
 
 use crate::store::blobs::BlobHash;
 use crate::store::{BlobStore, Store};
+use crate::types::MessageFlags;
 
 /// The sidecar name ingest gives the iMIP payload of an invite. It is an
 /// attachment blob like any other, but it is not user-facing attachment: the
@@ -75,7 +76,7 @@ pub struct MessageRow {
     /// strings the TUI and the dump use are derived from it by
     /// `tui::app::resolve_date`, so both stacks apply the same rule.
     pub date_display: Option<String>,
-    /// IMAP flag string, `\Seen` or empty.
+    /// IMAP flag string: the tokens of [`MessageFlags`], space separated.
     pub flags: Option<String>,
     pub has_attachments: bool,
     pub body_blob: Option<String>,
@@ -86,11 +87,25 @@ pub struct MessageRow {
 }
 
 impl MessageRow {
+    /// The second status axis (#TKT-0051), parsed out of the flag string.
+    pub fn flags(&self) -> MessageFlags {
+        MessageFlags::parse(self.flags.as_deref().unwrap_or_default())
+    }
+
     /// True when the server flagged the message as read.
     pub fn is_read(&self) -> bool {
-        self.flags
-            .as_deref()
-            .is_some_and(|f| f.contains("\\Seen"))
+        self.flags().seen
+    }
+
+    /// True when a reply to this message has gone out, from here or from any
+    /// other client the server told us about.
+    pub fn is_answered(&self) -> bool {
+        self.flags().answered
+    }
+
+    /// True when this message has been forwarded.
+    pub fn is_forwarded(&self) -> bool {
+        self.flags().forwarded
     }
 }
 
@@ -567,7 +582,7 @@ mod tests {
             has_attachments: false,
             message_id: Some(format!("<{subject}@example.com>")),
             attachments: Vec::new(),
-            is_read: false,
+            flags: Default::default(),
             calendar_ics: None,
             event: None,
         }
@@ -887,7 +902,7 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
     fn the_seen_flag_reads_back_off_the_row() {
         let fx = fixture();
         let mut e = email("read", "Mon, 01 Jan 2024 09:00:00 +0000");
-        e.is_read = true;
+        e.flags = crate::types::MessageFlags::seen(true);
         ingest(&fx, "inbox", 1, &e);
         ingest(&fx, "inbox", 2, &email("unread", "Mon, 01 Jan 2024 08:00:00 +0000"));
 

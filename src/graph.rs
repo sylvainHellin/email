@@ -828,7 +828,14 @@ fn graph_message_to_fetched_email(msg: &GraphMessage) -> FetchedEmail {
         has_attachments: msg.has_attachments,
         message_id,
         attachments: Vec::new(), // filled by caller if has_attachments
-        is_read: msg.is_read,
+        // Graph answers `isRead` and nothing else: the other two bits of the
+        // second axis (#TKT-0051) stay unset on this path, and the flag merge
+        // in `ingest::apply_seen_flags` is what keeps a Graph pass from
+        // erasing one a user set here. Ingest itself writes the set verbatim,
+        // so a *re-download* of a row this build flagged would drop that flag;
+        // the Graph fetch only downloads Message-IDs the store does not hold
+        // (`ingest::known_message_ids`), which is what keeps that out of reach.
+        flags: crate::types::MessageFlags::seen(msg.is_read),
         calendar_ics: None, // filled by caller once attachments are fetched
         event: None,
     }
@@ -1262,7 +1269,7 @@ pub async fn sync_mailboxes_graph(
 
         // Read status for messages the store already holds, one transaction
         // for the whole folder.
-        result.read_updated += crate::ingest::apply_seen_flags(
+        result.flags_updated += crate::ingest::apply_seen_flags(
             &store,
             account_name,
             target.role.as_str(),
@@ -1912,7 +1919,7 @@ mod tests {
             has_attachments: true,
             message_id: None,
             attachments,
-            is_read: false,
+            flags: Default::default(),
             calendar_ics: None,
             event: None,
         }

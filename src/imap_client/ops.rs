@@ -178,6 +178,55 @@ pub async fn mark_read_on_server(
     Ok(())
 }
 
+/// Add one flag to a message on the server, by `Message-ID` (#TKT-0051).
+///
+/// The write half of the second status axis: `\Answered` when a reply goes
+/// out, `$Forwarded` when a forward does. `+FLAGS` rather than `FLAGS`, so
+/// nothing the server already holds is cleared, and a message the search does
+/// not find is not an error -- the row may have been moved or deleted
+/// elsewhere since the draft was written, and the message still went out.
+///
+/// A server that refuses the keyword (`PERMANENTFLAGS` without `\*`) fails
+/// here, which the caller logs and lives with: the next sync overwrites the
+/// local bit with what the server believes, so the two never drift silently.
+pub async fn add_flag_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+    flag: &str,
+) -> Result<()> {
+    info!("Adding {flag} on server: Message-ID={message_id} in {mailbox}");
+    let mut session = open_imap_session(imap_config).await?;
+
+    session
+        .select(mailbox)
+        .await
+        .map_err(|e| anyhow!("Failed to select {}: {}", mailbox, e))?;
+
+    let query = format!("HEADER Message-ID \"{}\"", message_id);
+    let uids = session
+        .uid_search(&query)
+        .await
+        .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
+
+    if uids.is_empty() {
+        session.logout().await.ok();
+        return Ok(());
+    }
+
+    let uid = *uids.iter().next().expect("uids verified non-empty");
+    session
+        .uid_store(&uid.to_string(), &format!("+FLAGS ({flag})"))
+        .await
+        .map_err(|e| anyhow!("Failed to set the {} flag: {}", flag, e))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
+
+    session.logout().await.ok();
+    Ok(())
+}
+
 /// Mark an email as unread (remove \Seen) on the IMAP server.
 pub async fn mark_unread_on_server(
     imap_config: &ImapConfig,

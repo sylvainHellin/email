@@ -2466,6 +2466,8 @@ mod tests {
             date_sort: "2026-07-01T00:00:00".to_string(),
             has_attachments: false,
             read: false,
+            answered: false,
+            forwarded: false,
             is_invite,
         }
     }
@@ -2767,7 +2769,7 @@ mod store_backed_drafts {
             has_attachments: false,
             message_id: Some(format!("<{subject}@example.com>")),
             attachments: Vec::new(),
-            is_read: true,
+            flags: crate::types::MessageFlags::seen(true),
             calendar_ics: None,
             event: None,
         }
@@ -3099,6 +3101,8 @@ mod store_backed_mutations {
             date_sort: "2026-07-01T00:00:00".to_string(),
             has_attachments: false,
             read: true,
+            answered: false,
+            forwarded: false,
             is_invite: false,
         }
     }
@@ -3373,6 +3377,8 @@ mod store_backed_files {
             date_sort: String::new(),
             has_attachments: true,
             read: true,
+            answered: false,
+            forwarded: false,
             is_invite: false,
         }]);
         app.rebuild_visible();
@@ -3447,6 +3453,8 @@ mod store_backed_files {
             date_sort: "2026-07-01T00:00:00".to_string(),
             has_attachments: false,
             read: true,
+            answered: false,
+            forwarded: false,
             is_invite: false,
         }]);
         app.rebuild_visible();

@@ -37,7 +37,11 @@ pub struct FetchedEmail {
     pub has_attachments: bool,
     pub message_id: Option<String>,
     pub attachments: Vec<AttachmentData>,
-    pub is_read: bool,
+    /// What the server says has happened to this message: read, answered,
+    /// forwarded (#TKT-0051). The parser cannot know any of it -- flags are
+    /// mailbox state, not message bytes -- so it produces the empty set and
+    /// the fetch fills it in from `FLAGS`.
+    pub flags: crate::types::MessageFlags,
     /// Raw `text/calendar` payload (an iMIP invite), saved as a sidecar `.ics`
     /// next to the email. `None` when the email carries no calendar part.
     pub calendar_ics: Option<Vec<u8>>,
@@ -517,7 +521,7 @@ pub fn parse_rfc822_to_fetched_email(rfc822_body: &[u8]) -> Option<FetchedEmail>
         has_attachments: has_att,
         message_id,
         attachments: att_data,
-        is_read: false,
+        flags: crate::types::MessageFlags::default(),
         calendar_ics,
         event,
     })

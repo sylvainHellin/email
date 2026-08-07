@@ -7,6 +7,29 @@ use crate::config::ImapConfig;
 use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
 use crate::timing::TimingSpan;
+use crate::types::MessageFlags;
+
+/// The second status axis as the server states it (#TKT-0051): `\Seen`,
+/// `\Answered` and the `$Forwarded` keyword, read off one `FETCH FLAGS`
+/// response.
+///
+/// A keyword arrives as [`async_imap::types::Flag::Custom`], so it goes
+/// through [`MessageFlags::parse`] rather than a match arm, which is also what
+/// keeps the two spellings of the forwarded keyword in one place.
+fn flags_of(msg: &async_imap::types::Fetch) -> MessageFlags {
+    let mut out = MessageFlags::default();
+    for flag in msg.flags() {
+        match flag {
+            async_imap::types::Flag::Seen => out.seen = true,
+            async_imap::types::Flag::Answered => out.answered = true,
+            async_imap::types::Flag::Custom(name) => {
+                out.forwarded |= MessageFlags::parse(&name).forwarded;
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Fetch emails on an existing session using search criteria and optional limit.
 pub async fn fetch_emails_on_session(
@@ -51,7 +74,7 @@ pub async fn fetch_emails_on_session(
     for msg in fetched.iter() {
         let body_raw = msg.body().unwrap_or_default();
         if let Some(mut email) = parse_rfc822_to_fetched_email(body_raw) {
-            email.is_read = msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen));
+            email.flags = flags_of(msg);
             emails.push(email);
         }
     }
@@ -88,7 +111,8 @@ pub async fn fetch_emails(
 pub struct FetchedRaw {
     pub uid: u32,
     pub raw: Vec<u8>,
-    pub is_read: bool,
+    /// What the server says has happened to it: read, answered, forwarded.
+    pub flags: MessageFlags,
 }
 
 /// What the SELECT response said about the mailbox.
@@ -105,9 +129,10 @@ pub struct StoreFetch {
     pub messages: Vec<FetchedRaw>,
     /// How many UIDs in the window the store already held.
     pub skipped: usize,
-    /// The `\Seen` state of those already-held UIDs, the only server-to-local
-    /// read-status channel (#0004).
-    pub known_flags: Vec<(u32, bool)>,
+    /// The flags of those already-held UIDs, the only server-to-local channel
+    /// for the second status axis (#0004, #TKT-0051): read, answered and
+    /// forwarded all arrive here and nowhere else.
+    pub known_flags: Vec<(u32, MessageFlags)>,
     /// What SELECT said about the mailbox.
     pub state: MailboxState,
     /// UIDs the store holds for this mailbox that the server no longer lists.
@@ -455,12 +480,11 @@ pub async fn fetch_new_raw_on_session(
     span.mark("pass1_flags");
 
     let mut new_uids: Vec<u32> = Vec::new();
-    let mut known_flags: Vec<(u32, bool)> = Vec::new();
+    let mut known_flags: Vec<(u32, MessageFlags)> = Vec::new();
     for msg in flagged.iter() {
         let Some(uid) = msg.uid else { continue };
-        let is_seen = msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen));
         if known_uids.contains(&(uid as i64)) {
-            known_flags.push((uid, is_seen));
+            known_flags.push((uid, flags_of(msg)));
         } else {
             new_uids.push(uid);
         }
@@ -513,7 +537,7 @@ pub async fn fetch_new_raw_on_session(
         out.push(FetchedRaw {
             uid,
             raw: body.to_vec(),
-            is_read: msg.flags().any(|f| matches!(f, async_imap::types::Flag::Seen)),
+            flags: flags_of(msg),
         });
     }
 

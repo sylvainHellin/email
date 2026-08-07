@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A second status axis: read, answered, forwarded (#TKT-0051).** A message
+  used to have one bit of history, read or unread. It now carries three, and
+  they are independent: the list's marker column shows a dot for unread, a
+  reply arrow once you have answered it, a forward arrow once you have
+  forwarded it, and nothing for a message you have only read. Unread wins over
+  the two history glyphs, because new mail is what the list exists to surface.
+
+  The state is never typed in. Sending a reply marks the message it answers,
+  sending a forward marks the message it forwards, locally and on the server
+  (`\Answered` and the `$Forwarded` keyword every other client already
+  writes), and the reverse direction works too: a reply you sent from your
+  phone shows up here on the next sync. The flag is written after the message
+  has actually gone out, so a reply draft you abandon claims nothing. Reply and
+  forward drafts record their source in a new `in_reply_to:` /
+  `forwarded_from:` frontmatter key, which is what the post-send step reads.
+
+  Nothing has to be re-downloaded for this: the axis lives in the flag column
+  the store already had, and the next sync fills in the two new bits for
+  everything in its window. `mp dump-mailbox` reports them as `answered` and
+  `forwarded` beside `seen`. On a Microsoft Graph account only the read bit
+  syncs, because Graph exposes the other two through extended MAPI properties;
+  what mailypoppins sets there is kept locally and is not erased by a sync.
+
 ### Changed
 - **A mailbox is identified by its role, not by a directory path (#0064).**
   The types still described a filesystem namespace the store cutover deleted: a

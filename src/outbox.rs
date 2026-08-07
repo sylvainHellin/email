@@ -1410,7 +1410,7 @@ pub fn ingest_sent_copy(
         warn!("[outbox] the sent copy of {message_id} did not parse; not ingesting it");
         return Ok(());
     };
-    email.is_read = true;
+    email.flags = email.flags.with_seen(true);
     crate::ingest::ingest_message(
         store,
         blobs,

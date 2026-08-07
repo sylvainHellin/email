@@ -336,8 +336,8 @@ fn finish_sync(
     // sync just ingested (#0038 scope item 6), so there is nothing to bump.
 
     let mut msg = format!("Synced: {} new, {} existing", result.saved, result.skipped);
-    if result.read_updated > 0 {
-        msg.push_str(&format!(", {} read status updated", result.read_updated));
+    if result.flags_updated > 0 {
+        msg.push_str(&format!(", {} status updated", result.flags_updated));
     }
     if result.uid_rebound > 0 {
         msg.push_str(&format!(", {} renumbered", result.uid_rebound));
@@ -555,7 +555,9 @@ fn fetched_to_email_entry(account: &str, fetched: &FetchedEmail) -> EmailEntry {
         date_display,
         date_sort,
         has_attachments: fetched.has_attachments,
-        read: fetched.is_read,
+        read: fetched.flags.seen,
+        answered: fetched.flags.answered,
+        forwarded: fetched.flags.forwarded,
         is_invite: fetched.event.is_some(),
     }
 }
@@ -825,7 +827,7 @@ mod tests {
             has_attachments: true,
             message_id: Some("<m1@example.de>".to_string()),
             attachments: Vec::new(),
-            is_read: true,
+            flags: crate::types::MessageFlags::seen(true),
             calendar_ics: None,
             event: None,
         }

@@ -143,6 +143,15 @@ pub struct EmailEntry {
     pub date_sort: String,
     pub has_attachments: bool,
     pub read: bool,
+    /// True when a reply to this message has gone out (#TKT-0051), either from
+    /// here or from another client the server told us about.
+    ///
+    /// Three booleans rather than one collapsed state, because the axis is a
+    /// set: a message can be read, answered and forwarded at once. Which one
+    /// the marker column shows is [`crate::tui::ui::list`]'s decision.
+    pub answered: bool,
+    /// True when this message has been forwarded (#TKT-0051).
+    pub forwarded: bool,
     /// True when the message carries an iMIP payload, i.e. the store row has
     /// an `invite.ics` attachment blob (#0029, #0038 scope item 6).
     ///
@@ -346,7 +355,7 @@ fn status_for_mailbox(mailbox: &str) -> String {
 /// the preview shows (#0038 scope item 6, [`PreviewInvite`]).
 fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     let (date_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
-    let read = row.is_read();
+    let flags = row.flags();
     EmailEntry {
         msg: Some(MessageRef::new(row.id)),
         draft_id: None,
@@ -360,7 +369,9 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
         status: status.to_string(),
         date_display,
         date_sort,
-        read,
+        read: flags.seen,
+        answered: flags.answered,
+        forwarded: flags.forwarded,
         has_attachments: row.has_attachments,
         is_invite: row.is_invite,
     }
@@ -392,6 +403,10 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
         date_display,
         date_sort,
         read: true,
+        // The second axis is a property of received mail: a draft has neither
+        // been answered nor forwarded, it *is* the answer.
+        answered: false,
+        forwarded: false,
         has_attachments: false,
         is_invite: false,
     }
@@ -1691,7 +1706,7 @@ mod tests {
             has_attachments: false,
             message_id: Some(format!("<{subject}@example.com>")),
             attachments: Vec::new(),
-            is_read: read,
+            flags: crate::types::MessageFlags::seen(read),
             calendar_ics: None,
             event: None,
         }

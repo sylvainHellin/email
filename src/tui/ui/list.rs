@@ -13,6 +13,43 @@ use super::util::{pane_border_style, truncate};
 /// (`\u{f0c6}`); an invite may show both.
 const INVITE_GLYPH: &str = "\u{f00ed}";
 
+/// Nerd Font dot shown for a message the server has not marked `\Seen`.
+const UNREAD_GLYPH: &str = "\u{f444}";
+
+/// Nerd Font reply arrow: a reply to this message has gone out (#TKT-0051).
+const ANSWERED_GLYPH: &str = "\u{f045a}";
+
+/// Nerd Font forward arrow, the mirror of [`ANSWERED_GLYPH`]: this message has
+/// been forwarded (#TKT-0051).
+const FORWARDED_GLYPH: &str = "\u{f028d}";
+
+/// The one marker the status column shows for a message.
+///
+/// The column is two cells wide and the axis is a set (#TKT-0051), so three
+/// booleans have to collapse into one glyph. The precedence is unread,
+/// answered, forwarded, read:
+///
+/// - unread wins over everything, because new mail is the one thing the list
+///   exists to surface; hiding it behind a history glyph would be a regression
+///   of the read/unread axis the second one is supposed to sit beside;
+/// - answered outranks forwarded, because a message you replied to is settled
+///   and one you merely passed on may still be yours to answer;
+/// - a read message with no history keeps the blank cell it always had.
+fn status_marker(email: &EmailEntry) -> Span<'static> {
+    if !email.read {
+        Span::styled(UNREAD_GLYPH, Style::default().fg(theme::active().unread))
+    } else if email.answered {
+        Span::styled(ANSWERED_GLYPH, Style::default().fg(theme::active().success))
+    } else if email.forwarded {
+        Span::styled(
+            FORWARDED_GLYPH,
+            Style::default().fg(theme::active().accent_alt),
+        )
+    } else {
+        Span::styled(" ", Style::default())
+    }
+}
+
 /// Build the subject-cell prefix: invite calendar badge (if any) followed by
 /// the attachment paperclip (if any). Both, one, or neither may apply.
 fn invite_and_attachment_prefix(email: &EmailEntry) -> String {
@@ -128,7 +165,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
 
     let has_selection = !app.selection.is_empty();
 
-    // Unread indicator column is always present (2 chars)
+    // Status marker column is always present (2 chars): unread, answered or
+    // forwarded, one glyph at a time (#TKT-0051).
     let unread_col_width: usize = 2;
 
     if available_width > 45 {
@@ -177,13 +215,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                     };
                     cells.push(Cell::from(icon));
                 }
-                // Unread indicator
-                let marker = if email.read {
-                    Span::styled(" ", Style::default())
-                } else {
-                    Span::styled("\u{f444}", Style::default().fg(theme::active().unread))
-                };
-                cells.push(Cell::from(marker));
+                // Read/answered/forwarded indicator (#TKT-0051).
+                cells.push(Cell::from(status_marker(email)));
                 cells.push(Cell::from(email.date_display.clone()));
                 cells.push(Cell::from(contact));
                 cells.push(Cell::from(subject));
@@ -254,13 +287,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
                     };
                     cells.push(Cell::from(icon));
                 }
-                // Unread indicator
-                let marker = if email.read {
-                    Span::styled(" ", Style::default())
-                } else {
-                    Span::styled("\u{f444}", Style::default().fg(theme::active().unread))
-                };
-                cells.push(Cell::from(marker));
+                // Read/answered/forwarded indicator (#TKT-0051).
+                cells.push(Cell::from(status_marker(email)));
                 cells.push(Cell::from(email.date_display.clone()));
                 cells.push(Cell::from(subject));
 
@@ -303,7 +331,7 @@ mod badge_tests {
             from: "a".into(), to: "b".into(), cc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
-            has_attachments: has_att, read: false,
+            has_attachments: has_att, read: false, answered: false, forwarded: false,
             is_invite,
         }
     }
@@ -325,6 +353,38 @@ mod badge_tests {
         let p = invite_and_attachment_prefix(&entry(true, false));
         assert!(p.starts_with(INVITE_GLYPH));
         assert!(!p.contains('\u{f0c6}'));
+    }
+
+    /// The status column shows one glyph for a set of three (#TKT-0051), and
+    /// the order is unread, answered, forwarded, read. Unread wins over the
+    /// history glyphs because new mail is what the list exists to surface.
+    #[test]
+    fn the_status_marker_follows_the_precedence_unread_answered_forwarded_read() {
+        let marker = |read, answered, forwarded| {
+            let mut e = entry(false, false);
+            e.read = read;
+            e.answered = answered;
+            e.forwarded = forwarded;
+            status_marker(&e).content.to_string()
+        };
+
+        assert_eq!(marker(false, true, true), UNREAD_GLYPH);
+        assert_eq!(marker(true, true, true), ANSWERED_GLYPH);
+        assert_eq!(marker(true, false, true), FORWARDED_GLYPH);
+        assert_eq!(marker(true, false, false), " ");
+    }
+
+    /// Each glyph carries its own colour slot, so a theme can tell the three
+    /// states apart without reading the subject line.
+    #[test]
+    fn each_status_marker_carries_its_own_colour() {
+        let mut e = entry(false, false);
+        assert_eq!(status_marker(&e).style.fg, Some(theme::active().unread));
+        e.read = true;
+        e.forwarded = true;
+        assert_eq!(status_marker(&e).style.fg, Some(theme::active().accent_alt));
+        e.answered = true;
+        assert_eq!(status_marker(&e).style.fg, Some(theme::active().success));
     }
 }
 

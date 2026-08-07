@@ -15,6 +15,8 @@ const frontmatterFields = [
   { command: 'from', description: 'Sender address. Optional -- overrides default_from from config.' },
   { command: 'reply_to', description: 'Reply-to address. Optional.' },
   { command: 'attachments', description: 'List of absolute file paths to attach. Optional.' },
+  { command: 'in_reply_to', description: 'Message-ID of the message this draft answers. Written by mp reply; on send, the source is marked answered.' },
+  { command: 'forwarded_from', description: 'Message-ID of the message this draft forwards. Written by mp forward; on send, the source is marked forwarded.' },
 ];
 
 const basicDraft = `---
@@ -36,7 +38,6 @@ to: original-sender@example.com
 subject: "Re: Original subject"
 status: draft
 in_reply_to: "<message-id@example.com>"
-references: "<message-id@example.com>"
 ---
 
 Your reply goes here.
@@ -51,6 +52,7 @@ const forwardExample = `---
 to: ""
 subject: "Fwd: Original subject"
 status: draft
+forwarded_from: "<message-id@example.com>"
 attachments:
   - /path/to/original-attachment.pdf
 ---
@@ -169,9 +171,14 @@ Email body here.`;
       <h2 id="reply-drafts">Reply Drafts</h2>
       <p>
         Reply drafts are created with <code>mp reply</code> (or <code>r</code>/<code>R</code>
-        in the TUI). They include <code>in_reply_to</code> and <code>references</code>
-        headers for proper threading, and a <code>{"{{SIGNATURE}}"}</code> placeholder between the reply
-        area and the quoted original message.
+        in the TUI). They record the source message in <code>in_reply_to</code> and carry a
+        <code>{"{{SIGNATURE}}"}</code> placeholder between the reply area and the quoted original
+        message.
+      </p>
+      <p>
+        When the reply is sent, the message it answers is marked as answered, locally and
+        on the server. The list then shows a reply arrow next to it instead of the plain
+        read marker.
       </p>
       <p>
         When sent, the placeholder is replaced with the configured signature HTML.
@@ -186,7 +193,9 @@ Email body here.`;
         Forward drafts are created with <code>mp forward</code> (or <code>w</code> in the TUI).
         The <code>to:</code> field is left empty for you to fill in. The subject gets a
         "Fwd:" prefix, and any attachments from the original email are listed in the
-        <code>attachments:</code> array with their absolute file paths.
+        <code>attachments:</code> array with their absolute file paths. The source message
+        is recorded in <code>forwarded_from</code> and is marked as forwarded once the draft
+        goes out.
       </p>
       <Code code={forwardExample} lang="markdown" theme="catppuccin-mocha" />
     </section>

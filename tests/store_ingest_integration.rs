@@ -966,7 +966,7 @@ fn a_message_without_raw_bytes_ingests_and_upserts() {
         has_attachments: false,
         message_id: Some("<g1@example.com>".into()),
         attachments: Vec::new(),
-        is_read: true,
+        flags: email::types::MessageFlags::seen(true),
         calendar_ics: None,
         event: None,
     };
@@ -1007,7 +1007,7 @@ fn a_graph_message_keeps_its_html_body_as_a_blob() {
         has_attachments: false,
         message_id: Some("<g-html@example.com>".into()),
         attachments: Vec::new(),
-        is_read: true,
+        flags: email::types::MessageFlags::seen(true),
         calendar_ics: None,
         event: None,
     };
@@ -1269,6 +1269,79 @@ fn a_message_archived_elsewhere_ends_up_in_the_archive_only() {
 
 /// A Graph message, whose identity is its `Message-ID` and whose UID is the
 /// hash of it.
+/// The second status axis survives ingest (#TKT-0051): what the IMAP fetch
+/// read off `FLAGS` is what the row carries and what the read path answers.
+#[test]
+fn the_answered_and_forwarded_flags_reach_the_row_and_the_read_path() {
+    let f = Fixture::new();
+    let mut message = graph_email("<answered@example.com>", true);
+    message.flags = email::types::MessageFlags {
+        seen: true,
+        answered: true,
+        forwarded: true,
+    };
+    let outcome = f.ingest("inbox", 11, &message, None);
+
+    assert_eq!(f.text(outcome.row_id, "flags"), "\\Seen \\Answered $Forwarded");
+    let row = email::store::read::find_by_id(&f.store, outcome.row_id)
+        .unwrap()
+        .unwrap();
+    assert!(row.is_read() && row.is_answered() && row.is_forwarded());
+}
+
+/// The IMAP pass states the whole flag set, so it is truth for all three bits:
+/// a reply undone in another client (Thunderbird can clear `\Answered`) comes
+/// back as cleared here rather than sticking forever (#TKT-0051).
+#[test]
+fn an_imap_pass_replaces_the_whole_flag_set() {
+    let f = Fixture::new();
+    let mut message = graph_email("<flags@example.com>", true);
+    message.flags = email::types::MessageFlags {
+        seen: true,
+        answered: true,
+        forwarded: false,
+    };
+    f.ingest("inbox", 21, &message, None);
+
+    let updated = email::ingest::apply_flags(
+        &f.store,
+        "acct",
+        "inbox",
+        [(
+            21,
+            email::types::MessageFlags {
+                seen: true,
+                answered: false,
+                forwarded: true,
+            },
+        )],
+    );
+    assert_eq!(updated, 1);
+    let row = email::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
+    assert_eq!(row[0].flags.as_deref(), Some("\\Seen $Forwarded"));
+}
+
+/// Graph answers `isRead` and nothing else, so its pass merges that one bit
+/// in. Writing the whole set there would erase an `\Answered` no Graph call
+/// can restate (#TKT-0051).
+#[test]
+fn a_graph_pass_updates_the_read_bit_without_erasing_the_history_bits() {
+    let f = Fixture::new();
+    let mut message = graph_email("<graph-answered@example.com>", false);
+    message.flags = email::types::MessageFlags {
+        seen: false,
+        answered: true,
+        forwarded: true,
+    };
+    let uid = email::ingest::graph_uid("<graph-answered@example.com>");
+    f.ingest("inbox", uid, &message, None);
+
+    let updated = email::ingest::apply_seen_flags(&f.store, "acct", "inbox", [(uid, true)]);
+    assert_eq!(updated, 1);
+    let row = email::store::read::list_mailbox(&f.store, "acct", "inbox").unwrap();
+    assert_eq!(row[0].flags.as_deref(), Some("\\Seen \\Answered $Forwarded"));
+}
+
 fn graph_email(message_id: &str, is_read: bool) -> FetchedEmail {
     FetchedEmail {
         from: "a@example.com".into(),
@@ -1281,7 +1354,7 @@ fn graph_email(message_id: &str, is_read: bool) -> FetchedEmail {
         has_attachments: false,
         message_id: Some(message_id.to_string()),
         attachments: Vec::new(),
-        is_read,
+        flags: email::types::MessageFlags::seen(is_read),
         calendar_ics: None,
         event: None,
     }

@@ -30,8 +30,10 @@
 //!   missing or unparseable. The file build had a filename-derived fallback in
 //!   between; see the allow-list.
 //! - `flags`: sorted, deduplicated state tokens from the closed set
-//!   `approved`, `draft`, `seen`. `seen` comes from `\Seen` in
-//!   `messages.flags`. `draft` and `approved` cannot occur on a `messages`
+//!   `answered`, `approved`, `draft`, `forwarded`, `seen`. `seen`, `answered`
+//!   and `forwarded` are the three bits of the second status axis
+//!   (#TKT-0051), read out of `messages.flags` (`\Seen`, `\Answered`,
+//!   `$Forwarded`). `draft` and `approved` cannot occur on a `messages`
 //!   row: drafts are local files in the `drafts` index, permanently outside
 //!   this table and outside the dump contract (see the allow-list).
 //! - `attachments`: array of `{"name", "size"}`, sorted by name then size,
@@ -182,8 +184,15 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
     let (_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
 
     let mut flags: BTreeSet<String> = BTreeSet::new();
-    if row.is_read() {
+    let axis = row.flags();
+    if axis.seen {
         flags.insert("seen".to_string());
+    }
+    if axis.answered {
+        flags.insert("answered".to_string());
+    }
+    if axis.forwarded {
+        flags.insert("forwarded".to_string());
     }
     // `draft` and `approved` were frontmatter `status:` values. Nothing writes
     // them to a `messages` row: drafts live in the `drafts` index, outside

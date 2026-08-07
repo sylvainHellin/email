@@ -46,6 +46,91 @@ impl std::fmt::Display for EmailStatus {
     }
 }
 
+/// What has happened to a received message: the second status axis (#TKT-0051).
+///
+/// Orthogonal to [`EmailStatus`], which is the *draft* lifecycle and says
+/// nothing about received mail. This one is the history of a message that
+/// arrived: it was read, it was answered, it was forwarded, and any
+/// combination of the three can be true at once. That is why it is a set of
+/// booleans rather than an enum: collapsing it into one value is a display
+/// decision (`tui::ui::list`), not a storage one.
+///
+/// The storage is `messages.flags`, the IMAP flag string the column already
+/// held, so the axis costs no schema change: the tokens are `\Seen`,
+/// `\Answered` and the `$Forwarded` keyword (RFC 5788), which is what every
+/// other client writes. The server is truth for all three on the IMAP path
+/// (sync pass 1 fetches `FLAGS` over the whole window), so a store written by
+/// a build that only knew `\Seen` heals itself on the next sync instead of
+/// needing a migration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageFlags {
+    pub seen: bool,
+    pub answered: bool,
+    pub forwarded: bool,
+}
+
+/// The `\Seen` token, as stored and as IMAP spells it.
+pub const FLAG_SEEN: &str = "\\Seen";
+/// The `\Answered` token.
+pub const FLAG_ANSWERED: &str = "\\Answered";
+/// The forwarded keyword. `$Forwarded` is the registered spelling (RFC 5788)
+/// and what Thunderbird, Apple Mail and Dovecot use; `\Forwarded` is read back
+/// as the same thing because a few servers hand it over that way, but it is
+/// never written.
+pub const FLAG_FORWARDED: &str = "$Forwarded";
+
+impl MessageFlags {
+    /// Only the read bit, which is all the Graph path can answer.
+    pub fn seen(seen: bool) -> Self {
+        MessageFlags {
+            seen,
+            ..Default::default()
+        }
+    }
+
+    /// Read a stored (or server-sent) flag string. Unknown tokens are ignored:
+    /// the column is not the client's to curate, and `\Flagged` is #0007.
+    pub fn parse(flags: &str) -> Self {
+        let mut out = MessageFlags::default();
+        for token in flags.split_whitespace() {
+            if token.eq_ignore_ascii_case(FLAG_SEEN) {
+                out.seen = true;
+            } else if token.eq_ignore_ascii_case(FLAG_ANSWERED) {
+                out.answered = true;
+            } else if token.eq_ignore_ascii_case(FLAG_FORWARDED)
+                || token.eq_ignore_ascii_case("\\Forwarded")
+            {
+                out.forwarded = true;
+            }
+        }
+        out
+    }
+
+    /// The canonical stored form: the tokens that are set, in one fixed order,
+    /// so an unchanged flag set compares equal as a string and the `IFNULL(flags,
+    /// '') <> ?` guard in the store keeps meaning "actually changed".
+    pub fn to_flag_string(self) -> String {
+        let mut out: Vec<&str> = Vec::with_capacity(3);
+        if self.seen {
+            out.push(FLAG_SEEN);
+        }
+        if self.answered {
+            out.push(FLAG_ANSWERED);
+        }
+        if self.forwarded {
+            out.push(FLAG_FORWARDED);
+        }
+        out.join(" ")
+    }
+
+    /// This set with the read bit replaced, the other two untouched. What the
+    /// Graph path and the read/unread toggle apply, so neither can clobber a
+    /// history bit it knows nothing about.
+    pub fn with_seen(self, seen: bool) -> Self {
+        MessageFlags { seen, ..self }
+    }
+}
+
 /// The role a mailbox plays for an account, and the key its messages carry in
 /// the `messages.mailbox` column.
 ///
@@ -206,6 +291,20 @@ pub struct EmailFrontmatter {
     pub sent_via: Option<String>,
     #[serde(default)]
     pub message_id: Option<String>,
+    /// The `Message-ID` of the message this draft answers (#TKT-0051).
+    ///
+    /// Written by the reply builder and read once, by the post-send hook that
+    /// puts `\Answered` on the source: the second status axis is only honest
+    /// if it is set when the reply actually goes out, not when the draft is
+    /// opened. Optional and absent from every other draft, so a draft written
+    /// before this field existed parses unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// The `Message-ID` of the message this draft forwards (#TKT-0051). The
+    /// forward half of [`EmailFrontmatter::in_reply_to`]; the two are mutually
+    /// exclusive by construction, since a draft is built as one or the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<String>,
     /// The `date:` line the draft skeleton writes. Carried so the drafts index
     /// can list it; nothing in the send path reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,6 +367,70 @@ mod tests {
         assert_eq!(EmailStatus::Sent.to_string(), "sent");
     }
 
+    /// The second axis is a set, not an enum: a message can be read, answered
+    /// and forwarded at once, and the stored string round-trips all three.
+    #[test]
+    fn message_flags_round_trip_through_the_stored_string() {
+        let all = MessageFlags {
+            seen: true,
+            answered: true,
+            forwarded: true,
+        };
+        assert_eq!(all.to_flag_string(), "\\Seen \\Answered $Forwarded");
+        assert_eq!(MessageFlags::parse(&all.to_flag_string()), all);
+        assert_eq!(MessageFlags::default().to_flag_string(), "");
+        assert_eq!(MessageFlags::parse(""), MessageFlags::default());
+    }
+
+    /// A store written before this axis existed holds `\Seen` or nothing, and
+    /// reads back as exactly the read bit it always meant.
+    #[test]
+    fn a_pre_axis_flag_string_reads_as_the_read_bit_alone() {
+        assert_eq!(MessageFlags::parse("\\Seen"), MessageFlags::seen(true));
+    }
+
+    /// Flags this build does not own are not the client's to curate: `\Flagged`
+    /// is #0007 and must survive being read past, not be misread as something
+    /// else.
+    #[test]
+    fn unknown_flags_are_ignored_rather_than_guessed_at() {
+        assert_eq!(
+            MessageFlags::parse("\\Flagged \\Draft \\Recent"),
+            MessageFlags::default()
+        );
+    }
+
+    /// Servers disagree on the spelling of the forwarded keyword; both are
+    /// read, one is written.
+    #[test]
+    fn both_spellings_of_the_forwarded_keyword_are_read() {
+        assert!(MessageFlags::parse("$Forwarded").forwarded);
+        assert!(MessageFlags::parse("\\Forwarded").forwarded);
+        assert!(MessageFlags::parse("$forwarded").forwarded);
+        assert_eq!(
+            MessageFlags {
+                forwarded: true,
+                ..Default::default()
+            }
+            .to_flag_string(),
+            "$Forwarded"
+        );
+    }
+
+    /// The read/unread toggle and the Graph path answer one bit; the history
+    /// bits they know nothing about stay where they were.
+    #[test]
+    fn setting_the_read_bit_leaves_the_history_bits_alone() {
+        let answered = MessageFlags {
+            seen: true,
+            answered: true,
+            forwarded: false,
+        };
+        let unread = answered.with_seen(false);
+        assert!(!unread.seen);
+        assert!(unread.answered);
+    }
+
     /// The file-era placement states are gone from the type, so a draft that
     /// carries one is a draft this build refuses to read rather than one it
     /// silently reinterprets. Nothing writes them: the receive path stopped
@@ -320,6 +483,8 @@ mod tests {
             sent_at: None,
             sent_via: None,
             message_id: Some("<test@example.com>".to_string()),
+            in_reply_to: None,
+            forwarded_from: None,
             event: None,
         };
         let yaml = serde_yaml::to_string(&fm).unwrap();

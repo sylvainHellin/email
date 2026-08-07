@@ -61,6 +61,11 @@ pub struct SourceMessage {
     pub to: String,
     pub cc: Option<String>,
     pub subject: String,
+    /// The source's `Message-ID`, carried into the draft's `in_reply_to:` or
+    /// `forwarded_from:` so the post-send hook can find the row to flag
+    /// (#TKT-0051). `None` for a server-search hit that carried no header,
+    /// which simply means nothing is flagged when that draft goes out.
+    pub message_id: Option<String>,
     /// The `Date:` header verbatim, used in the attribution line.
     pub date: Option<String>,
     /// Plain-text body of the source message.
@@ -103,6 +108,7 @@ pub fn source_from_row(
         to: row.to.clone().unwrap_or_default(),
         cc: row.cc.clone(),
         subject: row.subject.clone().unwrap_or_default(),
+        message_id: Some(row.message_id.clone()),
         date: row.date_display.clone(),
         body,
         attachments,
@@ -147,6 +153,7 @@ pub fn source_from_fetched(
         to: fetched.to.clone(),
         cc: fetched.cc.clone(),
         subject: fetched.subject.clone(),
+        message_id: fetched.message_id.clone(),
         date: Some(fetched.date.clone()),
         body: fetched.body_text.trim().to_string(),
         attachments,
@@ -176,6 +183,19 @@ pub fn fwd_subject(subject: &str) -> String {
     } else {
         format!("Fwd: {subject}")
     }
+}
+
+/// The source `Message-ID` a draft may quote back, YAML-safe.
+///
+/// An empty or quote-bearing header is dropped rather than escaped: the value
+/// exists to be looked up in the `messages_message_id` index after a send, and
+/// a Message-ID containing a double quote is not one any server issued.
+fn source_message_id(source: &SourceMessage) -> Option<&str> {
+    source
+        .message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.contains('"'))
 }
 
 /// Reply to a message that is not a file: the #0050 path, used by
@@ -257,6 +277,12 @@ pub fn create_reply_draft_from(
         reply_subject.replace('"', "\\\"")
     ));
     fm.push_str("status: draft\n");
+    // What the post-send hook flags `\Answered` (#TKT-0051). Written here
+    // rather than acted on here: a draft that is never sent has answered
+    // nothing.
+    if let Some(message_id) = source_message_id(inbox) {
+        fm.push_str(&format!("in_reply_to: \"{message_id}\"\n"));
+    }
     fm.push_str("---\n");
 
     // Compose full content with {{SIGNATURE}} placeholder between reply area and quoted text
@@ -351,6 +377,10 @@ pub fn create_forward_draft_from(
         fwd_subject.replace('"', "\\\"")
     ));
     fm.push_str("status: draft\n");
+    // The forward half of the same hook: `$Forwarded` on send (#TKT-0051).
+    if let Some(message_id) = source_message_id(inbox) {
+        fm.push_str(&format!("forwarded_from: \"{message_id}\"\n"));
+    }
     if !attachment_paths.is_empty() {
         fm.push_str("attachments:\n");
         for path in &attachment_paths {
@@ -1688,6 +1718,8 @@ mod tests {
                 sent_at: None,
                 sent_via: None,
                 message_id: None,
+                in_reply_to: None,
+                forwarded_from: None,
                 event: None,
             },
             body_markdown: body.to_string(),

@@ -509,7 +509,7 @@ mod tests {
             has_attachments: false,
             message_id: id.map(|s| s.to_string()),
             attachments: Vec::new(),
-            is_read: false,
+            flags: Default::default(),
             calendar_ics: None,
             event: None,
         }

@@ -61,8 +61,9 @@ pub struct SyncResult {
     pub saved: usize,
     /// Messages the store already held (pass 1 hits).
     pub skipped: usize,
-    /// Rows whose `\Seen` flag was updated from the server.
-    pub read_updated: usize,
+    /// Rows whose flags were updated from the server: read, answered or
+    /// forwarded (#TKT-0051).
+    pub flags_updated: usize,
     /// Rows deleted because the server no longer lists their UID (a message
     /// archived, moved or deleted in another client).
     pub pruned: usize,
@@ -167,7 +168,7 @@ pub async fn sync_mailboxes(
                 ingest_failed = true;
                 continue;
             };
-            email.is_read = message.is_read;
+            email.flags = message.flags;
 
             let outcome = ingest::ingest_message(
                 &store,
@@ -216,14 +217,16 @@ pub async fn sync_mailboxes(
             fetched.download_incomplete || ingest_failed,
         ));
 
-        result.read_updated += ingest::apply_seen_flags(
+        // The IMAP server states the whole flag set, so it is truth for all
+        // three bits of the second axis (#TKT-0051), not just for `\Seen`.
+        result.flags_updated += ingest::apply_flags(
             &store,
             account_name,
             target.role.as_str(),
             fetched
                 .known_flags
                 .into_iter()
-                .map(|(uid, is_read)| (uid as i64, is_read)),
+                .map(|(uid, flags)| (uid as i64, flags)),
         );
 
         // The other half of the same diff: the UIDs the store holds for this

@@ -240,7 +240,7 @@ mod tests {
             has_attachments: false,
             message_id: Some("<seed@example.com>".into()),
             attachments: Vec::new(),
-            is_read: false,
+            flags: Default::default(),
             calendar_ics: None,
             event: None,
         };
@@ -280,6 +280,8 @@ mod tests {
                 sent_at: None,
                 sent_via: None,
                 message_id: None,
+                in_reply_to: None,
+                forwarded_from: None,
                 event: None,
             },
             body_markdown: String::new(),

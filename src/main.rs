@@ -759,6 +759,8 @@ async fn run_send_invite(
             sent_at: None,
             sent_via: None,
             message_id: None,
+            in_reply_to: None,
+            forwarded_from: None,
             event,
         },
         body_markdown: body,
@@ -1048,12 +1050,12 @@ async fn sync_one_account(
         );
     }
 
-    if result.read_updated > 0 {
+    if result.flags_updated > 0 {
         println!(
-            "{} {}Read status updated on {} message(s)",
+            "{} {}Status updated on {} message(s)",
             "ℹ".blue(),
             prefix,
-            result.read_updated,
+            result.flags_updated,
         );
     }
     if result.uid_rebound > 0 {

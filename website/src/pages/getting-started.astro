@@ -114,6 +114,13 @@ cargo install --path .`}
         <li><code>q</code> to quit</li>
       </ul>
       <p>
+        The marker column on the left of the list carries one glyph per message: a dot
+        for unread, a reply arrow once you have answered it, a forward arrow once you
+        have forwarded it, and nothing for a message you have only read. Answered and
+        forwarded are kept in step with the server, so a reply you sent from your phone
+        shows up here too.
+      </p>
+      <p>
         The TUI watches your inbox in the background (via IMAP IDLE or Graph polling)
         and fetches new mail automatically when it arrives.
       </p>

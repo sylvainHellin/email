@@ -42,6 +42,7 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use crate::store::blobs::BlobHash;
 use crate::store::{BlobStore, Store};
+use crate::types::MessageFlags;
 
 /// Where a row was before a mutation moved or removed it.
 ///
@@ -160,16 +161,58 @@ pub fn delete_by_uid(
     }
 }
 
-/// Set (or clear) `\Seen` on a row. Returns true when the flags changed.
+/// Set (or clear) `\Seen` on a row, leaving the history bits alone. Returns
+/// true when the flags changed.
+///
+/// The read bit is only one of the three the column carries since #TKT-0051,
+/// so this reads the row's flags and writes them back with that one bit
+/// replaced. Overwriting the column with `\Seen` (what it did while `\Seen`
+/// was the only flag there was) would erase an `\Answered` the moment the user
+/// marked a replied-to message unread.
 pub fn set_read(store: &Store, id: i64, read: bool) -> Result<bool> {
-    let flags = if read { "\\Seen" } else { "" };
+    update_flags(store, id, |flags| flags.with_seen(read))
+}
+
+/// Record that a reply to this row has gone out (#TKT-0051). Idempotent.
+pub fn set_answered(store: &Store, id: i64) -> Result<bool> {
+    update_flags(store, id, |flags| MessageFlags {
+        answered: true,
+        ..flags
+    })
+}
+
+/// Record that this row has been forwarded (#TKT-0051). Idempotent.
+pub fn set_forwarded(store: &Store, id: i64) -> Result<bool> {
+    update_flags(store, id, |flags| MessageFlags {
+        forwarded: true,
+        ..flags
+    })
+}
+
+/// Read one row's flags, apply `f`, write the canonical string back. Returns
+/// true when the stored string actually changed, which is what keeps a no-op
+/// toggle from counting as a mutation.
+fn update_flags(
+    store: &Store,
+    id: i64,
+    f: impl FnOnce(MessageFlags) -> MessageFlags,
+) -> Result<bool> {
+    let current: Option<String> = store
+        .conn()
+        .query_row("SELECT flags FROM messages WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .context("reading a message's flags")?
+        .flatten();
+    let flags = f(MessageFlags::parse(current.as_deref().unwrap_or_default())).to_flag_string();
     let changed = store
         .conn()
         .execute(
             "UPDATE messages SET flags = ?2 WHERE id = ?1 AND IFNULL(flags, '') <> ?2",
             rusqlite::params![id, flags],
         )
-        .context("setting a message's read flag")?;
+        .context("setting a message's flags")?;
     Ok(changed > 0)
 }
 
@@ -316,6 +359,26 @@ mod tests {
 
         assert!(set_read(&fx.store, id, false).unwrap());
         assert!(!read::find_by_id(&fx.store, id).unwrap().unwrap().is_read());
+    }
+
+    /// Marking a replied-to message unread must not forget that it was
+    /// replied to: the two axes are orthogonal, and the read one is written
+    /// far more often (#TKT-0051).
+    #[test]
+    fn toggling_read_leaves_the_answered_and_forwarded_bits_alone() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 2, "Answered and forwarded");
+        assert!(set_answered(&fx.store, id).unwrap());
+        assert!(set_forwarded(&fx.store, id).unwrap());
+        assert!(!set_answered(&fx.store, id).unwrap(), "idempotent");
+
+        set_read(&fx.store, id, true).unwrap();
+        set_read(&fx.store, id, false).unwrap();
+
+        let row = read::find_by_id(&fx.store, id).unwrap().unwrap();
+        assert!(!row.is_read());
+        assert!(row.is_answered());
+        assert!(row.is_forwarded());
     }
 
     /// A row that is already gone is a no-op, not an error: two mutations

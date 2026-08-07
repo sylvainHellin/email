@@ -611,3 +611,22 @@ A draft can be created, edited, approved and sent, and nothing deletes one ([#00
 The gap stayed invisible while send removed the file on its own, and appeared only on a machine upgraded from a version that did not, where nine `status: sent` drafts had no supported way out.
 The index side needs nothing built: `mp list` re-scans the drafts directory and drops the rows whose file is gone, so removing the file is the entire missing operation.
 A key bound once across every view is a promise made in every view, and the action behind it has to resolve per view or the binding lies in all but the one it was written for.
+
+## A flag column with one flag in it invites code that writes the string, not the flag
+
+`messages.flags` held `\Seen` or the empty string, and every writer treated it as a boolean spelled out in SQL: `set_read` wrote the literal `"\\Seen"`, `apply_seen_flag` overwrote the column with it, ingest derived it from one bool.
+That is exactly right until a second flag exists, at which point every one of those writes silently erases what it does not know about, and the erasure is invisible because the next sync restates the server's answer and hides the local loss (#TKT-0051).
+Adding `\Answered` and `$Forwarded` was therefore not a matter of writing two more tokens but of making every writer read-modify-write through one parsed type (`types::MessageFlags`), and of splitting the sync entry point in two: IMAP states the whole flag set and may replace it, Graph knows only `isRead` and may merge one bit.
+A column that encodes a set has to be written as a set from the first flag onwards, or the second one arrives as a bug in code nobody thought was about flags.
+
+## The flag column is a cache, which is what makes a second flag free
+
+The axis needed no schema bump, and the reason generalises: pass 1 of every IMAP sync fetches `FLAGS` for the whole download window, so a store that has never heard of `\Answered` fills the column in on the next pass with no migration and no re-download.
+A bump would have rebuilt every store and cost every user their backlog for a column that was already there and already refilled from the server on a timer.
+Before bumping `SCHEMA_VERSION`, check whether the new state is something the server restates anyway; if it is, the additive write is the whole migration.
+
+## Gmail accepts the `$Forwarded` keyword and hands it back as a custom flag
+
+Measured live on a Gmail account (#TKT-0051): `UID STORE +FLAGS ($Forwarded)` is accepted, survives, and comes back from `FETCH FLAGS` as `async_imap::types::Flag::Custom("$Forwarded")` rather than as any system flag.
+`\Answered` round-trips as `Flag::Answered`, which is what a reply sent from any other client sets, so the answered state syncs both directions without anything mailypoppins-specific on the wire.
+Read keyword matching case-insensitively and accept `\Forwarded` as well: the keyword is registered as `$Forwarded` (RFC 5788) but not every server spells it the same way, and only one spelling should ever be written.
