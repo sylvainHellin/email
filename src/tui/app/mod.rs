@@ -117,6 +117,13 @@ pub struct App {
     /// switched account/mailbox, requested a newer reload, or mutated the
     /// list optimistically) is dropped in `tui/bg.rs`.
     pub mailbox_load_generation: u64,
+    /// A message the next mailbox load should put the cursor on, set by the
+    /// conversation overlay's Enter jump (#0008). It survives the async
+    /// mailbox load that a cross-mailbox jump triggers: `switch_mailbox`
+    /// consumes it on a cache hit, and `BgResult::MailboxLoaded` consumes it
+    /// when the fresh list arrives. Cleared the moment it lands, so it never
+    /// hijacks a later unrelated mailbox switch.
+    pub pending_select: Option<MessageRef>,
     pub queued_action: Option<Action>,
     pub last_save_dir: Option<PathBuf>,
 
@@ -212,6 +219,7 @@ impl App {
             bg_count: 0,
             bg_spin_tick: 0,
             mailbox_load_generation: 0,
+            pending_select: None,
             queued_action: None,
             last_save_dir: None,
             status_log: VecDeque::new(),
@@ -303,6 +311,7 @@ impl App {
             bg_count: 0,
             bg_spin_tick: 0,
             mailbox_load_generation: 0,
+            pending_select: None,
             queued_action: None,
             last_save_dir: None,
             status_log: VecDeque::new(),
@@ -643,6 +652,7 @@ impl App {
             | Overlay::Dir(_)
             | Overlay::Mailbox(_)
             | Overlay::Rsvp(_)
+            | Overlay::Thread(_)
             | Overlay::Error(_) => None,
             // Contacts view (#0033): the list pane owns the hint bar (unless the
             // fuzzy-search input is armed, which is free-text — no hint row).
@@ -1532,6 +1542,57 @@ impl App {
 
         if changing {
             self.list_index = 0;
+        }
+        // A conversation-overlay jump may have parked a target for this load
+        // (#0008). On a cache hit the fresh list is already in place, so put
+        // the cursor on it now; on a cache miss the list is empty and this is
+        // a no-op, and `BgResult::MailboxLoaded` consumes the target instead.
+        self.consume_pending_select();
+    }
+
+    /// Put the cursor on [`Self::pending_select`] when the current list holds
+    /// it, clearing the target once it lands (#0008). A no-op when nothing is
+    /// pending or the message is not in the visible list yet (a cross-mailbox
+    /// jump whose async load has not arrived).
+    pub(crate) fn consume_pending_select(&mut self) {
+        let Some(target) = self.pending_select else {
+            return;
+        };
+        if let Some(pos) = self
+            .visible
+            .iter()
+            .position(|&i| self.emails.get(i).is_some_and(|e| e.msg == Some(target)))
+        {
+            self.list_index = pos;
+            self.headers_scroll = 0;
+            self.preview_scroll = 0;
+            self.pending_select = None;
+        }
+    }
+
+    /// Open a specific message by its store row, switching to the mailbox that
+    /// holds it when it is not the active one (#0008). Used by the conversation
+    /// overlay's Enter jump. `mailbox_id` is the `messages.mailbox` key the
+    /// thread listing carried, matched against the sidebar to find its index.
+    pub(crate) fn open_message(&mut self, msg: MessageRef, mailbox_id: &str) {
+        let idx = self
+            .mailboxes
+            .iter()
+            .position(|mb| mailbox_key(mb) == mailbox_id);
+        let Some(idx) = idx else {
+            self.set_status(format!(
+                "That message is in {mailbox_id}, which is not in the sidebar"
+            ));
+            return;
+        };
+        self.pending_select = Some(msg);
+        self.focus = Focus::List;
+        if idx == self.active_mailbox {
+            // Already loaded: place the cursor straight away.
+            self.consume_pending_select();
+        } else {
+            self.sidebar_index = idx;
+            self.switch_mailbox(idx);
         }
     }
 

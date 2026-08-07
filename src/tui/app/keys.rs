@@ -7,7 +7,7 @@ use super::{
     Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
     EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
-    RsvpOverlay, SearchBodies, SearchOverlayFocus,
+    RsvpOverlay, SearchBodies, SearchOverlayFocus, ThreadEntry, ThreadOverlay,
 };
 
 impl App {
@@ -24,6 +24,7 @@ impl App {
             Overlay::Dir(_) => return self.handle_dir_picker_key(key),
             Overlay::Mailbox(_) => return self.handle_mailbox_picker_key(key),
             Overlay::Rsvp(_) => return self.handle_rsvp_overlay_key(key),
+            Overlay::Thread(_) => return self.handle_thread_overlay_key(key),
             Overlay::Attachment(_) => return self.handle_attachment_picker_key(key),
             Overlay::Help => return self.handle_help_key(key),
             Overlay::Activity => return self.handle_activity_overlay_key(key),
@@ -576,6 +577,10 @@ impl App {
             A::Rsvp => {
                 self.pending_prefix = None;
                 self.open_rsvp_overlay();
+            }
+            A::OpenThread => {
+                self.pending_prefix = None;
+                self.open_thread_overlay();
             }
             A::NewDraft => {
                 self.pending_prefix = None;
@@ -1275,6 +1280,129 @@ impl App {
             summary,
             selected: 0,
         });
+    }
+
+    /// Build and open the conversation overlay for the cursor message (#0008).
+    ///
+    /// The thread is read straight out of the store: the selected row's
+    /// `thread_id`, then every message ingest gave that same id, oldest first
+    /// (see [`crate::store::read::thread_messages`]). Nothing re-parses headers
+    /// here; the grouping was decided at ingest. A message with no related mail
+    /// in the store (a lone message, or a reply whose parents are not
+    /// downloaded) says so rather than opening a one-line overlay.
+    fn open_thread_overlay(&mut self) {
+        let Some(msg) = self.selected_email_ref() else {
+            // A draft or an unresolved server-search hit has no store row.
+            if self.selected_email().is_some() {
+                self.set_status("A draft has no conversation to show".to_string());
+            }
+            return;
+        };
+        let account = self.account_config.name.clone();
+        let Some(store) = crate::store::open_store(&account) else {
+            self.set_status("This account has no store yet".to_string());
+            return;
+        };
+        let row = match crate::store::read::find_by_id(&store, msg.row_id()) {
+            Ok(Some(row)) => row,
+            _ => {
+                self.set_status("That message is no longer in the store".to_string());
+                return;
+            }
+        };
+        let thread_id = row
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
+        let rows = match crate::store::read::thread_messages(&store, &account, &thread_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.set_status(format!("Could not load the conversation: {e:#}"));
+                return;
+            }
+        };
+        if rows.len() <= 1 {
+            self.set_status("No related emails for this message in the store".to_string());
+            return;
+        }
+        let current_mid = row.message_id.clone();
+        let subject = row
+            .subject
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(no subject)".to_string());
+        let mut selected = 0;
+        let messages: Vec<ThreadEntry> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let flags = r.flags();
+                if r.message_id == current_mid {
+                    selected = i;
+                }
+                ThreadEntry {
+                    msg: MessageRef::new(r.id),
+                    mailbox: r.mailbox.clone(),
+                    from: super::extract_display_name(
+                        r.from.as_deref().unwrap_or_default(),
+                    ),
+                    date_display: super::resolve_date(
+                        &r.date_display,
+                        &None,
+                        std::path::Path::new(""),
+                    )
+                    .0,
+                    read: flags.seen,
+                    answered: flags.answered,
+                    forwarded: flags.forwarded,
+                    flagged: flags.flagged,
+                    current: r.message_id == current_mid,
+                }
+            })
+            .collect();
+        self.overlay = Overlay::Thread(ThreadOverlay {
+            subject,
+            messages,
+            selected,
+        });
+    }
+
+    /// Input for the conversation overlay (#0008): `j`/`k` move, `Enter`/`e`
+    /// opens the highlighted message (switching mailbox when it lives in
+    /// another), `Esc`/`q`/`T` closes.
+    fn handle_thread_overlay_key(&mut self, key: KeyEvent) -> Option<Message> {
+        let Overlay::Thread(overlay) = &mut self.overlay else {
+            return None;
+        };
+        let len = overlay.messages.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if overlay.selected + 1 < len {
+                    overlay.selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                overlay.selected = overlay.selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => {
+                overlay.selected = 0;
+            }
+            KeyCode::Char('G') => {
+                overlay.selected = len.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let target = overlay.messages.get(overlay.selected).cloned();
+                self.close_overlay();
+                if let Some(entry) = target {
+                    self.open_message(entry.msg, &entry.mailbox);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => {
+                self.close_overlay();
+            }
+            _ => {}
+        }
+        None
     }
 
     fn handle_rsvp_overlay_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -2342,6 +2470,32 @@ mod tests {
         // have read from the blob store is primed instead.
         app.prime_search_bodies(sample_bodies());
         app
+    }
+
+    /// A parked conversation-jump target lands on its row once the list holds
+    /// it, and clears itself so a later switch is not hijacked (#0008).
+    #[test]
+    fn a_pending_select_lands_on_its_row_and_clears() {
+        let mut app = app_with_emails(sample());
+        let target = app.emails[2].msg.unwrap();
+        app.list_index = 0;
+        app.pending_select = Some(target);
+        app.consume_pending_select();
+        assert_eq!(app.list_index, 2, "the cursor moved onto the parked target");
+        assert!(app.pending_select.is_none(), "the target cleared once it landed");
+    }
+
+    /// A target the current list does not hold is left parked (the async load
+    /// for a cross-mailbox jump has not arrived yet), not silently dropped.
+    #[test]
+    fn a_pending_select_absent_from_the_list_stays_parked() {
+        let mut app = app_with_emails(sample());
+        let absent = MessageRef::new(-999);
+        app.list_index = 1;
+        app.pending_select = Some(absent);
+        app.consume_pending_select();
+        assert_eq!(app.list_index, 1, "the cursor did not move");
+        assert_eq!(app.pending_select, Some(absent), "the target is still parked");
     }
 
     /// A Drafts row: no `messages` row behind it, its indexed `id:` instead

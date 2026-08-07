@@ -438,6 +438,10 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             // entries, then put the cursor back on the anchored email.
             app.rebuild_visible();
             app.restore_cursor(anchor, fallback);
+            // A conversation-overlay jump into this mailbox parked a target
+            // (#0008); now that the fresh list is here, put the cursor on it,
+            // overriding the anchor restore above.
+            app.consume_pending_select();
             if let Some(count) = app.mailbox_counts.get_mut(mailbox_idx) {
                 *count = app.emails.len();
             }

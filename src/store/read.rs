@@ -80,6 +80,13 @@ pub struct MessageRow {
     pub flags: Option<String>,
     pub has_attachments: bool,
     pub body_blob: Option<String>,
+    /// The conversation this message was assigned to at ingest
+    /// (`messages.thread_id`, #0008). It is the `Message-ID` of the thread
+    /// root: the parent's thread when `In-Reply-To` / `References` resolved to
+    /// a known row, otherwise the message's own id. Every message always has
+    /// one, so a thread of a single message is its own root. `None` only for a
+    /// store written before the column was filled, which re-ingest heals.
+    pub thread_id: Option<String>,
     /// True when the row carries an iMIP payload, i.e. an attachment blob
     /// named [`CALENDAR_SIDECAR_NAME`]. Computed in SQL so a mailbox listing
     /// can draw the invite badge without reading a single blob.
@@ -122,7 +129,7 @@ impl MessageRow {
 fn row_columns() -> String {
     format!(
         "id, mailbox, uid, message_id, from_, to_, cc, subject, \
-         date_display, flags, has_attachments, body_blob, \
+         date_display, flags, has_attachments, body_blob, thread_id, \
          EXISTS (SELECT 1 FROM message_blobs b \
                  WHERE b.message_row = messages.id AND b.kind = 'attachment' \
                    AND b.filename = '{CALENDAR_SIDECAR_NAME}')"
@@ -143,7 +150,8 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         flags: row.get(9)?,
         has_attachments: row.get::<_, i64>(10)? != 0,
         body_blob: row.get(11)?,
-        is_invite: row.get::<_, i64>(12)? != 0,
+        thread_id: row.get(12)?,
+        is_invite: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -237,6 +245,47 @@ pub fn find_by_message_id(
     Ok(out)
 }
 
+/// Every message of one conversation, oldest first (#0008).
+///
+/// The thread is the set of rows ingest gave the same `thread_id`, which is
+/// the `Message-ID` of the root the `In-Reply-To` / `References` chain
+/// resolved to (see [`crate::ingest`]). The assignment is done once at ingest
+/// and read straight out of the indexed column here; nothing is recomputed and
+/// no headers are re-parsed on the read path.
+///
+/// The same message can sit in several mailboxes (an inbox copy and its
+/// archived original), so a `Message-ID` that appears more than once is
+/// collapsed to a single conversation entry: the earliest row `id` wins, which
+/// is the first copy ingest saw. That keeps the conversation one line per
+/// logical message while still naming a concrete row to open.
+///
+/// Ordered by `date_sort ASC` with the row `id` as the tiebreaker, the reverse
+/// of a mailbox listing: a conversation reads oldest to newest, the way a mail
+/// client threads one.
+pub fn thread_messages(
+    store: &Store,
+    account: &str,
+    thread_id: &str,
+) -> Result<Vec<MessageRow>> {
+    let columns = row_columns();
+    let sql = format!(
+        "SELECT {columns} FROM messages
+         WHERE account = ?1 AND thread_id = ?2
+         ORDER BY date_sort ASC, id ASC"
+    );
+    let mut stmt = store.conn().prepare(&sql)?;
+    let rows = stmt.query_map((account, thread_id), row_from_sql)?;
+    let mut out: Vec<MessageRow> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows {
+        let row = row.context("reading a message row")?;
+        if seen.insert(row.message_id.clone()) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// One row addressed by its synthetic id.
 pub fn find_by_id(store: &Store, id: i64) -> Result<Option<MessageRow>> {
     let columns = row_columns();
@@ -314,7 +363,7 @@ pub fn list_invites(store: &Store, account: &str) -> Result<Vec<(MessageRow, Str
     );
     let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt.query_map((account, CALENDAR_SIDECAR_NAME), |row| {
-        Ok((row_from_sql(row)?, row.get::<_, String>(13)?))
+        Ok((row_from_sql(row)?, row.get::<_, String>(14)?))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -769,6 +818,64 @@ mod tests {
         assert!(find_by_message_id(&fx.store, "alice", "<nope@x>")
             .unwrap()
             .is_empty());
+    }
+
+    /// Ingest with raw bytes so `In-Reply-To` / `References` reach the thread
+    /// resolver, the same way the sync path hands ingest the RFC822.
+    fn ingest_raw(fx: &Fixture, mailbox: &str, uid: i64, email: &FetchedEmail, raw: &[u8]) -> i64 {
+        ingest_message(
+            &fx.store,
+            &fx.blobs,
+            &IngestInput {
+                account: "alice",
+                mailbox,
+                uid,
+                email,
+                raw: Some(raw),
+            },
+        )
+        .unwrap()
+        .row_id
+    }
+
+    /// A reply joins its parent's thread, and the conversation reads oldest
+    /// first regardless of the order the messages arrived (#0008).
+    #[test]
+    fn a_reply_shares_the_root_thread_oldest_first() {
+        let fx = fixture();
+        // Root arrives first; no In-Reply-To, so it roots its own thread.
+        let root = email("root", "Mon, 01 Jan 2024 09:00:00 +0000");
+        let root_id = ingest(&fx, "inbox", 1, &root);
+        let thread = find_by_id(&fx.store, root_id)
+            .unwrap()
+            .unwrap()
+            .thread_id
+            .unwrap();
+        assert_eq!(thread, "<root@example.com>", "a lone message roots its own thread");
+
+        // A reply points at the root through In-Reply-To in its raw headers.
+        let reply = email("reply", "Mon, 01 Jan 2024 11:00:00 +0000");
+        let raw = b"In-Reply-To: <root@example.com>\r\nMessage-ID: <reply@example.com>\r\n\r\nbody";
+        ingest_raw(&fx, "inbox", 2, &reply, raw);
+
+        let convo = thread_messages(&fx.store, "alice", &thread).unwrap();
+        let subjects: Vec<_> = convo.iter().map(|r| r.subject.clone().unwrap()).collect();
+        assert_eq!(subjects, vec!["root", "reply"], "oldest first");
+    }
+
+    /// The same logical message copied into a second mailbox is one
+    /// conversation entry, not two: the dedup keeps the thread one line per
+    /// Message-ID (#0008).
+    #[test]
+    fn a_thread_collapses_a_cross_mailbox_copy() {
+        let fx = fixture();
+        let root = email("root", "Mon, 01 Jan 2024 09:00:00 +0000");
+        ingest(&fx, "inbox", 1, &root);
+        // Archived copy of the very same message: same Message-ID, other box.
+        ingest(&fx, "archive", 5, &root);
+
+        let convo = thread_messages(&fx.store, "alice", "<root@example.com>").unwrap();
+        assert_eq!(convo.len(), 1, "a copy of one message is one conversation entry");
     }
 
     #[test]

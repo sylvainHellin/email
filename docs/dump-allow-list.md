@@ -29,3 +29,5 @@ Anything not listed here is a regression, not a difference.
   The parity direction is pre-nuke ⊆ branch; branch-only records are not differences.
 - Non-UTF-8 messages no longer disappear: the file build dropped a `.md` file whose bytes were not valid UTF-8, and with no file to be unreadable the nearest case, an unreadable body blob, degrades to an empty body while the record still appears.
 - The final sort tiebreaker is the `uid` instead of the file name, and since both are unique within a mailbox and neither is ever emitted, the order stays total and the output is unaffected.
+- `thread` is a new field with no pre-nuke counterpart: it dumps `messages.thread_id`, the conversation key ingest assigns from the `In-Reply-To` / `References` chain ([#0008](tickets/0008-threading-conversation-view.md)), so a script can group related mail without re-parsing headers.
+  It sits last in the record, after `invite`, so every earlier field keeps its position; the pre-nuke oracle simply had no such column.

@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use super::super::app::{
     App, AttachmentPicker, AttachmentPickerMode, ConfirmDialog, DirPicker, DirPickerMode,
-    MailboxPicker, PersistentError, RsvpOverlay,
+    MailboxPicker, PersistentError, RsvpOverlay, ThreadEntry, ThreadOverlay,
 };
 use super::super::theme;
 use super::util::truncate;
@@ -476,6 +476,109 @@ pub(super) fn render_mailbox_picker(picker: &MailboxPicker, frame: &mut Frame, a
         ))),
         chunks[2],
     );
+}
+
+/// Render the conversation (threading) overlay opened with `T` (#0008).
+///
+/// A read-only list of every message ingest grouped under the cursor
+/// message's `thread_id`, oldest first, one line per logical message. The
+/// message the overlay was opened from carries a caret so the reader keeps
+/// their place; the cursor row is highlighted. Enter opens the highlighted
+/// message, Esc closes. The status glyph mirrors the mail list's precedence
+/// (unread, answered, forwarded, read).
+pub(super) fn render_thread_overlay(overlay: &ThreadOverlay, frame: &mut Frame, area: Rect) {
+    let dialog_width = 76u16.min(area.width.saturating_sub(4));
+    let list_len = overlay.messages.len().max(1) as u16;
+    let dialog_height = (list_len + 5).min(area.height.saturating_sub(2));
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(dialog_width)])
+        .flex(Flex::Center)
+        .split(area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(dialog_height)])
+        .flex(Flex::Center)
+        .split(horizontal[0]);
+    let dialog_area = vertical[0];
+    frame.render_widget(Clear, dialog_area);
+
+    let title = format!(
+        " Conversation ({}): {} ",
+        overlay.messages.len(),
+        overlay.subject
+    );
+    let block = Block::default()
+        .title(truncate(&title, dialog_width.saturating_sub(2) as usize))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::active().border_focused))
+        .style(Style::default().bg(theme::active().bg));
+    let block_inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(block_inner);
+
+    let inner_width = chunks[0].width as usize;
+    let lines: Vec<Line> = overlay
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| thread_line(entry, i == overlay.selected, inner_width))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k nav  Enter open  Esc close",
+            Style::default().fg(theme::active().text_muted),
+        ))),
+        chunks[1],
+    );
+}
+
+/// One conversation row: `<caret> <marker> <date>  <from>  [mailbox]`.
+fn thread_line(entry: &ThreadEntry, cursor: bool, width: usize) -> Line<'static> {
+    // Status glyph, same precedence as the mail list (#TKT-0051 / #0007).
+    let (glyph, glyph_style) = if entry.flagged {
+        ("\u{f024}", Style::default().fg(theme::active().warning))
+    } else if !entry.read {
+        ("\u{f444}", Style::default().fg(theme::active().unread))
+    } else if entry.answered {
+        ("\u{f045a}", Style::default().fg(theme::active().success))
+    } else if entry.forwarded {
+        ("\u{f028d}", Style::default().fg(theme::active().accent_alt))
+    } else {
+        (" ", Style::default())
+    };
+
+    let caret = if entry.current { "\u{25b8} " } else { "  " };
+
+    let text_style = if cursor {
+        Style::default()
+            .fg(theme::active().heading)
+            .bg(theme::active().surface)
+    } else if !entry.read {
+        Style::default()
+            .fg(theme::active().text)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::active().text)
+    };
+
+    // The caret and the one-cell glyph cost three columns before the tail.
+    let tail = format!("{}  {}  [{}]", entry.date_display, entry.from, entry.mailbox);
+    let tail = truncate(&tail, width.saturating_sub(caret.chars().count() + 2));
+    Line::from(vec![
+        Span::styled(caret, Style::default().fg(theme::active().accent)),
+        Span::styled(glyph, glyph_style),
+        Span::styled(" ", text_style),
+        Span::styled(tail, text_style),
+    ])
 }
 
 pub(super) fn render_persistent_error(error: &PersistentError, frame: &mut Frame, area: Rect) {

@@ -45,6 +45,7 @@
       { "key": "*", "action": "Toggle flag/star" },
       { "key": "M", "action": "Move to mailbox (fuzzy picker)" },
       { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
+      { "key": "T", "action": "Show conversation (thread)" },
       { "key": "A", "action": "Approve draft" },
       { "key": "D", "action": "Mark approved as draft (reverse A)" },
       { "key": "x / X", "action": "Send / Send all approved" },

@@ -672,3 +672,15 @@ That loop carries the #0072 prune gate, the arrival marks and the deferred secon
 The change that keeps every one of those invariants is to split the loop into three phases and make only the middle one concurrent: read each mailbox's skip list from the store serially, fetch every mailbox in parallel with no store access at all, then ingest serially in target order exactly as before.
 The concurrency runs on `futures::stream::buffered`, not `buffer_unordered`, because `buffered` yields its results in input order however the fetches finish, so the serial ingest still sees its mailboxes in target order and the SQLite single-writer discipline is never in question.
 The load-bearing property is that swap, and it is one identifier, so it is pinned by a test that stalls the first future longest and asserts the output still comes back in order.
+
+## A read-side jump across mailboxes needs a one-shot target the async load consumes
+
+The conversation overlay ([#0008](tickets/0008-threading-conversation-view.md)) opens a message that may live in another mailbox, but a mailbox switch does not load synchronously: `switch_mailbox` on a cache miss shows an empty list and queues a background walk that lands later as `BgResult::MailboxLoaded`.
+So "select this row" cannot be a single post-switch line; the target is parked on `App::pending_select` and consumed in two places, the cache-hit tail of `switch_mailbox` and the `MailboxLoaded` handler after its own cursor restore.
+`consume_pending_select` clears the target only when it finds the row, so the parked value survives the async gap yet never lingers to hijack a later unrelated switch, because the row it names is always in its own mailbox's listing.
+
+## row_columns is shared, so a new column shifts every hand-indexed extra column after it
+
+Adding `thread_id` to `store::read::row_columns` shifted the trailing invite `EXISTS` predicate from index 12 to 13, and `row_from_sql` was updated to match.
+The trap is `list_invites`, which appends one more column (`b.hash`) to the same shared `row_columns` string and reads it by a hard-coded index that was one past the end: that index moves too, and nothing but a runtime `Invalid column type` panic flags it, since the query still compiles.
+Any column added to `row_columns` has to be chased into every query that concatenates extra selected columns onto it and reads them positionally.

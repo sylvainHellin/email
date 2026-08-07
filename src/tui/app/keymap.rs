@@ -259,6 +259,8 @@ pub enum KeyAction {
     ToggleFlag,
     MovePicker,
     Rsvp,
+    /// Open the conversation (threading) overlay for the cursor message (#0008).
+    OpenThread,
     Approve,
     MarkDraft,
     Send,
@@ -455,6 +457,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     bg("*", Chord::Char('*'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleFlag, "Toggle flag/star", false),
     bg("M", Chord::Char('M'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MovePicker, "Move to mailbox (fuzzy picker)", false),
     bg("V", Chord::Char('V'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Rsvp, "RSVP to invitation (Accept/Tentative/Decline)", false),
+    bg("T", Chord::Char('T'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenThread, "Show conversation (thread)", false),
     bg("A", Chord::Char('A'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Approve, "Approve draft", false),
     bg("D", Chord::Char('D'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MarkDraft, "Mark approved as draft (reverse A)", false),
     bg("x / X", Chord::Char('x'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Send, "Send / Send all approved", false),
@@ -899,6 +902,15 @@ mod tests {
         assert_eq!(
             resolve(KeyCtx::List, key('g'), None, &allow),
             Some(KeyAction::Manual)
+        );
+    }
+
+    /// `T` opens the conversation overlay from the list (#0008).
+    #[test]
+    fn thread_key_resolves_in_the_list() {
+        assert_eq!(
+            resolve(KeyCtx::List, key('T'), None, &allow),
+            Some(KeyAction::OpenThread)
         );
     }
 

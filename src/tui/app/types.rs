@@ -1348,6 +1348,44 @@ pub struct RsvpOverlay {
     pub selected: usize,
 }
 
+/// One message of the conversation shown in the thread overlay (#0008).
+///
+/// A flat row of display data plus the [`MessageRef`] the Enter key opens.
+/// `mailbox` is the store key (`messages.mailbox`), carried so the jump can
+/// resolve the sidebar index without a second store read; the overlay renders
+/// its sidebar label. `current` marks the message the overlay was opened from,
+/// so the reader keeps their place in the conversation.
+#[derive(Debug, Clone)]
+pub struct ThreadEntry {
+    pub msg: MessageRef,
+    pub mailbox: String,
+    pub from: String,
+    pub date_display: String,
+    pub read: bool,
+    pub answered: bool,
+    pub forwarded: bool,
+    pub flagged: bool,
+    /// True for the message the overlay was opened from.
+    pub current: bool,
+}
+
+/// State for the conversation (threading) overlay opened with `T` (#0008).
+///
+/// Read-only list of every message ingest put in the same `thread_id`, oldest
+/// first, across every mailbox of the active account. It is the "list the
+/// related emails" half of [#TKT-0051]: grouping a conversation, derived from
+/// the `In-Reply-To` / `References` chain ingest already resolved. Enter opens
+/// the highlighted message (switching mailbox when it lives in another), Esc
+/// closes.
+pub struct ThreadOverlay {
+    /// Subject of the message the overlay was opened from, shown in the title.
+    pub subject: String,
+    /// The conversation, oldest first.
+    pub messages: Vec<ThreadEntry>,
+    /// Cursor into `messages`.
+    pub selected: usize,
+}
+
 /// Data for rendering the confirmation dialog overlay.
 #[derive(Debug, Clone)]
 pub struct ConfirmDialog {
@@ -1393,6 +1431,8 @@ pub enum Overlay {
     Mailbox(MailboxPicker),
     /// RSVP overlay for a received invite (`V`, #0029).
     Rsvp(RsvpOverlay),
+    /// Conversation / threading overlay (`T`, #0008).
+    Thread(ThreadOverlay),
     /// Persistent error requiring explicit dismissal.
     Error(PersistentError),
 }

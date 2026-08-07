@@ -250,21 +250,21 @@ fn dump(tmp: &TempDir, args: &[&str]) -> String {
 /// envelope); it is written out literally so a change to that derivation
 /// shows up here as a deliberate edit.
 const EXPECTED: &str = concat!(
-    r#"{"account":"alpha","mailbox":"Team/Reports","message_id":"<weekly-1@example.com>","from":"bot@example.com","to":"sylvain@example.com","cc":null,"subject":"Weekly","date_sort":"2026-06-28T07:00:00","flags":["seen"],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"Team/Reports","message_id":"<weekly-1@example.com>","from":"bot@example.com","to":"sylvain@example.com","cc":null,"subject":"Weekly","date_sort":"2026-06-28T07:00:00","flags":["seen"],"attachments":[],"invite":false,"thread":"<weekly-1@example.com>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-9a19496e192edba7@local.invalid>","from":"undated@example.com","to":"sylvain@example.com","cc":null,"subject":"No date header","date_sort":"","flags":[],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-9a19496e192edba7@local.invalid>","from":"undated@example.com","to":"sylvain@example.com","cc":null,"subject":"No date header","date_sort":"","flags":[],"attachments":[],"invite":false,"thread":"<sha256-9a19496e192edba7@local.invalid>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-50b9b217cc3bf6f3@local.invalid>","from":"Organizer <organizer@example.com>","to":"sylvain@example.com","cc":null,"subject":"Kickoff","date_sort":"2026-07-01T07:00:00","flags":[],"attachments":[],"invite":true}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-50b9b217cc3bf6f3@local.invalid>","from":"Organizer <organizer@example.com>","to":"sylvain@example.com","cc":null,"subject":"Kickoff","date_sort":"2026-07-01T07:00:00","flags":[],"attachments":[],"invite":true,"thread":"<sha256-50b9b217cc3bf6f3@local.invalid>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<f7ef260c@example.com>","from":"Ivana Hecimovic <ivana@example.com>","to":"Sylvain Hellin <sylvain@example.com>","cc":"\"Prof. Petzold\" <petzold@example.com>","subject":"Bericht über Anträge","date_sort":"2026-07-02T11:57:30","flags":["seen"],"attachments":[{"name":"agenda.txt","size":3},{"name":"notes.pdf","size":14}],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<f7ef260c@example.com>","from":"Ivana Hecimovic <ivana@example.com>","to":"Sylvain Hellin <sylvain@example.com>","cc":"\"Prof. Petzold\" <petzold@example.com>","subject":"Bericht über Anträge","date_sort":"2026-07-02T11:57:30","flags":["seen"],"attachments":[{"name":"agenda.txt","size":3},{"name":"notes.pdf","size":14}],"invite":false,"thread":"<f7ef260c@example.com>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-56189be5b91b92d9@local.invalid>","from":"a@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-56189be5b91b92d9@local.invalid>","from":"a@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false,"thread":"<sha256-56189be5b91b92d9@local.invalid>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-a8c9281df15da4b3@local.invalid>","from":"b@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"inbox","message_id":"<sha256-a8c9281df15da4b3@local.invalid>","from":"b@example.com","to":"sylvain@example.com","cc":null,"subject":"Same second","date_sort":"2026-07-04T10:00:00","flags":[],"attachments":[],"invite":false,"thread":"<sha256-a8c9281df15da4b3@local.invalid>"}"#,
     "\n",
-    r#"{"account":"alpha","mailbox":"sent","message_id":"<sent-1@example.com>","from":"sylvain@example.com","to":"ivana@example.com","cc":null,"subject":"Re: Bericht","date_sort":"2026-06-29T12:00:00","flags":[],"attachments":[{"name":"report.pdf","size":8}],"invite":false}"#,
+    r#"{"account":"alpha","mailbox":"sent","message_id":"<sent-1@example.com>","from":"sylvain@example.com","to":"ivana@example.com","cc":null,"subject":"Re: Bericht","date_sort":"2026-06-29T12:00:00","flags":[],"attachments":[{"name":"report.pdf","size":8}],"invite":false,"thread":"<sent-1@example.com>"}"#,
     "\n",
-    r#"{"account":"beta","mailbox":"archive","message_id":"<old-1@example.com>","from":"someone@example.com","to":"beta@example.com","cc":null,"subject":"Old thread","date_sort":"2026-05-01T05:00:00","flags":["seen"],"attachments":[],"invite":false}"#,
+    r#"{"account":"beta","mailbox":"archive","message_id":"<old-1@example.com>","from":"someone@example.com","to":"beta@example.com","cc":null,"subject":"Old thread","date_sort":"2026-05-01T05:00:00","flags":["seen"],"attachments":[],"invite":false,"thread":"<old-1@example.com>"}"#,
     "\n",
 );
 

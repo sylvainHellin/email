@@ -49,6 +49,22 @@ All notable changes to this project are documented in this file.
   `email-cli X.Y.Z`.
 
 ### Added
+- **See a message's whole conversation (#0008).** `T` on a message in the list
+  opens a conversation overlay: every message that belongs to the same thread,
+  oldest first, across every mailbox of the account (a reply sitting in Sent
+  shows beside the original in Inbox). `j`/`k` move through it, `Enter` opens
+  the highlighted message (switching mailbox when it lives in another one), and
+  `Esc` closes. Each row carries its date, sender, mailbox and the same status
+  glyph the list uses; a caret marks the message the overlay was opened from.
+  The grouping is derived from the `In-Reply-To` / `References` headers ingest
+  already resolves into a per-message `thread_id`, so no re-parsing or extra
+  sync happens when the overlay opens, and a message whose relatives are not
+  downloaded says so rather than opening a one-line overlay. `mp dump-mailbox
+  --json` now carries a `thread` field beside `invite`, the conversation key,
+  so a script can group related mail without touching headers; this closes the
+  "list the related emails" half of #TKT-0051 that threading was always meant
+  to own.
+
 - **Flag important messages with a server-backed star (#0007).** `*` on a
   message in the list toggles the IMAP `\Flagged` system flag, marking it
   important the same way every other mail client does. A flagged row shows a

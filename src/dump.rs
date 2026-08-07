@@ -43,6 +43,14 @@
 //!   `attachments:` frontmatter list excluded it.
 //! - `invite`: `true` when the message carries an iMIP payload, i.e. the row
 //!   has an `invite.ics` attachment blob (`MessageRow::is_invite`).
+//! - `thread`: `messages.thread_id`, the conversation key ingest assigned
+//!   (#0008). It is the `Message-ID` of the thread root: equal to this
+//!   message's own `message_id` when it starts a thread, and equal to an
+//!   earlier message's id when it is a reply whose `In-Reply-To` / `References`
+//!   resolved to a known row. Grouping the dump by this field is the CLI half
+//!   of "list the related emails" (#TKT-0051). `null` only for a store written
+//!   before the column was filled, which re-ingest heals. This field has no
+//!   pre-nuke counterpart; see the allow-list.
 //!
 //! # Ordering
 //!
@@ -88,6 +96,7 @@ pub struct EnvelopeRecord {
     pub flags: Vec<String>,
     pub attachments: Vec<AttachmentRecord>,
     pub invite: bool,
+    pub thread: Option<String>,
 }
 
 /// Collect envelope records for every account in `accounts`, restricted to the
@@ -227,6 +236,7 @@ fn read_record(store: &Store, account: &str, row: &MessageRow) -> EnvelopeRecord
         flags: flags.into_iter().collect(),
         attachments,
         invite: row.is_invite,
+        thread: row.thread_id.clone(),
     }
 }
 
@@ -261,13 +271,14 @@ mod tests {
             flags: vec!["seen".to_string()],
             attachments: vec![AttachmentRecord { name: "a.pdf".to_string(), size: Some(3) }],
             invite: false,
+            thread: Some("<t@example.com>".to_string()),
         };
         let out = to_ndjson(std::slice::from_ref(&record));
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('\n'));
         assert_eq!(
             out.trim_end(),
-            r#"{"account":"a","mailbox":"inbox","message_id":null,"from":"x@example.com","to":null,"cc":null,"subject":"hi","date_sort":"2026-01-01T00:00:00","flags":["seen"],"attachments":[{"name":"a.pdf","size":3}],"invite":false}"#
+            r#"{"account":"a","mailbox":"inbox","message_id":null,"from":"x@example.com","to":null,"cc":null,"subject":"hi","date_sort":"2026-01-01T00:00:00","flags":["seen"],"attachments":[{"name":"a.pdf","size":3}],"invite":false,"thread":"<t@example.com>"}"#
         );
     }
 }
