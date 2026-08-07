@@ -59,6 +59,17 @@ The `render/` subdirectory keeps it clear of the attachment names materialised b
 `mp show <selector>` does not exist; the store read surface is [#0062](0062-cli-store-read-surface.md), which owns `mp show` and `mp list-messages`.
 The renderer added here (`store::read::render_markdown`) is the natural body of that command when #0062 is picked up.
 
+## Known edges (post-ship review of `6bc486a`, recorded not fixed)
+
+**An attachment named literally `render` denies the read-only open for that row.**
+`parse::sanitize_attachment_filename` (`src/parse.rs:318-329`) replaces only `/`, `\` and NUL and strips control characters, so an attachment called `render` materialises as a regular file at `mailypoppins-<row id>/render`.
+`render_temp_file`'s `create_dir_all` (`src/tui/actions.rs:80-83`) then fails and the open declines with "Open failed: creating ...".
+In the reverse order, with the directory already there, `materialise_attachments` fails on `fs::write` into a directory and returns `Err` for the whole row, so `o` and `O` decline for every attachment of that message, not just the colliding one.
+
+The collision is pre-existing: `render_temp_file` and the `render/` subdirectory predate this ticket, used by the browser rendition and the invite source.
+It is denial only, with no escape from the 0700 per-row directory, which is why it is recorded here instead of fixed.
+The Decisions line above ("cannot name a subdirectory because ingest sanitises path separators out of them") answers path traversal; it does not answer a plain file named `render`.
+
 ## Acceptance criteria
 
 - `e` or `Enter` on a received row in any mailbox opens the message in `$EDITOR` as Markdown with frontmatter.

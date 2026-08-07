@@ -62,7 +62,7 @@
       { "key": "j/k", "action": "Navigate results" },
       { "key": "gg / G", "action": "Jump to top / bottom" },
       { "key": "d/u", "action": "Half-page down / up" },
-      { "key": "Enter / e", "action": "Open in editor (read-only)" },
+      { "key": "Enter / e", "action": "Open in editor (mail read-only)" },
       { "key": "r / R", "action": "Reply / Reply-all" },
       { "key": "w", "action": "Forward" },
       { "key": "a", "action": "Archive" },

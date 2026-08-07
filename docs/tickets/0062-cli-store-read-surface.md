@@ -26,6 +26,7 @@ The data-access-layer plan promises CLI reads; they were never built.
 2. `mp list-messages`: list one mailbox or a whole account, honouring the existing `-A/--account` and `--mailbox` flags, with a `--limit`.
 3. Reuse `store::read` unchanged; this ticket adds no query.
 4. Document both in `mp --help` and on the website command pages, per the repo rule that those pages are derived from the CLI help.
+5. `store::read::render_markdown` ([#0075](0075-open-received-mail-in-editor.md)) is the natural body of `mp show`, but it appends the message body verbatim after the closing `---` fence, so a body whose first line is `---` reads back ambiguously; fence or escape the body before anything downstream parses that output.
 
 ## Acceptance criteria
 

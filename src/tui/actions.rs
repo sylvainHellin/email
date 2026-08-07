@@ -323,17 +323,45 @@ fn open_readonly_view(
     let Some(path) = readonly_view_for_row(app, row_id) else {
         return Ok(());
     };
-    suspend_terminal(terminal)?;
+    // Neither half of the terminal dance may return before the rendition is
+    // discarded: a terminal that cannot be suspended or restored must not
+    // also leave the 0444 file behind for the next open to trip over.
+    if let Err(e) = suspend_terminal(terminal) {
+        discard_readonly_view(&path);
+        return Err(e);
+    }
     let result = edit_file(&path);
-    resume_terminal(terminal)?;
-    let _ = std::fs::remove_file(&path);
+    let resumed = resume_terminal(terminal);
+    finish_readonly_view(app, &path, result);
+    resumed
+}
+
+/// Remove the read-only view, saying so in the log when it survives (#0075).
+///
+/// The removal is unconditional: a clean exit, an editor that never launched
+/// and one that exited non-zero all land here, because the file is scratch in
+/// every case. A removal that fails is logged rather than swallowed, and no
+/// further: the next open rebuilds over whatever is left (`write_readonly`
+/// removes first), so it is a trace for the log, not an error the user can
+/// act on.
+fn discard_readonly_view(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        log::warn!(
+            "[open] the read-only view left {} behind: {e}",
+            path.display()
+        );
+    }
+}
+
+/// Discard the read-only view and say how the editor session ended (#0075).
+fn finish_readonly_view(app: &mut App, path: &Path, result: Result<()>) {
+    discard_readonly_view(path);
     match result {
         Ok(()) => app.set_status(
             "Returned from the read-only copy (edits do not reach the message)".to_string(),
         ),
         Err(e) => app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +754,11 @@ fn send_status_line(report: &SendReport) -> Result<String> {
 ///
 /// A mutation without a store is not a silent no-op: the row it would have
 /// written is the whole local half of the operation.
+///
+/// Despite the name it is also the plain open helper, and read-only flows use
+/// it as such (attachments, the browser rendition, the read-only view #0075):
+/// it opens the two stores and nothing else, and `what` only names the
+/// operation in the failure status line.
 fn store_for_mutation(app: &mut App, what: &str) -> Option<(crate::store::Store, BlobStore)> {
     let account = app.account_config.name.clone();
     match open_store(&account) {
@@ -3724,6 +3757,39 @@ mod store_backed_files {
         assert_eq!(again, path);
         std::fs::remove_file(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    /// The rendition is scratch whichever way the editor session ends: a
+    /// clean exit and an editor that failed both come back with no 0444 file
+    /// left on disk (#0075).
+    #[test]
+    fn the_read_only_view_is_discarded_however_the_editor_exits() {
+        let fx = Fixture::new();
+        let row = fx.ingest(&fixture_email("Quarterly Report"));
+        let mut app = app_on_row(&row);
+
+        let path = readonly_view_for_row(&mut app, row.id).unwrap();
+        assert!(path.exists());
+        finish_readonly_view(&mut app, &path, Ok(()));
+        assert!(!path.exists(), "a clean exit takes the rendition with it");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Returned from the read-only copy (edits do not reach the message)")
+        );
+
+        // An editor that never launched, or exited non-zero, leaves nothing
+        // behind either -- the status line is the only difference.
+        let path = readonly_view_for_row(&mut app, row.id).unwrap();
+        assert!(path.exists());
+        finish_readonly_view(&mut app, &path, Err(anyhow::anyhow!("editor exited with 1")));
+        assert!(
+            !path.exists(),
+            "a failed editor takes the rendition with it too"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Open failed: editor exited with 1")
+        );
     }
 
     /// A message with no subject still gets a name a human can read, and one

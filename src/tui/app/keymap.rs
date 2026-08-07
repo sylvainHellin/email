@@ -469,7 +469,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     manual("j/k", KeyCtx::ServerSearch, "Navigate results", true),
     manual("gg / G", KeyCtx::ServerSearch, "Jump to top / bottom", false),
     manual("d/u", KeyCtx::ServerSearch, "Half-page down / up", false),
-    manual("Enter / e", KeyCtx::ServerSearch, "Open in editor (read-only)", true),
+    manual("Enter / e", KeyCtx::ServerSearch, "Open in editor (mail read-only)", true),
     manual("r / R", KeyCtx::ServerSearch, "Reply / Reply-all", false),
     manual("w", KeyCtx::ServerSearch, "Forward", false),
     manual("a", KeyCtx::ServerSearch, "Archive", false),
