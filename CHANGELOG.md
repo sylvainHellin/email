@@ -18,6 +18,18 @@ All notable changes to this project are documented in this file.
   did, and wiring them onto the queue is the follow-up half of #0039. No
   user-visible behaviour changed.
 
+### Fixed
+- **The mutation queue converges a crash-replay instead of surfacing a false
+  failure (#0039 review, internal).** A move, delete or mark-read whose server
+  half landed just before a crash used to replay against a message the source
+  folder no longer held; the IMAP move/delete and Graph mark-read backends
+  reported that not-found as a plain error, so the drain retried it to the
+  budget, parked a succeeded op as `failed` and rolled the local state back
+  under it. Those backends now return a typed `ops::NotFoundOnServer`, and the
+  drain treats it as a converged replay (retire the row, keep the optimistic
+  write). Direct CLI and TUI callers still see the same user-facing "not found"
+  error, so deleting a message the server no longer holds still reports it.
+
 ### Changed
 - **The Contacts and Calendar views got a visual-polish pass (#TKT-0048).**
   They now share the Mail list's cursor-row convention (a raised surface fill

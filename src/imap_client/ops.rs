@@ -45,11 +45,14 @@ pub async fn move_email_on_server(
 
     if uids.is_empty() {
         session.logout().await.ok();
-        return Err(anyhow!(
-            "Email with Message-ID {} not found in {} on server",
-            message_id,
-            source_mailbox
-        ));
+        // A typed not-found, so the durable queue's drain can converge a
+        // replay whose move already landed (#0039 review); a direct CLI/TUI
+        // caller still sees the same message through `Display`.
+        return Err(crate::ops::NotFoundOnServer {
+            message_id: message_id.to_string(),
+            mailbox: Some(source_mailbox.to_string()),
+        }
+        .into());
     }
 
     let uid = *uids.iter().next().expect("uids verified non-empty");
@@ -107,11 +110,13 @@ pub async fn delete_email_on_server(
 
     if uids.is_empty() {
         session.logout().await.ok();
-        return Err(anyhow!(
-            "Email with Message-ID {} not found in {} on server",
-            message_id,
-            source_mailbox
-        ));
+        // Typed not-found: the queue drain converges a replay whose delete
+        // already landed (#0039 review), while a direct caller still errors.
+        return Err(crate::ops::NotFoundOnServer {
+            message_id: message_id.to_string(),
+            mailbox: Some(source_mailbox.to_string()),
+        }
+        .into());
     }
 
     let uid = *uids.iter().next().expect("uids verified non-empty");

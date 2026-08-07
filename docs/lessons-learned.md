@@ -713,3 +713,13 @@ A test that enqueues a row and then drains with a tidy synthetic clock (`now = 1
 The gate is correct; the test's clock was below the row's real one.
 Drive these drains from `unix_now()`-relative offsets (`unix_now() + 10` for immediate eligibility, `base + N * 10_000_000` to step past successive backoff windows), because the state transitions that stamp `updated` (`bump_attempt`, `fail_and_roll_back`) also use the real clock, not the `now` the drain was handed.
 When a scheduler mixes an injected clock (the drain's `now`) with a wall-clock one (the row's `updated`), a test has to speak the wall-clock one or its rows look permanently not-yet-due.
+
+## A succeeded server op that crashes before its queue row retires must converge on replay, or it surfaces as a false failure
+
+The durable mutation queue (`src/pending_ops.rs`) commits the local write and the op it owes in one transaction, then a background drain runs the server op and retires the row.
+The dangerous window is server-op-succeeded-then-crash-before-retire: on restart the row is still `queued`, the drain replays the op, and the message is already gone from the source folder.
+Some backends reported that not-found as a plain `Err` (`imap_client::move_email_on_server` / `delete_email_on_server`, `graph::mark_read_graph`) while others returned `Ok` (the IMAP flag ops, `graph::move`/`delete`), so a replayed IMAP move retried to `MAX_ATTEMPTS`, parked a *succeeded* op as `failed`, and `fail_and_roll_back` moved the local row home: local diverged from the server until the next full sync, and a completed move was shown as failed.
+The "idempotent by Message-ID, a no-op on both backends" claim in the module doc was simply false for those three paths.
+The fix is a typed not-found signal, not string matching: the backends return `ops::NotFoundOnServer` and the drain treats it as a converged replay (retire the row, no rollback), while every other error stays a genuine failure that rolls back once the budget is spent.
+Keep the typed error's `Display` byte-identical to the old `anyhow!` text so direct CLI/TUI callers still show the user the same "not found" message; the split is drain-converges vs caller-errors, decided by `NotFoundOnServer::is_in`, not by changing what the backend prints.
+Test honesty matters here: a fake executor scripted to return `Ok` on replay validates the harness, not the backends, and hides exactly this blocker, so the crash-replay test must script the real not-found and assert convergence, paired with a genuine-error test that still rolls back.

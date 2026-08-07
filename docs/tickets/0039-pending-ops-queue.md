@@ -50,6 +50,16 @@ From [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06
 
 - [#0040](0040-drop-file-layer-cutover.md) (the legacy tree can be retired once every mutation is durable).
 
+## Review fix (blocker 2, crash-replay convergence)
+
+The first landing claimed the server op was "idempotent by Message-ID, a no-op on both backends", which was false on the crash-replay window (server op succeeded, crash before the row retired).
+Three not-found paths returned a plain `Err`: `imap_client::move_email_on_server` / `delete_email_on_server` on an empty UID search, and `graph::mark_read_graph` on a not-found id.
+A replayed IMAP move therefore retried to `MAX_ATTEMPTS`, parked a succeeded op as `failed`, and rolled the local row home, diverging from the server and surfacing a false failure.
+The fix is a typed not-found signal (`ops::NotFoundOnServer`), not string matching: those three backends return it, and `pending_ops::drain` treats it as a converged replay (retire the row, no rollback), while every other error stays a genuine failure that rolls back once the budget is spent.
+The IMAP flag ops and Graph move/delete already returned `Ok` on not-found, so all four op kinds converge on replay.
+Direct CLI and TUI callers are untouched: the typed error's `Display` is byte-identical to the old messages, so a user deleting a message the server no longer holds still sees the not-found error.
+Also this pass: the crash-replay test now scripts the real not-found and asserts convergence (paired with a genuine-error rollback regression), `pending_ops::drain` is `pub(crate)` so no caller drains outside `drain_account`'s engine lock, and `store::rebuild` documents that `pending_ops` is deliberately dropped on a rebuild (a pending mutation is server-recoverable, unlike an outbox submission).
+
 ## Implementation status (2026-08-11)
 
 Landed this pass, the durability core.
@@ -58,7 +68,7 @@ The approved increment boundary puts the review-gated half in a tight, fully off
 - `src/pending_ops.rs`: the durable queue, the mutation twin of `src/outbox.rs`, following its patterns rather than inventing parallel ones.
   The local write and the queue row commit in one transaction (`apply_move`, `apply_delete`, `apply_set_read`, `apply_set_flagged`).
   A background `drain` retires successful ops and backs off transient failures on the outbox's `backoff_secs` curve, and past a retry budget it rolls the local state back to the server's and parks the row `failed`.
-  Replay is exactly-once for the local half by construction: the write happens once inside the commit and the drain never re-applies it, only the server op, which is idempotent by Message-ID.
+  Replay is exactly-once for the local half by construction: the write happens once inside the commit and the drain never re-applies it, only the server op, and the drain converges that op on replay (see the review-fix note below).
   States are `queued` and `failed` only, and a successful op deletes its row, because a done mutation (unlike a partial-delivery send) has nothing to retain.
 - `src/ops.rs`: the amendment's "move `mutations.rs` to `src/ops.rs`" for the parts the queue needs.
   `ServerOp`, `Backend` and `run_ops` now live at library layer, re-exported from `tui/mutations.rs` so the TUI call sites read unchanged.

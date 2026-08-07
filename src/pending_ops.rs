@@ -19,10 +19,13 @@
 //!   sync tick, exactly where [`crate::send::resume_outbox`] already runs;
 //! - replay is exactly-once for the local half by construction: the local write
 //!   happened once, inside the commit, and the drain **never re-applies it**. It
-//!   runs only the server op, which is idempotent by Message-ID (a second move,
-//!   delete or flag of a message already in that state is a no-op on both
-//!   backends), so a crash between the server op and the row's retirement
-//!   converges on a re-run;
+//!   runs only the server op, and the drain **converges** that op on replay. A
+//!   move, delete or flag whose server half already landed before the crash
+//!   replays against a message the source folder no longer holds; both backends
+//!   report that as a typed [`crate::ops::NotFoundOnServer`], which the drain
+//!   treats as success and retires the row. So a crash between the server op and
+//!   the row's retirement re-runs the op and converges, rather than parking a
+//!   succeeded op as `failed` and rolling the local state back under it;
 //! - two drains racing on these rows is the destructive case the engine
 //!   advisory lock ([`crate::engine_lock`], #0061) exists to exclude, so a live
 //!   drain runs under that lock ([`drain_account`]).
@@ -359,6 +362,10 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOp> {
 /// The server side of the drain, as a trait so the state machine is testable
 /// against an in-memory fake. The live implementation is [`Backend`]; a test
 /// drives every retry and rollback path offline.
+///
+/// An executor reports faithfully: a not-found on the server surfaces as an
+/// [`Err`] carrying [`crate::ops::NotFoundOnServer`], and [`drain`] owns the
+/// policy of treating that as a converged replay rather than a failure.
 pub trait OpExecutor {
     fn execute(&mut self, op: &ServerOp) -> impl Future<Output = Result<()>> + Send;
 }
@@ -391,7 +398,17 @@ pub struct DrainResult {
 /// The drain **does not re-apply the local write**: that happened once, in the
 /// transaction that enqueued the row. This is the guard against a duplicate
 /// apply on replay after a crash.
-pub async fn drain<E: OpExecutor>(
+///
+/// A server op that comes back [`crate::ops::NotFoundOnServer`] is a converged
+/// replay, not a failure: the op's earlier attempt already moved, deleted or
+/// flagged the message, so the row is retired like any success. Every other
+/// error is a genuine failure and is retried, then rolled back once the budget
+/// is spent.
+///
+/// `pub(crate)`, not `pub`: the only lock-guarded entry point is
+/// [`drain_account`], and draining outside that lock is the race the engine
+/// advisory lock (#0061) exists to exclude.
+pub(crate) async fn drain<E: OpExecutor>(
     store: &Store,
     blobs: &BlobStore,
     account: &str,
@@ -406,6 +423,17 @@ pub async fn drain<E: OpExecutor>(
         }
         match exec.execute(&row.op).await {
             Ok(()) => {
+                retire(store, row.id)?;
+                result.completed += 1;
+            }
+            Err(e) if crate::ops::NotFoundOnServer::is_in(&e) => {
+                // The op already landed before the crash: the message is gone
+                // from the source, which is exactly where a successful op
+                // leaves it. Retire the row, do not roll the local state back.
+                info!(
+                    "[pending_ops] op {} ({}) target already gone on server; converged",
+                    row.id, row.kind
+                );
                 retire(store, row.id)?;
                 result.completed += 1;
             }
@@ -601,6 +629,18 @@ mod tests {
         }
     }
 
+    /// The typed not-found a real backend returns when the op's server half
+    /// already landed and the message is gone from the source folder. Scripting
+    /// this into the fake is what exercises the drain's convergence contract
+    /// rather than an assumed-idempotent backend.
+    fn not_found(message_id: &str) -> Result<()> {
+        Err(crate::ops::NotFoundOnServer {
+            message_id: message_id.to_string(),
+            mailbox: Some("INBOX".to_string()),
+        }
+        .into())
+    }
+
     /// Applying a move writes the row *and* the queue row in one transaction:
     /// the store shows the move, and a queued op is durably recorded.
     #[test]
@@ -638,27 +678,74 @@ mod tests {
         assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive");
     }
 
-    /// Crash-safety: the local write and the queue row are already committed,
-    /// so a "restart" (a fresh drain over the same store) replays the op and
-    /// converges, running the idempotent server op once more and then retiring
-    /// the row. Nothing re-applies the local move.
+    /// Crash-safety with the real not-found contract: the server move landed
+    /// before the crash, so on restart the replay finds the message already
+    /// gone from the source. The backend reports [`crate::ops::NotFoundOnServer`],
+    /// and the drain must **converge** (retire the row, keep the optimistic
+    /// move), not fail the succeeded op and roll it back. This is the #0039
+    /// review blocker: a scripted `Ok` hides it, so the fake returns the true
+    /// not-found here.
     #[tokio::test]
     async fn a_queued_op_replays_after_a_simulated_crash() {
         let fx = fixture();
         let id = fx.ingest_plain("inbox", 1, "Receipt");
         apply_move(&fx.store, "alice", id, "archive", move_op("<inbox-1@example.com>")).unwrap();
 
-        // The "crash": the process died before the drain ran. On restart the
-        // row is still queued and the store still shows the optimistic move.
+        // The "crash": the process died after the server move but before the
+        // drain retired the row. On restart the row is still queued and the
+        // store still shows the optimistic move.
         assert_eq!(queued_ops(&fx.store, "alice").unwrap().len(), 1);
         assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive");
 
-        let mut exec = FakeExecutor::always_ok();
-        drain(&fx.store, &fx.blobs, "alice", &mut exec, unix_now() + 10).await.unwrap();
+        let mut exec = FakeExecutor::scripted(vec![not_found("<inbox-1@example.com>")]);
+        let result = drain(&fx.store, &fx.blobs, "alice", &mut exec, unix_now() + 10)
+            .await
+            .unwrap();
 
         assert_eq!(exec.seen.len(), 1, "replay runs the op once");
-        assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive");
+        assert_eq!(result.completed, 1, "a not-found replay converges, it does not fail");
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive",
+            "a converged replay keeps the move; it is not rolled back"
+        );
         assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
+        assert!(failed_ops(&fx.store, "alice").unwrap().is_empty());
+    }
+
+    /// The discrimination the blocker turns on: a single not-found converges on
+    /// the first attempt (a succeeded op that crashed before retiring), while a
+    /// genuine error is retried and rolled back once the budget is spent. One
+    /// test pins both so a future change cannot make the drain swallow real
+    /// failures as "converged".
+    #[tokio::test]
+    async fn not_found_converges_but_a_genuine_error_still_rolls_back() {
+        // Not-found: converges at once, no rollback, no failed row.
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 1, "Receipt");
+        apply_move(&fx.store, "alice", id, "archive", move_op("<inbox-1@example.com>")).unwrap();
+        let mut exec = FakeExecutor::scripted(vec![not_found("<inbox-1@example.com>")]);
+        let r = drain(&fx.store, &fx.blobs, "alice", &mut exec, unix_now() + 10).await.unwrap();
+        assert_eq!((r.completed, r.failed), (1, 0));
+        assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive");
+        assert!(failed_ops(&fx.store, "alice").unwrap().is_empty());
+
+        // Genuine error: retried to the budget, then rolled the row home and
+        // parked as failed. A not-found must never be mistaken for this.
+        let id2 = fx.ingest_plain("inbox", 2, "Other");
+        apply_move(&fx.store, "alice", id2, "archive", move_op("<inbox-2@example.com>")).unwrap();
+        let base = unix_now();
+        for tick in 0..MAX_ATTEMPTS {
+            let mut exec = FakeExecutor::scripted(vec![Err(anyhow::anyhow!("NO server refused"))]);
+            drain(&fx.store, &fx.blobs, "alice", &mut exec, base + (tick + 1) * 10_000_000)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            read::find_by_id(&fx.store, id2).unwrap().unwrap().mailbox, "inbox",
+            "a genuine refusal must still roll the row home"
+        );
+        assert_eq!(failed_ops(&fx.store, "alice").unwrap().len(), 1);
     }
 
     /// A transient failure keeps the row queued and backs off: a second drain

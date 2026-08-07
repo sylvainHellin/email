@@ -20,6 +20,15 @@
 //! 3. It writes a `store-rebuild-<timestamp>.txt` note next to the store when
 //!    outbox rows were involved, so a discarded submission is never silent.
 //!
+//! `pending_ops` (#0039) is deliberately **not** carried, unlike the outbox it
+//! otherwise mirrors. A pending mutation is a flag, move or delete of a message
+//! the server still holds, so a queued-but-undrained row that a rebuild drops
+//! costs at most a redone flag or a delayed move, never a lost message: the next
+//! full sync restates the server's truth over the dropped optimistic write. The
+//! outbox is carried because a submission to a mail server is a side effect no
+//! sync can reconstruct; a pending mutation is not, so dropping it is safe and
+//! the rebuild stays a cache rebuild for this table.
+//!
 //! The read is row by row on purpose. The file reaching this module has
 //! usually failed an `integrity_check`, and a damaged page ends a SQLite scan
 //! for good: `Rows::advance` resets the statement on a step error, so every

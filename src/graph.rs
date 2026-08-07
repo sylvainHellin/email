@@ -1668,10 +1668,14 @@ pub async fn mark_read_graph(
         client.update_read_status(&graph_id, is_read).await?;
         Ok(())
     } else {
-        Err(anyhow!(
-            "Message {} not found on server",
-            internet_message_id
-        ))
+        // Typed not-found so the durable queue's drain converges a replay whose
+        // read toggle already landed (#0039 review); a direct caller still sees
+        // it as an error through `Display`.
+        Err(crate::ops::NotFoundOnServer {
+            message_id: internet_message_id.to_string(),
+            mailbox: None,
+        }
+        .into())
     }
 }
 

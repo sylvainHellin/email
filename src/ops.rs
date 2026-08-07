@@ -20,10 +20,58 @@
 //! Message-ID addressing the outbox's Sent dedup already relies on, because it
 //! is the proven seam and needs no widening of the `imap_client` op signatures.
 
+use std::error::Error as StdError;
+use std::fmt;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GraphConfig, ImapConfig};
+
+/// A backend op found no message to act on: the server's copy is already gone.
+///
+/// A *typed* not-found signal, so the durable queue's drain
+/// ([`crate::pending_ops`], #0039 review) can tell "the target is already in
+/// the desired state" from a real transport failure without matching on error
+/// strings. A move or delete that succeeded on the server, then crashed before
+/// its queue row retired, replays against a message the source folder no longer
+/// holds; the backend reports that as this error and the drain treats it as a
+/// converged op rather than parking a success as `failed`.
+///
+/// Direct CLI and TUI call sites keep seeing it as an ordinary error through
+/// [`std::fmt::Display`], so a user acting on a message the server no longer
+/// holds still gets the same message they always did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotFoundOnServer {
+    /// The `Message-ID` the op named.
+    pub message_id: String,
+    /// The source folder searched, when the backend knows it (IMAP). Graph
+    /// resolves by id across the mailbox, so it has no folder to name.
+    pub mailbox: Option<String>,
+}
+
+impl fmt::Display for NotFoundOnServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.mailbox {
+            Some(mailbox) => write!(
+                f,
+                "Email with Message-ID {} not found in {} on server",
+                self.message_id, mailbox
+            ),
+            None => write!(f, "Message {} not found on server", self.message_id),
+        }
+    }
+}
+
+impl StdError for NotFoundOnServer {}
+
+impl NotFoundOnServer {
+    /// True when `err` is, or wraps, a not-found signal from either backend.
+    /// The drain uses this to converge a replay instead of failing it.
+    pub fn is_in(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<NotFoundOnServer>().is_some()
+    }
+}
 
 /// What the background thread (or the queue drain) will ask the server to do.
 ///
