@@ -684,3 +684,10 @@ So "select this row" cannot be a single post-switch line; the target is parked o
 Adding `thread_id` to `store::read::row_columns` shifted the trailing invite `EXISTS` predicate from index 12 to 13, and `row_from_sql` was updated to match.
 The trap is `list_invites`, which appends one more column (`b.hash`) to the same shared `row_columns` string and reads it by a hard-coded index that was one past the end: that index moves too, and nothing but a runtime `Invalid column type` panic flags it, since the query still compiles.
 Any column added to `row_columns` has to be chased into every query that concatenates extra selected columns onto it and reads them positionally.
+
+## A wrong-store lookup can print a right-looking error, so parse the selector's account before opening any store
+
+`mp delete mp://tum/drafts/<id>` under a non-tum default failed with `no match for <id> in the drafts index of tum/drafts`, while `mp delete -A tum <same>` succeeded ([#0073](tickets/0073-delete-draft.md) follow-up).
+The selector parser already lets an `mp://<account>/…` segment override `-A`/the default, but every command in `main.rs` opened its store from the pre-chosen `account_config` *before* parsing, so a cross-account selector was resolved against the wrong account's index; the miss then formatted the scope from the query's own account (`tum/drafts`), naming the account the caller asked for while having searched a different one.
+The error looked correct because it echoed the selector, which is exactly what made the bug hard to see: the fix is to resolve the account from the selector first (`account_for_selector`) and only then open the store and, for received mail, load the server credentials.
+Where a command binds its transport before the selector is parsed (`mp send`, `mp invite`), a cross-account selector cannot be honoured cheaply, so it fails loudly with "selector names account X but this command is bound to Y" rather than acting on the wrong account.

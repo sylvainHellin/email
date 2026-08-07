@@ -10,7 +10,7 @@ use mailypoppins::selector::{Namespace, Selector};
 use mailypoppins::store::read::materialise_attachments;
 use mailypoppins::store::Store;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use log::{error, info, warn};
@@ -960,6 +960,63 @@ fn resolve_received_arg(
     mailypoppins::selector::resolve_received(store, &query)
 }
 
+/// The account a selector operates on: its own `mp://<account>/…` segment when
+/// present, otherwise the `-A`/default account already resolved. The selector's
+/// account overrides the flag because naming it in the selector is the more
+/// specific statement, exactly as `parse_in` lets it override `--mailbox`.
+///
+/// Every selector command must call this *before* opening a store or loading a
+/// transport, so a cross-account selector opens the right account's store and
+/// server credentials instead of resolving against the default and reporting a
+/// wrong-store miss (the #0073 follow-up bug). A selector naming an
+/// unconfigured account fails here, loudly, rather than as a phantom miss.
+fn account_for_selector(
+    selector: &str,
+    default: &AccountConfig,
+    global: &GlobalConfig,
+) -> Result<AccountConfig> {
+    let parts = mailypoppins::selector::parse(selector)?;
+    match parts.account {
+        Some(name) if name != default.name => global
+            .accounts
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known = global
+                    .accounts
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow!(
+                    "selector names account '{name}', which is not configured (known: {})",
+                    if known.is_empty() { "none" } else { known.as_str() }
+                )
+            }),
+        _ => Ok(default.clone()),
+    }
+}
+
+/// Guard for a command whose transport is loaded before the selector is parsed
+/// (`mp send`, `mp invite`): the SMTP/Graph credentials and the signature
+/// already belong to `bound`, so a cross-account selector cannot be honoured
+/// without reloading them. Rather than send from the wrong account silently, or
+/// widen the send path to rebind mid-command, fail loudly and point at `-A`.
+fn ensure_selector_account_matches(selector: &str, bound: &AccountConfig) -> Result<()> {
+    let parts = mailypoppins::selector::parse(selector)?;
+    if let Some(name) = parts.account {
+        if name != bound.name {
+            bail!(
+                "selector names account '{name}', but this command is bound to '{}' \
+                 (its transport is already configured); re-run with `-A {name}`",
+                bound.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The mailboxes an account is configured for, as a human-readable list for
 /// the error a `--mailbox` typo produces.
 fn configured_mailbox_names(account: &AccountConfig) -> String {
@@ -1236,6 +1293,10 @@ async fn main() -> Result<()> {
                      invitation"
                 )
             })?;
+            // Transport and signature are already bound to this account; a
+            // cross-account selector fails loudly rather than sending from the
+            // wrong account (see `ensure_selector_account_matches`).
+            ensure_selector_account_matches(&selector, &account_config)?;
             let store = drafts_store(&account_config.name)?;
             let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
             drop(store);
@@ -1595,6 +1656,10 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Validate { selector }) => {
+            let account_config = match &selector {
+                Some(sel) => account_for_selector(sel, &account_config, &global_config)?,
+                None => account_config.clone(),
+            };
             let store = drafts_store(&account_config.name)?;
             let targets: Vec<(Selector, PathBuf)> = match selector {
                 Some(ref sel) => {
@@ -1642,6 +1707,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::MarkApproved { selector }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = drafts_store(&account_config.name)?;
             let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
             drop(store);
@@ -1655,6 +1721,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::MarkDraft { selector }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = drafts_store(&account_config.name)?;
             let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
             drop(store);
@@ -1696,12 +1763,14 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Path { selector }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = drafts_store(&account_config.name)?;
             let (row, _canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
             println!("{}", row.path.display());
         }
 
         Some(Commands::Edit { selector }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = drafts_store(&account_config.name)?;
             let (row, canonical) = resolve_draft_arg(&store, &selector, &account_config.name)?;
             drop(store);
@@ -1718,6 +1787,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Reply { selector, all, mailbox }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
@@ -1737,6 +1807,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Forward { selector, mailbox }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
@@ -1772,6 +1843,10 @@ async fn main() -> Result<()> {
                     "RSVP is not supported for Graph accounts yet (#0036, blocked on #0035)"
                 ));
             }
+            // The RSVP goes out over this account's SMTP transport, already
+            // bound; a cross-account selector fails loudly rather than replying
+            // from the wrong account.
+            ensure_selector_account_matches(&selector, &account_config)?;
 
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
@@ -1953,6 +2028,9 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Archive { selector, mailbox }) => {
+            // The server move and the row rewrite both belong to the selector's
+            // account: resolve it before opening the store or loading creds.
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
@@ -2026,6 +2104,11 @@ async fn main() -> Result<()> {
             } else {
                 // `required_unless_present = "sent"` guarantees the selector.
                 let selector = selector.expect("clap requires a selector without --sent");
+                // A cross-account selector deletes from its own account, so the
+                // store and (for received mail) the server credentials must be
+                // the selector's, not `-A`'s (the #0073 follow-up bug).
+                let account_config =
+                    account_for_selector(&selector, &account_config, &global_config)?;
                 if is_drafts_selector(&selector, mailbox.as_deref())? {
                     // Drafts are local-only: no server op, just the file and
                     // the index row the rescan drops (#0073).
@@ -2072,6 +2155,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Open { selector, mailbox }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
@@ -2092,6 +2176,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Save { selector, output, mailbox }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
             let store = received_store(&account_config.name)?;
             let (row, canonical) =
                 resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
@@ -2281,6 +2366,8 @@ async fn main() -> Result<()> {
         None => {
             if let Some(ref selector) = cli.selector {
                 // Preview mode (dry run): a draft selector, never a path.
+                let account_config =
+                    account_for_selector(selector, &account_config, &global_config)?;
                 let store = drafts_store(&account_config.name)?;
                 let (row, _canonical) =
                     resolve_draft_arg(&store, selector, &account_config.name)?;

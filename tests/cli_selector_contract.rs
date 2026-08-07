@@ -367,3 +367,183 @@ fn an_unknown_key_names_the_namespace_it_searched() {
     let stderr = fx.err(&["send", "0123456789abcdef"]);
     assert!(stderr.contains("drafts"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// Cross-account selectors (#0073 follow-up)
+// ---------------------------------------------------------------------------
+
+/// A two-account config whose first account is the default. Every command here
+/// runs *without* `-A`, so a selector that names the second account is the only
+/// thing telling the binary which account to touch: the property under test is
+/// that the account is resolved from the selector before any store is opened.
+struct XAcctFixture {
+    tmp: TempDir,
+}
+
+impl XAcctFixture {
+    const DEFAULT: &'static str = "perso";
+    const OTHER: &'static str = "tum";
+
+    fn new() -> Self {
+        let tmp = TempDir::new().expect("tempdir");
+        let config_dir = tmp.path().join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[[accounts]]\nname = \"{d}\"\ndefault_from = \"me@{d}.example\"\n\n\
+                 [[accounts]]\nname = \"{o}\"\ndefault_from = \"me@{o}.example\"\n",
+                d = Self::DEFAULT,
+                o = Self::OTHER,
+            ),
+        )
+        .expect("write config");
+        Self { tmp }
+    }
+
+    fn data(&self) -> PathBuf {
+        self.tmp.path().join("data")
+    }
+
+    fn drafts_dir(&self, account: &str) -> PathBuf {
+        self.data().join("accounts").join(account).join("drafts")
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(MP)
+            .args(args)
+            .env("HOME", self.tmp.path().join("home"))
+            .env("MAILYPOPPINS_CONFIG_DIR", self.tmp.path().join("config"))
+            .env("MAILYPOPPINS_DATA_DIR", self.data())
+            .output()
+            .expect("mp must run")
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.run(args);
+        assert!(
+            out.status.success(),
+            "mp {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn err(&self, args: &[&str]) -> String {
+        let out = self.run(args);
+        assert!(!out.status.success(), "mp {args:?} unexpectedly succeeded");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Write a draft with a fixed `id:` into an account, the way an agent does.
+    fn draft(&self, account: &str, id: &str, subject: &str) {
+        let dir = self.drafts_dir(account);
+        fs::create_dir_all(&dir).expect("drafts dir");
+        fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\nid: {id}\nto: a@example.com\nsubject: {subject}\nstatus: draft\n---\n\nBody\n"
+            ),
+        )
+        .expect("write draft");
+    }
+
+    /// Ingest one received message into an account's store, the way sync does.
+    fn ingest(&self, account: &str, mailbox: &str, message_id: &str, subject: &str) {
+        let account_dir = self.data().join("accounts").join(account);
+        fs::create_dir_all(&account_dir).expect("account dir");
+        let store = Store::open(account_dir.join("store.sqlite3")).expect("store");
+        let blobs = BlobStore::new(account_dir.join("blobs"));
+        let email = FetchedEmail {
+            from: "Sender <sender@example.com>".to_string(),
+            to: "me@example.com".to_string(),
+            cc: None,
+            subject: subject.to_string(),
+            date: "Mon, 01 Jan 2026 09:00:00 +0000".to_string(),
+            body_text: format!("body of {subject}"),
+            html_body: None,
+            has_attachments: false,
+            message_id: Some(format!("<{message_id}>")),
+            attachments: Vec::new(),
+            flags: Default::default(),
+            calendar_ics: None,
+            event: None,
+        };
+        ingest_message(
+            &store,
+            &blobs,
+            &IngestInput {
+                account,
+                mailbox,
+                uid: 1,
+                email: &email,
+                raw: None,
+            },
+        )
+        .expect("ingest");
+    }
+}
+
+/// The reported bug: `mp delete mp://tum/drafts/<id>` under a `perso` default
+/// deleted nothing and reported a wrong-store miss. It must resolve the account
+/// from the selector, delete the draft in `tum`, and leave `perso` untouched.
+#[test]
+fn a_cross_account_drafts_selector_deletes_from_its_own_account() {
+    let fx = XAcctFixture::new();
+    fx.draft(XAcctFixture::OTHER, "4cd422197faf4a57", "Cross-account draft");
+    // A same-id draft in the default account would be the wrong one to touch.
+    fx.draft(XAcctFixture::DEFAULT, "4cd422197faf4a57", "Default-account draft");
+
+    // No `-A`: the selector's account is the only thing naming `tum`.
+    let out = fx.ok(&["delete", "mp://tum/drafts/4cd422197faf4a57"]);
+    assert!(out.contains("mp://tum/drafts/4cd422197faf4a57"), "{out}");
+
+    // The `tum` draft is gone; the identically-keyed `perso` draft is not.
+    let tum_list = fx.ok(&["list", "-A", "tum"]);
+    assert!(!tum_list.contains("4cd422197faf4a57"), "tum draft survived: {tum_list}");
+    let perso_list = fx.ok(&["list"]);
+    assert!(perso_list.contains("4cd422197faf4a57"), "perso draft was touched: {perso_list}");
+}
+
+/// A received-namespace read command honours a cross-account selector too: it
+/// resolves the message in `tum`'s store, not the default's. The read fails
+/// only because the message has no attachments, and it names the `tum`
+/// selector it settled on, proving it searched the right store.
+#[test]
+fn a_cross_account_received_selector_reads_from_its_own_account() {
+    let fx = XAcctFixture::new();
+    fx.ingest(XAcctFixture::OTHER, "inbox", "xacct@example.com", "In tum inbox");
+
+    // Without the fix this reported "no local store yet" or a wrong-store miss
+    // against `perso`; now it finds the `tum` message and reports no
+    // attachments to save.
+    let stderr = fx.err(&["save", "mp://tum/inbox/xacct@example.com"]);
+    assert!(stderr.contains("has no attachments"), "{stderr}");
+    assert!(stderr.contains("mp://tum/inbox/xacct@example.com"), "{stderr}");
+}
+
+/// A command bound to its account's transport before the selector is parsed
+/// (`mp send`) refuses a cross-account selector loudly, naming both accounts,
+/// rather than sending from the wrong one.
+#[test]
+fn a_send_bound_to_another_account_fails_loudly_on_a_cross_account_selector() {
+    let fx = XAcctFixture::new();
+    fx.draft(XAcctFixture::OTHER, "sendme00000000ff", "Would-be send");
+
+    let stderr = fx.err(&["send", "mp://tum/drafts/sendme00000000ff"]);
+    assert!(stderr.contains("bound to 'perso'"), "{stderr}");
+    assert!(stderr.contains("tum"), "{stderr}");
+    // The failure is the guard, not a wrong-store miss or a transport error.
+    assert!(!stderr.contains("no match"), "{stderr}");
+}
+
+/// A selector naming an account that is not configured fails where the account
+/// is resolved, with the account named, instead of surfacing downstream as a
+/// phantom miss against the default account's store.
+#[test]
+fn a_selector_naming_an_unconfigured_account_fails_with_that_account_named() {
+    let fx = XAcctFixture::new();
+    let stderr = fx.err(&["delete", "mp://ghost/drafts/whatever"]);
+    assert!(stderr.contains("ghost"), "{stderr}");
+    assert!(stderr.contains("not configured"), "{stderr}");
+}

@@ -25,6 +25,24 @@
 //! lookup. Zero matches names the namespace searched; more than one match (the
 //! cross-mailbox copy) lists every fully qualified candidate and asks for
 //! `--mailbox`, and never picks one.
+//!
+//! # The effective account is the selector's, resolved before any store opens
+//!
+//! A selector's own `mp://<account>/…` segment overrides `-A/--account` and the
+//! default, the same way its mailbox segment overrides `--mailbox`: naming a
+//! thing inside the selector is the more specific statement. The consequence a
+//! caller must honour is an ordering one. The account is resolved from the
+//! selector *before* any store is opened or any server credential is loaded, so
+//! a cross-account selector addresses its own account's index and transport.
+//! Opening the default account's store first and resolving against it turns a
+//! valid cross-account selector into a wrong-store miss whose error even prints
+//! the selector's account as the scope it searched, which is actively
+//! misleading (the #0073 follow-up bug: `mp delete mp://tum/drafts/<id>` under a
+//! `perso` default). A command whose transport is bound before the selector is
+//! parsed (`mp send`, `mp invite`) cannot honour a cross-account selector
+//! cheaply; it fails loudly with "selector names account X but this command is
+//! bound to Y" rather than operate on the wrong account. No command silently
+//! resolves a selector against an account the selector did not name.
 
 use std::fmt;
 

@@ -57,6 +57,20 @@ All notable changes to this project are documented in this file.
 - **A sent draft records `sent_via: "mailypoppins X.Y.Z"` (#0022),** not
   `email-cli X.Y.Z`.
 
+### Fixed
+- **A cross-account `mp://` selector now resolves against the account it names
+  (#0073 follow-up).** Commands opened the store for `-A`/the default account
+  before parsing the selector, so `mp delete mp://tum/drafts/<id>` under a
+  different default searched the wrong account's index and failed with a
+  right-looking `no match … of tum/drafts`, while `mp delete -A tum <same>`
+  worked. Every selector command (delete, reply, forward, archive, save, open,
+  path, edit, mark-approved, mark-draft, validate, preview) now resolves the
+  account from the selector first, then opens the right store and, for received
+  mail, loads the right server credentials. Commands whose transport is bound
+  before the selector is parsed (`mp send`, `mp invite`) refuse a cross-account
+  selector loudly ("selector names account X but this command is bound to Y")
+  rather than acting on the wrong account.
+
 ### Added
 - **See a message's whole conversation (#0008).** `T` on a message in the list
   opens a conversation overlay: every message that belongs to the same thread,
