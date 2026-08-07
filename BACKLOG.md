@@ -20,8 +20,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
-- [#0061 Engine advisory lock on store.lock](docs/tickets/0061-engine-advisory-lock.md) -- refactor _(fold-into-#0039 candidate)_
-- [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; send durability moved to #0037; absorbs mutation unification and the engine lock)_
+- [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; in progress: the durability core, op-seam extraction and the engine lock (#0061, absorbed) have landed; the TUI/CLI consumer rewiring and killing the "Quick sync queued" stacking are the deferred half)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_
 - [#0059 Extract a SyncBackend trait](docs/tickets/0059-syncbackend-trait.md) -- refactor _(the IMAP/Graph parity half is parked; what stands is the testable sync-engine seam #0041 assumes)_

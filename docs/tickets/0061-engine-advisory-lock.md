@@ -3,7 +3,7 @@ id: 0061
 title: Engine advisory lock on store.lock (mp sync plus an open TUI is a live double writer)
 type: refactor
 priority: later
-status: open
+status: done
 created: 2026-08-06
 ---
 
@@ -37,3 +37,12 @@ The lock was never built, and the second writer it was meant to exclude exists t
 
 This may fold into [#0039](0039-pending-ops-queue.md) rather than ship alone: #0039 needs the lock to make its drain safe, and the review recommends pulling it in there.
 Kept as its own ticket so the pre-#0039 exposure stays visible; close it as a duplicate if #0039 absorbs it.
+
+## Resolution (2026-08-11): absorbed into #0039
+
+Built as `src/engine_lock.rs` in the #0039 durability core: a non-blocking exclusive `flock` on `<account_dir>/store.lock`, taken by whichever process runs the engine and released for free on exit or crash by `close(2)`.
+A process that cannot take it degrades to read-only against the store (it still reads and still enqueues `pending_ops` rows, a plain WAL write) and does not drain, so the lock-holder's engine drains what everyone enqueues.
+The durable queue's live drain gates on it (`pending_ops::drain_account`).
+Covered by unit tests: a second live holder is refused, dropping the holder frees the lock, and the lock file persists across a take/release cycle so there is no unlink race.
+The explicit `mp sync` plus open-TUI acceptance run belongs with the consumer wiring deferred in #0039 (the drain is not yet called from the resume points), so it is tracked there.
+Closed as a duplicate of #0039.

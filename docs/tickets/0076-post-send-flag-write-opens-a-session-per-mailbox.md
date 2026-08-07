@@ -56,6 +56,13 @@ Closing it needs the source's mailbox to reach `send_draft`, and the draft file 
 That means a new frontmatter key, which is a draft-format change and a website-documentation change, so it is a decision rather than a sweep fix.
 Left as a known gap: the local half of the axis is correct for every hit that resolved, which is every hit after the next sync.
 
+## #0039 verdict (2026-08-11): not subsumed
+
+The durable `pending_ops` queue landed its core in [#0039](0039-pending-ops-queue.md) (queue engine, engine lock, op-seam extraction).
+It drains user mutations (archive, delete, move, mark-read), not the post-send `\Answered` / `$Forwarded` bookkeeping this ticket is about.
+Direction 2 here ("the flag write becomes a queued op") could ride that queue, but only once #0039's deferred consumer wiring exists and a best-effort op kind that must never fail a delivered send is added, so nothing in the #0039 core pass subsumes this.
+Still open; revisit alongside the #0039 TUI/CLI wiring.
+
 ## Acceptance criteria
 
 - One IMAP session for a source held in N mailboxes, pinned by whatever the chosen direction makes testable offline.

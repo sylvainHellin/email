@@ -10,6 +10,12 @@ created: 2026-08-09
 The flagging feature (#0007) shipped the `\Flagged` star, its server round-trip and its list marker, but not the "support filtering for flagged" half of the ticket.
 A flagged view is local-only: the bit is already in `messages.flags` and mirrored into `EmailEntry.flagged`, so no server call is needed.
 
+## #0039 verdict (2026-08-11): not subsumed
+
+Checked while landing the [#0039](0039-pending-ops-queue.md) durable-queue core.
+This is a local read-side view (filter and sort `messages.flags` for `\Flagged`), with no server op and no queue, so the mutation queue does not touch it.
+Still open, unchanged.
+
 ## Notes
 
 - The TUI has one local filter surface today, the `/` search over `App::visible` (`search_query == filter(emails)`).

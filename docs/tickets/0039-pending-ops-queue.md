@@ -3,7 +3,7 @@ id: 0039
 title: Durable pending_ops queue for flag, move and delete mutations
 type: refactor
 priority: later
-status: open
+status: in-progress
 created: 2026-07-14
 ---
 
@@ -49,3 +49,56 @@ From [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06
 ## Unblocks
 
 - [#0040](0040-drop-file-layer-cutover.md) (the legacy tree can be retired once every mutation is durable).
+
+## Implementation status (2026-08-11)
+
+Landed this pass, the durability core.
+The approved increment boundary puts the review-gated half in a tight, fully offline-tested diff and gives the product-visible TUI rewiring its own pass.
+
+- `src/pending_ops.rs`: the durable queue, the mutation twin of `src/outbox.rs`, following its patterns rather than inventing parallel ones.
+  The local write and the queue row commit in one transaction (`apply_move`, `apply_delete`, `apply_set_read`, `apply_set_flagged`).
+  A background `drain` retires successful ops and backs off transient failures on the outbox's `backoff_secs` curve, and past a retry budget it rolls the local state back to the server's and parks the row `failed`.
+  Replay is exactly-once for the local half by construction: the write happens once inside the commit and the drain never re-applies it, only the server op, which is idempotent by Message-ID.
+  States are `queued` and `failed` only, and a successful op deletes its row, because a done mutation (unlike a partial-delivery send) has nothing to retain.
+- `src/ops.rs`: the amendment's "move `mutations.rs` to `src/ops.rs`" for the parts the queue needs.
+  `ServerOp`, `Backend` and `run_ops` now live at library layer, re-exported from `tui/mutations.rs` so the TUI call sites read unchanged.
+  A remote op is email logic, which the TUI-implements-no-email-logic invariant keeps out of `tui/`.
+  The prepare/rollback pairing stays in `tui/mutations.rs` for now because it is keyed on `MessageRef`, a TUI type, and relocating it belongs with the consumer rewiring below.
+- `src/engine_lock.rs`: the engine advisory lock ([#0061](0061-engine-advisory-lock.md) folded in), a non-blocking `flock` on `<account_dir>/store.lock`.
+  Two drains racing on the queue is the destructive case it excludes.
+  A process that cannot take it degrades to read-only and lets the holder drain, which `drain_account` gates on.
+
+Decisions taken where the ticket left a choice, smallest design consistent with the outbox precedent:
+
+- **Addressing.**
+  `target_message_id` is the `messages` row id (amendment), and the full server addressing rides in the JSON payload as a `ServerOp`, which names the message by `Message-ID`.
+  The uid fast-path the amendment notes (carry the uid on `ServerOp`, keep the full-mailbox `UID SEARCH HEADER` as a fallback for sentinel UIDs) is deferred: it is a latency refinement, not a durability guarantee, and it would widen every `imap_client::ops` signature.
+  The first cut keeps the Message-ID addressing the outbox's Sent dedup already relies on.
+- **Failure classification.**
+  The `imap_client` and Graph op functions return a plain error with no permanent-vs-transient verdict, unlike the outbox's SMTP classification, so the drain retries a bounded `MAX_ATTEMPTS` times under backoff and then surfaces the failure.
+  A standing refusal (a delete the server rejects) surfaces after the budget rather than on the first attempt.
+  This satisfies the acceptance criterion, a failed op with its error and the local row returned to the server's state, without inventing a classifier the backends cannot feed.
+- **Test-harness decision (acceptance criterion).**
+  An in-memory `OpExecutor` fake, exactly the seam `outbox::SentMailbox` uses, not a live-server validation and not an IMAP mock server (there is none, and building one is [#0059](0059-syncbackend-trait.md)).
+  The crash-safety, replay, idempotency, backoff and per-kind rollback paths are all covered offline and deterministically in `src/pending_ops.rs`.
+
+### Absorption verdicts
+
+- **[#0061](0061-engine-advisory-lock.md): absorbed.**
+  The lock lands here as `src/engine_lock.rs`; closed as a duplicate.
+- **[#0076](0076-post-send-flag-write-opens-a-session-per-mailbox.md): not subsumed.**
+  #0076 is about the send path (`mark_source_after_send` opening one IMAP session per mailbox), which lives in the library and is shared with `mp send-approved`.
+  The durable queue drains user mutations (archive, delete, move, mark-read), not the post-send `\Answered` / `$Forwarded` bookkeeping, and routing that write through this queue would need the queue wired into `send_draft` and a new op kind for a best-effort flag that must never fail a delivered send.
+  Its direction 2 ("the flag write becomes a queued op") could ride this queue once the consumer wiring below exists, but nothing in this pass subsumes it, so it stays open.
+- **[#0079](0079-flagged-filter.md): not subsumed.**
+  #0079 is a local read-side view (filter and sort `messages.flags` for `\Flagged`), with no server op and no queue.
+  Untouched by this ticket, and left open.
+
+### Remaining scope (its own pass and review)
+
+The product-visible half, deferred deliberately:
+
+1. Wire the TUI `Action` handlers to enqueue through `apply_*` and apply the local store change, instead of spawning a per-op IMAP task; `BgResult` carries op state transitions back to `App::update`; pending and failed ops surfaced in the UI (`pending_ops::counts` / `failed_ops` are ready for a badge).
+2. Wire the CLI mutation commands (`mp archive`, `mp delete`) to the same seam, and relocate the `MessageRef`-keyed prepare/rollback pairing into `src/ops.rs` as part of that unification.
+3. Run the drain from the existing resume points (startup and the sync tick, beside `resume_outbox`), under the engine lock, taking care not to add sync traffic against live accounts.
+4. Kill the "Quick sync queued (N ops pending...)" stacking (owner directive 2026-08-05): with mutations in the durable queue there is nothing for the user-visible sync to wait behind.

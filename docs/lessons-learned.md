@@ -704,3 +704,12 @@ The row is carried on a typed `EmailEntry::skip` field rather than the `(msg: No
 The golden-frame style legend records `fg:error` now, and a parse-skipped draft row is drawn in it, but the drafts frame parks the cursor on that row so the preview can show the parse error, and the table's `row_highlight_style` (bg:surface + fg:selection) wins on the cursor row.
 So the error colour does not appear in that row's style run at all; it is proven instead by the calendar frame, where a cancelled event's `cancelled` label is the same `fg:error` off the cursor, and by a `list_row_style` unit test.
 When a frame needs to prove a row's own foreground, the cursor has to sit somewhere else, because the highlight is a full restyle, not an overlay.
+
+## A backoff gate keyed on wall-clock `updated` makes a test that passes a small synthetic `now` a silent no-op
+
+The durable queues stamp every row `updated = unix_now()` and gate a retry on `updated + backoff_secs(attempts) > now` (`src/outbox.rs`, `src/pending_ops.rs`).
+A fresh row has `attempts = 0`, so the backoff is `0` and the row is eligible the instant `now >= updated`, which in production it always is because the drain passes `unix_now()`.
+A test that enqueues a row and then drains with a tidy synthetic clock (`now = 10_000`) trips over the fact that `updated` is a real ~1.7e9 timestamp: `updated + 0 > 10_000` is true, so the row is treated as still backing off and the drain silently processes nothing, `completed == 0` with no error.
+The gate is correct; the test's clock was below the row's real one.
+Drive these drains from `unix_now()`-relative offsets (`unix_now() + 10` for immediate eligibility, `base + N * 10_000_000` to step past successive backoff windows), because the state transitions that stamp `updated` (`bump_attempt`, `fail_and_roll_back`) also use the real clock, not the `now` the drain was handed.
+When a scheduler mixes an injected clock (the drain's `now`) with a wall-clock one (the row's `updated`), a test has to speak the wall-clock one or its rows look permanently not-yet-due.

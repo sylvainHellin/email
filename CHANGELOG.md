@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Durable mutation queue and single-engine lock, the #0039 core (internal).**
+  Archive, delete, move and mark-read now have a durable home (`src/pending_ops.rs`)
+  that commits the local store change and the server op it owes in one
+  transaction, so a crash between the two can no longer lose a flag change or
+  strand an optimistic move. A background drain retires confirmed ops, backs off
+  transient failures, and past a retry budget rolls the local state back to the
+  server's and surfaces the failure. A non-blocking `flock` on
+  `<account_dir>/store.lock` (`src/engine_lock.rs`) makes at most one process the
+  engine for an account, so `mp sync` and an open TUI cannot double-drain. This
+  ships the durability plumbing only; the TUI and CLI still mutate the way they
+  did, and wiring them onto the queue is the follow-up half of #0039. No
+  user-visible behaviour changed.
+
 ### Changed
 - **The Contacts and Calendar views got a visual-polish pass (#TKT-0048).**
   They now share the Mail list's cursor-row convention (a raised surface fill

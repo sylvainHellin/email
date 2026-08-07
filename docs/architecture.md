@@ -62,7 +62,7 @@ The two were one column until #0054, which stored a UID where a modseq was read 
 `arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
 - `outbox` carries the durable send state machine described below.
 - `drafts` is the derived index over the drafts directory.
-- `pending_ops` is shape only so far: the durable mutation queue is #0039.
+- `pending_ops` carries the durable mutation queue (#0039): one row per owed server op, with `kind`, the `messages` row id in `target_message_id`, the full `ServerOp` plus its rollback in the JSON `payload`, and a `queued` / `failed` state. `src/pending_ops.rs` owns it, the mutation twin of `outbox`. Like `outbox` its live paths are not the schema's concern, but unlike `outbox` it is a plain cache table: a lost queue row loses a flag change or delays a move, never a message, so it is dropped and rebuilt with the file.
 - Every table carries `account`, although one file holds one account.
 The redundancy keeps a future shared database a schema change rather than a rewrite of every query.
 
@@ -89,9 +89,11 @@ Attachments are blobs, so anything that needs a file materialises them: `mp open
 ### Mutate
 
 A flag, move, archive or delete is one local write plus one server op.
-`src/tui/mutations.rs` pairs them: the `prepare_*` functions apply the local write through `src/store/write.rs` and hand back the `ServerOp` to fire in the background plus the row's previous coordinates, so a failed op rolls back.
+`src/tui/mutations.rs` pairs them: the `prepare_*` functions apply the local write through `src/store/write.rs` and hand back the `ServerOp` (now defined in `src/ops.rs`, the library home of the remote op) to fire in the background plus the row's previous coordinates, so a failed op rolls back.
 The CLI calls the server first and then writes the store.
-Neither ordering survives a crash between the halves; the durable queue that would fix that is #0039.
+Neither ordering survives a crash between the halves.
+The durable queue that fixes that, `src/pending_ops.rs` (#0039), has landed its core: `apply_move` / `apply_delete` / `apply_set_read` / `apply_set_flagged` commit the local write and the queued op in one transaction, a background `drain` retires confirmed ops and rolls failed ones back under the engine lock, and replay is exactly-once for the local half because the drain runs only the server op and never re-applies the local change.
+The TUI and CLI mutation paths above are not yet routed through it (the deferred half of #0039), so the crash window still exists on those live paths until they are.
 
 ### Send
 
@@ -162,6 +164,9 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/draft.rs` | Draft parsing and validation, reply and forward creation (`create_draft_from_source`), `source_from_row`, status transitions, `settle_sent_draft` |
 | `src/send.rs` | `markdown_to_html`, message building, `send_draft` + `SendContext`, per-recipient submission, `DurableSend`, `resume_outbox` |
 | `src/outbox.rs` | The durable send state machine and its blob refcounting |
+| `src/ops.rs` | `ServerOp` (the remote half of a mutation) and its IMAP/Graph execution seam `run_ops` / `run_op`, at library layer so the durable queue and the CLI can drive it without depending on `tui/` |
+| `src/pending_ops.rs` | The durable mutation queue (#0039): atomic local-write-plus-enqueue, the drain with backoff and per-kind rollback, crash-replay |
+| `src/engine_lock.rs` | One engine per account across processes (#0061): a non-blocking `flock` on `<account_dir>/store.lock`, released on exit or crash |
 | `src/graph.rs` | Microsoft Graph REST client: folders, fetch, sync, send, move, delete, read flags, search |
 | `src/calendar.rs` + `src/invite.rs` | iCalendar receive-side parsing and send-side building |
 | `src/contacts/` + `src/contacts_cmd.rs` | Contact index built from `messages` rows, frecency ranking, per-account cache at `account_dir(name)/contacts-cache.json`. CLI: `mp contacts {rebuild,stats,list}`. |
