@@ -325,17 +325,26 @@ pub fn create(conn: &Connection) -> Result<()> {
 /// into. That is why this is stamped in `meta` and runs once rather than on
 /// every open: a permanent "a mark of 0 means nothing" rule would reopen the
 /// bulk-move hole the mark exists to close.
+///
+/// The clear and its stamp commit together. Split across two transactions, a
+/// failure between them would leave the marks cleared and the file unstamped,
+/// so the next open would sweep again and clear a mark that is legitimate by
+/// then, which is exactly what "once per file" is here to prevent.
 pub fn sweep_first_contact_arrival_marks(conn: &Connection) -> Result<usize> {
     if get_meta(conn, META_ARRIVAL_MARK_SWEPT)?.is_some() {
         return Ok(0);
     }
-    let cleared = conn
+    let tx = conn
+        .unchecked_transaction()
+        .context("beginning the arrival-mark sweep")?;
+    let cleared = tx
         .execute(
             "UPDATE sync_cursors SET arrival_mark = NULL WHERE arrival_mark = 0",
             [],
         )
         .context("clearing pre-fix arrival marks")?;
-    set_meta(conn, META_ARRIVAL_MARK_SWEPT, "1")?;
+    set_meta(&tx, META_ARRIVAL_MARK_SWEPT, "1")?;
+    tx.commit().context("committing the arrival-mark sweep")?;
     Ok(cleared)
 }
 

@@ -108,7 +108,9 @@ Deriving the mark is fixed; the rows the previous build wrote are not, and there
 They are cleared by a one-shot sweep, `UPDATE sync_cursors SET arrival_mark = NULL WHERE arrival_mark = 0`, run on the first open by a build that has the fix and stamped in `meta` (`arrival_mark_zero_swept`) so it never runs again.
 One-shot rather than on every open, because a mark of `0` is still the right answer after the fix: a mailbox that had never held a message when it was last synced records a top of `0`, and a bulk move into it makes every copy an arrival.
 A standing "a mark of 0 means nothing" rule would reopen the bulk-move hole for that mailbox for good.
-The residual risk of the sweep is one mailbox in that state at the exact moment of the upgrade losing its deferral for one pass.
+The residual risk of the sweep is one mailbox in that state at the exact moment of the upgrade losing its deferral permanently.
+Once the mark is cleared the next pass derives its floor from the recorded top, which already sits above the stragglers, so every later pass reads them as backlog too.
+Only a full sync brings them in, and the store is a cache, so that is a recovery.
 
 ### Pins
 

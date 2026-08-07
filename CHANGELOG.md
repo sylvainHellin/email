@@ -135,8 +135,8 @@ All notable changes to this project are documented in this file.
   beyond the extra mailboxes: `mp sync --mailbox inbox` on an account whose
   config has no `[mailboxes.inbox]` used to work by accident, because the name
   was passed to the server verbatim and most servers resolve `inbox` to `INBOX`,
-  and now errors. Plain `mp sync` already synced nothing at all for such an
-  account, and the error names the mailboxes that are configured.
+  and now errors. Plain `mp sync` never synced that mailbox for such an account
+  either, and the error names the mailboxes that are configured.
 - **A rebuild salvages a long-lived outbox again (#0066 review).** Reading the
   rows a damaged page hid works by probing positions the listing never named,
   and the probe started at position 1 whatever the table held. An outbox that

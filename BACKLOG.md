@@ -37,6 +37,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0067 Contacts guard refinements (observed_at, corrupt cache, partial erosion)](docs/tickets/0067-contacts-guard-refinements.md) -- bug
 - [#0069 Delete the file-era invite rewriters (set_event_rsvp, InboxFrontmatter)](docs/tickets/0069-drop-file-era-invite-rewriters.md) -- chore _(from the #0057 review)_
 - [#0070 Audit the website for file-era claims](docs/tickets/0070-website-file-era-claims.md) -- chore _(website; from the #0057 review)_
+- [#0074 An ingest failure is not carried by the arrival mark](docs/tickets/0074-arrival-mark-misses-ingest-failures.md) -- bug _(from the #0072 sweep review)_
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
 - [#0031 iMIP cancellations/updates (CANCEL / SEQUENCE)](docs/tickets/0031-imip-cancel-update.md) -- feature
 - [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature
