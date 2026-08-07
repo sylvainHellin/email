@@ -15,6 +15,13 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
+<<<<<<< Updated upstream
+||||||| Stash base
+- [#0064 Retire path-shaped identity (MailboxRole, MailboxInfo.id, EmailStatus)](docs/tickets/0064-identity-type-cleanup.md) -- refactor _(before #TKT-0051; concrete half of #0022)_
+=======
+- [#0064 Retire path-shaped identity (MailboxRole, MailboxInfo.id, EmailStatus)](docs/tickets/0064-identity-type-cleanup.md) -- refactor _(before #TKT-0051; concrete half of #0022)_
+- [#0072 No way to delete a draft (CLI selector rejected, TUI `d` reports "nothing to delete")](docs/tickets/0072-delete-draft.md) -- bug
+>>>>>>> Stashed changes
 - [#0005 Parallel IMAP fetch per mailbox](docs/tickets/0005-parallel-imap-fetch-per-mailbox.md) -- perf
 - [#0007 Flagging / starring](docs/tickets/0007-flagging-starring.md) -- feature
 - [#0008 Threading / conversation view](docs/tickets/0008-threading-conversation-view.md) -- feature
