@@ -580,7 +580,6 @@ Graph gets away with the strict form because it downloads by id, so its backlog 
 What the prune actually depends on is narrower: an inbox row may go because another mailbox ingested the copy the message moved to, and a move issues a fresh UID at the *top* of the destination, so the flag to compute is whether every UID above the mailbox's arrival mark landed ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrival_coverage`).
 When two backends share a safety gate, share the predicate and let each compute its own inputs; the flag's name travels, its derivation does not.
 
-<<<<<<< Updated upstream
 ## A watermark recomputed from the store each pass measures the wrong thing after the first one
 
 The IMAP prune gate held a pass back when a UID above the mailbox's high-water mark had not been ingested, and derived that mark afresh from `max(known)` every pass (#0072 review).
@@ -605,8 +604,6 @@ Because the prune needs every mailbox complete before it applies anything, one s
 "Assume the worst when you know nothing" is the right answer for one pass and the wrong thing to write down, because a record of ignorance is indistinguishable from a record of a real obligation.
 The fix is to make the two distinguishable rather than to soften the mark: no cursor row is first contact, where everything the server lists is backlog and nothing is owed, while a cursor row is history even when every local row is gone, and its recorded top (`sync_cursors.last_uid`) is what a mailbox emptied elsewhere and then bulk-moved into is measured against.
 Before persisting a value a later run will be held to, ask what it means when it was computed from no information; if that reads the same as a genuine obligation, it is the absence that has to be representable ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrival_mark`).
-||||||| Stash base
-=======
 ## A lifecycle with no terminal state leaves its dead ends on disk
 
 A draft can be created, edited, approved and sent, and nothing deletes one ([#0073](tickets/0073-delete-draft.md)).
@@ -614,4 +611,3 @@ A draft can be created, edited, approved and sent, and nothing deletes one ([#00
 The gap stayed invisible while send removed the file on its own, and appeared only on a machine upgraded from a version that did not, where nine `status: sent` drafts had no supported way out.
 The index side needs nothing built: `mp list` re-scans the drafts directory and drops the rows whose file is gone, so removing the file is the entire missing operation.
 A key bound once across every view is a promise made in every view, and the action behind it has to resolve per view or the binding lies in all but the one it was written for.
->>>>>>> Stashed changes
