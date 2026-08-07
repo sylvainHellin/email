@@ -61,10 +61,19 @@ Decisions taken where the ticket left a fork:
 ## Bug found and fixed on the way
 
 `MailboxInfo.dir` was built by `config::mailbox_dir`, which *slugified* the server name of an `[[mailboxes.extra]]` mailbox, while `all_configured_mailboxes` handed the sync path that server name verbatim and ingest wrote it into `messages.mailbox` unchanged.
-An extra mailbox named `Team/Reports` was therefore listed, counted, quick-moved into and dumped under the key `team-reports`, which no row ever carries: it showed empty, its counter read 0, and a message quick-moved into it got a row under a key sync never touches.
+An extra mailbox named `Team/Reports` was therefore listed, counted and quick-moved into under the key `team-reports`, which no synced row ever carries: the sidebar showed it empty, its counter read 0, and `mp dump-mailbox team-reports` returned nothing at all, because the filter never matched the `Team/Reports` rows sync had written.
+The rows a quick move wrote were the mirror image: they landed under `team-reports`, a key sync never touches.
+Selectors and `mp dump-mailbox --json` always spelled a synced row's mailbox segment with the server name, and still do; what changes for such a mailbox is that the slug no longer names it anywhere.
 With `MailboxInfo.id` the sidebar key *is* the ingest key, and a test pins that (`the_sidebar_key_is_the_key_ingest_writes`).
 The `dump_mailbox_integration` fixture had encoded the reader's convention (it ingested under `team-reports`) and is now written from the writer's; that changes the dump's mailbox segment and its sort position for extra mailboxes only.
 No account configures an extra mailbox today, so no live store holds a slug-keyed row (checked: `inbox`, `archive`, `sent` only).
+
+## Follow-up from the review of a81ca52
+
+`mp sync --mailbox <name>` had the same bug class on the CLI input path: the role came from `MailboxRole::from(<what the user typed>)` while the server name came from the configured mapping, so `--mailbox projects` against a mailbox configured as `Projects` selected the right folder on the server and ingested its messages under the key `projects`, which the sidebar never lists and no selector resolves.
+Both halves of a sync target now come from one mapping (`config::find_sync_target`), and a `--mailbox` name that matches no configured mailbox is an error naming the ones that are configured, rather than a sync into a key the rest of the product cannot see.
+
+The dead `impl From<String> for MailboxRole` is gone; `From<&str>` was the only one with callers.
 
 ## Not in scope, left open
 

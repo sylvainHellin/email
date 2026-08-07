@@ -932,6 +932,26 @@ fn resolve_received_arg(
     email::selector::resolve_received(store, &query)
 }
 
+/// The mailboxes an account is configured for, as a human-readable list for
+/// the error a `--mailbox` typo produces.
+fn configured_mailbox_names(account: &AccountConfig) -> String {
+    let names: Vec<String> = all_configured_mailboxes(account)
+        .iter()
+        .map(|(role, mapping)| {
+            if role.as_str().eq_ignore_ascii_case(&mapping.server) {
+                mapping.server.clone()
+            } else {
+                format!("{} ({})", role.as_str(), mapping.server)
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// One account's `mp sync`: the outbox drain, the sync itself, the contacts
 /// hook, and the per-account summary lines.
 ///
@@ -945,13 +965,24 @@ async fn sync_one_account(
     dry_run: bool,
 ) -> Result<()> {
     let targets: Vec<imap_client::SyncTarget> = if let Some(user_mailboxes) = mailbox {
+        // Both halves of a target come from one configured mapping: building
+        // the role from the typed string files an extra mailbox's rows under
+        // `projects` while the rest of the product reads `Projects` (#0064).
         user_mailboxes
             .iter()
-            .map(|mb| imap_client::SyncTarget {
-                role: MailboxRole::from(mb.as_str()),
-                server_name: find_server_name_for_role(account_config, mb),
+            .map(|mb| {
+                let (role, server_name) = find_sync_target(account_config, mb)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "account '{}' has no mailbox '{}' configured; it knows {}",
+                            account_config.name,
+                            mb,
+                            configured_mailbox_names(account_config)
+                        )
+                    })?;
+                Ok(imap_client::SyncTarget { role, server_name })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     } else {
         all_configured_mailboxes(account_config)
             .iter()

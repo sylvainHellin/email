@@ -51,8 +51,8 @@ username = ""               # Falls back to smtp.username if omitted
 # Password falls back to SMTP password if not set separately
 
 [mailboxes.inbox]
-server = "INBOX"            # IMAP folder name; the local directory is
-                            # always <data_dir>/accounts/<name>/inbox/
+server = "INBOX"            # IMAP folder name; its messages are stored
+                            # under the key "inbox" in the account database
 
 [mailboxes.archive]
 server = "Archive"

@@ -884,6 +884,26 @@ pub fn find_server_name_for_role(account: &AccountConfig, name: &str) -> String 
     }
 }
 
+/// Resolve a user-typed mailbox name to the pair a sync target is made of: the
+/// store key its rows are filed under, and the name to SELECT on the server.
+///
+/// Both halves come from the same configured mapping, which is the point
+/// (#0064 review note 2). Building the role straight from the typed string
+/// gives `Other("projects")` for a mailbox configured as `Projects`, so the
+/// pass ingests under a key the sidebar never lists and the selectors never
+/// resolve, while the server name resolves case-insensitively and the fetch
+/// succeeds: rows land in a mailbox that does not exist locally.
+///
+/// `None` means the name matches no configured mailbox, which the caller
+/// reports rather than syncing a mailbox the rest of the product cannot see.
+pub fn find_sync_target(account: &AccountConfig, name: &str) -> Option<(MailboxRole, String)> {
+    let requested = MailboxRole::from(name);
+    all_configured_mailboxes(account)
+        .into_iter()
+        .find(|(role, mapping)| *role == requested || mapping.server.eq_ignore_ascii_case(name))
+        .map(|(role, mapping)| (role, mapping.server.clone()))
+}
+
 /// Find the AccountConfig whose default_from matches the given from address.
 pub fn find_account_by_from<'a>(config: &'a GlobalConfig, from: &str) -> Option<&'a AccountConfig> {
     let lower = from.to_lowercase();
@@ -1254,6 +1274,64 @@ name = "test"
         let account = AccountConfig::default();
         // Unknown role falls through to the name itself
         assert_eq!(find_server_name_for_role(&account, "Junk"), "Junk");
+    }
+
+    // -----------------------------------------------------------------------
+    // find_sync_target (#0064 review note 2)
+    // -----------------------------------------------------------------------
+
+    fn account_with_extra() -> AccountConfig {
+        AccountConfig {
+            mailboxes: MailboxesConfig {
+                inbox: Some(MailboxMapping {
+                    server: "INBOX".to_string(),
+                }),
+                extra: Some(vec![MailboxMapping {
+                    server: "Projects".to_string(),
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// `mp sync --mailbox projects` must file its rows under the key the
+    /// sidebar lists, `Projects`, not under the string the user typed.
+    #[test]
+    fn a_sync_target_takes_its_key_from_the_configured_mailbox() {
+        let account = account_with_extra();
+        assert_eq!(
+            find_sync_target(&account, "projects"),
+            Some((
+                MailboxRole::Other("Projects".to_string()),
+                "Projects".to_string()
+            ))
+        );
+        assert_eq!(
+            find_sync_target(&account, "PROJECTS"),
+            Some((
+                MailboxRole::Other("Projects".to_string()),
+                "Projects".to_string()
+            ))
+        );
+    }
+
+    /// A role name and the server name behind it are the same target.
+    #[test]
+    fn a_role_name_and_its_server_name_resolve_to_one_target() {
+        let account = account_with_extra();
+        let expected = Some((MailboxRole::Inbox, "INBOX".to_string()));
+        assert_eq!(find_sync_target(&account, "inbox"), expected);
+        assert_eq!(find_sync_target(&account, "INBOX"), expected);
+        assert_eq!(find_sync_target(&account, "Inbox"), expected);
+    }
+
+    /// A name nothing is configured for has no key to file rows under, so the
+    /// caller reports it instead of inventing one.
+    #[test]
+    fn an_unconfigured_mailbox_has_no_sync_target() {
+        assert_eq!(find_sync_target(&account_with_extra(), "Junk"), None);
+        assert_eq!(find_sync_target(&AccountConfig::default(), "inbox"), None);
     }
 
     // -----------------------------------------------------------------------

@@ -106,12 +106,6 @@ impl From<&str> for MailboxRole {
     }
 }
 
-impl From<String> for MailboxRole {
-    fn from(name: String) -> Self {
-        MailboxRole::from(name.as_str())
-    }
-}
-
 impl std::fmt::Display for MailboxRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

@@ -488,6 +488,27 @@ mod tests {
         assert_eq!(mailbox.email.to_string(), "jane@example.com");
     }
 
+    /// The same trap on the RSVP path: an account whose address carries a
+    /// display name with a comma builds a reply whose `from:` must still parse
+    /// where `submit` derives `MAIL FROM` from it (#0063 review, second half).
+    #[test]
+    fn an_rsvp_reply_carries_the_from_it_validated() {
+        let built = build_reply_message(
+            "Doe, Jane <jane@example.com>",
+            "organizer@example.com",
+            "Accepted: Planning",
+            "Accepted.",
+            "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+        )
+        .expect("the build accepts a display name it can quote");
+        assert_eq!(built.from, "\"Doe, Jane\" <jane@example.com>");
+        let mailbox: Mailbox = built
+            .from
+            .parse()
+            .expect("the stored from address parses on the submission path");
+        assert_eq!(mailbox.email.to_string(), "jane@example.com");
+    }
+
     // -----------------------------------------------------------------------
     // RecipientRole display
     // -----------------------------------------------------------------------
@@ -980,7 +1001,13 @@ pub fn build_reply_message(
     plain_body: &str,
     reply_ics: &str,
 ) -> Result<BuiltMessage> {
-    let from_mailbox: Mailbox = normalize_address_for_smtp(from)
+    // Normalised once and carried on the built message, the twin of what
+    // `build_draft_message` does: `submit` parses `BuiltMessage::from` to
+    // derive `MAIL FROM`, so a raw `Doe, Jane <j@x.com>` stored here would
+    // pass the build and then fail every submission it would ever get
+    // (#0063 review).
+    let normalized_from = normalize_address_for_smtp(from);
+    let from_mailbox: Mailbox = normalized_from
         .parse()
         .context("Invalid 'from' address for RSVP reply")?;
     let organizer_mailbox: Mailbox = normalize_address_for_smtp(organizer)
@@ -1002,7 +1029,7 @@ pub fn build_reply_message(
         message_id: message_id_of(&raw_message),
         raw: raw_message,
         recipients: vec![(organizer.to_string(), RecipientRole::To)],
-        from: from.to_string(),
+        from: normalized_from,
         // An RSVP is built from an invitation, not from a draft file, and
         // there is no second copy of it to press send on.
         draft_key: None,

@@ -22,10 +22,14 @@ All notable changes to this project are documented in this file.
   ingested that mailbox under the server name verbatim, so an extra mailbox
   named `Team/Reports` listed empty, counted zero, and swallowed any message
   quick-moved into it under a key sync never reads. Both sides now use the one
-  key. For anyone with such a mailbox this changes the mailbox segment of its
-  `mp://` selectors and of `mp dump-mailbox --json` from the slug to the server
-  name, and `--mailbox <slug>` no longer selects it; the server name and the
-  sidebar label both do.
+  key. For anyone with such a mailbox, the synced rows were the ones that could
+  not be reached: they carry the server name, and the slug-shaped filter behind
+  the sidebar, `mp dump-mailbox` and `--mailbox <slug>` never matched them, so
+  the mailbox read as empty everywhere. What did carry the slug was a row a
+  quick move had written under it, which is the half that has to be re-filed.
+  The selectors and the dump keep spelling a synced row's mailbox segment with
+  the server name, as they always did, and `--mailbox` now takes the server
+  name or the sidebar label rather than the slug.
 
   A `.md` file whose frontmatter says `status: inbox` or `status: archived` no
   longer parses. Nothing has written one since the receive path stopped writing
@@ -96,6 +100,27 @@ All notable changes to this project are documented in this file.
   the inbox row is pruned on the next quick sync the archived copy is re-filed
   only by a full sync. On servers that implement a move as copy-and-expunge
   (Exchange, Dovecot) one pass does both halves.
+- **`mp sync --mailbox <name>` files an extra mailbox's messages under the key
+  the rest of the product reads (#0064 review).** The role came from the string
+  typed on the command line while the server name came from the configured
+  mapping, so `--mailbox projects` against a mailbox configured as `Projects`
+  selected the right folder on the server and ingested its messages under
+  `projects`, a key the sidebar never lists and no selector resolves. Both
+  halves of a sync target now come from one mapping, and a `--mailbox` name
+  that matches no configured mailbox is an error that names the ones that do,
+  rather than a sync into a key nothing reads.
+- **A rebuild salvages a long-lived outbox again (#0066 review).** Reading the
+  rows a damaged page hid works by probing positions the listing never named,
+  and the probe started at position 1 whatever the table held. An outbox that
+  has drained and refilled for years keeps its live rows at positions far above
+  that, so the probe budget was spent entirely on the empty range below the
+  first row and recovered nothing. It now starts where the table says its rows
+  start.
+- **An RSVP reply queues the `from:` address it validated (#0063 review).**
+  `build_draft_message` was fixed to carry the normalised address; its twin on
+  the RSVP path still stored the raw one, so an account address like
+  `Doe, Jane <jane@example.com>` built a reply that failed every submission it
+  would ever get.
 - **A message archived in another client now leaves the local inbox on the
   next sync (#0072).** The prune diffed the store's UIDs against the download
   window only, the last `--limit` UIDs the fetch had read, so a message the

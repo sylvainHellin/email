@@ -178,6 +178,14 @@ pub(super) fn salvage_outbox(path: &Path) -> Salvage {
         .query_row("SELECT MAX(rowid) FROM outbox", [], |r| r.get(0))
         .ok()
         .flatten();
+    // Where the probe starts. A table whose live rowids all sit above the
+    // salvage budget (an outbox that has drained and refilled for years) would
+    // otherwise be probed from position 1 and recover nothing at all, because
+    // the budget runs out long before the first row (#0066 review 2).
+    let first_rowid: Option<i64> = conn
+        .query_row("SELECT MIN(rowid) FROM outbox", [], |r| r.get(0))
+        .ok()
+        .flatten();
 
     match list_rowids(&conn) {
         Ok((ids, stopped)) => {
@@ -210,7 +218,14 @@ pub(super) fn salvage_outbox(path: &Path) -> Salvage {
                 // reached: the probe covers the whole table minus the
                 // positions already listed.
                 let budget = SALVAGE_LIMIT.saturating_sub(count);
-                let probed = probe_unlisted(&conn, &listed, last_rowid, budget, &mut salvage);
+                let probed = probe_unlisted(
+                    &conn,
+                    &listed,
+                    first_rowid,
+                    last_rowid,
+                    budget,
+                    &mut salvage,
+                );
                 salvage.lost.push((
                     "<the outbox could not be read to the end>".to_string(),
                     gap_reason(&e, count, reads.read, &probed, claimed, last_rowid),
@@ -358,6 +373,7 @@ struct Probed {
 fn probe_unlisted(
     conn: &Connection,
     listed: &HashSet<i64>,
+    first_rowid: Option<i64>,
     last_rowid: Option<i64>,
     budget: usize,
     salvage: &mut Salvage,
@@ -369,10 +385,18 @@ fn probe_unlisted(
     if budget == 0 {
         return Probed::default();
     }
-    // Rowids are normally positive, but nothing stops a file from holding
-    // negative ones, so the walk starts at 1 or at the lowest position the
-    // listing named, whichever is lower.
-    let from = listed.iter().copied().min().unwrap_or(1).min(1);
+    // The walk starts where the table says its rows start, so a budget of a
+    // few thousand positions is spent on positions that can hold a row rather
+    // than on the empty range below the first one. A `MIN(rowid)` the damaged
+    // file would not answer falls back to 1, which is where this used to start
+    // unconditionally, and a listing that named something lower still (nothing
+    // stops a file from holding negative rowids) pulls the start down to it.
+    let from = match (first_rowid, listed.iter().copied().min()) {
+        (Some(first), Some(lowest_listed)) => first.min(lowest_listed),
+        (Some(first), None) => first,
+        (None, Some(lowest_listed)) => lowest_listed.min(1),
+        (None, None) => 1,
+    };
     if from > last_rowid {
         return Probed::default();
     }
@@ -1666,7 +1690,14 @@ mod tests {
         // naming 2 and 3: what an index-ordered listing leaves behind.
         let listed: HashSet<i64> = [1, 4, 5].into_iter().collect();
         let mut salvage = Salvage::default();
-        let probed = probe_unlisted(store.conn(), &listed, Some(5), SALVAGE_LIMIT, &mut salvage);
+        let probed = probe_unlisted(
+            store.conn(),
+            &listed,
+            Some(1),
+            Some(5),
+            SALVAGE_LIMIT,
+            &mut salvage,
+        );
         assert_eq!(probed.recovered, 2, "the skipped positions hold rows");
         assert_eq!(probed.refused, 0);
         assert_eq!(probed.upto, Some(3));
@@ -1683,12 +1714,63 @@ mod tests {
         let probed = probe_unlisted(
             store.conn(),
             &all,
+            Some(1),
             Some(5),
             SALVAGE_LIMIT,
             &mut Salvage::default(),
         );
         assert!(probed.covered_everything);
         assert_eq!(probed.upto, None);
+    }
+
+    /// #0066 review 2: a long-lived outbox has drained and refilled many
+    /// times, so every live row sits at a rowid far above the salvage budget.
+    /// Probing from position 1 spends the whole budget on the empty range
+    /// below the first row and recovers nothing.
+    #[test]
+    fn the_probe_starts_where_the_rows_are_not_at_position_one() {
+        let (_dir, path, blobs) = account_dir();
+        let store = Store::open(&path).unwrap();
+        for i in 1..=3 {
+            enqueue(
+                &store,
+                &blobs,
+                &format!("<{i}@example.com>"),
+                "pending_send",
+                format!("raw message {i}").as_bytes(),
+            );
+        }
+        // Where an outbox that has been draining for years keeps its rows.
+        store
+            .conn()
+            .execute("UPDATE outbox SET id = id + 10000", [])
+            .unwrap();
+
+        let budget = 3;
+        let listed = HashSet::new();
+        let mut salvage = Salvage::default();
+        let probed = probe_unlisted(
+            store.conn(),
+            &listed,
+            Some(10001),
+            Some(10003),
+            budget,
+            &mut salvage,
+        );
+        assert_eq!(probed.recovered, 3, "the budget lands on the live rows");
+        assert_eq!(salvage.rows.len(), 3);
+
+        // What it used to do, and what a `MIN(rowid)` the damaged file will
+        // not answer still falls back to.
+        let probed = probe_unlisted(
+            store.conn(),
+            &listed,
+            None,
+            Some(10003),
+            budget,
+            &mut Salvage::default(),
+        );
+        assert_eq!(probed.recovered, 0);
     }
 
     /// The two halves of a gap note have to agree: a row named as unreadable a
