@@ -16,44 +16,16 @@
 //! op. The queue that fixes that is
 //! [#0039](../../docs/tickets/0039-pending-ops-queue.md).
 
-use anyhow::Result;
-
 use super::app::MessageRef;
-use crate::config::{GraphConfig, ImapConfig};
 use crate::store::write::{self, MutatedRow};
 use crate::store::{open_store, BlobStore, Store};
 
-/// What the background thread will ask the server to do.
-///
-/// Every variant names the message by `Message-ID`, which is the only handle
-/// both backends share and the one that survives the local row moving.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ServerOp {
-    /// Move between server folders. Archiving is this with the archive folder
-    /// as destination, exactly as `move_email_on_server` has always framed it.
-    Move {
-        message_id: String,
-        source_mailbox: String,
-        dest_mailbox: String,
-    },
-    Delete {
-        message_id: String,
-        source_mailbox: String,
-    },
-    SetRead {
-        message_id: String,
-        mailbox: String,
-        read: bool,
-    },
-    /// Toggle the `\Flagged` star (#0007). Like [`ServerOp::SetRead`], the
-    /// server is truth on the IMAP path, so a local toggle needs a UID STORE
-    /// write the next sync restates.
-    SetFlagged {
-        message_id: String,
-        mailbox: String,
-        flagged: bool,
-    },
-}
+// The remote op and its execution seam moved to the library-level
+// [`crate::ops`] module (#0039): the durable `pending_ops` queue drains the
+// same ops from a background engine with no terminal, so a remote op is email
+// logic that must not live under `tui/`. Re-exported so the TUI call sites in
+// `actions.rs` read unchanged.
+pub(crate) use crate::ops::{run_ops, Backend, ServerOp};
 
 /// One mutation that has already been applied locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,160 +204,10 @@ pub(crate) fn rollback_flag(account: &str, msg: MessageRef, flagged: bool) {
     }
 }
 
-/// The backend a batch of ops runs against, resolved on the UI thread before
-/// the spawn so a missing config never leaves a half-applied mutation behind.
-pub(crate) enum Backend {
-    Imap(Box<ImapConfig>),
-    Graph(Box<GraphConfig>),
-}
-
-/// Run one op, index-aligned results for a whole batch.
-///
-/// IMAP batches a homogeneous list over a single connection, which is what the
-/// pre-store build did for archive and delete; Graph has no session to share,
-/// so it runs them in order.
-pub(crate) async fn run_ops(backend: &Backend, ops: &[ServerOp]) -> Vec<Result<()>> {
-    match backend {
-        Backend::Graph(config) => {
-            let mut out = Vec::with_capacity(ops.len());
-            for op in ops {
-                out.push(run_graph(config, op).await);
-            }
-            out
-        }
-        Backend::Imap(config) => match homogeneous(ops) {
-            Some(Homogeneous::Move { source, dest }) if ops.len() > 1 => {
-                let ids: Vec<String> = ops.iter().map(message_id_of).collect();
-                crate::imap_client::batch_move_on_server(config, &ids, source, dest).await
-            }
-            Some(Homogeneous::Delete { source }) if ops.len() > 1 => {
-                let ids: Vec<String> = ops.iter().map(message_id_of).collect();
-                crate::imap_client::batch_delete_on_server(config, &ids, source).await
-            }
-            _ => {
-                let mut out = Vec::with_capacity(ops.len());
-                for op in ops {
-                    out.push(run_imap(config, op).await);
-                }
-                out
-            }
-        },
-    }
-}
-
-async fn run_imap(config: &ImapConfig, op: &ServerOp) -> Result<()> {
-    match op {
-        ServerOp::Move {
-            message_id,
-            source_mailbox,
-            dest_mailbox,
-        } => {
-            crate::imap_client::move_email_on_server(
-                config,
-                message_id,
-                source_mailbox,
-                dest_mailbox,
-            )
-            .await
-        }
-        ServerOp::Delete {
-            message_id,
-            source_mailbox,
-        } => crate::imap_client::delete_email_on_server(config, message_id, source_mailbox).await,
-        ServerOp::SetRead {
-            message_id,
-            mailbox,
-            read,
-        } => {
-            if *read {
-                crate::imap_client::mark_read_on_server(config, message_id, mailbox).await
-            } else {
-                crate::imap_client::mark_unread_on_server(config, message_id, mailbox).await
-            }
-        }
-        ServerOp::SetFlagged {
-            message_id,
-            mailbox,
-            flagged,
-        } => {
-            let flag = crate::types::FLAG_FLAGGED;
-            if *flagged {
-                crate::imap_client::add_flag_on_server(config, message_id, mailbox, flag).await
-            } else {
-                crate::imap_client::remove_flag_on_server(config, message_id, mailbox, flag).await
-            }
-        }
-    }
-}
-
-async fn run_graph(config: &GraphConfig, op: &ServerOp) -> Result<()> {
-    match op {
-        ServerOp::Move {
-            message_id,
-            dest_mailbox,
-            ..
-        } => crate::graph::move_message_graph(config, message_id, dest_mailbox).await,
-        ServerOp::Delete { message_id, .. } => {
-            crate::graph::delete_message_graph(config, message_id).await
-        }
-        ServerOp::SetRead {
-            message_id, read, ..
-        } => crate::graph::mark_read_graph(config, message_id, *read).await,
-        // Graph stays seen-only (#0007): the star is parked locally, honoured
-        // by the store and the list, but never mirrored to Graph. A no-op Ok
-        // rather than an error, so the optimistic local write stands.
-        ServerOp::SetFlagged { message_id, .. } => {
-            log::debug!("[graph] flag parked locally for {message_id}; Graph is seen-only");
-            Ok(())
-        }
-    }
-}
-
-/// A batch that can share one IMAP session: same kind, same folders.
-enum Homogeneous<'a> {
-    Move { source: &'a str, dest: &'a str },
-    Delete { source: &'a str },
-}
-
-fn homogeneous(ops: &[ServerOp]) -> Option<Homogeneous<'_>> {
-    let first = ops.first()?;
-    match first {
-        ServerOp::Move {
-            source_mailbox,
-            dest_mailbox,
-            ..
-        } => ops
-            .iter()
-            .all(|op| {
-                matches!(op, ServerOp::Move { source_mailbox: s, dest_mailbox: d, .. }
-                    if s == source_mailbox && d == dest_mailbox)
-            })
-            .then_some(Homogeneous::Move {
-                source: source_mailbox,
-                dest: dest_mailbox,
-            }),
-        ServerOp::Delete { source_mailbox, .. } => ops
-            .iter()
-            .all(|op| matches!(op, ServerOp::Delete { source_mailbox: s, .. } if s == source_mailbox))
-            .then_some(Homogeneous::Delete {
-                source: source_mailbox,
-            }),
-        ServerOp::SetRead { .. } | ServerOp::SetFlagged { .. } => None,
-    }
-}
-
-fn message_id_of(op: &ServerOp) -> String {
-    match op {
-        ServerOp::Move { message_id, .. }
-        | ServerOp::Delete { message_id, .. }
-        | ServerOp::SetRead { message_id, .. }
-        | ServerOp::SetFlagged { message_id, .. } => message_id.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::{homogeneous, Homogeneous};
     use crate::reconcile::tests::{fixture, invite_ics, Fixture};
     use crate::store::read;
     use crate::tui::app::calendar_view;
