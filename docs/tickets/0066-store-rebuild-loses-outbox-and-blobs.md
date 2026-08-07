@@ -67,6 +67,30 @@ All four are fixed in the follow-up commit; the salvage now reads row by row rat
 - Note, unbounded salvage: a foreign database holding a large table named `outbox` produced a 12.6 MB note.
   A salvage reads at most 10 000 rows and says in the note when it stopped at that bound.
 
+## Review follow-up 2 (2026-08-07)
+
+The fresh-context review of `7a9b050` passed the change with no blocker and eight notes, all deferred to here, and all eight are fixed.
+None of them changes what a healthy rebuild does: every one is about a salvage reading a file that is already damaged, and about the note it leaves adding up.
+
+- A position the old file listed and then would not produce was dropped with no counter and no note entry (`QueryReturnedNoRows` in the row-by-row read).
+  A listing that completed cleanly pushes no gap entry at all, so a row the file itself claimed vanished with the note reporting nothing missing.
+  Those positions are now counted and named as one summary line.
+- The probe past a stopped listing only covered positions above the highest one listed.
+  The listing carries no `ORDER BY` on purpose, so the planner may serve it from `outbox_state`, whose order is `(state, rowid)`: a listing stopped mid-index leaves un-listed positions scattered *below* the highest it reached, and those were never re-read.
+  The probe now walks the whole range up to `MAX(rowid)` minus the positions already listed, inside the same 10 000-read budget, with a `HashSet` making the skip cheap.
+- `id + 1` on the highest listed rowid panicked `Store::open` on a row at `i64::MAX`, in any build with overflow checks, against this module's own contract that nothing here may fail an open.
+  The arithmetic is gone with the probe rewrite, and a one-row `i64::MAX` outbox is now a test.
+- The note's "about N were never read" counted refused rows as read, because it measured positions listed rather than rows returned, so it under-reported by exactly the rows named as unreadable a few lines above it.
+  The two halves of the note now agree.
+- A table of exactly 10 000 rows took the truncation arm and warned that rows "were left in the deleted file" when the salvage had read every one of them.
+  The bound coinciding with the last row is no longer reported as a loss.
+- When the listing had already named every position the table holds, the note still said "everything past that point is gone" and then "about 0 were never read".
+  It now says there was nothing past it to re-read.
+- The fallback scan's termination-on-error branch (the `WITHOUT ROWID` shape) rested on inspection alone.
+  It has a damaged-file test of its own now, built on the same recipe as the rowid case.
+- A salvaged value is whatever the old file happened to hold and nothing truncated it, so one oversized `message_id` landed in the note in full.
+  Values are clipped to 200 characters on their way into the note only; a carried row keeps every byte it had.
+
 ## Residual risks
 
 - Carried blob bytes are stat'd, not re-hashed.
@@ -78,6 +102,9 @@ All four are fixed in the follow-up commit; the salvage now reads row by row rat
   A crash *inside* the per-row replay leaves some rows carried and the rest gone, and since the note is written after that loop, no note is left either.
   The next open finds a valid v4 store, does not rebuild, and there is no second chance.
   Milliseconds wide and the same kind of window as the documented one; closing it means writing the salvage to disk before the drop, which is the sidecar design this ticket rejected.
+- The salvage budget of 10 000 reads covers the listing and the probe together, so a damaged table with more positions than that is re-read only as far as the budget reaches.
+  What is left over is counted against `COUNT(*)` in the note rather than named row by row.
+  No real outbox is that size; a foreign database holding a table named `outbox` can be.
 - The note files accumulate with no rotation, one per rebuild that touched the outbox.
   Their timestamp carries milliseconds, so two rebuilds of the same account in the same second no longer overwrite each other.
 - A second `mp` process holding a healthy store on the same account while this one rebuilds loses its store file (pre-existing) and now its blob files too.

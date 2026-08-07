@@ -26,8 +26,12 @@
 //! later `next()` says "no more rows" and a single scan would lose the whole
 //! tail without noticing. So the salvage lists the rowids first and reads one
 //! row per query, which costs one row per damaged page instead of all of
-//! them, and whatever the listing itself could not reach is counted against
-//! `COUNT(*)` and named in the note (#0066 review follow-up).
+//! them. A listing that stopped early is itself a btree walk that stopped
+//! early, and it carries no `ORDER BY`, so the positions it never named are
+//! not simply the ones above the highest it reached: the salvage goes back
+//! over every position between the first and `MAX(rowid)` that the listing did
+//! not name, within the same budget, and whatever is still unreachable is
+//! counted against `COUNT(*)` and named in the note (#0066 review follow-up).
 //!
 //! The sweep assumes the rebuild is the only thing touching the account
 //! directory: a blob written by a concurrent ingest whose row has not
@@ -67,6 +71,12 @@ const UNREADABLE_STATE: &str = "failed";
 /// file it feeds are held in memory.
 const SALVAGE_LIMIT: usize = 10_000;
 
+/// How much of one salvaged value goes into the note file. Every value here is
+/// whatever the old file happened to hold, so a single oversized `message_id`
+/// must not turn a note into a dump. Long enough that a real message-id, a
+/// state and a blob hash all pass through untouched.
+const NOTE_VALUE_LIMIT: usize = 200;
+
 /// One `outbox` row read out of the file that is about to be deleted.
 ///
 /// Every field is what the old file happened to hold, not what the current
@@ -99,8 +109,8 @@ impl SalvagedRow {
     fn describe(&self) -> String {
         format!(
             "{} ({})",
-            self.message_id.as_deref().unwrap_or("<no message-id>"),
-            self.state.as_deref().unwrap_or("unreadable state")
+            clip(self.message_id.as_deref().unwrap_or("<no message-id>")),
+            clip(self.state.as_deref().unwrap_or("unreadable state"))
         )
     }
 }
@@ -171,26 +181,47 @@ pub(super) fn salvage_outbox(path: &Path) -> Salvage {
 
     match list_rowids(&conn) {
         Ok((ids, stopped)) => {
-            let listed = ids.len();
-            let past = ids.last().copied().map(|id| id + 1).unwrap_or(1);
-            read_rows_by_id(&conn, ids, true, &mut salvage);
+            let count = ids.len();
+            let listed: HashSet<i64> = ids.iter().copied().collect();
+            let reads = read_rows_by_id(&conn, ids, true, &mut salvage);
+            if reads.missing > 0 {
+                // The file named the position and then held no row there: a
+                // page that still parses but has lost the cell, or a row
+                // deleted between the two queries. Either way a row the file
+                // itself claimed is gone, and a clean listing pushes no gap
+                // entry, so this is the only place it can be named.
+                salvage.lost.push((
+                    format!(
+                        "<{} row(s) the old file listed and then would not produce>",
+                        reads.missing
+                    ),
+                    "the old file named the position and held no row there when it was read"
+                        .to_string(),
+                ));
+            }
             if let Some(e) = stopped {
                 // The listing walks a btree like anything else, so it stops at
-                // the damaged page too. Every later row is still addressable
-                // by position: each read seeks from the root, so it reaches
-                // whatever the damage does not actually sit on. Positions that
-                // hold no row answer "no rows" and cost nothing.
-                let budget = SALVAGE_LIMIT.saturating_sub(listed);
-                let probed = probe_past(&conn, past, last_rowid, budget, &mut salvage);
+                // the damaged page too. Every row it did not reach is still
+                // addressable by position: each read seeks from the root, so
+                // it reaches whatever the damage does not actually sit on.
+                // Positions that hold no row answer "no rows" and cost
+                // nothing. The listing is deliberately unordered, so what it
+                // missed is not necessarily above the highest position it
+                // reached: the probe covers the whole table minus the
+                // positions already listed.
+                let budget = SALVAGE_LIMIT.saturating_sub(count);
+                let probed = probe_unlisted(&conn, &listed, last_rowid, budget, &mut salvage);
                 salvage.lost.push((
                     "<the outbox could not be read to the end>".to_string(),
-                    gap_reason(&e, listed, &probed, claimed, last_rowid),
+                    gap_reason(&e, count, reads.read, &probed, claimed, last_rowid),
                 ));
-            } else if listed >= SALVAGE_LIMIT {
-                salvage.lost.push((
-                    "<the outbox was too large to read in full>".to_string(),
-                    truncation_reason(listed, claimed),
-                ));
+            } else if count >= SALVAGE_LIMIT {
+                if let Some(reason) = truncation_reason(count, claimed) {
+                    salvage.lost.push((
+                        "<the outbox was too large to read in full>".to_string(),
+                        reason,
+                    ));
+                }
             }
         }
         Err(e) => {
@@ -234,19 +265,32 @@ fn list_rowids(conn: &Connection) -> Result<(Vec<i64>, Option<String>), rusqlite
     Ok((ids, stopped))
 }
 
+/// What one pass of row-by-row reads got back.
+#[derive(Debug, Default)]
+struct Reads {
+    /// Positions that answered with a row.
+    read: usize,
+    /// Positions that refused to be read.
+    refused: usize,
+    /// Positions that answered "no row". Only counted for a pass over
+    /// positions the file itself listed, where an empty position is a row the
+    /// file claimed and would not produce; past a damaged page an empty
+    /// position is the ordinary answer and means nothing.
+    missing: usize,
+}
+
 /// Read one row per query, so a damaged page costs that row and no other.
 ///
-/// Returns how many positions answered with a row and how many refused to be
-/// read. `name_each` says whether a refusal is named in the note one by one:
-/// true for a position the file itself listed (a row was there and is gone),
-/// false for a position only guessed at past a damaged page, where a refusal
-/// says nothing about whether a row was ever there and is counted instead.
+/// `name_each` says whether a refusal is named in the note one by one: true
+/// for a position the file itself listed (a row was there and is gone), false
+/// for a position only guessed at past a damaged page, where a refusal says
+/// nothing about whether a row was ever there and is counted instead.
 fn read_rows_by_id(
     conn: &Connection,
     ids: impl IntoIterator<Item = i64>,
     name_each: bool,
     salvage: &mut Salvage,
-) -> (usize, usize) {
+) -> Reads {
     let mut stmt = match conn.prepare("SELECT * FROM outbox WHERE rowid = ?1") {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -254,23 +298,27 @@ fn read_rows_by_id(
                 "<the outbox could not be read row by row>".to_string(),
                 format!("the old file refused the read: {e}"),
             ));
-            return (0, 0);
+            return Reads::default();
         }
     };
-    let (mut read, mut refused) = (0usize, 0usize);
+    let mut reads = Reads::default();
     for id in ids {
         match stmt.query_row([id], |row| Ok(read_salvaged_row(row))) {
             // A finished row owes nothing and is not worth carrying.
             Ok(row) => {
-                read += 1;
+                reads.read += 1;
                 if row.state.as_deref() != Some("done") {
                     salvage.rows.push(row);
                 }
             }
             // Gone between the listing and the read, or never there at all.
-            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                if name_each {
+                    reads.missing += 1;
+                }
+            }
             Err(e) => {
-                refused += 1;
+                reads.refused += 1;
                 if name_each {
                     warn!("[store] outbox row {id} could not be read out of the old file: {e}");
                     salvage.lost.push((
@@ -281,26 +329,35 @@ fn read_rows_by_id(
             }
         }
     }
-    (read, refused)
+    reads
 }
 
-/// What reading position by position past a damaged page got back.
+/// What reading position by position around a damaged page got back.
 #[derive(Debug, Default)]
 struct Probed {
     /// Positions that answered with a row.
     recovered: usize,
     /// Positions that refused to be read. A row may or may not have been there.
     refused: usize,
-    /// The last position tried, when there was one.
+    /// The highest position tried, when any was.
     upto: Option<i64>,
+    /// Set when the listing had already named every position the table holds,
+    /// so there was nothing left to re-read and no gap to warn about.
+    covered_everything: bool,
 }
 
-/// Read the rows past the point where the listing stopped, one position at a
-/// time, bounded by what the table says its last position is and by whatever
-/// is left of the salvage budget.
-fn probe_past(
+/// Read every position the listing did not name, one at a time, bounded by
+/// what the table says its last position is and by whatever is left of the
+/// salvage budget.
+///
+/// Not just the positions above the highest one listed: the listing carries no
+/// `ORDER BY` on purpose, so the planner may serve it from the `outbox_state`
+/// index, whose order is `(state, rowid)`. A listing that stopped mid-index
+/// therefore leaves un-listed positions scattered below the highest one it did
+/// reach, and those are rows too.
+fn probe_unlisted(
     conn: &Connection,
-    from: i64,
+    listed: &HashSet<i64>,
     last_rowid: Option<i64>,
     budget: usize,
     salvage: &mut Salvage,
@@ -309,22 +366,44 @@ fn probe_past(
         // Without a last position there is no bounded range to walk.
         return Probed::default();
     };
-    if budget == 0 || last_rowid < from {
+    if budget == 0 {
         return Probed::default();
     }
-    let upto = last_rowid.min(from.saturating_add(budget as i64 - 1));
-    let (recovered, refused) = read_rows_by_id(conn, from..=upto, false, salvage);
+    // Rowids are normally positive, but nothing stops a file from holding
+    // negative ones, so the walk starts at 1 or at the lowest position the
+    // listing named, whichever is lower.
+    let from = listed.iter().copied().min().unwrap_or(1).min(1);
+    if from > last_rowid {
+        return Probed::default();
+    }
+    // `take` bounds the walk: the filter skips at most `listed.len()`
+    // positions before yielding, so this costs at most one salvage budget plus
+    // one listing however wide the range is.
+    let ids: Vec<i64> = (from..=last_rowid)
+        .filter(|id| !listed.contains(id))
+        .take(budget)
+        .collect();
+    let Some(&upto) = ids.last() else {
+        return Probed {
+            covered_everything: true,
+            ..Probed::default()
+        };
+    };
+    let reads = read_rows_by_id(conn, ids, false, salvage);
     Probed {
-        recovered,
-        refused,
+        recovered: reads.read,
+        refused: reads.refused,
         upto: Some(upto),
+        covered_everything: false,
     }
 }
 
 /// The fallback read for a table with no rowids to address rows by.
 ///
 /// One scan, so the first damaged page ends it; what that costs is counted
-/// against `COUNT(*)` and named rather than dropped quietly.
+/// against `COUNT(*)` and named rather than dropped quietly. The
+/// termination-on-error branch below is covered by
+/// `a_damaged_rowidless_outbox_names_what_the_scan_could_not_reach`.
 fn scan_rows(conn: &Connection, claimed: Option<i64>, salvage: &mut Salvage) {
     let mut stmt = match conn.prepare(&format!("SELECT * FROM outbox LIMIT {SALVAGE_LIMIT}")) {
         Ok(stmt) => stmt,
@@ -357,35 +436,47 @@ fn scan_rows(conn: &Connection, claimed: Option<i64>, salvage: &mut Salvage) {
     if let Some(e) = stopped {
         salvage.lost.push((
             "<the outbox could not be read to the end>".to_string(),
-            gap_reason(&e, read, &Probed::default(), claimed, None),
+            gap_reason(&e, read, read, &Probed::default(), claimed, None),
         ));
     } else if read >= SALVAGE_LIMIT {
-        salvage.lost.push((
-            "<the outbox was too large to read in full>".to_string(),
-            truncation_reason(read, claimed),
-        ));
+        if let Some(reason) = truncation_reason(read, claimed) {
+            salvage.lost.push((
+                "<the outbox was too large to read in full>".to_string(),
+                reason,
+            ));
+        }
     }
 }
 
 /// Say what a read that stopped early left behind, as precisely as the old
 /// file still allows.
+///
+/// `listed` is how many positions the read named, `read` how many of them
+/// actually answered with a row: a refusal is named on its own line in the
+/// same note and must not also be counted as read here, or the two halves of
+/// the note disagree.
 fn gap_reason(
     error: &str,
-    reached: usize,
+    listed: usize,
+    read: usize,
     probed: &Probed,
     claimed: Option<i64>,
     last_rowid: Option<i64>,
 ) -> String {
-    let mut reason = format!("the old file stopped listing rows after {reached} of them ({error})");
+    let mut reason = format!("the old file stopped listing rows after {listed} of them ({error})");
     match probed.upto {
         Some(upto) => reason.push_str(&format!(
             "; reading position by position up to {upto} recovered {} more row(s) and left {} \
              position(s) unreadable",
             probed.recovered, probed.refused
         )),
+        None if probed.covered_everything => reason.push_str(
+            "; the listing had already named every position the table holds, so there was nothing \
+             past it to re-read",
+        ),
         None => reason.push_str("; everything past that point is gone"),
     }
-    let read = reached + probed.recovered;
+    let read = read + probed.recovered;
     if let Some(claimed) = claimed {
         let missing = (claimed - read as i64).max(0);
         reason.push_str(&format!(
@@ -402,18 +493,26 @@ fn gap_reason(
     reason
 }
 
-/// Say that the salvage stopped at its own bound rather than at the end.
-fn truncation_reason(read: usize, claimed: Option<i64>) -> String {
+/// Say that the salvage stopped at its own bound rather than at the end, when
+/// it actually did.
+///
+/// `None` when the table held no more rows than the bound: a table of exactly
+/// [`SALVAGE_LIMIT`] rows is read whole, and the bound coinciding with the
+/// last row is not a loss to warn about.
+fn truncation_reason(read: usize, claimed: Option<i64>) -> Option<String> {
     match claimed {
-        Some(claimed) if claimed > read as i64 => format!(
+        Some(claimed) if claimed <= read as i64 => None,
+        Some(claimed) => Some(format!(
             "the table held {claimed} row(s) and a salvage reads at most {SALVAGE_LIMIT}, so \
              {} of them were left in the deleted file",
             claimed - read as i64
-        ),
-        _ => format!(
+        )),
+        // The count itself was unreadable, so the bound may or may not have
+        // cost anything and the note says only what is certain.
+        None => Some(format!(
             "a salvage reads at most {SALVAGE_LIMIT} row(s), and the table had at least that many, \
              so any beyond them were left in the deleted file"
-        ),
+        )),
     }
 }
 
@@ -444,6 +543,21 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Cut a salvaged value down to what a note file can carry, on a character
+/// boundary. Applied where a value reaches the note, never where it reaches
+/// the rebuilt store: a carried row keeps every byte it had.
+fn clip(value: &str) -> String {
+    let mut cut = String::new();
+    for (taken, c) in value.chars().enumerate() {
+        if taken == NOTE_VALUE_LIMIT {
+            cut.push_str("... (clipped)");
+            return cut;
+        }
+        cut.push(c);
+    }
+    cut
 }
 
 /// A text column that may not exist and may not be text.
@@ -543,8 +657,12 @@ fn restore_row(conn: &Connection, blobs: &BlobStore, row: &SalvagedRow) -> Resul
         .raw_blob
         .as_deref()
         .ok_or_else(|| "the row named no raw message".to_string())?;
-    let hash = BlobHash::parse(raw_blob)
-        .map_err(|_| format!("'{raw_blob}' is not a blob hash, so the bytes are unreachable"))?;
+    let hash = BlobHash::parse(raw_blob).map_err(|_| {
+        format!(
+            "'{}' is not a blob hash, so the bytes are unreachable",
+            clip(raw_blob)
+        )
+    })?;
 
     let size = fs::metadata(blobs.path_for(&hash))
         .map_err(|_| "the raw bytes are no longer in the blob store".to_string())?
@@ -598,7 +716,7 @@ fn carried_state(row: &SalvagedRow) -> (String, Option<String>) {
         other => {
             reasons.push(format!(
                 "its state was unreadable ({})",
-                other.unwrap_or("none")
+                clip(other.unwrap_or("none"))
             ));
             UNREADABLE_STATE.to_string()
         }
@@ -1376,6 +1494,315 @@ mod tests {
         assert!(
             carried > ROWS / 2,
             "a damaged page must not cost the tail of the table: carried {carried} of {ROWS}"
+        );
+    }
+
+    /// A file that lists positions and then produces no row at them: a page
+    /// that still parses but has lost the cell, a row deleted between the two
+    /// queries, or (as here) a table shape that is not a table at all. The
+    /// listing completes cleanly, so nothing else in the salvage would ever
+    /// mention the rows it named.
+    #[test]
+    fn a_position_the_old_file_lists_and_will_not_produce_is_named_in_the_note() {
+        let (dir, path, _blobs) = account_dir();
+        {
+            let conn = Connection::open(&path).unwrap();
+            // `random()` is re-evaluated per query, so every position the
+            // listing hands out is one the row-by-row read cannot find again.
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE base (
+                     id         INTEGER PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 );
+                 INSERT INTO base (account, message_id, raw_blob, state)
+                 VALUES ('alice', '<one@example.com>', 'nothing', 'pending_send'),
+                        ('alice', '<two@example.com>', 'nothing', 'pending_send');
+                 CREATE VIEW outbox AS
+                     SELECT random() AS rowid, account, message_id, raw_blob, state FROM base;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(schema::SCHEMA_VERSION));
+        let notice =
+            notice_file(dir.path()).expect("a row the file listed and would not produce is a loss");
+        let text = fs::read_to_string(notice).unwrap();
+        assert!(
+            text.contains("<2 row(s) the old file listed and then would not produce>"),
+            "the note has to count them rather than drop them: {text}"
+        );
+    }
+
+    /// The top of the rowid range. Nothing in the salvage may fail an open,
+    /// and arithmetic on a position is where that is easiest to lose: `id + 1`
+    /// on `i64::MAX` panicked `Store::open` in any build with overflow checks.
+    #[test]
+    fn a_row_at_the_top_of_the_position_range_does_not_fail_the_open() {
+        let (_dir, path, blobs) = account_dir();
+        let hash = blobs.write(b"raw at the top of the range").unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     id         INTEGER PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO outbox (id, account, message_id, raw_blob, state)
+                 VALUES (?1, 'alice', '<topmost@example.com>', ?2, 'pending_send')",
+                rusqlite::params![i64::MAX, hash.as_str()],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let message_id: String = store
+            .conn()
+            .query_row("SELECT message_id FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(message_id, "<topmost@example.com>");
+    }
+
+    /// A table of exactly the salvage bound is read whole. The bound landing
+    /// on the last row is not a truncation, and warning about rows "left in
+    /// the deleted file" when there were none is a false alarm.
+    #[test]
+    fn an_outbox_of_exactly_the_salvage_bound_is_not_reported_as_truncated() {
+        let (dir, path, _blobs) = account_dir();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     id         INTEGER PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO outbox (account, message_id, raw_blob, state)
+                         VALUES ('alice', ?1, 'nothing', 'done')",
+                    )
+                    .unwrap();
+                for i in 0..SALVAGE_LIMIT {
+                    stmt.execute([format!("<{i}@example.com>")]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), Some(schema::SCHEMA_VERSION));
+        assert!(
+            notice_file(dir.path()).is_none(),
+            "every row was read, so there is nothing to warn about"
+        );
+    }
+
+    /// The note is a note. A salvaged value is whatever the old file held, so
+    /// what reaches the note is clipped; what reaches the rebuilt store is not.
+    #[test]
+    fn an_oversized_value_is_clipped_in_the_note_and_kept_in_the_store() {
+        let (dir, path, blobs) = account_dir();
+        let message_id = format!("<{}@example.com>", "x".repeat(8192));
+        {
+            let store = Store::open(&path).unwrap();
+            enqueue(&store, &blobs, &message_id, "pending_send", b"raw oversized");
+        }
+        stamp_a_wrong_version(&path);
+
+        let store = Store::open(&path).unwrap();
+        let carried: String = store
+            .conn()
+            .query_row("SELECT message_id FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(carried, message_id, "the row itself keeps every byte it had");
+
+        let notice = notice_file(dir.path()).expect("a carried row leaves a note");
+        let text = fs::read_to_string(notice).unwrap();
+        assert!(text.contains("... (clipped)"), "{text}");
+        assert!(
+            text.len() < 1024,
+            "the note stays a note, not a dump: {} bytes",
+            text.len()
+        );
+    }
+
+    /// The listing carries no `ORDER BY` on purpose, so one that stopped early
+    /// may have skipped positions *below* the highest it reached. Those hold
+    /// rows like any other and the probe has to go back for them.
+    #[test]
+    fn the_probe_goes_back_for_positions_the_listing_skipped() {
+        let (_dir, path, blobs) = account_dir();
+        let store = Store::open(&path).unwrap();
+        for i in 1..=5 {
+            enqueue(
+                &store,
+                &blobs,
+                &format!("<{i}@example.com>"),
+                "pending_send",
+                format!("raw message {i}").as_bytes(),
+            );
+        }
+
+        // A listing that named positions 1, 4 and 5 and stopped without ever
+        // naming 2 and 3: what an index-ordered listing leaves behind.
+        let listed: HashSet<i64> = [1, 4, 5].into_iter().collect();
+        let mut salvage = Salvage::default();
+        let probed = probe_unlisted(store.conn(), &listed, Some(5), SALVAGE_LIMIT, &mut salvage);
+        assert_eq!(probed.recovered, 2, "the skipped positions hold rows");
+        assert_eq!(probed.refused, 0);
+        assert_eq!(probed.upto, Some(3));
+        let mut recovered: Vec<String> = salvage
+            .rows
+            .iter()
+            .filter_map(|r| r.message_id.clone())
+            .collect();
+        recovered.sort();
+        assert_eq!(recovered, vec!["<2@example.com>", "<3@example.com>"]);
+
+        // And a listing that did name every position leaves nothing to probe.
+        let all: HashSet<i64> = (1..=5).collect();
+        let probed = probe_unlisted(
+            store.conn(),
+            &all,
+            Some(5),
+            SALVAGE_LIMIT,
+            &mut Salvage::default(),
+        );
+        assert!(probed.covered_everything);
+        assert_eq!(probed.upto, None);
+    }
+
+    /// The two halves of a gap note have to agree: a row named as unreadable a
+    /// few lines above is not also a row that was read, and a read that
+    /// reached the end of the table does not leave a gap past it.
+    #[test]
+    fn the_gap_note_counts_refused_rows_as_unread_and_claims_no_gap_it_has_not_found() {
+        let refused_two = gap_reason(
+            "database disk image is malformed",
+            5,
+            3,
+            &Probed::default(),
+            Some(5),
+            None,
+        );
+        assert!(
+            refused_two.contains("stopped listing rows after 5 of them"),
+            "{refused_two}"
+        );
+        assert!(
+            refused_two.contains("about 2 were never read"),
+            "a position that refused to be read is not a row that was read: {refused_two}"
+        );
+
+        let nothing_past = gap_reason(
+            "database disk image is malformed",
+            5,
+            5,
+            &Probed {
+                covered_everything: true,
+                ..Probed::default()
+            },
+            Some(5),
+            Some(5),
+        );
+        assert!(
+            !nothing_past.contains("everything past that point is gone"),
+            "there is no gap past the last position: {nothing_past}"
+        );
+        assert!(
+            nothing_past.contains("about 0 were never read"),
+            "{nothing_past}"
+        );
+    }
+
+    /// The fallback scan's own termination-on-error branch: a `WITHOUT ROWID`
+    /// table has no positions to read one at a time, so the salvage falls back
+    /// to a single scan, and the first damaged page ends it for good. What
+    /// that costs still has to be named rather than counted as zero.
+    #[test]
+    fn a_damaged_rowidless_outbox_names_what_the_scan_could_not_reach() {
+        const ROWS: usize = 400;
+        let (dir, path, blobs) = account_dir();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size = 512;
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE outbox (
+                     message_id TEXT NOT NULL PRIMARY KEY,
+                     account    TEXT NOT NULL,
+                     raw_blob   TEXT NOT NULL,
+                     state      TEXT NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
+                [schema::SCHEMA_VERSION.to_string()],
+            )
+            .unwrap();
+            for i in 0..ROWS {
+                let hash = blobs.write(format!("raw message {i}").as_bytes()).unwrap();
+                conn.execute(
+                    "INSERT INTO outbox (account, message_id, raw_blob, state)
+                     VALUES ('alice', ?1, ?2, 'pending_send')",
+                    rusqlite::params![format!("<{i:04}@example.com>"), hash.as_str()],
+                )
+                .unwrap();
+            }
+        }
+
+        // Same recipe as the rowid case: zero 4 KB in the middle of the file,
+        // page-aligned, well clear of the header and the schema on page 1.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let len = fs::metadata(&path).unwrap().len();
+            assert!(len > 16 * 1024, "the probe needs a file with a middle");
+            let at = (len / 2) / 512 * 512;
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(at)).unwrap();
+            file.write_all(&[0u8; 4096]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let carried: usize = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap() as usize;
+        assert!(carried < ROWS, "the probe is only meaningful if the damage cost something");
+        let notice = notice_file(dir.path()).expect("a rebuild that lost submissions writes a note");
+        let text = fs::read_to_string(notice).unwrap();
+        assert!(
+            text.contains("Discarded, because they could not be carried"),
+            "the loss must be named, not counted as zero: {text}"
+        );
+        assert!(
+            text.contains("stopped listing rows after"),
+            "the note has to say the scan did not reach the end: {text}"
+        );
+        assert!(
+            text.contains("never read") || text.contains("could not be established"),
+            "and has to say what that left unread: {text}"
         );
     }
 

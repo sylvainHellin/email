@@ -535,6 +535,14 @@ The loop's error arm runs once and the iterator then reports a clean end of tabl
 An `Err` inside an iteration is the end of that iteration unless the API says otherwise, and a loop that treats it as "skip one, continue" silently truncates.
 Reading a damaged table means addressing rows individually (`SELECT ... WHERE rowid = ?`, one query each, each seeking from the btree root), and counting what was reached against `COUNT(*)` or `MAX(rowid)` so the gap can be named instead of assumed to be zero ([src/store/rebuild.rs](../src/store/rebuild.rs)).
 
+## A query with no `ORDER BY` has no "after the last row it returned"
+
+The recovery built on the lesson above listed the rowids first and then re-read the positions the listing never reached, taking those to be the ones above the highest rowid it had returned (#0066 review follow-up 2).
+The listing omits `ORDER BY` deliberately, so that the planner may serve it from the smaller `outbox_state` index instead of the damaged table btree, and that index is ordered `(state, rowid)`: a listing that stops mid-index has skipped rowids scattered *below* its own maximum, and every one of them was silently written off.
+It looked correct because the test table held one state, where index order and rowid order coincide.
+When a read is deliberately left unordered, the set it did not reach is the complement of what it returned, not a suffix, and the code that goes back for the remainder has to be written from the complement (`1..=MAX(rowid)` minus a `HashSet` of what was listed).
+An unordered result read as if it were ordered is a bug that only the favourable test data hides.
+
 ## `lettre`'s `is_response()` does not mean "the server responded with an error"
 
 The send path classified an SMTP failure as clean or ambiguous with `!(err.is_response() || err.is_client() || err.is_tls())`, on the reading that a response error is the server saying no in words (#0063).
