@@ -36,6 +36,11 @@ pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// informational (it makes a stale store obvious in a bug report).
 pub const META_APP_VERSION: &str = "app_version";
 
+/// `meta` key recording that [`sweep_first_contact_arrival_marks`] has run
+/// against this file. Present from creation on a store this build made, so the
+/// sweep only ever touches a file an earlier build wrote.
+pub const META_ARRIVAL_MARK_SWEPT: &str = "arrival_mark_zero_swept";
+
 /// Tables that must exist for a store to count as a valid v4 file. Checked on
 /// open so that a file which is stamped v4 but structurally incomplete (a
 /// half-written create, a hand-edited database) is rebuilt rather than used.
@@ -125,8 +130,8 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   usable (`snippet()`, `highlight()` and selecting a column value all fail),
 ///   and there is nothing to rebuild from, because a store that loses its index
 ///   is dropped and refilled by the next sync.
-/// - `sync_cursors.arrival_mark` is the only column here a *later* pass reads
-///   back: the UID above which the mailbox still owes the store a message the
+/// - `sync_cursors.arrival_mark` is what a *later* pass is held to: the UID
+///   above which the mailbox still owes the store a message the
 ///   server lists (a bulk move whose destination copies did not fit the
 ///   download window). Recomputing it from the stored UIDs cannot work, since
 ///   ingesting the top of the window raises that high-water mark above the
@@ -136,11 +141,16 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   and leaves it NULL.
 /// - `sync_cursors` keeps the two resume points apart, because they are not
 ///   the same number: `last_uid` is the highest UID the recording fetch saw,
-///   while `highest_modseq` is a CONDSTORE modification sequence. Both are
-///   write-only today. The IMAP pull resumes from `known_uids_with_cursor`
-///   (the stored UID set plus uidvalidity), not from `last_uid`; `last_uid` is
-///   what #0041 and #0059 will resume from once the pull is a delta rather
-///   than a window. `highest_modseq` stays NULL until #0041 issues
+///   while `highest_modseq` is a CONDSTORE modification sequence. The IMAP
+///   pull resumes from `known_uids_with_cursor` (the stored UID set plus
+///   uidvalidity), not from `last_uid`, which is what #0041 and #0059 will
+///   resume from once the pull is a delta rather than a window. What reads
+///   `last_uid` today is the arrival gate, and only to tell an untouched
+///   mailbox from one whose rows are gone: the *absence* of a cursor row is
+///   first contact, where everything the server lists is backlog and no mark
+///   may be persisted, while a row recording a top of 100 means a message
+///   above 100 is an arrival even when the store holds nothing (#0072).
+///   `highest_modseq` stays NULL until #0041 issues
 ///   `CHANGEDSINCE`, as does `deltalink` (Graph's `deltaLink`, waiting on
 ///   #0042). They were one column until #0054, which stored a UID in
 ///   `highest_modseq`: a UID-sized number read as a modseq makes the server
@@ -293,7 +303,40 @@ pub fn create(conn: &Connection) -> Result<()> {
         .with_context(|| format!("creating store schema v{SCHEMA_VERSION}"))?;
     set_meta(conn, META_SCHEMA_VERSION, &SCHEMA_VERSION.to_string())?;
     set_meta(conn, META_APP_VERSION, env!("CARGO_PKG_VERSION"))?;
+    // Nothing to sweep in a file that starts empty, and stamping it here is
+    // what keeps the sweep to the one-shot it is meant to be.
+    set_meta(conn, META_ARRIVAL_MARK_SWEPT, "1")?;
     Ok(())
+}
+
+/// Clear the arrival marks of `0` a pre-fix build persisted, once per file.
+///
+/// The build that introduced `sync_cursors.arrival_mark` derived it from an
+/// empty store on a first sync and wrote `Some(0)`, a mark no capped pass can
+/// ever meet; because the carried mark is combined with `min` it could not rise
+/// again, and `pass_may_prune` needs every target complete, so one such mailbox
+/// suspended the prune for the whole account until a manual full sync (#0072
+/// sweep review B1). Deriving the mark is fixed, but the rows already on disk
+/// are not, and there is no migrator to rewrite them (the store is a cache, so
+/// a version mismatch is answered by a rebuild instead).
+///
+/// A mark of `0` is still legitimately reachable after the fix, for a mailbox
+/// that had never held a message when it was last synced and was then bulk-moved
+/// into. That is why this is stamped in `meta` and runs once rather than on
+/// every open: a permanent "a mark of 0 means nothing" rule would reopen the
+/// bulk-move hole the mark exists to close.
+pub fn sweep_first_contact_arrival_marks(conn: &Connection) -> Result<usize> {
+    if get_meta(conn, META_ARRIVAL_MARK_SWEPT)?.is_some() {
+        return Ok(0);
+    }
+    let cleared = conn
+        .execute(
+            "UPDATE sync_cursors SET arrival_mark = NULL WHERE arrival_mark = 0",
+            [],
+        )
+        .context("clearing pre-fix arrival marks")?;
+    set_meta(conn, META_ARRIVAL_MARK_SWEPT, "1")?;
+    Ok(cleared)
 }
 
 /// Write a `meta` row, replacing any existing value for the key.

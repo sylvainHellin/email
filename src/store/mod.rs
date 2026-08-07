@@ -302,6 +302,22 @@ fn open_validated(path: &Path) -> Result<Connection> {
         return Err(anyhow!("schema v{SCHEMA_VERSION} is incomplete"));
     }
 
+    // One-shot, and not a reason to reject the file: a store that cannot be
+    // written to here is still perfectly readable, and the sweep is a fix for
+    // rows an earlier build wrote, not a validity requirement (#0072).
+    match schema::sweep_first_contact_arrival_marks(&conn) {
+        Ok(0) => {}
+        Ok(cleared) => info!(
+            "[store] cleared {cleared} first-sync arrival mark(s) of 0 in {}: they held the \
+             prune gate shut for the whole account (#0072)",
+            path.display()
+        ),
+        Err(e) => warn!(
+            "[store] could not clear the pre-fix arrival marks in {}: {e:#}",
+            path.display()
+        ),
+    }
+
     Ok(conn)
 }
 
@@ -548,6 +564,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "rebuilt store must be empty");
+    }
+
+    /// A store an earlier build wrote can hold arrival marks of 0, which no
+    /// capped pass can ever meet and which suspend the prune for the whole
+    /// account (#0072 sweep review B1). They are cleared once, on the first
+    /// open by a build that has the fix, and never again: a mark of 0 stays a
+    /// legitimate answer for a mailbox that was empty when it was last synced.
+    #[test]
+    fn pre_fix_arrival_marks_of_zero_are_swept_once() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        let cursor = |conn: &Connection, mailbox: &str, mark: Option<i64>| {
+            conn.execute(
+                "INSERT INTO sync_cursors (account, mailbox, arrival_mark) VALUES ('alice', ?1, ?2)
+                 ON CONFLICT (account, mailbox) DO UPDATE SET arrival_mark = excluded.arrival_mark",
+                (mailbox, mark),
+            )
+            .unwrap();
+        };
+        let mark = |conn: &Connection, mailbox: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT arrival_mark FROM sync_cursors WHERE account = 'alice' AND mailbox = ?1",
+                [mailbox],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // A file the pre-fix build left behind: the stamp is what marks it as
+        // one, so it is removed to reproduce that state.
+        {
+            let store = Store::open(&path).unwrap();
+            cursor(store.conn(), "inbox", Some(0));
+            cursor(store.conn(), "archive", Some(100));
+            store
+                .conn()
+                .execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [schema::META_ARRIVAL_MARK_SWEPT],
+                )
+                .unwrap();
+        }
+
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(mark(store.conn(), "inbox"), None, "the stuck mark is gone");
+            assert_eq!(
+                mark(store.conn(), "archive"),
+                Some(100),
+                "a real deferral is not swept with it"
+            );
+            // A mark of 0 written after the sweep is a genuine one and stays.
+            cursor(store.conn(), "inbox", Some(0));
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            mark(store.conn(), "inbox"),
+            Some(0),
+            "the sweep runs once, or the bulk-move hole it guards reopens for good"
+        );
     }
 
     #[test]

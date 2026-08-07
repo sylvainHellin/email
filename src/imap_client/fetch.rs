@@ -203,18 +203,42 @@ pub struct ArrivalCoverage {
 }
 
 /// The line above which every listed UID must be in the store for the pass to
-/// count as complete.
+/// count as complete, or `None` when the mailbox has no line to stand on.
 ///
-/// Without a carried mark it is the store's own high-water mark. With one it is
-/// the lower of the two, which is the whole point: a pass that ingested the top
-/// of the window raises `high_water` above the arrivals it could *not* reach,
-/// and deriving the mark afresh would put them below it and declare the pass
-/// complete (#0072 review note 1).
-fn arrival_mark(known: &std::collections::HashSet<i64>, ceiling: u32, carried: Option<u32>) -> u32 {
-    let high_water = high_water(known, ceiling);
+/// The floor is what the mailbox is known to have held: the store's own
+/// high-water mark, or the top the last recorded pass saw (`sync_cursors.last_uid`,
+/// `prior`) when the rows themselves are gone. A UID at or below it existed
+/// before the last pass and was already passed over as backlog, so it is not an
+/// arrival now. `prior` is clamped to the same `ceiling` the rest of the module
+/// uses, which is what keeps a placeholder UID from lifting the floor to 2^62.
+///
+/// With a carried mark the answer is the lower of the two, which is the whole
+/// point: a pass that ingested the top of the window raises the floor above the
+/// arrivals it could *not* reach, and deriving the mark afresh would put them
+/// below it and declare the pass complete (#0072 review note 1).
+///
+/// `None` is *first contact*: no carried mark, no cursor row, no rows. Nothing
+/// about this mailbox is known yet, so nothing the server lists is an arrival
+/// and there is no mark worth handing to the next pass. Persisting one there is
+/// what turned a first capped sync of a large mailbox into a mark of `0` that
+/// no positional window could ever meet, suspending the prune account-wide
+/// until a manual full sync (#0072 sweep review B1).
+fn arrival_mark(
+    known: &std::collections::HashSet<i64>,
+    ceiling: u32,
+    carried: Option<u32>,
+    prior: Option<u32>,
+) -> Option<u32> {
+    let prior = prior.map(|uid| uid.min(ceiling));
+    let floor = high_water(known, ceiling).max(prior.unwrap_or(0));
     match carried {
-        Some(mark) => mark.min(high_water),
-        None => high_water,
+        Some(mark) => Some(mark.min(floor)),
+        // A cursor row is history even when it records a top of 0 and every
+        // local row is gone: a mailbox emptied and then bulk-moved into still
+        // has to defer, which is why the cursor is consulted rather than the
+        // rows alone.
+        None if prior.is_none() && floor == 0 => None,
+        None => Some(floor),
     }
 }
 
@@ -237,23 +261,29 @@ fn arrival_mark(known: &std::collections::HashSet<i64>, ceiling: u32, carried: O
 /// mark therefore stays put until a pass actually reaches through it, which any
 /// full sync does; it also clears when the stragglers stop being listed (deleted
 /// on the server), so it cannot deadlock.
+///
+/// First contact ([`arrival_mark`] returning `None`) is the one case that hands
+/// nothing on. The pass is still reported short whenever it could not take the
+/// whole listing, which costs one conservative pass and nothing more, because
+/// the cursor it writes gives the next pass a real floor to stand on.
 fn arrival_coverage(
     listed: &[u32],
     known: &std::collections::HashSet<i64>,
     ceiling: u32,
     ingested: &[u32],
     carried: Option<u32>,
+    prior: Option<u32>,
 ) -> ArrivalCoverage {
-    let mark = arrival_mark(known, ceiling, carried);
+    let mark = arrival_mark(known, ceiling, carried, prior);
     let ingested: std::collections::HashSet<u32> = ingested.iter().copied().collect();
     let incomplete = listed
         .iter()
-        .filter(|&&uid| uid > mark)
+        .filter(|&&uid| uid > mark.unwrap_or(0))
         .filter(|&&uid| !known.contains(&(uid as i64)))
         .any(|uid| !ingested.contains(uid));
     ArrivalCoverage {
         incomplete,
-        pending_mark: incomplete.then_some(mark),
+        pending_mark: mark.filter(|_| incomplete),
     }
 }
 
@@ -325,13 +355,14 @@ pub async fn fetch_new_raw_on_session(
 
     let stored_uidvalidity = known.uidvalidity;
     let stored_arrival_mark = known.arrival_mark;
+    let stored_prior_high_water = known.prior_high_water;
     let (known_uids, uidvalidity_reset) = known.resolve(state.uid_validity);
-    // A mark is a UID, so a renumbering makes it meaningless: drop it with the
-    // skip list it travelled with.
-    let carried_mark = if uidvalidity_reset {
-        None
+    // A mark and a recorded top are both UIDs, so a renumbering makes them
+    // meaningless: they are dropped with the skip list they travelled with.
+    let (carried_mark, prior_high_water) = if uidvalidity_reset {
+        (None, None)
     } else {
-        stored_arrival_mark
+        (stored_arrival_mark, stored_prior_high_water)
     };
     if uidvalidity_reset {
         warn!(
@@ -378,7 +409,14 @@ pub async fn fetch_new_raw_on_session(
     // hardcoding "complete" would force the gate open on a prune-only pass
     // (#0072 review note 3). An empty listing has no arrivals and stays open.
     let empty = |state: MailboxState| {
-        let coverage = arrival_coverage(&listed, &known_uids, ceiling, &[], carried_mark);
+        let coverage = arrival_coverage(
+            &listed,
+            &known_uids,
+            ceiling,
+            &[],
+            carried_mark,
+            prior_high_water,
+        );
         StoreFetch {
             messages: Vec::new(),
             skipped: 0,
@@ -430,7 +468,14 @@ pub async fn fetch_new_raw_on_session(
     let skipped = known_flags.len();
 
     if new_uids.is_empty() {
-        let coverage = arrival_coverage(&listed, &known_uids, ceiling, &[], carried_mark);
+        let coverage = arrival_coverage(
+            &listed,
+            &known_uids,
+            ceiling,
+            &[],
+            carried_mark,
+            prior_high_water,
+        );
         return Ok(StoreFetch {
             messages: Vec::new(),
             skipped,
@@ -473,7 +518,14 @@ pub async fn fetch_new_raw_on_session(
     }
 
     let downloaded: Vec<u32> = out.iter().map(|m| m.uid).collect();
-    let coverage = arrival_coverage(&listed, &known_uids, ceiling, &downloaded, carried_mark);
+    let coverage = arrival_coverage(
+        &listed,
+        &known_uids,
+        ceiling,
+        &downloaded,
+        carried_mark,
+        prior_high_water,
+    );
     Ok(StoreFetch {
         messages: out,
         skipped,
@@ -568,7 +620,7 @@ mod tests {
     fn old_backlog_the_window_skipped_is_not_a_missed_arrival() {
         let known = HashSet::from([50, 51]);
         let listed: Vec<u32> = (1..=51).collect();
-        let coverage = arrival_coverage(&listed, &known, 51, &[], None);
+        let coverage = arrival_coverage(&listed, &known, 51, &[], None, Some(51));
         assert!(!coverage.incomplete);
         assert_eq!(coverage.pending_mark, None);
     }
@@ -578,8 +630,8 @@ mod tests {
     #[test]
     fn an_arrival_the_window_cut_off_is_a_missed_arrival() {
         let known = HashSet::from([50]);
-        assert!(arrival_coverage(&[50, 51, 52], &known, 52, &[52], None).incomplete);
-        assert!(!arrival_coverage(&[50, 51, 52], &known, 52, &[51, 52], None).incomplete);
+        assert!(arrival_coverage(&[50, 51, 52], &known, 52, &[52], None, Some(50)).incomplete);
+        assert!(!arrival_coverage(&[50, 51, 52], &known, 52, &[51, 52], None, Some(50)).incomplete);
     }
 
     /// A first sync of a mailbox bigger than the window has no mark to stand
@@ -588,7 +640,61 @@ mod tests {
     #[test]
     fn a_first_sync_of_a_capped_mailbox_is_incomplete() {
         let known = HashSet::new();
-        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[2, 3], None).incomplete);
+        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[2, 3], None, None).incomplete);
+    }
+
+    /// ...and it hands *no* mark to the next pass, which is the difference
+    /// between one conservative pass and a permanently shut gate (#0072 sweep
+    /// review B1).
+    ///
+    /// A capped first sync of a large mailbox used to persist a mark of 0: the
+    /// carried mark is combined with `min`, so it could never rise again, and a
+    /// mark of 0 demands the whole mailbox be in the store before any pass
+    /// counts as complete, which a positional window never achieves. Because
+    /// `pass_may_prune` needs *every* target complete, one such mailbox
+    /// suspended the prune for the whole account until a manual full sync, and
+    /// the schema v5 rebuild put every user in exactly that state.
+    #[test]
+    fn a_first_capped_sync_of_a_large_mailbox_hands_on_no_mark() {
+        let listed: Vec<u32> = (1..=8000).collect();
+        let window: Vec<u32> = (7951..=8000).collect();
+        let nothing_known = HashSet::new();
+
+        let first = arrival_coverage(&listed, &nothing_known, 8000, &window, None, None);
+        assert!(
+            first.incomplete,
+            "one pass of conservatism is fine: the store has nothing to prune yet anyway"
+        );
+        assert_eq!(
+            first.pending_mark, None,
+            "the forbidden pre-fix answer is Some(0), a mark no window can ever meet"
+        );
+
+        // The next pass stands on the cursor the first one wrote (top of the
+        // window) plus the rows it ingested, and prunes normally.
+        let known: HashSet<i64> = (7951..=8000).map(i64::from).collect();
+        let second = arrival_coverage(&listed, &known, 8000, &[], None, Some(8000));
+        assert!(!second.incomplete, "the backlog below the window is not an arrival");
+        assert_eq!(second.pending_mark, None);
+    }
+
+    /// The edge that keeps first contact from being "the store holds no rows":
+    /// a mailbox emptied in another client and then bulk-moved into has no rows
+    /// left, but its cursor still records the top it reached. That recorded top
+    /// is the floor, so the 200 copies the window could not take still hold the
+    /// gate shut.
+    #[test]
+    fn an_emptied_then_refilled_mailbox_defers_on_its_recorded_top() {
+        let listed: Vec<u32> = (101..=400).collect();
+        let window: Vec<u32> = (301..=400).collect();
+        let nothing_known = HashSet::new();
+
+        let coverage = arrival_coverage(&listed, &nothing_known, 400, &window, None, Some(100));
+        assert!(
+            coverage.incomplete,
+            "101..=300 arrived above the recorded top and are not in the store"
+        );
+        assert_eq!(coverage.pending_mark, Some(100));
     }
 
     /// A pass that comes up short leaves the mark it stood on behind, so the
@@ -596,7 +702,7 @@ mod tests {
     #[test]
     fn a_short_pass_hands_its_mark_to_the_next_one() {
         let known = HashSet::from([50]);
-        let coverage = arrival_coverage(&[50, 51, 52], &known, 52, &[52], None);
+        let coverage = arrival_coverage(&[50, 51, 52], &known, 52, &[52], None, Some(50));
         assert!(coverage.incomplete);
         assert_eq!(coverage.pending_mark, Some(50));
     }
@@ -616,7 +722,7 @@ mod tests {
 
         // Pass 1: the store holds 1..=100, the move added 101..=400.
         let known_before: HashSet<i64> = (1..=100).collect();
-        let pass1 = arrival_coverage(&listed, &known_before, 400, &window, None);
+        let pass1 = arrival_coverage(&listed, &known_before, 400, &window, None, Some(100));
         assert!(
             pass1.incomplete,
             "pass 1 could not reach 101..=300 and must defer"
@@ -627,12 +733,13 @@ mod tests {
         // window has nothing new in it.
         let mut known_after = known_before.clone();
         known_after.extend((301..=400).map(i64::from));
-        let derived = arrival_coverage(&listed, &known_after, 400, &[], None);
+        let derived = arrival_coverage(&listed, &known_after, 400, &[], None, Some(400));
         assert!(
             !derived.incomplete,
             "the pre-fix behaviour this test exists to forbid: a mark of 400 sees no arrival"
         );
-        let carried = arrival_coverage(&listed, &known_after, 400, &[], pass1.pending_mark);
+        let carried =
+            arrival_coverage(&listed, &known_after, 400, &[], pass1.pending_mark, Some(400));
         assert!(
             carried.incomplete,
             "101..=300 are still not in the store, so pass 2 must defer too"
@@ -641,9 +748,37 @@ mod tests {
 
         // A full sync brings the stragglers in and the gate opens.
         let everything: Vec<u32> = (101..=300).collect();
-        let opened = arrival_coverage(&listed, &known_after, 400, &everything, carried.pending_mark);
+        let opened = arrival_coverage(
+            &listed,
+            &known_after,
+            400,
+            &everything,
+            carried.pending_mark,
+            Some(400),
+        );
         assert!(!opened.incomplete);
         assert_eq!(opened.pending_mark, None, "the mark clears once it is met");
+    }
+
+    /// No mark can get stuck, including the lowest one there is. A mark of 0 is
+    /// still reachable after the fix, and legitimately so: a mailbox that had
+    /// never held a message when it was last synced records a top of 0, and a
+    /// bulk move into it makes every copy an arrival. Ingesting through it
+    /// clears it, which is the property that makes the whole mechanism safe to
+    /// persist.
+    #[test]
+    fn any_persisted_mark_clears_once_a_pass_reaches_through_it() {
+        let listed: Vec<u32> = (1..=300).collect();
+        let known: HashSet<i64> = (201..=300).map(i64::from).collect();
+
+        let stuck = arrival_coverage(&listed, &known, 300, &[], Some(0), Some(300));
+        assert!(stuck.incomplete);
+        assert_eq!(stuck.pending_mark, Some(0), "a mark of 0 holds the gate shut");
+
+        let backlog: Vec<u32> = (1..=200).collect();
+        let opened = arrival_coverage(&listed, &known, 300, &backlog, Some(0), Some(300));
+        assert!(!opened.incomplete, "a full sync reaches through any mark");
+        assert_eq!(opened.pending_mark, None);
     }
 
     /// The other way out of a carried mark: the arrivals that were never
@@ -652,7 +787,7 @@ mod tests {
     #[test]
     fn a_carried_mark_clears_when_the_missing_arrivals_stop_being_listed() {
         let known: HashSet<i64> = HashSet::from([1, 2, 3]);
-        let coverage = arrival_coverage(&[1, 2, 3], &known, 10, &[], Some(1));
+        let coverage = arrival_coverage(&[1, 2, 3], &known, 10, &[], Some(1), Some(3));
         assert!(!coverage.incomplete);
         assert_eq!(coverage.pending_mark, None);
     }
@@ -662,10 +797,28 @@ mod tests {
     #[test]
     fn the_carried_mark_wins_over_a_higher_high_water() {
         let known: HashSet<i64> = HashSet::from([10, 90]);
-        assert_eq!(arrival_mark(&known, 100, Some(10)), 10);
-        assert_eq!(arrival_mark(&known, 100, None), 90);
+        assert_eq!(arrival_mark(&known, 100, Some(10), Some(90)), Some(10));
+        assert_eq!(arrival_mark(&known, 100, None, Some(90)), Some(90));
         // A stale mark above the store's own high-water mark cannot loosen it.
-        assert_eq!(arrival_mark(&known, 100, Some(95)), 90);
+        assert_eq!(arrival_mark(&known, 100, Some(95), Some(90)), Some(90));
+    }
+
+    /// The floor a pass stands on: the higher of what the store holds and what
+    /// the cursor recorded, and `None` only when there is neither.
+    #[test]
+    fn the_mark_is_none_only_at_first_contact() {
+        let nothing = HashSet::new();
+        assert_eq!(arrival_mark(&nothing, 100, None, None), None);
+        // A cursor row is history, even one that recorded no UID.
+        assert_eq!(arrival_mark(&nothing, 100, None, Some(0)), Some(0));
+        assert_eq!(arrival_mark(&nothing, 100, None, Some(40)), Some(40));
+        // Rows without a cursor row still count: the store knows something.
+        let known: HashSet<i64> = HashSet::from([40]);
+        assert_eq!(arrival_mark(&known, 100, None, None), Some(40));
+        // The recorded top only ever raises the floor, and is clamped to the
+        // same ceiling that keeps a placeholder out of the high-water mark.
+        assert_eq!(arrival_mark(&known, 100, None, Some(10)), Some(40));
+        assert_eq!(arrival_mark(&known, 100, None, Some(4_000_000)), Some(100));
     }
 
     /// `mp sync -n 0` computes a full vanished set and downloads nothing. It
@@ -674,7 +827,7 @@ mod tests {
     #[test]
     fn a_pass_that_downloads_nothing_is_not_complete() {
         let known: HashSet<i64> = HashSet::from([1, 2]);
-        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[], None).incomplete);
+        assert!(arrival_coverage(&[1, 2, 3], &known, 3, &[], None, Some(2)).incomplete);
     }
 
     /// ...and stays complete when the mailbox is genuinely empty, which is the
@@ -682,7 +835,7 @@ mod tests {
     #[test]
     fn an_empty_listing_is_a_complete_pass() {
         let known: HashSet<i64> = HashSet::from([1, 2]);
-        let coverage = arrival_coverage(&[], &known, 2, &[], None);
+        let coverage = arrival_coverage(&[], &known, 2, &[], None, Some(2));
         assert!(!coverage.incomplete);
         assert_eq!(coverage.pending_mark, None);
     }

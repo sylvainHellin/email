@@ -74,6 +74,29 @@ All notable changes to this project are documented in this file.
   `Failed to read attachment: <path>`, the wording the CLI already used.
 
 ### Fixed
+- **A first sync no longer switches the removal prune off for the whole
+  account (#0072 sweep review).** The arrival gate derives the line it holds a
+  pass to from what the mailbox is known to have held, and an empty store knows
+  nothing, so the first capped sync of a mailbox bigger than the download window
+  persisted a mark of `0`: a line demanding that every message the server lists
+  be in the store before any pass counts as complete, which a window of 50 or
+  100 never reaches, and which could not rise again because the carried mark is
+  combined with `min`. Since the prune needs *every* mailbox complete before it
+  applies anything, one such mailbox held back removals across the whole
+  account, and the schema v5 rebuild plus a capped default (`-n 50`, and 100 for
+  the TUI's quick sync) put every store in exactly that state on the first sync
+  of the previous build. First contact is not an arrivals situation: with no
+  cursor row and no rows, everything the server lists is backlog, which is the
+  distinction the gate is built on, so that pass now hands nothing to the next
+  one. It still reports itself short, which costs one conservative pass and
+  nothing more. The bulk-move deferral the mark exists for is unchanged, because
+  a mailbox that has been synced before *has* a cursor: a mailbox emptied
+  elsewhere and then bulk-moved into holds no rows at all, and the top its
+  cursor recorded is what the 200 copies a 100-UID window could not take are
+  still measured against. A store the previous build wrote has its marks of `0`
+  cleared once, on the first open by this one; that sweep is stamped in `meta`
+  and never runs again, because a mark of `0` stays the right answer for a
+  mailbox that held no message at all when it was last synced.
 - **A bulk move no longer loses its messages one sync after the gate deferred
   it, and store schema v5 (#0072 review).** The prune gate held a pass back
   when a message that had arrived above the mailbox's high-water mark was not
@@ -108,7 +131,12 @@ All notable changes to this project are documented in this file.
   `projects`, a key the sidebar never lists and no selector resolves. Both
   halves of a sync target now come from one mapping, and a `--mailbox` name
   that matches no configured mailbox is an error that names the ones that do,
-  rather than a sync into a key nothing reads.
+  rather than a sync into a key nothing reads. That strictness reaches one case
+  beyond the extra mailboxes: `mp sync --mailbox inbox` on an account whose
+  config has no `[mailboxes.inbox]` used to work by accident, because the name
+  was passed to the server verbatim and most servers resolve `inbox` to `INBOX`,
+  and now errors. Plain `mp sync` already synced nothing at all for such an
+  account, and the error names the mailboxes that are configured.
 - **A rebuild salvages a long-lived outbox again (#0066 review).** Reading the
   rows a damaged page hid works by probing positions the listing never named,
   and the probe started at position 1 whatever the table held. An outbox that

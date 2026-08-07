@@ -928,6 +928,16 @@ pub struct KnownUids {
     /// pass brought every arrival in. Meaningless across a UIDVALIDITY change,
     /// like the UID set it travels with.
     pub arrival_mark: Option<u32>,
+    /// The top of the mailbox as of the last recorded pass (`sync_cursors.last_uid`),
+    /// and `None` when the store has no cursor row for it at all.
+    ///
+    /// That `None` is the whole point: it is the only way to tell first contact
+    /// from a mailbox whose local rows are simply gone, and the two must not be
+    /// treated alike. A mailbox with history defers when messages land above its
+    /// recorded top; one without has no arrivals at all, only backlog (#0072).
+    /// A recorded top of 0 is history too, so this is `Some(0)` rather than
+    /// `None` when the cursor exists but recorded no UID.
+    pub prior_high_water: Option<u32>,
 }
 
 impl KnownUids {
@@ -966,6 +976,11 @@ pub fn known_uids_with_cursor(store: &Store, account: &str, mailbox: &str) -> Re
             .as_ref()
             .and_then(|c| c.arrival_mark)
             .and_then(|m| u32::try_from(m).ok()),
+        prior_high_water: cursor.as_ref().map(|c| {
+            c.last_uid
+                .and_then(|uid| u32::try_from(uid).ok())
+                .unwrap_or(0)
+        }),
     })
 }
 

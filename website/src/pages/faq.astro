@@ -117,6 +117,14 @@ import AccordionItem from '../components/AccordionItem.astro';
             client converges on the next sync.
           </p>
           <p>
+            One pass holds removals back: the one that could not bring in everything that landed
+            since the previous sync, because a message missing from the store is not evidence that
+            it is gone from the server. The status line says so when it happens
+            (<code>N removal(s) held back</code>), and the next complete pass applies them. A
+            first sync of a new account is such a pass by definition, since nothing local is known
+            yet.
+          </p>
+          <p>
             A message that was <em>moved</em> converges as soon as the sync has read the copy in
             its destination. On servers that issue a new identifier on a move (Exchange, Dovecot)
             that is the same pass. On Gmail, archiving only removes the Inbox label and the copy

@@ -71,3 +71,49 @@ The result is correct but asymmetric.
 The inbox row goes, which is the removal this ticket is about, and the archive copy is re-filed the next time the archive mailbox is synced in full (`S` in the TUI, `mp sync -n <huge>`).
 Measured on the guinea pig account: All Mail uid 1 against a window bottom of 234.
 This is the intended behaviour, not a deferral the gate can improve: a positional window cannot drain a backlog, which is what #0041 (CONDSTORE/QRESYNC) would change by making the pull a delta rather than a window.
+
+## Follow-up from the sweep review: the first sync persisted a mark no pass could meet
+
+Persisting the mark turned one pass of conservatism into a permanent one for every store that had just been created.
+The mark is derived from what the mailbox is known to have held, an empty store knows nothing, and `high_water` answers `0` for an empty set, so the first capped sync of a mailbox bigger than the download window wrote `pending_mark = Some(0)`.
+A mark of `0` says every UID the server lists must be in the store before the pass counts as complete, which a window of 50 or 100 never reaches on a mailbox of thousands, and the carried mark is combined with `min`, so it could not rise again.
+`pass_may_prune` needs every target complete, so one such mailbox held the removals of the whole account, and schema v5 rebuilds every store while both entry points into a first sync are capped (`mp sync` defaults to `-n 50`, the TUI's quick sync to 100).
+Every user of that build landed in "prunes off until a manual full sync" on first use.
+
+Measured against the guinea pig account, both builds against the same live Gmail mailbox, each in its own data directory:
+
+| | after the first `mp sync -n 50` | a synthetic vanished inbox row, next `mp sync -n 50` |
+|---|---|---|
+| the build being fixed | `arrival_mark` 0 on inbox, archive and sent | `⚠ 1 removal(s) held back` |
+| this build | `arrival_mark` NULL on all three | `ℹ 1 message(s) left their mailbox on the server`, row gone |
+
+### Why first contact is not an arrivals situation
+
+The whole gate rests on the distinction between an arrival and a backlog: a quick sync deliberately never fetches the backlog, so measuring coverage against it reports every capped pass as short.
+A mailbox nothing is known about has no arrivals, only backlog, so there is nothing to hand to the next pass.
+The pass still reports itself short, which is one conservative pass and costs nothing: a store that has just been created has no rows to prune anyway, and the cursor that pass writes gives the next one a real line to stand on.
+
+Clamping the persisted mark to the bottom of the download window would have been the wrong fix.
+It is exactly the bulk-move hole this ticket's previous round closed: a mark of 100 against a window bottom of 301 lets pass 2 declare the 200 stragglers old news.
+
+### The edge that keeps "no rows" from meaning "first contact"
+
+A mailbox emptied in another client and then bulk-moved into holds no local rows either, and it must still defer.
+What separates it from first contact is its cursor row, so the gate reads `sync_cursors.last_uid` as the floor when the rows are gone: the *absence* of a cursor row is first contact, a row recording a top of 100 means a UID above 100 is an arrival even against an empty store.
+A recorded top is clamped to the same ceiling as the high-water mark, so a placeholder UID cannot lift the floor, and it is dropped along with the mark and the skip list across a UIDVALIDITY change, since all three are UIDs.
+
+### Migration: the marks of `0` already on disk
+
+Deriving the mark is fixed; the rows the previous build wrote are not, and there is no migrator (the store is a cache, so a version mismatch is answered by a rebuild).
+They are cleared by a one-shot sweep, `UPDATE sync_cursors SET arrival_mark = NULL WHERE arrival_mark = 0`, run on the first open by a build that has the fix and stamped in `meta` (`arrival_mark_zero_swept`) so it never runs again.
+One-shot rather than on every open, because a mark of `0` is still the right answer after the fix: a mailbox that had never held a message when it was last synced records a top of `0`, and a bulk move into it makes every copy an arrival.
+A standing "a mark of 0 means nothing" rule would reopen the bulk-move hole for that mailbox for good.
+The residual risk of the sweep is one mailbox in that state at the exact moment of the upgrade losing its deferral for one pass.
+
+### Pins
+
+- `a_first_capped_sync_of_a_large_mailbox_hands_on_no_mark` asserts the forbidden pre-fix answer (`Some(0)`) and that the next pass, standing on the cursor the first one wrote, prunes normally.
+- `an_emptied_then_refilled_mailbox_defers_on_its_recorded_top` and `the_recorded_top_tells_first_contact_from_an_emptied_mailbox` pin the edge above, at the derivation and at the store round trip.
+- `the_pass_after_a_bulk_move_still_defers_while_arrivals_are_missing` is unchanged in what it asserts.
+- `any_persisted_mark_clears_once_a_pass_reaches_through_it` pins that no mark can get stuck, including `0`.
+- `pre_fix_arrival_marks_of_zero_are_swept_once` pins both halves of the migration: the stuck mark goes, a real deferral does not, and a mark written after the sweep survives the next open.

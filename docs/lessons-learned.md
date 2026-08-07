@@ -595,3 +595,12 @@ Gmail moves nothing: archiving removes the `INBOX` label and the copy in `[Gmail
 The arrival gate cannot help, because by its own definition, correctly, that copy is not an arrival.
 The behaviour is therefore correct but asymmetric: the inbox row is pruned on the next quick sync and the archived copy is re-filed only by a full sync of the archive mailbox.
 Anything written for users about removals converging "on the next sync" has to say so ([website/src/pages/faq.astro](../website/src/pages/faq.astro)).
+
+## A conservative default answer, once persisted, stops being a default
+
+The same arrival mark that had to be persisted to survive its own success (the entry above) then had to learn not to be persisted at first contact.
+The mark is derived from what the mailbox is known to have held, an empty store knows nothing, and `high_water` answers `0` for an empty set, so the first capped sync of a mailbox bigger than the download window wrote a mark of `0`: the line that says every message the server lists must be in the store before any pass counts as complete, which a positional window of 50 or 100 never reaches, and which the carrying rule (`carried.min(derived)`) could never let rise again.
+Because the prune needs every mailbox complete before it applies anything, one such mailbox held the removals of the whole account, and the schema bump that shipped alongside rebuilt every store, so the state was universal rather than rare (#0072 sweep review).
+"Assume the worst when you know nothing" is the right answer for one pass and the wrong thing to write down, because a record of ignorance is indistinguishable from a record of a real obligation.
+The fix is to make the two distinguishable rather than to soften the mark: no cursor row is first contact, where everything the server lists is backlog and nothing is owed, while a cursor row is history even when every local row is gone, and its recorded top (`sync_cursors.last_uid`) is what a mailbox emptied elsewhere and then bulk-moved into is measured against.
+Before persisting a value a later run will be held to, ask what it means when it was computed from no information; if that reads the same as a genuine obligation, it is the absence that has to be representable ([src/imap_client/fetch.rs](../src/imap_client/fetch.rs), `arrival_mark`).

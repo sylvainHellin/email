@@ -689,6 +689,7 @@ fn a_uidvalidity_reset_refetches_the_window_and_rebinds_what_moved() {
         uids: HashSet::from([7]),
         uidvalidity: None,
         arrival_mark: None,
+        prior_high_water: None,
     }
     .resolve(Some(42));
     assert!(!reset);
@@ -855,6 +856,67 @@ fn the_arrival_mark_survives_the_cursor_round_trip() {
             .unwrap()
             .arrival_mark,
         None
+    );
+}
+
+/// The other half of the cursor a later pass reads back: the top the mailbox
+/// had reached, which is how first contact is told apart from a mailbox whose
+/// local rows are gone (#0072 sweep review B1).
+#[test]
+fn the_recorded_top_tells_first_contact_from_an_emptied_mailbox() {
+    let f = Fixture::new();
+
+    // Never synced: no cursor row, so no floor to stand on.
+    assert_eq!(
+        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+            .unwrap()
+            .prior_high_water,
+        None,
+        "first contact must be distinguishable, or a capped first sync persists a mark of 0"
+    );
+
+    // Synced once and then emptied in another client: the rows are gone but
+    // the recorded top remains, and it is what a bulk move is measured against.
+    email::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(7),
+            last_uid: Some(100),
+            uidnext: Some(101),
+            exists: Some(0),
+            highest_modseq: None,
+            deltalink: None,
+            arrival_mark: None,
+        },
+    )
+    .unwrap();
+    let known = email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox").unwrap();
+    assert!(known.uids.is_empty());
+    assert_eq!(known.prior_high_water, Some(100));
+
+    // A cursor that recorded no UID at all is still history, not first contact.
+    email::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &email::ingest::MailboxCursor {
+            uidvalidity: Some(7),
+            last_uid: None,
+            uidnext: None,
+            exists: Some(0),
+            highest_modseq: None,
+            deltalink: None,
+            arrival_mark: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        email::ingest::known_uids_with_cursor(&f.store, "acct", "inbox")
+            .unwrap()
+            .prior_high_water,
+        Some(0)
     );
 }
 
