@@ -3,6 +3,17 @@ use super::app::{
     StatusLevel,
 };
 
+/// The status level of a completed sync/fetch: Success, unless the drain
+/// suffix says mutations were rolled back, which must not ride a green line
+/// (#0039 review note).
+fn drained_sync_level(text: &str) -> StatusLevel {
+    if text.contains(super::helpers::FAILED_OPS_MARKER) {
+        StatusLevel::Warning
+    } else {
+        StatusLevel::Success
+    }
+}
+
 /// Whether a `BgResult::MailboxLoaded` may be applied or must be dropped
 /// as stale (P1 step 2). A background walk is only valid if the user is
 /// still looking at the same account and mailbox it was requested for,
@@ -167,7 +178,8 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Fetch complete".into() } else { msg };
-                    app.set_status_level(text, StatusLevel::Success);
+                    let level = drained_sync_level(&text);
+                    app.set_status_level(text, level);
                     // Desktop notification for genuinely new inbox mail
                     // (#0009). Opt-in via `notifications = true` in
                     // config.toml; no-op when the list is empty (read-flag
@@ -200,7 +212,8 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             match result {
                 Ok(msg) => {
                     let text = if msg.is_empty() { "Sync complete".into() } else { msg };
-                    app.set_status_level(text, StatusLevel::Success);
+                    let level = drained_sync_level(&text);
+                    app.set_status_level(text, level);
                     refresh_after_server_sync(app, account_index);
                 }
                 Err(e) => {
@@ -301,6 +314,19 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // drained_sync_level (#0039 review note)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_rollback_suffix_downgrades_the_sync_status_to_warning() {
+        assert!(matches!(
+            drained_sync_level("Synced 3 mailboxes; 2 mutation(s) failed and were rolled back (see the log)"),
+            StatusLevel::Warning
+        ));
+        assert!(matches!(drained_sync_level("Sync complete"), StatusLevel::Success));
+    }
 
     // -----------------------------------------------------------------------
     // mailbox_loaded_is_current (P1 step 2: background mailbox loads)

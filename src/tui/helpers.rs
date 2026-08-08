@@ -323,6 +323,11 @@ pub(super) async fn lib_do_sync(
     }))
 }
 
+/// The fragment every failed-drain status suffix carries, so the completion
+/// handler can honestly downgrade the status level of an otherwise-successful
+/// sync that also rolled mutations back (#0039 review note).
+pub(crate) const FAILED_OPS_MARKER: &str = "mutation(s) failed and were rolled back";
+
 /// Drain the account's pending-mutation queue at the sync/fetch resume point
 /// (#0039), returning a status suffix that names any failures.
 ///
@@ -335,7 +340,7 @@ pub(super) async fn lib_do_sync(
 async fn drain_pending_ops(account_config: &AccountConfig) -> String {
     match crate::pending_ops::resume_account(account_config).await {
         Ok(Some(r)) if r.failed > 0 => {
-            format!("; {} mutation(s) failed and were rolled back (see the log)", r.failed)
+            format!("; {} {FAILED_OPS_MARKER} (see the log)", r.failed)
         }
         Ok(_) => String::new(),
         Err(e) => {
