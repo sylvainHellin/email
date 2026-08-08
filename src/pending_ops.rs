@@ -65,6 +65,7 @@ use log::{info, warn};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::config::AccountConfig;
 use crate::ops::{run_op, Backend, ServerOp};
 use crate::outbox::{backoff_secs, unix_now};
 use crate::store::write::MutatedRow;
@@ -478,6 +479,86 @@ pub async fn drain_account(
     }
 }
 
+/// Resume the mutation queue for one account: the startup and sync-tick entry
+/// point, the mutation twin of [`crate::send::resume_outbox`].
+///
+/// It builds the backend and takes the engine lock **only when a row is owed**,
+/// so a clean account costs one cheap `COUNT` and no server traffic: the ticket
+/// asks for no sync traffic against live accounts beyond draining actually
+/// queued ops (#0039). `Ok(None)` means there was nothing to drain, or another
+/// process holds the engine lock and is draining this account instead.
+pub async fn resume_account(account: &AccountConfig) -> Result<Option<DrainResult>> {
+    let path = crate::config::store_path(&account.name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let store = Store::open(&path)?;
+    let (queued, _failed) = counts(&store, &account.name)?;
+    if queued == 0 {
+        return Ok(None);
+    }
+    let blobs = BlobStore::for_account(&account.name);
+    let mut backend = Backend::resolve(account)?;
+    drain_account(&store, &blobs, &account.name, &mut backend).await
+}
+
+/// Run one just-enqueued op synchronously and settle its row, for a caller that
+/// wants the op's own outcome rather than the background drain's convergence
+/// (the CLI).
+///
+/// On success the row is retired; on any failure the local half is rolled back,
+/// the row is discarded, and the error is returned verbatim, so a
+/// [`crate::ops::NotFoundOnServer`] reaches the user byte-identical to the
+/// pre-queue path. Unlike [`drain`] this does **not** converge a not-found: a
+/// synchronous caller runs the op once, in the same process that enqueued it, so
+/// it is never a crash replay, and a message the server does not hold is a
+/// genuine error to report rather than a converged replay to swallow.
+pub async fn run_and_settle(
+    store: &Store,
+    blobs: &BlobStore,
+    op_id: i64,
+    backend: &Backend,
+) -> Result<()> {
+    let row = row_by_id(store, op_id)?
+        .ok_or_else(|| anyhow::anyhow!("pending op {op_id} vanished before it could run"))?;
+    let outcome = run_op(backend, &row.op).await;
+    settle(store, blobs, &row, outcome)
+}
+
+/// Retire a settled op on success, or roll its local half back and discard it
+/// on failure, returning the error verbatim.
+///
+/// Split from [`run_and_settle`] so the settle policy is unit-testable without a
+/// live backend: the execution is one `await`, this is the whole decision.
+fn settle(store: &Store, blobs: &BlobStore, row: &PendingOp, outcome: Result<()>) -> Result<()> {
+    match outcome {
+        Ok(()) => {
+            retire(store, row.id)?;
+            Ok(())
+        }
+        Err(e) => {
+            apply_rollback(store, blobs, &row.rollback)?;
+            retire(store, row.id)?;
+            Err(e)
+        }
+    }
+}
+
+/// One decoded row by its `pending_ops.id`, for the synchronous settle path.
+fn row_by_id(store: &Store, id: i64) -> Result<Option<PendingOp>> {
+    store
+        .conn()
+        .query_row(
+            "SELECT id, account, kind, target_message_id, payload, state, attempts,
+                    last_error, created, updated
+             FROM pending_ops WHERE id = ?1",
+            [id],
+            row_from_sql,
+        )
+        .optional()
+        .context("reading a pending op by id")
+}
+
 /// Retire a row whose op succeeded. A done mutation has nothing to say, so the
 /// row is deleted rather than parked.
 fn retire(store: &Store, id: i64) -> Result<()> {
@@ -867,6 +948,72 @@ mod tests {
         assert!(read::find_by_id(&fx.store, id).unwrap().is_none(), "a delete has nothing to restore");
         assert_eq!(failed_ops(&fx.store, "alice").unwrap().len(), 1);
         assert_eq!(counts(&fx.store, "alice").unwrap(), (0, 1));
+    }
+
+    /// The CLI's synchronous settle: a succeeded op retires its row and the
+    /// optimistic local change stands.
+    #[test]
+    fn settle_retires_a_succeeded_op_and_keeps_the_local_change() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 1, "Receipt");
+        let (_prev, op_id) = apply_move(&fx.store, "alice", id, "archive", move_op("<inbox-1@example.com>"))
+            .unwrap()
+            .unwrap();
+
+        let row = row_by_id(&fx.store, op_id).unwrap().unwrap();
+        settle(&fx.store, &fx.blobs, &row, Ok(())).unwrap();
+
+        assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "archive");
+        assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
+    }
+
+    /// A refused op the CLI settles rolls its local half home, discards the row
+    /// and returns the error, so the CLI reports it and exits.
+    #[test]
+    fn settle_rolls_a_refused_op_home_and_returns_the_error() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 1, "Receipt");
+        let (_prev, op_id) = apply_move(&fx.store, "alice", id, "archive", move_op("<inbox-1@example.com>"))
+            .unwrap()
+            .unwrap();
+
+        let row = row_by_id(&fx.store, op_id).unwrap().unwrap();
+        let err = settle(&fx.store, &fx.blobs, &row, Err(anyhow::anyhow!("NO server refused"))).unwrap_err();
+
+        assert!(format!("{err:#}").contains("refused"));
+        assert_eq!(read::find_by_id(&fx.store, id).unwrap().unwrap().mailbox, "inbox");
+        assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
+    }
+
+    /// CLI outcome parity: unlike the background [`drain`], the synchronous
+    /// settle does **not** converge a not-found. A `mp delete` for a message the
+    /// server no longer holds reports the not-found error byte-identical to the
+    /// pre-queue path, because a synchronous caller is never a crash replay.
+    #[test]
+    fn settle_surfaces_a_not_found_verbatim_for_the_cli() {
+        let fx = fixture();
+        let id = fx.ingest_invite("inbox", 1, "Standup", &invite_ics("uid-a", 0, &["a@x.com"]));
+        let op = ServerOp::Delete {
+            message_id: "<inbox-1@example.com>".to_string(),
+            source_mailbox: "INBOX".to_string(),
+        };
+        let (_prev, op_id) = apply_delete(&fx.store, &fx.blobs, "alice", id, op).unwrap().unwrap();
+
+        let not_found = crate::ops::NotFoundOnServer {
+            message_id: "<inbox-1@example.com>".to_string(),
+            mailbox: Some("INBOX".to_string()),
+        };
+        let expected = not_found.to_string();
+        let row = row_by_id(&fx.store, op_id).unwrap().unwrap();
+        let err = settle(&fx.store, &fx.blobs, &row, Err(not_found.into())).unwrap_err();
+
+        assert_eq!(err.to_string(), expected);
+        assert_eq!(
+            expected,
+            "Email with Message-ID <inbox-1@example.com> not found in INBOX on server"
+        );
+        assert!(read::find_by_id(&fx.store, id).unwrap().is_none(), "a delete has nothing to restore");
+        assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
     }
 
     /// Mutating a missing row is a no-op, not an error or a queued op.

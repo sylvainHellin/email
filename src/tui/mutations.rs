@@ -1,213 +1,165 @@
-//! The two halves of a mutation, and the seam between them.
+//! The TUI's entry into the durable mutation queue.
 //!
 //! A flag, a move, an archive or a delete is one local write and one server op.
-//! This module owns the pairing: [`prepare_move`], [`prepare_delete`],
-//! [`prepare_read_flag`] and [`prepare_flag`] apply the local write to the store immediately and
-//! hand back the [`ServerOp`] the caller fires in the background, together with
-//! the row's previous coordinates so a failed op can be rolled back.
+//! [`queue_move`], [`queue_delete`], [`queue_read_flag`] and [`queue_flag`]
+//! commit the local store change and the owed [`ServerOp`] in one transaction
+//! through [`crate::pending_ops`] (#0039), then hand back the rows they touched
+//! so the caller can drop them from the list it is showing. The server op is
+//! retired later by the background drain at the sync/fetch resume point, and a
+//! refusal is rolled back there, so the TUI no longer spawns a per-op server
+//! thread and keeps no rollback of its own: the queue owns both.
 //!
-//! Splitting it out of `actions.rs` is what makes the pairing testable: an
-//! action arm needs a live terminal and a background channel, while a prepare
-//! function needs only a store, so a test can assert both halves at once (the
-//! row changed, and *this* op was dispatched) over an ingested fixture.
-//!
-//! Durability is unchanged from the pre-store build: the local write lands
-//! first, the server op is fire-and-forget, and a crash between them loses the
-//! op. The queue that fixes that is
-//! [#0039](../../docs/tickets/0039-pending-ops-queue.md).
+//! Splitting it out of `actions.rs` keeps the pairing testable: an action arm
+//! needs a live terminal, while a queue function needs only a store, so a test
+//! can assert both halves at once (the row changed, and *this* op was queued)
+//! over an ingested fixture.
 
 use super::app::MessageRef;
-use crate::store::write::{self, MutatedRow};
-use crate::store::{open_store, BlobStore, Store};
+use crate::ops::ServerOp;
+use crate::pending_ops;
+use crate::store::write;
+use crate::store::{BlobStore, Store};
 
-// The remote op and its execution seam moved to the library-level
-// [`crate::ops`] module (#0039): the durable `pending_ops` queue drains the
-// same ops from a background engine with no terminal, so a remote op is email
-// logic that must not live under `tui/`. Re-exported so the TUI call sites in
-// `actions.rs` read unchanged.
-pub(crate) use crate::ops::{run_ops, Backend, ServerOp};
-
-/// One mutation that has already been applied locally.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Prepared {
-    /// The row's coordinates *before* the local write, for the rollback.
-    pub previous: MutatedRow,
-    /// The op to fire at the server.
-    pub op: ServerOp,
-}
-
-impl Prepared {
-    /// The `messages.id` this mutation applied to.
-    pub fn msg(&self) -> MessageRef {
-        MessageRef::new(self.previous.id)
+/// The Message-ID a queued op names, read off the row before the op is built.
+///
+/// The durable `apply_*` functions read the row's coordinates themselves inside
+/// their commit, but they take the [`ServerOp`] ready-made, and the op names the
+/// message by Message-ID; this is the one lightweight read that supplies it.
+/// `None` (with a log line) when the row is already gone, which is a skip rather
+/// than an error.
+fn message_id_of(store: &Store, msg: MessageRef, what: &str) -> Option<String> {
+    match write::row_coordinates(store, msg.row_id()) {
+        Ok(Some(row)) => Some(row.message_id),
+        Ok(None) => {
+            log::warn!("[store] {msg} has no row to {what}");
+            None
+        }
+        Err(e) => {
+            log::warn!("[store] reading {msg} to {what} failed: {e:#}");
+            None
+        }
     }
 }
 
-/// Move rows into `dest_mailbox` (the store's mailbox key) and return the ops
-/// that carry them to `dest_server` on the server.
+/// Move rows into `dest_mailbox` (the store's mailbox key) and queue the server
+/// moves that carry them to `dest_server`. Returns the rows actually moved, for
+/// the list update.
 ///
 /// Rows that are already gone are skipped rather than reported: a message the
 /// store no longer holds cannot be moved, and a second mutation racing the
 /// first is a user action rather than a bug.
-pub(crate) fn prepare_move(
+pub(crate) fn queue_move(
     store: &Store,
+    account: &str,
     msgs: &[MessageRef],
     dest_mailbox: &str,
     source_server: &str,
     dest_server: &str,
-) -> Vec<Prepared> {
-    let mut out = Vec::with_capacity(msgs.len());
+) -> Vec<MessageRef> {
+    let mut moved = Vec::with_capacity(msgs.len());
     for msg in msgs {
-        match write::move_row(store, msg.row_id(), dest_mailbox) {
-            Ok(Some(previous)) => {
-                let op = ServerOp::Move {
-                    message_id: previous.message_id.clone(),
-                    source_mailbox: source_server.to_string(),
-                    dest_mailbox: dest_server.to_string(),
-                };
-                out.push(Prepared { previous, op });
-            }
+        let Some(message_id) = message_id_of(store, *msg, "move") else {
+            continue;
+        };
+        let op = ServerOp::Move {
+            message_id,
+            source_mailbox: source_server.to_string(),
+            dest_mailbox: dest_server.to_string(),
+        };
+        match pending_ops::apply_move(store, account, msg.row_id(), dest_mailbox, op) {
+            Ok(Some(_)) => moved.push(*msg),
             Ok(None) => log::warn!("[store] {msg} has no row to move"),
-            Err(e) => log::warn!("[store] moving {msg} failed: {e:#}"),
+            Err(e) => log::warn!("[store] queuing a move for {msg} failed: {e:#}"),
         }
     }
-    out
+    moved
 }
 
-/// Delete rows and return the ops that delete them on the server.
-pub(crate) fn prepare_delete(
+/// Delete rows and queue the server deletes. Returns the rows actually removed.
+pub(crate) fn queue_delete(
     store: &Store,
     blobs: &BlobStore,
+    account: &str,
     msgs: &[MessageRef],
     source_server: &str,
-) -> Vec<Prepared> {
-    let mut out = Vec::with_capacity(msgs.len());
+) -> Vec<MessageRef> {
+    let mut deleted = Vec::with_capacity(msgs.len());
     for msg in msgs {
-        match write::delete_row(store, blobs, msg.row_id()) {
-            Ok(Some(previous)) => {
-                let op = ServerOp::Delete {
-                    message_id: previous.message_id.clone(),
-                    source_mailbox: source_server.to_string(),
-                };
-                out.push(Prepared { previous, op });
-            }
+        let Some(message_id) = message_id_of(store, *msg, "delete") else {
+            continue;
+        };
+        let op = ServerOp::Delete {
+            message_id,
+            source_mailbox: source_server.to_string(),
+        };
+        match pending_ops::apply_delete(store, blobs, account, msg.row_id(), op) {
+            Ok(Some(_)) => deleted.push(*msg),
             Ok(None) => log::warn!("[store] {msg} has no row to delete"),
-            Err(e) => log::warn!("[store] deleting {msg} failed: {e:#}"),
+            Err(e) => log::warn!("[store] queuing a delete for {msg} failed: {e:#}"),
         }
     }
-    out
+    deleted
 }
 
-/// Set the read flag on rows and return the ops that mirror it to the server.
-pub(crate) fn prepare_read_flag(
+/// Set the read flag on rows and queue the server ops that mirror it. Returns
+/// the rows actually flagged.
+pub(crate) fn queue_read_flag(
     store: &Store,
+    account: &str,
     msgs: &[MessageRef],
     read: bool,
     server_mailbox: &str,
-) -> Vec<Prepared> {
+) -> Vec<MessageRef> {
     let mut out = Vec::with_capacity(msgs.len());
     for msg in msgs {
-        let previous = match write::row_coordinates(store, msg.row_id()) {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                log::warn!("[store] {msg} has no row to flag");
-                continue;
-            }
-            Err(e) => {
-                log::warn!("[store] reading {msg} failed: {e:#}");
-                continue;
-            }
-        };
-        if let Err(e) = write::set_read(store, msg.row_id(), read) {
-            log::warn!("[store] flagging {msg} failed: {e:#}");
+        let Some(message_id) = message_id_of(store, *msg, "flag") else {
             continue;
-        }
+        };
         let op = ServerOp::SetRead {
-            message_id: previous.message_id.clone(),
+            message_id,
             mailbox: server_mailbox.to_string(),
             read,
         };
-        out.push(Prepared { previous, op });
+        match pending_ops::apply_set_read(store, account, msg.row_id(), read, op) {
+            Ok(Some(_)) => out.push(*msg),
+            Ok(None) => log::warn!("[store] {msg} has no row to flag"),
+            Err(e) => log::warn!("[store] queuing a read flag for {msg} failed: {e:#}"),
+        }
     }
     out
 }
 
-/// Set the `\Flagged` star on rows and return the ops that mirror it to the
-/// server (#0007). The local write lands first, exactly as the read toggle
-/// does; the star rides the same `flags` column through a read-modify-write.
-pub(crate) fn prepare_flag(
+/// Set the `\Flagged` star on rows and queue the server ops that mirror it
+/// (#0007). Returns the rows actually starred.
+pub(crate) fn queue_flag(
     store: &Store,
+    account: &str,
     msgs: &[MessageRef],
     flagged: bool,
     server_mailbox: &str,
-) -> Vec<Prepared> {
+) -> Vec<MessageRef> {
     let mut out = Vec::with_capacity(msgs.len());
     for msg in msgs {
-        let previous = match write::row_coordinates(store, msg.row_id()) {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                log::warn!("[store] {msg} has no row to flag");
-                continue;
-            }
-            Err(e) => {
-                log::warn!("[store] reading {msg} failed: {e:#}");
-                continue;
-            }
-        };
-        if let Err(e) = write::set_flagged(store, msg.row_id(), flagged) {
-            log::warn!("[store] starring {msg} failed: {e:#}");
+        let Some(message_id) = message_id_of(store, *msg, "flag") else {
             continue;
-        }
+        };
         let op = ServerOp::SetFlagged {
-            message_id: previous.message_id.clone(),
+            message_id,
             mailbox: server_mailbox.to_string(),
             flagged,
         };
-        out.push(Prepared { previous, op });
+        match pending_ops::apply_set_flagged(store, account, msg.row_id(), flagged, op) {
+            Ok(Some(_)) => out.push(*msg),
+            Ok(None) => log::warn!("[store] {msg} has no row to flag"),
+            Err(e) => log::warn!("[store] queuing a flag for {msg} failed: {e:#}"),
+        }
     }
     out
-}
-
-/// Put a moved row back after its server op failed.
-///
-/// A delete has no counterpart here on purpose: the row is gone and there is
-/// nothing to restore it from. The next sync of the mailbox refetches the UID
-/// and ingest re-inserts it, which is what the failure status already tells the
-/// user to do (see `crate::store::write`).
-pub(crate) fn rollback_move(account: &str, previous: &MutatedRow) {
-    let Some(store) = open_store(account) else {
-        log::warn!("[store] no store to roll {} back into", previous.id);
-        return;
-    };
-    if let Err(e) = write::restore_row(&store, previous) {
-        log::warn!("[store] rolling back message #{} failed: {e:#}", previous.id);
-    }
-}
-
-/// Put a read flag back after its server op failed.
-pub(crate) fn rollback_read_flag(account: &str, msg: MessageRef, read: bool) {
-    let Some(store) = open_store(account) else {
-        return;
-    };
-    if let Err(e) = write::set_read(&store, msg.row_id(), read) {
-        log::warn!("[store] rolling back the read flag on {msg} failed: {e:#}");
-    }
-}
-
-/// Put the `\Flagged` star back after its server op failed (#0007).
-pub(crate) fn rollback_flag(account: &str, msg: MessageRef, flagged: bool) {
-    let Some(store) = open_store(account) else {
-        return;
-    };
-    if let Err(e) = write::set_flagged(&store, msg.row_id(), flagged) {
-        log::warn!("[store] rolling back the flag on {msg} failed: {e:#}");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{homogeneous, Homogeneous};
     use crate::reconcile::tests::{fixture, invite_ics, Fixture};
     use crate::store::read;
     use crate::tui::app::calendar_view;
@@ -220,21 +172,27 @@ mod tests {
         read::find_by_id(&fx.store, id).unwrap().map(|r| r.mailbox)
     }
 
+    /// The one queued op of an account, when a test expects exactly one.
+    fn only_queued_op(fx: &Fixture) -> ServerOp {
+        let queued = pending_ops::queued_ops(&fx.store, "alice").unwrap();
+        assert_eq!(queued.len(), 1, "expected exactly one queued op");
+        queued[0].op.clone()
+    }
+
     /// Archive is a move with a fixed destination: the row lands in the archive
-    /// mailbox immediately, and the op the caller fires names the message by
-    /// Message-ID with the two *server* folders, not the store's mailbox keys.
+    /// mailbox immediately, and the queued op names the message by Message-ID
+    /// with the two *server* folders, not the store's mailbox keys.
     #[test]
-    fn archiving_moves_the_row_and_dispatches_a_server_move() {
+    fn archiving_moves_the_row_and_queues_a_server_move() {
         let fx = fixture();
         let id = fx.ingest_plain("inbox", 1, "Receipt");
 
-        let prepared = prepare_move(&fx.store, &refs(&[id]), "archive", "INBOX", "Archive");
+        let moved = queue_move(&fx.store, "alice", &refs(&[id]), "archive", "INBOX", "Archive");
 
         assert_eq!(mailbox_of(&fx, id).as_deref(), Some("archive"));
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].msg(), MessageRef::new(id));
+        assert_eq!(moved, vec![MessageRef::new(id)]);
         assert_eq!(
-            prepared[0].op,
+            only_queued_op(&fx),
             ServerOp::Move {
                 message_id: "<inbox-1@example.com>".to_string(),
                 source_mailbox: "INBOX".to_string(),
@@ -243,19 +201,20 @@ mod tests {
         );
     }
 
-    /// Delete removes the row and dispatches a server delete against the folder
-    /// the message was actually in, rather than the hardcoded INBOX the file
-    /// build had to assume.
+    /// Delete removes the row and queues a server delete against the folder the
+    /// message was actually in, rather than the hardcoded INBOX the file build
+    /// had to assume.
     #[test]
-    fn deleting_removes_the_row_and_dispatches_a_server_delete() {
+    fn deleting_removes_the_row_and_queues_a_server_delete() {
         let fx = fixture();
         let id = fx.ingest_plain("archive", 4, "Junk");
 
-        let prepared = prepare_delete(&fx.store, &fx.blobs, &refs(&[id]), "Archive");
+        let deleted = queue_delete(&fx.store, &fx.blobs, "alice", &refs(&[id]), "Archive");
 
+        assert_eq!(deleted, vec![MessageRef::new(id)]);
         assert!(mailbox_of(&fx, id).is_none(), "the row survived the delete");
         assert_eq!(
-            prepared[0].op,
+            only_queued_op(&fx),
             ServerOp::Delete {
                 message_id: "<archive-4@example.com>".to_string(),
                 source_mailbox: "Archive".to_string(),
@@ -263,99 +222,66 @@ mod tests {
         );
     }
 
-    /// The flag lands on the row first, and the op carries the new state and
-    /// the folder to apply it in.
+    /// The flag lands on the row first, and the queued op carries the new state
+    /// and the folder to apply it in.
     #[test]
-    fn flagging_writes_seen_and_dispatches_the_matching_server_op() {
+    fn flagging_writes_seen_and_queues_the_matching_server_op() {
         let fx = fixture();
         let id = fx.ingest_plain("inbox", 2, "Unread");
 
-        let prepared = prepare_read_flag(&fx.store, &refs(&[id]), true, "INBOX");
+        queue_read_flag(&fx.store, "alice", &refs(&[id]), true, "INBOX");
 
         assert!(read::find_by_id(&fx.store, id).unwrap().unwrap().is_read());
         assert_eq!(
-            prepared[0].op,
+            only_queued_op(&fx),
             ServerOp::SetRead {
                 message_id: "<inbox-2@example.com>".to_string(),
                 mailbox: "INBOX".to_string(),
                 read: true,
             }
         );
-
-        let prepared = prepare_read_flag(&fx.store, &refs(&[id]), false, "INBOX");
-        assert!(!read::find_by_id(&fx.store, id).unwrap().unwrap().is_read());
-        assert!(matches!(prepared[0].op, ServerOp::SetRead { read: false, .. }));
     }
 
-    /// The star lands on the row first and the op carries the new state and the
-    /// folder to apply it in (#0007). Flagging leaves the read bit alone.
+    /// The star lands on the row first and the queued op carries the new state
+    /// and the folder to apply it in (#0007). Flagging leaves the read bit
+    /// alone.
     #[test]
-    fn flagging_writes_the_star_and_dispatches_the_matching_server_op() {
+    fn flagging_writes_the_star_and_queues_the_matching_server_op() {
         let fx = fixture();
         let id = fx.ingest_plain("inbox", 7, "Important");
 
-        let prepared = prepare_flag(&fx.store, &refs(&[id]), true, "INBOX");
+        queue_flag(&fx.store, "alice", &refs(&[id]), true, "INBOX");
 
         let row = read::find_by_id(&fx.store, id).unwrap().unwrap();
         assert!(row.is_flagged());
         assert!(!row.is_read(), "flagging must not touch the read bit");
         assert_eq!(
-            prepared[0].op,
+            only_queued_op(&fx),
             ServerOp::SetFlagged {
                 message_id: "<inbox-7@example.com>".to_string(),
                 mailbox: "INBOX".to_string(),
                 flagged: true,
             }
         );
-
-        let prepared = prepare_flag(&fx.store, &refs(&[id]), false, "INBOX");
-        assert!(!read::find_by_id(&fx.store, id).unwrap().unwrap().is_flagged());
-        assert!(matches!(prepared[0].op, ServerOp::SetFlagged { flagged: false, .. }));
     }
 
-    /// A batch applies every row and produces one op per message, in order.
-    /// The ops are homogeneous, which is what lets IMAP run them over a single
-    /// connection.
+    /// A batch moves every row and queues one op per message: the store shows
+    /// the whole selection archived and the queue owes one op each.
     #[test]
-    fn a_batch_moves_every_row_and_dispatches_one_op_each() {
+    fn a_batch_moves_every_row_and_queues_one_op_each() {
         let fx = fixture();
         let ids: Vec<i64> = (1..=3)
             .map(|uid| fx.ingest_plain("inbox", uid, &format!("Mail {uid}")))
             .collect();
 
-        let prepared = prepare_move(&fx.store, &refs(&ids), "archive", "INBOX", "Archive");
+        let moved = queue_move(&fx.store, "alice", &refs(&ids), "archive", "INBOX", "Archive");
 
-        assert_eq!(prepared.len(), 3);
+        assert_eq!(moved.len(), 3);
         for id in &ids {
             assert_eq!(mailbox_of(&fx, *id).as_deref(), Some("archive"));
         }
         assert_eq!(read::list_mailbox(&fx.store, "alice", "inbox").unwrap().len(), 0);
-        let ops: Vec<ServerOp> = prepared.iter().map(|p| p.op.clone()).collect();
-        assert!(
-            matches!(homogeneous(&ops), Some(Homogeneous::Move { source: "INBOX", dest: "Archive" })),
-            "a uniform batch must be runnable over one connection"
-        );
-    }
-
-    /// Mixed folders are not batchable: two moves out of different mailboxes
-    /// cannot share one SELECT, so they fall back to one session each.
-    #[test]
-    fn a_mixed_batch_is_not_run_over_one_connection() {
-        let fx = fixture();
-        let a = fx.ingest_plain("inbox", 1, "From inbox");
-        let b = fx.ingest_plain("archive", 1, "From archive");
-
-        let mut ops: Vec<ServerOp> = prepare_move(&fx.store, &refs(&[a]), "archive", "INBOX", "Archive")
-            .into_iter()
-            .map(|p| p.op)
-            .collect();
-        ops.extend(
-            prepare_move(&fx.store, &refs(&[b]), "inbox", "Archive", "INBOX")
-                .into_iter()
-                .map(|p| p.op),
-        );
-
-        assert!(homogeneous(&ops).is_none());
+        assert_eq!(pending_ops::queued_ops(&fx.store, "alice").unwrap().len(), 3);
     }
 
     /// Moving an invite is what the Calendar view has to hear about: the
@@ -371,7 +297,7 @@ mod tests {
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].msg, MessageRef::new(id));
 
-        prepare_move(&fx.store, &refs(&[id]), "archive", "INBOX", "Archive");
+        queue_move(&fx.store, "alice", &refs(&[id]), "archive", "INBOX", "Archive");
         let rebuilt = calendar_view::load_events_for_account(&fx.store, &fx.blobs, "alice", "");
 
         assert_eq!(rebuilt.len(), 1, "the invite is still on the agenda");
@@ -388,7 +314,7 @@ mod tests {
         let stale = calendar_view::load_events_for_account(&fx.store, &fx.blobs, "alice", "");
         assert_eq!(stale.len(), 1);
 
-        prepare_delete(&fx.store, &fx.blobs, &refs(&[id]), "INBOX");
+        queue_delete(&fx.store, &fx.blobs, "alice", &refs(&[id]), "INBOX");
         let rebuilt = calendar_view::load_events_for_account(&fx.store, &fx.blobs, "alice", "");
 
         assert!(rebuilt.is_empty(), "a deleted invite stayed on the agenda");
@@ -396,14 +322,15 @@ mod tests {
     }
 
     /// A reference to a row that is gone is skipped rather than reported: it
-    /// produces no op, so nothing is fired at the server for a message the
-    /// store no longer holds.
+    /// queues no op, so nothing is owed to the server for a message the store
+    /// no longer holds.
     #[test]
-    fn a_dead_reference_prepares_nothing() {
+    fn a_dead_reference_queues_nothing() {
         let fx = fixture();
-        assert!(prepare_move(&fx.store, &refs(&[404]), "archive", "INBOX", "Archive").is_empty());
-        assert!(prepare_delete(&fx.store, &fx.blobs, &refs(&[404]), "INBOX").is_empty());
-        assert!(prepare_read_flag(&fx.store, &refs(&[404]), true, "INBOX").is_empty());
-        assert!(prepare_flag(&fx.store, &refs(&[404]), true, "INBOX").is_empty());
+        assert!(queue_move(&fx.store, "alice", &refs(&[404]), "archive", "INBOX", "Archive").is_empty());
+        assert!(queue_delete(&fx.store, &fx.blobs, "alice", &refs(&[404]), "INBOX").is_empty());
+        assert!(queue_read_flag(&fx.store, "alice", &refs(&[404]), true, "INBOX").is_empty());
+        assert!(queue_flag(&fx.store, "alice", &refs(&[404]), true, "INBOX").is_empty());
+        assert!(pending_ops::queued_ops(&fx.store, "alice").unwrap().is_empty());
     }
 }

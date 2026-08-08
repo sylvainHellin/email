@@ -303,6 +303,12 @@ pub(super) async fn lib_do_sync(
     // not be appended when the message was sent lands here (#0037 item 5).
     crate::send::resume_outbox(account_config).await;
 
+    // And the mutation queue's drain tick (#0039): archive, delete, move and
+    // flag toggles enqueued locally are retired before this sync reads the
+    // mailboxes they changed, under the engine lock. Drained before the read
+    // so the server has converged by the time the reconcile looks at it.
+    let ops_suffix = drain_pending_ops(account_config).await;
+
     // An account-level failure (a refused login above all) has to reach the
     // log: the status line it otherwise becomes loses every race against a
     // concurrent account that succeeded, which is how #0068 stayed invisible
@@ -312,9 +318,34 @@ pub(super) async fn lib_do_sync(
     let result = sync_mailboxes(imap_config, &account_config.name, &targets, limit, false)
         .await
         .inspect_err(|e| log::error!("[sync] account '{}' failed: {e:#}", account_config.name))?;
-    Ok((finish_sync(account_config, &result), SyncResultMeta {
+    Ok((format!("{}{ops_suffix}", finish_sync(account_config, &result)), SyncResultMeta {
         new_inbox_mail: result.new_inbox_mail.clone(),
     }))
+}
+
+/// Drain the account's pending-mutation queue at the sync/fetch resume point
+/// (#0039), returning a status suffix that names any failures.
+///
+/// A drained op is silent: it only mirrored a change the store already made, so
+/// there is nothing new to tell the user. A failed op has already been rolled
+/// back by the drain and reappears when the sync refresh reloads the list, so
+/// the suffix points at the log rather than repeating the per-op error the
+/// drain has already written there. The drain builds no backend and takes no
+/// lock unless a row is actually owed, so a clean account adds no traffic.
+async fn drain_pending_ops(account_config: &AccountConfig) -> String {
+    match crate::pending_ops::resume_account(account_config).await {
+        Ok(Some(r)) if r.failed > 0 => {
+            format!("; {} mutation(s) failed and were rolled back (see the log)", r.failed)
+        }
+        Ok(_) => String::new(),
+        Err(e) => {
+            log::warn!(
+                "[pending_ops] draining {} at the sync tick failed: {e:#}",
+                account_config.name
+            );
+            String::new()
+        }
+    }
 }
 
 /// Post-sync hooks shared by both backends, and the one-line status message.
@@ -445,6 +476,11 @@ pub(super) async fn lib_do_sync_graph(
     // Same reason as the IMAP path above: an account-level failure has to be
     // in the log, not only in a status line another account will overwrite
     // (#0068, #0071).
+    // The mutation queue drains here too (#0039), before the Graph read. Graph
+    // has no outbox resume (its resubmit is a no-op), but move / delete /
+    // mark-read ops are real work the queue owes the server.
+    let ops_suffix = drain_pending_ops(account_config).await;
+
     let result = crate::graph::sync_mailboxes_graph(
         graph_config,
         &account_config.name,
@@ -455,7 +491,7 @@ pub(super) async fn lib_do_sync_graph(
     .await
     .inspect_err(|e| log::error!("[sync] account '{}' failed: {e:#}", account_config.name))?;
 
-    Ok((finish_sync(account_config, &result), SyncResultMeta {
+    Ok((format!("{}{ops_suffix}", finish_sync(account_config, &result)), SyncResultMeta {
         new_inbox_mail: result.new_inbox_mail.clone(),
     }))
 }

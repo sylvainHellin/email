@@ -6,6 +6,8 @@ use mailypoppins::draft::*;
 use mailypoppins::send::*;
 use mailypoppins::config_cmd::*;
 use mailypoppins::graph;
+use mailypoppins::ops::{Backend, ServerOp};
+use mailypoppins::pending_ops;
 use mailypoppins::selector::{Namespace, Selector};
 use mailypoppins::store::read::materialise_attachments;
 use mailypoppins::store::Store;
@@ -1124,6 +1126,22 @@ async fn sync_one_account(
                 drained.still_open + drained.awaiting_submission
             );
         }
+
+        // The sync tick is also the mutation queue's drain tick (#0039): a
+        // move, delete or flag toggle enqueued locally (by the TUI, or by a
+        // CLI invocation that crashed before its op ran) is retired here,
+        // before this sync reads the mailboxes those ops changed. Nothing is
+        // drained when nothing is owed, so a clean account adds no traffic.
+        if let Some(ops) = pending_ops::resume_account(account_config).await? {
+            if ops.completed > 0 || ops.failed > 0 {
+                println!(
+                    "  {} mutations: {} completed, {} failed",
+                    "↻".dimmed(),
+                    ops.completed,
+                    ops.failed
+                );
+            }
+        }
     }
 
     let result = if account_config.auth_method == AuthMethod::Graph {
@@ -2076,23 +2094,27 @@ async fn main() -> Result<()> {
             let source_server = find_server_name_for_role(&account_config, &row.mailbox);
             let dest_server = find_server_name_for_role(&account_config, ARCHIVE_MAILBOX);
 
-            // Server first, then the row. The TUI writes the row first because
-            // a user is watching the list; a CLI invocation has nobody to keep
-            // responsive, so it takes the ordering that needs no rollback.
-            if account_config.auth_method == AuthMethod::Graph {
-                let graph_config = GraphConfig::load(&account_config)?;
-                graph::move_message_graph(&graph_config, &row.message_id, &dest_server).await?;
-            } else {
-                let imap_config = ImapConfig::load(&account_config)?;
-                imap_client::move_email_on_server(
-                    &imap_config,
-                    &row.message_id,
-                    &source_server,
-                    &dest_server,
-                )
-                .await?;
-            }
-            mailypoppins::store::write::move_row(&store, row.id, ARCHIVE_MAILBOX)?;
+            // Through the durable queue, the same seam the TUI drains (#0039):
+            // the row moves and the owed server op commit in one transaction,
+            // then the op runs synchronously so the CLI keeps its blocking UX.
+            // A crash between the two halves leaves the op queued for the next
+            // drain rather than losing it, which server-first-then-row could
+            // not promise. On a server refusal `run_and_settle` rolls the row
+            // home and propagates the error verbatim, so a not-found stays
+            // byte-identical to the pre-queue message.
+            let op = ServerOp::Move {
+                message_id: row.message_id.clone(),
+                source_mailbox: source_server,
+                dest_mailbox: dest_server,
+            };
+            let backend = Backend::resolve(&account_config)?;
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
+            let Some((_previous, op_id)) =
+                pending_ops::apply_move(&store, &account_config.name, row.id, ARCHIVE_MAILBOX, op)?
+            else {
+                return Err(anyhow!("{canonical} is no longer in the store"));
+            };
+            pending_ops::run_and_settle(&store, &blobs, op_id, &backend).await?;
             println!("{} archived {}", "\u{2713}".green(), canonical);
             println!(
                 "  {} {}",
@@ -2173,21 +2195,30 @@ async fn main() -> Result<()> {
                     let source_server =
                         find_server_name_for_role(&account_config, &row.mailbox);
 
-                    if account_config.auth_method == AuthMethod::Graph {
-                        let graph_config = GraphConfig::load(&account_config)?;
-                        graph::delete_message_graph(&graph_config, &row.message_id).await?;
-                    } else {
-                        let imap_config = ImapConfig::load(&account_config)?;
-                        imap_client::delete_email_on_server(
-                            &imap_config,
-                            &row.message_id,
-                            &source_server,
-                        )
-                        .await?;
-                    }
+                    // The durable queue again (#0039): the row delete and the
+                    // owed server delete commit together, then the op runs
+                    // synchronously. A delete has nothing to roll back (the row
+                    // is gone and the server still holds the message), so a
+                    // refusal propagates verbatim and the next sync refetches
+                    // the UID; the not-found message stays byte-identical.
+                    let op = ServerOp::Delete {
+                        message_id: row.message_id.clone(),
+                        source_mailbox: source_server,
+                    };
+                    let backend = Backend::resolve(&account_config)?;
                     let blobs =
                         mailypoppins::store::BlobStore::for_account(&account_config.name);
-                    mailypoppins::store::write::delete_row(&store, &blobs, row.id)?;
+                    let Some((_previous, op_id)) = pending_ops::apply_delete(
+                        &store,
+                        &blobs,
+                        &account_config.name,
+                        row.id,
+                        op,
+                    )?
+                    else {
+                        return Err(anyhow!("{canonical} is no longer in the store"));
+                    };
+                    pending_ops::run_and_settle(&store, &blobs, op_id, &backend).await?;
                     println!("{} deleted {}", "\u{2713}".green(), canonical);
                 }
             }

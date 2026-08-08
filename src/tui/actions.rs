@@ -14,8 +14,7 @@ use super::helpers::{
     edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
 };
 use crate::store::open_store;
-use super::mutations::{self, Backend, Prepared, ServerOp};
-use super::ui;
+use super::mutations;
 
 use crate::draft::{
     create_draft_from_source, find_drafts, new_draft_skeleton, DraftFromSource,
@@ -49,18 +48,24 @@ pub(super) fn queued_action_is_releasable(app: &App) -> bool {
     !sync_is_blocked(app) && app.pending_actions.is_empty()
 }
 
-/// Park `action` until the background work clears, announcing it once.
+/// Park `action` until the running sync or fetch clears, announcing it once.
 ///
 /// Re-parking the same action is silent: the user asked for one sync and one
 /// activity-log line is the honest record of that. A different action taking
 /// the slot announces itself, because it is a different answer to the user.
+///
+/// The message no longer counts "ops pending" (#0039): a mutation used to be a
+/// background job that a requested sync stacked behind, re-announcing itself on
+/// every keypress. Mutations now enqueue silently into the durable queue and
+/// block nothing, so the only thing a sync can wait behind is another sync or
+/// fetch, and the line says just that.
 fn park_until_idle(app: &mut App, action: Action, label: &str) {
     let already_parked = app
         .queued_action
         .as_ref()
         .is_some_and(|parked| std::mem::discriminant(parked) == std::mem::discriminant(&action));
     if !already_parked {
-        app.set_status(format!("{label} queued ({} ops pending...)", app.bg_count));
+        app.set_status(format!("{label} queued (waiting for the current sync)"));
     }
     app.queued_action = Some(action);
 }
@@ -911,63 +916,11 @@ fn selected_selector(app: &App) -> Option<crate::selector::Selector> {
     Some(crate::selector::Selector::for_message(account, &row))
 }
 
-/// The backend the server op runs against, resolved before any optimistic
-/// write so a missing config leaves the store and the list untouched.
-fn backend_for_mutation(app: &mut App) -> Option<Backend> {
-    if app.is_graph() {
-        match app.graph_config.clone() {
-            Some(c) => Some(Backend::Graph(Box::new(c))),
-            None => {
-                app.set_status_level("Graph not configured".to_string(), StatusLevel::Error);
-                None
-            }
-        }
-    } else {
-        match app.imap_config.clone() {
-            Some(c) => Some(Backend::Imap(Box::new(c))),
-            None => {
-                app.set_status_level("IMAP not configured".to_string(), StatusLevel::Error);
-                None
-            }
-        }
-    }
-}
-
-/// Fire the server half of a batch of already-applied mutations.
-///
-/// One `BgResult` per op, so the counters the UI keeps stay balanced, and one
-/// rollback per failure: a move that the server refused is put back where it
-/// came from, which is what the pre-store build did by moving the file back.
-/// A refused delete has nothing to put back and converges on the next sync
-/// (see [`crate::store::write`]); a refused flag is rolled back by the
-/// `BgResult::ToggleRead` handler, which owns the in-memory half too.
-fn dispatch<F>(
-    account: String,
-    backend: Backend,
-    prepared: Vec<Prepared>,
-    tx: mpsc::Sender<BgResult>,
-    report: F,
-) where
-    F: Fn(&Prepared, Result<String, String>) -> BgResult + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let ops: Vec<ServerOp> = prepared.iter().map(|p| p.op.clone()).collect();
-        let results = rt.block_on(mutations::run_ops(&backend, &ops));
-        for (prep, result) in prepared.iter().zip(results) {
-            let result = match result {
-                Ok(()) => Ok(String::new()),
-                Err(e) => {
-                    if matches!(prep.op, ServerOp::Move { .. }) {
-                        mutations::rollback_move(&account, &prep.previous);
-                    }
-                    Err(e.to_string())
-                }
-            };
-            let _ = tx.send(report(prep, result));
-        }
-    });
-}
+// The server half of a mutation is no longer fired from here (#0039): a
+// mutation enqueues its op through `mutations::queue_*` and the durable
+// `pending_ops` drain retires it at the next sync/fetch resume point, rolling
+// back a refusal itself. So this module keeps no backend resolver, no per-op
+// dispatch thread and no rollback of its own: the queue owns all three.
 
 /// What a mutation leaves stale beyond the list it just changed.
 ///
@@ -1326,7 +1279,7 @@ pub(super) fn handle_action(
         }
         Action::Archive => {
             if let Some(msg) = app.selected_email_ref() {
-                archive_msgs(app, terminal, bg_tx, vec![msg], false)?;
+                archive_msgs(app, vec![msg], false);
             }
         }
 
@@ -1347,16 +1300,16 @@ pub(super) fn handle_action(
             } else if let Some(id) = draft_id {
                 delete_draft(app, &id);
             } else if let Some(msg) = app.selected_email_ref() {
-                delete_msgs(app, terminal, bg_tx, vec![msg], false)?;
+                delete_msgs(app, vec![msg], false);
             }
         }
 
         Action::BatchArchive(msgs) => {
-            archive_msgs(app, terminal, bg_tx, msgs, true)?;
+            archive_msgs(app, msgs, true);
         }
 
         Action::BatchDelete(msgs) => {
-            delete_msgs(app, terminal, bg_tx, msgs, true)?;
+            delete_msgs(app, msgs, true);
         }
 
         Action::BatchDeleteDrafts(ids) => {
@@ -1365,8 +1318,9 @@ pub(super) fn handle_action(
 
         Action::MoveToMailbox { msgs, dest_idx } => {
             // Quick-move to an arbitrary mailbox (#0018): the generalized
-            // archive. The store row moves optimistically, the server op
-            // follows, and a refusal puts the row back (#0038 item 7).
+            // archive. The store row moves and the owed server move enqueue in
+            // one transaction; the drain carries it to the server at the next
+            // resume point and rolls a refusal back (#0039).
             let (dest_mailbox, dest_label) = match app.mailboxes.get(dest_idx) {
                 Some(mb) => (mailbox_key(mb), mb.label.clone()),
                 None => return Ok(()),
@@ -1387,21 +1341,15 @@ pub(super) fn handle_action(
             };
             let source_server = app.active_server_mailbox();
 
-            // Resolve the backend and the store BEFORE any optimistic
-            // mutation (same order as Archive) so a missing config leaves the
-            // list and the rows untouched.
-            let Some(backend) = backend_for_mutation(app) else {
-                return Ok(());
-            };
             let Some((store, _blobs)) = store_for_mutation(app, "Move") else {
                 return Ok(());
             };
-
+            let account = app.account_config.name.clone();
             let touched_invite = any_invite(app, &msgs);
-            let prepared =
-                mutations::prepare_move(&store, &msgs, &dest_mailbox, &source_server, &dest_server);
+            let moved =
+                mutations::queue_move(&store, &account, &msgs, &dest_mailbox, &source_server, &dest_server);
             drop(store);
-            if prepared.is_empty() {
+            if moved.is_empty() {
                 app.set_status_level(
                     "Move failed: nothing to move".to_string(),
                     StatusLevel::Error,
@@ -1409,36 +1357,20 @@ pub(super) fn handle_action(
                 return Ok(());
             }
 
-            let moved: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
-            app.remove_selected_from_list_batch(&moved);
+            let removed: HashSet<MessageRef> = moved.iter().copied().collect();
+            app.remove_selected_from_list_batch(&removed);
             app.selection.clear();
             refresh_after_mutation(app, Some(dest_idx), touched_invite);
 
-            let count = prepared.len();
-            app.bg_count += count;
-            app.bg_mutations += count;
+            let count = moved.len();
             app.set_status_level(
                 if count == 1 {
-                    format!("Moving to {dest_label}...")
+                    format!("Moved to {dest_label}")
                 } else {
-                    format!("Moving {count} emails to {dest_label}...")
+                    format!("Moved {count} emails to {dest_label}")
                 },
-                StatusLevel::Progress,
+                StatusLevel::Success,
             );
-            terminal.draw(|frame| ui::view(app, frame))?;
-
-            let acct_idx = app.active_account;
-            let source_idx = app.active_mailbox;
-            let account = app.account_config.name.clone();
-            dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
-                BgResult::Move {
-                    account_index: acct_idx,
-                    source_mailbox_idx: source_idx,
-                    dest_mailbox_idx: dest_idx,
-                    dest_label: dest_label.clone(),
-                    result,
-                }
-            });
         }
 
         Action::ToggleRead => {
@@ -1452,7 +1384,7 @@ pub(super) fn handle_action(
                 } else {
                     "Marked as unread"
                 };
-                if set_read_flag(app, bg_tx, vec![msg], new_read) {
+                if set_read_flag(app, vec![msg], new_read) {
                     app.set_status(label.to_string());
                 }
             }
@@ -1468,7 +1400,7 @@ pub(super) fn handle_action(
                 let Some(msg) = email.msg else {
                     return Ok(());
                 };
-                set_read_flag(app, bg_tx, vec![msg], true);
+                set_read_flag(app, vec![msg], true);
             }
         }
 
@@ -1478,7 +1410,7 @@ pub(super) fn handle_action(
                 .any(|m| app.emails.iter().any(|e| e.msg == Some(*m) && !e.read));
             let new_read = any_unread;
             let count = msgs.len();
-            if set_read_flag(app, bg_tx, msgs, new_read) {
+            if set_read_flag(app, msgs, new_read) {
                 app.selection.clear();
                 app.set_status(if new_read {
                     format!("Marked {count} as read")
@@ -1495,7 +1427,7 @@ pub(super) fn handle_action(
                     return Ok(());
                 };
                 let label = if new_flag { "Flagged" } else { "Unflagged" };
-                if set_flag(app, bg_tx, vec![msg], new_flag) {
+                if set_flag(app, vec![msg], new_flag) {
                     app.set_status(label.to_string());
                 }
             }
@@ -1507,7 +1439,7 @@ pub(super) fn handle_action(
                 .any(|m| app.emails.iter().any(|e| e.msg == Some(*m) && !e.flagged));
             let new_flag = any_unflagged;
             let count = msgs.len();
-            if set_flag(app, bg_tx, msgs, new_flag) {
+            if set_flag(app, msgs, new_flag) {
                 app.selection.clear();
                 app.set_status(if new_flag {
                     format!("Flagged {count}")
@@ -1850,7 +1782,7 @@ pub(super) fn handle_action(
         | Action::SearchResultForward
         | Action::SearchResultArchive
         | Action::SearchResultOpenInBrowser => {
-            handle_search_result_action(app, terminal, action, bg_tx)?;
+            handle_search_result_action(app, terminal, action)?;
         }
 
         Action::Sync => {
@@ -2450,7 +2382,6 @@ fn handle_search_result_action(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     action: Action,
-    bg_tx: &mpsc::Sender<BgResult>,
 ) -> Result<()> {
     match action {
         Action::SearchResultOpen => {
@@ -2531,7 +2462,7 @@ fn handle_search_result_action(
                 app.server_search_index = app.server_search_results.len() - 1;
             }
 
-            archive_msgs(app, terminal, bg_tx, vec![msg], false)?;
+            archive_msgs(app, vec![msg], false);
         }
 
         _ => {}
@@ -2583,231 +2514,149 @@ fn search_result_draft(
     write_draft_and_edit(app, terminal, &source, kind, what)
 }
 
-/// Archive one or many messages: the store rows move into the archive mailbox,
-/// then the server op follows (#0038 scope item 7).
+/// Archive one or many messages: the store rows move into the archive mailbox
+/// and the owed server moves enqueue in the same transaction (#0039).
 ///
-/// `batch` says whether the selection should be cleared afterwards, which is
-/// the only difference between the single and the batch arm.
-fn archive_msgs(
-    app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    bg_tx: &mpsc::Sender<BgResult>,
-    msgs: Vec<MessageRef>,
-    batch: bool,
-) -> Result<()> {
+/// The drain carries them to the server at the next sync/fetch resume point and
+/// rolls a refusal back, so there is no per-op thread and no status to wait on:
+/// the local move is instant and confirmed. `batch` says whether the selection
+/// should be cleared afterwards, the only difference between the single and the
+/// batch arm.
+fn archive_msgs(app: &mut App, msgs: Vec<MessageRef>, batch: bool) {
     let Some(dest_idx) = app.find_mailbox_by_kind(MailboxKind::Archive) else {
         app.set_status_level(
             "Archive mailbox not configured".to_string(),
             StatusLevel::Error,
         );
-        return Ok(());
+        return;
     };
     let dest_mailbox = match app.mailboxes.get(dest_idx) {
         Some(mb) => mailbox_key(mb),
-        None => return Ok(()),
+        None => return,
     };
     let dest_server = app.archive_server_name.clone();
     let source_server = app.active_server_mailbox();
 
-    let Some(backend) = backend_for_mutation(app) else {
-        return Ok(());
-    };
     let Some((store, _blobs)) = store_for_mutation(app, "Archive") else {
-        return Ok(());
+        return;
     };
-
+    let account = app.account_config.name.clone();
     let touched_invite = any_invite(app, &msgs);
-    let prepared =
-        mutations::prepare_move(&store, &msgs, &dest_mailbox, &source_server, &dest_server);
+    let archived_refs =
+        mutations::queue_move(&store, &account, &msgs, &dest_mailbox, &source_server, &dest_server);
     drop(store);
-    if prepared.is_empty() {
+    if archived_refs.is_empty() {
         app.set_status_level(
             "Archive failed: nothing to archive".to_string(),
             StatusLevel::Error,
         );
-        return Ok(());
+        return;
     }
 
-    let archived: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
+    let archived: HashSet<MessageRef> = archived_refs.iter().copied().collect();
     app.remove_selected_from_list_batch(&archived);
     if batch {
         app.selection.clear();
     }
     refresh_after_mutation(app, Some(dest_idx), touched_invite);
 
-    let count = prepared.len();
-    app.bg_count += count;
-    app.bg_mutations += count;
+    let count = archived_refs.len();
     app.set_status_level(
         if count == 1 {
-            "Archiving...".to_string()
+            "Email archived".to_string()
         } else {
-            format!("Archiving {count} emails...")
+            format!("Archived {count} emails")
         },
-        StatusLevel::Progress,
+        StatusLevel::Success,
     );
-    terminal.draw(|frame| ui::view(app, frame))?;
-
-    let acct_idx = app.active_account;
-    let account = app.account_config.name.clone();
-    dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
-        BgResult::Archive {
-            account_index: acct_idx,
-            result,
-        }
-    });
-    Ok(())
 }
 
-/// Delete one or many messages: the store rows go, then the server op follows.
+/// Delete one or many messages: the store rows go and the owed server deletes
+/// enqueue in the same transaction (#0039).
 ///
 /// The rows are removed rather than tombstoned, so a refused server delete is
-/// answered by the next sync refetching the message; see
-/// [`crate::store::write`] for why that is the right shape here.
-fn delete_msgs(
-    app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    bg_tx: &mpsc::Sender<BgResult>,
-    msgs: Vec<MessageRef>,
-    batch: bool,
-) -> Result<()> {
+/// answered by the next sync refetching the message; the drain surfaces the
+/// refusal (see [`crate::pending_ops`]).
+fn delete_msgs(app: &mut App, msgs: Vec<MessageRef>, batch: bool) {
     let source_server = app.active_server_mailbox();
-    let Some(backend) = backend_for_mutation(app) else {
-        return Ok(());
-    };
     let Some((store, blobs)) = store_for_mutation(app, "Delete") else {
-        return Ok(());
+        return;
     };
-
+    let account = app.account_config.name.clone();
     let touched_invite = any_invite(app, &msgs);
-    let prepared = mutations::prepare_delete(&store, &blobs, &msgs, &source_server);
+    let deleted_refs = mutations::queue_delete(&store, &blobs, &account, &msgs, &source_server);
     drop(store);
-    if prepared.is_empty() {
+    if deleted_refs.is_empty() {
         app.set_status_level(
             "Delete failed: nothing to delete".to_string(),
             StatusLevel::Error,
         );
-        return Ok(());
+        return;
     }
 
     // Every deleted row's id is dead the moment the row is: the list, the
     // selection set and the cursor anchor must not carry one across this
     // boundary, because a re-ingest of the same message mints a new id.
-    let deleted: HashSet<MessageRef> = prepared.iter().map(|p| p.msg()).collect();
+    let deleted: HashSet<MessageRef> = deleted_refs.iter().copied().collect();
     app.remove_selected_from_list_batch(&deleted);
     if batch {
         app.selection.clear();
     }
     refresh_after_mutation(app, None, touched_invite);
 
-    let count = prepared.len();
-    app.bg_count += count;
-    app.bg_mutations += count;
+    let count = deleted_refs.len();
     app.set_status_level(
         if count == 1 {
-            "Deleting...".to_string()
+            "Email deleted".to_string()
         } else {
-            format!("Deleting {count} emails...")
+            format!("Deleted {count} emails")
         },
-        StatusLevel::Progress,
+        StatusLevel::Success,
     );
-    terminal.draw(|frame| ui::view(app, frame))?;
-
-    let acct_idx = app.active_account;
-    let account = app.account_config.name.clone();
-    dispatch(account, backend, prepared, bg_tx.clone(), move |_prep, result| {
-        BgResult::Delete {
-            account_index: acct_idx,
-            result,
-        }
-    });
-    Ok(())
 }
 
-/// Set the read flag on one or many messages: store row first, then the server.
+/// Set the read flag on one or many messages: the store row and the owed server
+/// op commit together (#0039).
 ///
 /// Returns false when nothing was applied, so the caller can skip its status
 /// line. The in-memory list is updated beside the row because the list is what
-/// the user is looking at; both halves are rolled back together by the
-/// `BgResult::ToggleRead` handler when the server refuses.
-fn set_read_flag(
-    app: &mut App,
-    bg_tx: &mpsc::Sender<BgResult>,
-    msgs: Vec<MessageRef>,
-    read: bool,
-) -> bool {
+/// the user is looking at; the drain rolls both the store row and (on the next
+/// refresh) the list back if the server refuses.
+fn set_read_flag(app: &mut App, msgs: Vec<MessageRef>, read: bool) -> bool {
     let server_mailbox = app.active_server_mailbox();
-    let Some(backend) = backend_for_mutation(app) else {
-        return false;
-    };
     let Some((store, _blobs)) = store_for_mutation(app, "Read flag") else {
         return false;
     };
-    let prepared = mutations::prepare_read_flag(&store, &msgs, read, &server_mailbox);
+    let account = app.account_config.name.clone();
+    let flagged = mutations::queue_read_flag(&store, &account, &msgs, read, &server_mailbox);
     drop(store);
-    if prepared.is_empty() {
+    if flagged.is_empty() {
         return false;
     }
 
-    for prep in &prepared {
-        app.set_email_read(prep.msg(), read);
+    for msg in &flagged {
+        app.set_email_read(*msg, read);
     }
-
-    let acct_idx = app.active_account;
-    let account = app.account_config.name.clone();
-    // ToggleRead deliberately does not touch `bg_mutations`: a flag does not
-    // block a fetch the way a move does.
-    app.bg_count += prepared.len();
-    dispatch(account, backend, prepared, bg_tx.clone(), move |prep, result| {
-        BgResult::ToggleRead {
-            account_index: acct_idx,
-            msg: prep.msg(),
-            new_read_state: read,
-            result,
-        }
-    });
     true
 }
 
-/// Set the `\Flagged` star on one or many messages: store row first, then the
-/// server (#0007). Modelled on [`set_read_flag`]; both halves are rolled back
-/// together by the `BgResult::ToggleFlag` handler when the server refuses.
-fn set_flag(
-    app: &mut App,
-    bg_tx: &mpsc::Sender<BgResult>,
-    msgs: Vec<MessageRef>,
-    flagged: bool,
-) -> bool {
+/// Set the `\Flagged` star on one or many messages (#0007): the store row and
+/// the owed server op commit together (#0039). Modelled on [`set_read_flag`].
+fn set_flag(app: &mut App, msgs: Vec<MessageRef>, flagged: bool) -> bool {
     let server_mailbox = app.active_server_mailbox();
-    let Some(backend) = backend_for_mutation(app) else {
-        return false;
-    };
     let Some((store, _blobs)) = store_for_mutation(app, "Flag") else {
         return false;
     };
-    let prepared = mutations::prepare_flag(&store, &msgs, flagged, &server_mailbox);
+    let account = app.account_config.name.clone();
+    let starred = mutations::queue_flag(&store, &account, &msgs, flagged, &server_mailbox);
     drop(store);
-    if prepared.is_empty() {
+    if starred.is_empty() {
         return false;
     }
 
-    for prep in &prepared {
-        app.set_email_flagged(prep.msg(), flagged);
+    for msg in &starred {
+        app.set_email_flagged(*msg, flagged);
     }
-
-    let acct_idx = app.active_account;
-    let account = app.account_config.name.clone();
-    // A flag does not block a fetch the way a move does, so it stays off
-    // `bg_mutations`, exactly like the read toggle.
-    app.bg_count += prepared.len();
-    dispatch(account, backend, prepared, bg_tx.clone(), move |prep, result| {
-        BgResult::ToggleFlag {
-            account_index: acct_idx,
-            msg: prep.msg(),
-            new_flag_state: flagged,
-            result,
-        }
-    });
     true
 }
 
@@ -2872,7 +2721,10 @@ mod tests {
         }
 
         assert_eq!(app.status_log.len(), 1, "one keypress, one activity line");
-        assert_eq!(app.status_log[0].message, "Quick sync queued (2 ops pending...)");
+        assert_eq!(
+            app.status_log[0].message,
+            "Quick sync queued (waiting for the current sync)"
+        );
         assert!(matches!(app.queued_action, Some(Action::Fetch)));
     }
 
@@ -2888,7 +2740,10 @@ mod tests {
         park_until_idle(&mut app, Action::Sync, "Full sync");
 
         assert_eq!(app.status_log.len(), 2);
-        assert_eq!(app.status_log[1].message, "Full sync queued (1 ops pending...)");
+        assert_eq!(
+            app.status_log[1].message,
+            "Full sync queued (waiting for the current sync)"
+        );
         assert!(matches!(app.queued_action, Some(Action::Sync)));
     }
 
@@ -2900,7 +2755,6 @@ mod tests {
     fn a_parked_action_is_released_only_once_the_gate_it_re_enters_has_cleared() {
         let mut app = App::default_for_tests();
         app.bg_count = 1;
-        app.bg_mutations = 0;
         assert!(sync_is_blocked(&app));
         assert!(
             !queued_action_is_releasable(&app),

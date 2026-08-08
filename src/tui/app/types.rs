@@ -867,40 +867,11 @@ pub enum BgResult {
         account_index: usize,
         result: Result<String, String>,
     },
-    Archive {
-        account_index: usize,
-        result: Result<String, String>,
-    },
-    /// A quick-move to an arbitrary mailbox finished (#0018). Carries
-    /// the source + destination mailbox indices and the destination
-    /// label so the handler can invalidate the right caches (the user
-    /// may have switched mailboxes while the move was in flight) and
-    /// report where the email went.
-    Move {
-        account_index: usize,
-        source_mailbox_idx: usize,
-        dest_mailbox_idx: usize,
-        dest_label: String,
-        result: Result<String, String>,
-    },
-    Delete {
-        account_index: usize,
-        result: Result<String, String>,
-    },
-    ToggleRead {
-        account_index: usize,
-        msg: MessageRef,
-        new_read_state: bool,
-        result: Result<String, String>,
-    },
-    /// The server op of a flag/star toggle came back (#0007). Rolls both
-    /// halves back on failure, exactly as [`BgResult::ToggleRead`] does.
-    ToggleFlag {
-        account_index: usize,
-        msg: MessageRef,
-        new_flag_state: bool,
-        result: Result<String, String>,
-    },
+    // Archive / Move / Delete / ToggleRead / ToggleFlag are gone (#0039):
+    // a mutation no longer fires a per-op server thread that reports back
+    // here. It enqueues into the durable `pending_ops` queue and the drain
+    // retires it at the sync/fetch resume point, surfacing failures through
+    // the sync result rather than a dedicated BgResult.
     ServerSearch {
         result: Result<Vec<SearchHit>, String>,
     },

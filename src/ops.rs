@@ -26,7 +26,7 @@ use std::fmt;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GraphConfig, ImapConfig};
+use crate::config::{AccountConfig, AuthMethod, GraphConfig, ImapConfig};
 
 /// A backend op found no message to act on: the server's copy is already gone.
 ///
@@ -135,6 +135,24 @@ impl ServerOp {
 pub enum Backend {
     Imap(Box<ImapConfig>),
     Graph(Box<GraphConfig>),
+}
+
+impl Backend {
+    /// The backend an account's owed ops run against, loaded from its config.
+    ///
+    /// The account's `auth_method` decides the transport, not whichever config
+    /// happens to be present: a Graph account drains over Graph or not at all.
+    /// This is the resolver the durable queue's background drain
+    /// ([`crate::pending_ops::resume_account`]) uses, the config-side twin of
+    /// the TUI's `backend_for_mutation`, so a drain from `mp sync` or a
+    /// terminal-less engine builds the same backend the interactive path does.
+    pub fn resolve(account: &AccountConfig) -> Result<Backend> {
+        if account.auth_method == AuthMethod::Graph {
+            Ok(Backend::Graph(Box::new(GraphConfig::load(account)?)))
+        } else {
+            Ok(Backend::Imap(Box::new(ImapConfig::load(account)?)))
+        }
+    }
 }
 
 /// Run one op, index-aligned results for a whole batch.
