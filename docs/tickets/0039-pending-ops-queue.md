@@ -3,7 +3,7 @@ id: 0039
 title: Durable pending_ops queue for flag, move and delete mutations
 type: refactor
 priority: later
-status: in-progress
+status: done
 created: 2026-07-14
 ---
 
@@ -112,3 +112,14 @@ The product-visible half, deferred deliberately:
 2. Wire the CLI mutation commands (`mp archive`, `mp delete`) to the same seam, and relocate the `MessageRef`-keyed prepare/rollback pairing into `src/ops.rs` as part of that unification.
 3. Run the drain from the existing resume points (startup and the sync tick, beside `resume_outbox`), under the engine lock, taking care not to add sync traffic against live accounts.
 4. Kill the "Quick sync queued (N ops pending...)" stacking (owner directive 2026-08-05): with mutations in the durable queue there is nothing for the user-visible sync to wait behind.
+
+## Implementation status (piece 4, the consumer wiring)
+
+Landed the product-visible half, closing the ticket.
+
+- **TUI.** `src/tui/mutations.rs` is now the TUI's entry into the queue: `queue_move` / `queue_delete` / `queue_read_flag` / `queue_flag` call `pending_ops::apply_*` (local write plus enqueue in one transaction) and return the rows they touched for the list update. The action handlers (`archive_msgs`, `delete_msgs`, `set_read_flag`, `set_flag`, the `MoveToMailbox` arm and the search-result archive) no longer spawn a per-op server thread, keep no rollback, and no longer touch `bg_count` / `bg_mutations`: the change is instant and the server op is retired in the background. The per-op `BgResult::{Archive,Move,Delete,ToggleRead,ToggleFlag}` variants and their `bg.rs` handlers are gone with the threads that fed them.
+- **CLI.** `mp archive` and `mp delete` enqueue through the same `apply_*` and then run the op synchronously with `pending_ops::run_and_settle`, so the CLI keeps its blocking UX and its crash durability. `run_and_settle` retires the row on success and, on failure, rolls the local half back and returns the error verbatim; unlike the background drain it does not converge a not-found, because a synchronous caller is never a crash replay, so `mp delete` for a message the server no longer holds still prints the byte-identical not-found error.
+- **Resume points.** The drain runs beside `resume_outbox` at the sync/fetch tick (`pending_ops::resume_account` in `lib_do_sync` / `lib_do_sync_graph`, and in the `mp sync` CLI path). Startup reaches it through the auto-fetch. `resume_account` builds no backend and takes no engine lock unless a row is owed, so a clean account adds no server traffic. A drain that rolls an op back names the failure in the sync line; the rolled-back row reappears when the sync refresh reloads.
+- **Killed the stacking.** With mutations off the background-job counters, a sync requested during mutations is no longer parked, and `park_until_idle` no longer prints "(N ops pending)": the only thing a sync can wait behind is another sync or fetch.
+
+Deferred, out of scope for the durability contract this ticket owns: a persistent status-bar badge for pending/failed ops (`counts` / `failed_ops` remain ready for one), and the uid fast-path on `ServerOp`. The `bg_mutations` field is now always zero and vestigial; it was left in place to keep the account save/restore churn out of this diff, and is a cleanup candidate.

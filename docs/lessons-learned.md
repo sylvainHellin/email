@@ -723,3 +723,13 @@ The "idempotent by Message-ID, a no-op on both backends" claim in the module doc
 The fix is a typed not-found signal, not string matching: the backends return `ops::NotFoundOnServer` and the drain treats it as a converged replay (retire the row, no rollback), while every other error stays a genuine failure that rolls back once the budget is spent.
 Keep the typed error's `Display` byte-identical to the old `anyhow!` text so direct CLI/TUI callers still show the user the same "not found" message; the split is drain-converges vs caller-errors, decided by `NotFoundOnServer::is_in`, not by changing what the backend prints.
 Test honesty matters here: a fake executor scripted to return `Ok` on replay validates the harness, not the backends, and hides exactly this blocker, so the crash-replay test must script the real not-found and assert convergence, paired with a genuine-error test that still rolls back.
+
+## The same not-found is a converged replay for the background drain but a real error for the synchronous CLI
+
+Wiring the consumers onto the queue (#0039 piece 4) surfaced that the not-found policy is caller-dependent, not a property of the op.
+The background drain (`pending_ops::drain`, used by the TUI and the sync-tick `resume_account`) converges a `NotFoundOnServer`, because it cannot tell a genuine miss from a crash-replay of an op whose server half already landed, and converging is the only choice that does not surface a succeeded op as failed.
+The CLI wants the opposite: `mp delete <id>` for a message the server no longer holds must print the not-found error, and a regression pins that string byte-identical.
+The resolution is that the CLI does not use the converging drain at all.
+`pending_ops::run_and_settle` enqueues, runs the single owed op, and returns its raw result, retiring on success and rolling the local half back on any failure including not-found, because a synchronous caller runs the op once in the process that enqueued it and so is never a crash-replay.
+So the queue is one seam with two settle policies (`drain` converges, `run_and_settle` reports), and the discriminator is which entry point the caller picked, not what the backend returned.
+Keep `run_and_settle` testable offline by splitting the settle decision (`settle(store, blobs, row, outcome)`) from the one `await` that produces the outcome; the decision is what a not-found regression needs to exercise, and it needs no live backend.

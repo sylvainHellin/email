@@ -88,12 +88,13 @@ Attachments are blobs, so anything that needs a file materialises them: `mp open
 
 ### Mutate
 
-A flag, move, archive or delete is one local write plus one server op.
-`src/tui/mutations.rs` pairs them: the `prepare_*` functions apply the local write through `src/store/write.rs` and hand back the `ServerOp` (now defined in `src/ops.rs`, the library home of the remote op) to fire in the background plus the row's previous coordinates, so a failed op rolls back.
-The CLI calls the server first and then writes the store.
-Neither ordering survives a crash between the halves.
-The durable queue that fixes that, `src/pending_ops.rs` (#0039), has landed its core: `apply_move` / `apply_delete` / `apply_set_read` / `apply_set_flagged` commit the local write and the queued op in one transaction, a background `drain` retires confirmed ops and rolls failed ones back under the engine lock, and replay is exactly-once for the local half because the drain runs only the server op and never re-applies the local change.
-The TUI and CLI mutation paths above are not yet routed through it (the deferred half of #0039), so the crash window still exists on those live paths until they are.
+A flag, move, archive or delete is one local write plus one server op, and both frontends now route it through the durable queue `src/pending_ops.rs` (#0039).
+`apply_move` / `apply_delete` / `apply_set_read` / `apply_set_flagged` commit the local write and the owed `ServerOp` (defined in `src/ops.rs`, the library home of the remote op) in one transaction, so a crash between the halves can never lose the op nor leave the store optimistically changed with nothing owed.
+The TUI's `src/tui/mutations.rs` `queue_*` functions call those `apply_*` and return the rows they touched for the list update; the TUI keeps no server thread and no rollback of its own, because the queue owns both.
+The background `drain` retires confirmed ops and rolls failed ones back under the engine lock, and it runs at the sync/fetch resume points beside `resume_outbox` (`pending_ops::resume_account`), draining nothing and building no backend when no row is owed.
+Replay is exactly-once for the local half because the drain runs only the server op and never re-applies the local change, and it converges a crash-replayed not-found rather than failing it.
+The CLI (`mp archive`, `mp delete`) enqueues through the same `apply_*` and then runs the op synchronously with `pending_ops::run_and_settle`, keeping its blocking UX: a success retires the row, a refusal rolls the local half back and returns the error verbatim, so a not-found stays byte-identical to the pre-queue message.
+The synchronous settle deliberately does *not* converge a not-found, because a CLI invocation runs the op once in the process that enqueued it and so is never a crash replay.
 
 ### Send
 
@@ -165,7 +166,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/send.rs` | `markdown_to_html`, message building, `send_draft` + `SendContext`, per-recipient submission, `DurableSend`, `resume_outbox` |
 | `src/outbox.rs` | The durable send state machine and its blob refcounting |
 | `src/ops.rs` | `ServerOp` (the remote half of a mutation) and its IMAP/Graph execution seam `run_ops` / `run_op`, at library layer so the durable queue and the CLI can drive it without depending on `tui/` |
-| `src/pending_ops.rs` | The durable mutation queue (#0039): atomic local-write-plus-enqueue, the drain with backoff and per-kind rollback, crash-replay |
+| `src/pending_ops.rs` | The durable mutation queue (#0039): atomic local-write-plus-enqueue, the drain with backoff and per-kind rollback, crash-replay, `resume_account` (sync-tick drain) and `run_and_settle` (the CLI's synchronous single-op path) |
 | `src/engine_lock.rs` | One engine per account across processes (#0061): a non-blocking `flock` on `<account_dir>/store.lock`, released on exit or crash |
 | `src/graph.rs` | Microsoft Graph REST client: folders, fetch, sync, send, move, delete, read flags, search |
 | `src/calendar.rs` + `src/invite.rs` | iCalendar receive-side parsing and send-side building |
@@ -194,7 +195,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | **`src/tui/`** | |
 | `mod.rs` | Event loop (`run_loop`), watcher spawn, background result drain |
 | `actions.rs` | `handle_action()`, the side-effect dispatch for all `Action` variants. Branches on `is_graph()`. |
-| `mutations.rs` | The local write plus server op pairing, testable without a terminal |
+| `mutations.rs` | The TUI's `queue_*` entry into the durable mutation queue (#0039): local write plus enqueue, testable without a terminal |
 | `bg.rs` | `handle_bg_result()`, processing background task completions |
 | `helpers.rs` | Terminal suspend and resume, editor, clipboard, the two watcher loops, `lib_do_sync`, `lib_do_sync_graph`, `resolve_send_account` |
 | `event.rs` | Crossterm event polling |
@@ -228,7 +229,7 @@ What stays absolute is the protocol boundary: no SMTP, IMAP, MIME or Graph code 
 - Account state proxy pattern.
 `App` holds a `Vec<AccountState>` plus top-level proxy fields (mailboxes, list index) that mirror the active account, with `save_to_account()` and `load_from_account()` syncing on switch.
 This avoids routing every key handler through indirect access.
-- Mutations are optimistic: local state and store update immediately, the server follows in the background, and a failed op rolls the row back.
+- Mutations are optimistic: local state and store update immediately, the server op is retired by the durable-queue drain at the next sync/fetch resume point, and a refusal rolls the row back there (#0039).
 
 ## Multi-account
 
@@ -266,7 +267,9 @@ Both backends hold their prunes back for this reason.
 It is a full walk of the file, so it runs once per file per process, not once per open.
 - **Read-flag updates land in one transaction per mailbox**, not one commit per message.
 - **Queued mutations.**
-Fetch and sync are deferred while mutations are in flight (`bg_mutations > 0`) and auto-triggered on completion.
+A mutation enqueues into the durable `pending_ops` queue and applies locally at once, spawning no background job.
+Nothing defers a fetch or sync behind it any more: #0039 retired the `bg_mutations` gate and the "Quick sync queued (N ops pending)" stacking it needed.
+The owed server op is drained at the next sync/fetch resume point.
 
 ## Data and config layout
 

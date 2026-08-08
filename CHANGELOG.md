@@ -31,6 +31,19 @@ All notable changes to this project are documented in this file.
   error, so deleting a message the server no longer holds still reports it.
 
 ### Changed
+- **Archive, delete, move and flag toggles are now durable, in the TUI and the
+  CLI alike (#0039).** Both frontends route every mutation through the
+  `pending_ops` queue: the local change and the server op it owes commit in one
+  transaction, so a crash between the two can no longer strand an optimistic
+  move or lose a flag change. In the TUI the change is instant and the server op
+  is retired in the background by the drain at the next sync or fetch (it builds
+  no connection and adds no traffic when nothing is owed); a refusal is rolled
+  back there and named in the sync line. This retires the per-mutation server
+  threads and, with them, the "Quick sync queued (N ops pending)" stacking a
+  sync used to log once per keypress. `mp archive` and `mp delete` keep their
+  synchronous feel, enqueueing and then running the op in the same call, and
+  still print the same not-found error for a message the server no longer holds.
+
 - **The Contacts and Calendar views got a visual-polish pass (#TKT-0048).**
   They now share the Mail list's cursor-row convention (a raised surface fill
   carrying the selection foreground, in place of the solid green highlight each

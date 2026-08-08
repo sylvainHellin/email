@@ -20,7 +20,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
-- [#0039 Durable pending_ops queue for flag/move/delete ops](docs/tickets/0039-pending-ops-queue.md) -- refactor _(data layer, Stage 3; in progress: the durability core, op-seam extraction and the engine lock (#0061, absorbed) have landed; the TUI/CLI consumer rewiring and killing the "Quick sync queued" stacking are the deferred half)_
 - [#0040 Decommission the legacy .md tree; one-time draft import](docs/tickets/0040-drop-file-layer-cutover.md) -- chore _(data layer, Stage 4; closes TKT-0047)_
 - [#TKT-0047 Reconcile walks attachment .md files (forged REPLY can poison PARTSTATs)](docs/tickets/TKT-0047-reconcile-walks-attachment-markdown.md) -- bug _(parked, accepted risk, resolved by #0040)_
 - [#0059 Extract a SyncBackend trait](docs/tickets/0059-syncbackend-trait.md) -- refactor _(the IMAP/Graph parity half is parked; what stands is the testable sync-engine seam #0041 assumes)_
@@ -32,7 +31,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0069 Delete the file-era invite rewriters (set_event_rsvp, InboxFrontmatter)](docs/tickets/0069-drop-file-era-invite-rewriters.md) -- chore _(from the #0057 review)_
 - [#0070 Audit the website for file-era claims](docs/tickets/0070-website-file-era-claims.md) -- chore _(website; from the #0057 review)_
 - [#0074 An ingest failure is not carried by the arrival mark](docs/tickets/0074-arrival-mark-misses-ingest-failures.md) -- bug _(from the #0072 sweep review)_
-- [#0076 The post-send flag write opens one IMAP session per mailbox](docs/tickets/0076-post-send-flag-write-opens-a-session-per-mailbox.md) -- perf _(from the #TKT-0051 review; subsumed by #0039 if that lands first)_
+- [#0076 The post-send flag write opens one IMAP session per mailbox](docs/tickets/0076-post-send-flag-write-opens-a-session-per-mailbox.md) -- perf _(from the #TKT-0051 review; not subsumed by #0039, but its direction 2 could ride the queue now that the consumer wiring has landed)_
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_
 - [#0079 Local filter/sort for flagged messages](docs/tickets/0079-flagged-filter.md) -- feature _(from #0007; the flag round-trip and marker shipped, the local filtered view did not)_
