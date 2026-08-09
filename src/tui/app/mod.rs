@@ -82,7 +82,6 @@ pub struct App {
     pub search_query: String,
     pub search_includes_body: bool,
     pub watcher_active: bool,
-    pub bg_mutations: usize,
     pub imap_config: Option<crate::config::ImapConfig>,
     pub smtp_config: Option<crate::config::SmtpConfig>,
     pub graph_config: Option<crate::config::GraphConfig>,
@@ -200,7 +199,6 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
-            bg_mutations: 0,
             imap_config: None,
             smtp_config: None,
             graph_config: None,
@@ -292,7 +290,6 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
-            bg_mutations: 0,
             imap_config: None,
             smtp_config: None,
             graph_config: None,
@@ -350,7 +347,6 @@ impl App {
             acct.email_cache = self.email_cache.clone();
             acct.search_query = self.search_query.clone();
             acct.search_includes_body = self.search_includes_body;
-            acct.bg_mutations = self.bg_mutations;
             acct.watcher_active = self.watcher_active;
         }
     }
@@ -369,7 +365,6 @@ impl App {
             self.search_query = acct.search_query.clone();
             self.search_includes_body = acct.search_includes_body;
             self.watcher_active = acct.watcher_active;
-            self.bg_mutations = acct.bg_mutations;
             self.imap_config = acct.imap_config.clone();
             self.smtp_config = acct.smtp_config.clone();
             self.graph_config = acct.graph_config.clone();

@@ -324,7 +324,6 @@ mod tests {
             selection: std::collections::HashSet::new(),
             search_query: String::new(),
             search_includes_body: false,
-            bg_mutations: 0,
             watcher_active: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,

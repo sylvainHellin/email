@@ -18,6 +18,17 @@ All notable changes to this project are documented in this file.
   did, and wiring them onto the queue is the follow-up half of #0039. No
   user-visible behaviour changed.
 
+### Removed
+- **Two dead seams left by the mutation-queue wiring (internal).** `App`'s
+  always-zero `bg_mutations` field and its per-account save/restore are gone:
+  mutations stopped being background jobs when #0039 wired the queue, so the
+  counter had nothing left to count. `ops::run_ops` and its `homogeneous`
+  batch-detection helper are gone too: the durable queue drains one row at a
+  time through `run_op` and no consumer ever called the batch form. The
+  `imap_client` batch primitives it wrapped (`batch_move_on_server`,
+  `batch_delete_on_server`) stay, so a future multi-op drain has something to
+  build on.
+
 ### Fixed
 - **The mutation queue converges a crash-replay instead of surfacing a false
   failure (#0039 review, internal).** A move, delete or mark-read whose server

@@ -751,7 +751,6 @@ pub struct AccountState {
     pub selection: std::collections::HashSet<EntryKey>,
     pub search_query: String,
     pub search_includes_body: bool,
-    pub bg_mutations: usize,
     pub watcher_active: bool,
     pub has_unseen: bool,
     /// Non-`done` outbox rows for this account (#0037 item 5). Refreshed at
@@ -826,7 +825,6 @@ impl AccountState {
             selection: std::collections::HashSet::new(),
             search_query: String::new(),
             search_includes_body: false,
-            bg_mutations: 0,
             watcher_active: false,
             has_unseen: false,
             outbox,

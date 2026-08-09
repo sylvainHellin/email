@@ -31,7 +31,7 @@ use crate::types::EmailStatus;
 
 /// Whether a fetch or a sync must wait. One gate, named once, because the
 /// release condition in the event loop has to be the *same* condition: they
-/// drifted apart (`bg_count` here, `bg_mutations` there), and the 250 ms tick
+/// drifted apart (`bg_count` here, a mutation counter there), and the 250 ms tick
 /// then released the parked action into this refusal about four times a
 /// second.
 pub(super) fn sync_is_blocked(app: &App) -> bool {
@@ -2749,8 +2749,8 @@ mod tests {
 
     /// The release condition and the gate the released action re-enters are
     /// the same condition. A background sync raises `bg_count` without
-    /// raising `bg_mutations`, which is exactly the case the old
-    /// `bg_mutations == 0` release got wrong.
+    /// raising any mutation counter, which is exactly the case the old
+    /// mutations-are-idle release got wrong.
     #[test]
     fn a_parked_action_is_released_only_once_the_gate_it_re_enters_has_cleared() {
         let mut app = App::default_for_tests();

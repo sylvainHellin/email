@@ -271,7 +271,7 @@ It is a full walk of the file, so it runs once per file per process, not once pe
 - **Read-flag updates land in one transaction per mailbox**, not one commit per message.
 - **Queued mutations.**
 A mutation enqueues into the durable `pending_ops` queue and applies locally at once, spawning no background job.
-Nothing defers a fetch or sync behind it any more: #0039 retired the `bg_mutations` gate and the "Quick sync queued (N ops pending)" stacking it needed.
+Nothing defers a fetch or sync behind it any more: #0039 retired the mutation-count gate and the "Quick sync queued (N ops pending)" stacking it needed, and #0076 removed the vestigial always-zero field it left behind.
 The owed server op is drained at the next sync/fetch resume point.
 
 ## Data and config layout
