@@ -566,8 +566,12 @@ pub struct MailboxCursor {
     /// #0054 split the column, which would have made `CHANGEDSINCE` return
     /// nothing and no error. Unused until #0041 issues that fetch.
     pub highest_modseq: Option<i64>,
-    /// Graph `deltaLink` (unused until the delta fetch lands, see
-    /// `TODO(#0037-4b-or-0038)` in `src/graph.rs`).
+    /// Graph `deltaLink`: the resume point of `/messages/delta` for this
+    /// folder (#0042). Written only by a Graph pass that covered the whole
+    /// folder and wrote every message it found, so the token's meaning is
+    /// "at this point the store held everything the folder listed"; cleared
+    /// by [`clear_mailbox_deltalink`] on expiry, on any doubt about the token
+    /// chain, and on a folder-identity change.
     pub deltalink: Option<String>,
     /// The IMAP arrival mark (#0072): the UID above which this mailbox still
     /// owes the store an arrival, so the prune gate stays shut until a pass
@@ -660,6 +664,51 @@ pub fn clear_mailbox_modseq(store: &Store, account: &str, mailbox: &str) {
         (account, mailbox),
     ) {
         log::warn!("could not clear the modseq for {account}/{mailbox}: {e}");
+    }
+}
+
+/// Record a Graph delta resume point and the folder identity it is bound to,
+/// and touch nothing else (#0042).
+///
+/// The narrow twin of [`record_mailbox_cursor`], and it exists because a delta
+/// pass makes none of the observations that function writes unconditionally: it
+/// never lists the folder, so it does not know `exists`, and going through the
+/// wide writer would null the last known-good count on every quick sync. The
+/// two columns here are exactly what the pass did learn.
+///
+/// Best-effort for the same reason as [`clear_mailbox_deltalink`]: a token that
+/// failed to persist costs the next pass a full enumeration.
+pub fn record_delta_token(store: &Store, account: &str, mailbox: &str, identity: i64, link: &str) {
+    if let Err(e) = store.conn().execute(
+        "INSERT INTO sync_cursors (account, mailbox, uidvalidity, deltalink)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (account, mailbox) DO UPDATE SET
+            uidvalidity = excluded.uidvalidity,
+            deltalink = excluded.deltalink",
+        rusqlite::params![account, mailbox, identity, link],
+    ) {
+        log::warn!("could not record the deltaLink for {account}/{mailbox}: {e}");
+    }
+}
+
+/// Drop the Graph delta resume token for `(account, mailbox)`.
+///
+/// The `deltalink` twin of [`clear_mailbox_modseq`], and it exists for the
+/// same reason: `record_mailbox_cursor` carries the token forward with a
+/// `COALESCE` and therefore cannot clear it, while the delta path must be able
+/// to throw it away the moment it is in doubt (a 410 from Graph, a page chain
+/// that ended without a `@odata.deltaLink`, a folder whose id changed under
+/// the token). Discarding costs one full enumeration; keeping a token that no
+/// longer describes the store would silently skip messages (#0042).
+///
+/// Best-effort, like its twin: a mailbox with no cursor row updates nothing,
+/// and a store error here costs a full-window pass, not correctness.
+pub fn clear_mailbox_deltalink(store: &Store, account: &str, mailbox: &str) {
+    if let Err(e) = store.conn().execute(
+        "UPDATE sync_cursors SET deltalink = NULL WHERE account = ?1 AND mailbox = ?2",
+        (account, mailbox),
+    ) {
+        log::warn!("could not clear the deltaLink for {account}/{mailbox}: {e}");
     }
 }
 

@@ -55,6 +55,21 @@ const MAX_RETRY_AFTER_SECS: u64 = 120;
 /// enumeration read as truth is a mass prune (see [`FolderEnumeration`]).
 const MAX_ENUMERATION_PAGES: usize = 250;
 
+/// Pages one `/messages/delta` walk will follow before giving up (#0042).
+///
+/// Same ceiling and same reasoning as [`MAX_ENUMERATION_PAGES`], with a
+/// stricter consequence: an enumeration that hits its cap merely declines to
+/// prune, while a delta walk that hits its cap has no `@odata.deltaLink` to
+/// resume from and no way to know what it did not see, so it throws the token
+/// away and the pass falls back to the full enumeration.
+const MAX_DELTA_PAGES: usize = 250;
+
+/// Messages per delta page, asked for with `Prefer: odata.maxpagesize`.
+///
+/// The delta endpoint takes its page size from the header rather than from
+/// `$top`, which it rejects.
+const DELTA_PAGE_SIZE: usize = 200;
+
 /// The characters a Graph message id must not carry unescaped into a `/$batch`
 /// sub-request URL.
 ///
@@ -1031,6 +1046,442 @@ fn enumeration_url(folder_path: &str, ordered: bool) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// #0042: /messages/delta
+// ---------------------------------------------------------------------------
+
+/// One entry of a `/messages/delta` page: either a message whose state
+/// changed, or a removal.
+///
+/// A removal carries `id` and `@removed` and *nothing else*, which is the
+/// whole reason the prune below does not consume it: see [`FolderDelta`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphDeltaEntry {
+    id: String,
+    #[serde(default)]
+    internet_message_id: Option<String>,
+    #[serde(default)]
+    is_read: bool,
+    #[serde(default)]
+    received_date_time: Option<String>,
+    #[serde(rename = "@removed", default)]
+    removed: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphDeltaPage {
+    value: Vec<GraphDeltaEntry>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
+}
+
+/// What one delta walk saw: the messages whose state changed since the stored
+/// token, how many removals it was told about, and the token that resumes
+/// after it.
+///
+/// `changed` is keyed like [`FolderEnumeration::entries`], on the trimmed
+/// `internetMessageId`, but it is **not** a folder listing: it is a change set,
+/// so `known − changed` is meaningless and the prune must never be computed
+/// from it.
+#[derive(Debug, Clone, Default)]
+pub struct FolderDelta {
+    pub changed: HashMap<String, FolderEntry>,
+    /// How many `@removed` entries the walk reported.
+    pub removed: usize,
+    /// The `@odata.deltaLink` the last page carried. A walk that ended without
+    /// one never becomes a [`FolderDelta`]; it is a [`DeltaVerdict::Discard`].
+    pub delta_link: String,
+    /// Pages walked, for the log line and the timing evidence.
+    pub pages: usize,
+}
+
+impl FolderDelta {
+    /// Whether this delta hands the pass back to the full enumeration.
+    ///
+    /// **The `@removed` decision (#0042).** A removal entry names the message
+    /// by Graph's own `id`, and the store does not hold that id: a Graph row's
+    /// identity is [`crate::ingest::graph_uid`] of the `internetMessageId`,
+    /// which a removal entry does not carry and which the server will not sell
+    /// back for a message it has just deleted. So the delta cannot map a
+    /// removal onto a row, and the prune keeps its existing source of truth,
+    /// the full folder listing (`known − enumerated`, [`vanished_graph_uids`]).
+    ///
+    /// A pass whose delta reports any removal therefore escalates: it throws
+    /// the change set away, enumerates the folder in full and prunes exactly as
+    /// a pre-#0042 pass did. That keeps the #0072/#0074 coverage and
+    /// deferred-prune gates working on unchanged inputs, and it costs the
+    /// enumeration only on passes that would have had something to delete.
+    ///
+    /// The rejected alternative was to persist Graph's message id per row so a
+    /// removal could be resolved directly. That is a schema column and a store
+    /// rebuild for every account, and it buys latency on deletions rather than
+    /// correctness; it is recorded as a follow-up on the ticket instead.
+    fn forces_full_enumeration(&self) -> bool {
+        self.removed > 0
+    }
+}
+
+/// Why a pass took the full enumeration instead of the delta, or what it did
+/// with a token it could not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaVerdict {
+    /// Use the stored token.
+    Use,
+    /// No token stored: this is the bootstrap pass.
+    NoToken,
+    /// A full sync (`limit == usize::MAX`) always relists the folder, so the
+    /// prune and the token both get a fresh, whole-folder observation.
+    FullSync,
+    /// The folder's Graph id is not the one the token was minted against.
+    FolderChanged,
+    /// Something about the token or the walk is in doubt; the token is dropped
+    /// and this pass enumerates.
+    Discard(DeltaDiscard),
+}
+
+/// The reasons a delta token is thrown away rather than merely unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaDiscard {
+    /// Graph answered 410: the sync state behind the token is gone.
+    Expired,
+    /// The stored string is not a Graph delta URL.
+    Malformed,
+    /// The page chain hit [`MAX_DELTA_PAGES`].
+    PageCap,
+    /// The walk ran out of pages without an `@odata.deltaLink`, so there is no
+    /// resume point and no proof the chain was complete.
+    NoResumePoint,
+    /// The request failed for any other reason.
+    Failed,
+}
+
+/// Whether this pass may use the stored delta token, decided before any
+/// request is issued.
+///
+/// The cardinal rule of #0042, and the same one #0041 wrote for CONDSTORE: the
+/// delta may only ever be *faster*, never the only thing that looked. Every
+/// branch that is not an exact match on a token this client minted for this
+/// folder falls back to the full enumeration, which is the pre-#0042 pass and
+/// misses nothing.
+///
+/// `identity_matches` is the Graph analogue of UIDVALIDITY: the token is bound
+/// to a folder id, so a folder deleted and recreated under the same well-known
+/// name (or a config that repoints a role at a different folder) invalidates
+/// it. Graph would answer such a token with a 404 or a 410 anyway, which the
+/// walk would discard on; this check makes the invalidation the client's own
+/// rather than a server behaviour we depend on.
+fn delta_verdict(limit: usize, stored: Option<&str>, identity_matches: bool) -> DeltaVerdict {
+    let Some(token) = stored else {
+        return DeltaVerdict::NoToken;
+    };
+    if !token.starts_with(GRAPH_BASE) || !token.contains("/delta") {
+        return DeltaVerdict::Discard(DeltaDiscard::Malformed);
+    }
+    if !identity_matches {
+        return DeltaVerdict::FolderChanged;
+    }
+    // A full sync is the periodic whole-folder observation everything else
+    // leans on: it is what reopens the prune on removals the delta declined to
+    // resolve, and what re-mints the token from a listing rather than from a
+    // chain of increments.
+    if limit == usize::MAX {
+        return DeltaVerdict::FullSync;
+    }
+    DeltaVerdict::Use
+}
+
+/// What an HTTP status on the delta endpoint means for the token.
+///
+/// 410 is the documented expiry (`resyncRequired`); 404 is the folder having
+/// gone out from under the token. Everything else that is not a success is a
+/// plain failure, and all three land in the same place, because a delta that
+/// did not complete cannot be told apart from one that skipped a message.
+fn delta_status_discard(status: reqwest::StatusCode) -> Option<DeltaDiscard> {
+    if status.is_success() {
+        None
+    } else if status == reqwest::StatusCode::GONE || status == reqwest::StatusCode::NOT_FOUND {
+        Some(DeltaDiscard::Expired)
+    } else {
+        Some(DeltaDiscard::Failed)
+    }
+}
+
+/// Fold one delta page into the change set, counting removals separately.
+///
+/// An entry with `@removed` is counted and dropped: it names a message by
+/// Graph id, which the store cannot resolve (see
+/// [`FolderDelta::forces_full_enumeration`]). An entry with no usable
+/// `internetMessageId` is dropped for the same reason [`absorb_page`] drops
+/// one.
+fn absorb_delta_page(
+    changed: &mut HashMap<String, FolderEntry>,
+    removed: &mut usize,
+    page: Vec<GraphDeltaEntry>,
+) {
+    for entry in page {
+        if entry.removed.is_some() {
+            *removed += 1;
+            continue;
+        }
+        let Some(mid) = entry.internet_message_id else { continue };
+        let mid = mid.trim();
+        if mid.is_empty() {
+            continue;
+        }
+        changed.insert(
+            mid.to_string(),
+            FolderEntry {
+                graph_id: entry.id,
+                is_read: entry.is_read,
+                received: entry.received_date_time,
+            },
+        );
+    }
+}
+
+/// The first-page URL of a delta walk, and the `$deltatoken=latest` form that
+/// mints a resume point without enumerating anything.
+fn delta_url(folder_path: &str, latest: bool) -> String {
+    let latest = if latest { "&$deltatoken=latest" } else { "" };
+    format!(
+        "{}/me/mailFolders/{}/messages/delta?\
+         $select=id,internetMessageId,isRead,receivedDateTime{}",
+        GRAPH_BASE, folder_path, latest
+    )
+}
+
+/// A `$select=id` folder response.
+///
+/// Not [`GraphMailFolder`]: that type requires `displayName`, which a
+/// `$select=id` projection does not return, so reusing it would fail the parse
+/// of every identity check.
+#[derive(Debug, Deserialize)]
+struct GraphFolderId {
+    id: String,
+}
+
+/// The folder id as the 63-bit hash the `uidvalidity` column can hold.
+///
+/// Graph's folder id is the analogue of IMAP's UIDVALIDITY (it is what a
+/// resume token is bound to) so it is stored in the analogous column, hashed
+/// because the column is an integer. Same hash as
+/// [`crate::ingest::graph_uid`], which is a stable 63-bit digest of a string
+/// and carries no message-specific meaning.
+fn folder_identity_hash(folder_id: &str) -> i64 {
+    crate::ingest::graph_uid(folder_id)
+}
+
+impl GraphClient {
+    /// The folder's Graph id: the identity a delta token is bound to.
+    async fn folder_identity(&self, folder: &str) -> Result<String> {
+        let url = format!(
+            "{}/me/mailFolders/{}?$select=id",
+            GRAPH_BASE,
+            resolve_folder_path(folder)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(self.bearer())
+            .send()
+            .await
+            .context("Failed to read the folder id")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Read folder id of '{}' failed (HTTP {}): {}",
+                folder,
+                status,
+                body
+            ));
+        }
+        let folder: GraphFolderId = resp.json().await.context("Failed to parse the folder")?;
+        Ok(folder.id)
+    }
+
+    /// Mint a delta resume point for `folder` describing the folder *now*,
+    /// without listing it (`$deltatoken=latest`).
+    ///
+    /// Called **before** the enumeration it will be stored alongside, never
+    /// after: a token taken after the listing would silently cover the window
+    /// between the two, and a message that arrived in it would never be
+    /// reported by any pass. Taken first, that window is replayed by the next
+    /// delta at worst.
+    ///
+    /// A tenant that rejects `$deltatoken=latest` gets `None` and keeps the
+    /// pre-#0042 behaviour for good; no token is ever guessed.
+    async fn mint_delta_token(&self, folder: &str) -> Option<String> {
+        let url = delta_url(&resolve_folder_path(folder), true);
+        let resp = match self.client.get(&url).bearer_auth(self.bearer()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Could not mint a delta token for '{folder}': {e}");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                "Graph refused a delta token for '{folder}' (HTTP {status}): {body}; \
+                 this account keeps enumerating the folder in full"
+            );
+            return None;
+        }
+        match resp.json::<GraphDeltaPage>().await {
+            Ok(page) => page.delta_link,
+            Err(e) => {
+                warn!("Could not parse the delta token for '{folder}': {e}");
+                None
+            }
+        }
+    }
+
+    /// Walk `/messages/delta` from a stored token.
+    ///
+    /// `Ok(Ok(delta))` is a complete chain ending in a fresh resume point;
+    /// `Ok(Err(discard))` is every doubt there is, and every one of them means
+    /// the same thing to the caller: drop the token, enumerate the folder.
+    async fn walk_delta(&self, link: &str) -> Result<FolderDelta, DeltaDiscard> {
+        let mut changed = HashMap::new();
+        let mut removed = 0usize;
+        let mut pages = 0usize;
+        let mut url = link.to_string();
+
+        loop {
+            if pages >= MAX_DELTA_PAGES {
+                return Err(DeltaDiscard::PageCap);
+            }
+            pages += 1;
+            let resp = match self
+                .client
+                .get(&url)
+                .bearer_auth(self.bearer())
+                .header("Prefer", format!("odata.maxpagesize={DELTA_PAGE_SIZE}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Graph delta request failed: {e}");
+                    return Err(DeltaDiscard::Failed);
+                }
+            };
+            if let Some(discard) = delta_status_discard(resp.status()) {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!("Graph delta answered HTTP {status}: {body}");
+                return Err(discard);
+            }
+            let page: GraphDeltaPage = match resp.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Could not parse a Graph delta page: {e}");
+                    return Err(DeltaDiscard::Failed);
+                }
+            };
+            absorb_delta_page(&mut changed, &mut removed, page.value);
+
+            match (page.next_link, page.delta_link) {
+                (Some(next), _) => url = next,
+                (None, Some(delta_link)) => {
+                    return Ok(FolderDelta { changed, removed, delta_link, pages })
+                }
+                (None, None) => return Err(DeltaDiscard::NoResumePoint),
+            }
+        }
+    }
+
+    /// The delta twin of [`GraphClient::fetch_new_messages`]: walk the change
+    /// set, then download by id the changed messages the store does not hold.
+    ///
+    /// Returns `Ok(None)` when the delta reported removals, which hands the
+    /// pass to the full enumeration with the token left in place
+    /// ([`FolderDelta::forces_full_enumeration`]).
+    async fn fetch_delta(
+        &self,
+        folder: &str,
+        limit: usize,
+        known_ids: &HashSet<String>,
+        link: &str,
+    ) -> Result<Option<DeltaFetch>, DeltaDiscard> {
+        let delta = self.walk_delta(link).await?;
+        info!(
+            "Graph delta for '{folder}': {} page(s), {} changed, {} removed",
+            delta.pages,
+            delta.changed.len(),
+            delta.removed,
+        );
+        if delta.forces_full_enumeration() {
+            return Ok(None);
+        }
+
+        let (new, found) = select_for_download(&delta.changed, known_ids, limit);
+        let capped = found > new.len();
+        if new.is_empty() {
+            return Ok(Some(DeltaFetch {
+                new_emails: Vec::new(),
+                changed: delta.changed,
+                delta_link: delta.delta_link,
+                download_incomplete: capped,
+            }));
+        }
+        let graph_ids: Vec<&str> = new.iter().map(|entry| entry.graph_id.as_str()).collect();
+        let batch = match self.fetch_messages_by_ids(&graph_ids).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Graph delta download failed for '{folder}': {e:#}");
+                return Err(DeltaDiscard::Failed);
+            }
+        };
+        let download_incomplete = capped || batch.fell_short();
+        Ok(Some(DeltaFetch {
+            new_emails: batch.emails,
+            changed: delta.changed,
+            delta_link: delta.delta_link,
+            download_incomplete,
+        }))
+    }
+}
+
+/// What one delta pass hands the orchestrator.
+///
+/// The shape deliberately differs from [`FolderFetch`]: there is no
+/// `enumeration`, because a change set is not a folder listing and nothing may
+/// diff against it, and no `skipped`, because a delta does not walk past the
+/// messages it already holds.
+struct DeltaFetch {
+    new_emails: Vec<FetchedEmail>,
+    /// The changed messages, for the read-flag pass.
+    changed: HashMap<String, FolderEntry>,
+    /// The resume point, stored only if this pass covered and wrote
+    /// everything.
+    delta_link: String,
+    download_incomplete: bool,
+}
+
+/// Whether a pass has earned the right to store its delta resume point.
+///
+/// The token means "at this point the store held every message the folder
+/// listed", and that is the whole safety argument for using it later: a delta
+/// from a token with that property reports every subsequent change, so the
+/// property survives. A pass that left a message undownloaded, or downloaded
+/// one it could not write, does not have the property and must not mint the
+/// claim; the older token stays and the next pass replays from it.
+///
+/// This is the same rule #0041 wrote for the CONDSTORE resume point, for the
+/// same reason, and it is what keeps the #0074 ingest bound honest on this
+/// path: `ingest_failed` is false once a poisoned message has been given up
+/// on, so a message the store will never accept cannot wedge the delta chain
+/// for good.
+fn may_record_delta_token(covered: bool, download_incomplete: bool, ingest_failed: bool) -> bool {
+    covered && !download_incomplete && !ingest_failed
+}
+
 /// Fold one page of an enumeration into the map.
 ///
 /// The key is `internetMessageId` **trimmed**, because that is the identity
@@ -1156,9 +1607,14 @@ fn vanished_graph_uids(
 /// pass that could not fetch its destination copy, and holds no row anywhere
 /// until the backlog drains.
 ///
-/// TODO(#0042): this still enumerates `internetMessageId` for the whole folder
-/// on every pass. The `sync_cursors.deltalink` column is written as NULL until
-/// the `/messages/delta` fetch replaces that enumeration.
+/// Since #0042 a quick sync may replace the enumeration with a
+/// `/messages/delta` walk from the token in `sync_cursors.deltalink`. The
+/// delta is strictly an accelerator: [`delta_verdict`] refuses it on anything
+/// unusual, any doubt during the walk throws the token away
+/// ([`DeltaDiscard`]), a delta that reports removals hands the pass back to the
+/// enumeration ([`FolderDelta::forces_full_enumeration`]), a full sync always
+/// relists, and a token is only ever minted by a pass that saw the whole
+/// folder and wrote every message in it ([`may_record_delta_token`]).
 pub async fn sync_mailboxes_graph(
     config: &GraphConfig,
     account_name: &str,
@@ -1193,25 +1649,130 @@ pub async fn sync_mailboxes_graph(
 
     for target in targets {
         let known = crate::ingest::known_message_ids(&store, account_name, target.role.as_str())?;
+        let mailbox = target.role.as_str();
+        let stored = crate::ingest::load_mailbox_cursor(&store, account_name, mailbox)?;
+        let stored_token = stored.as_ref().and_then(|c| c.deltalink.clone());
+        let stored_identity = stored.as_ref().and_then(|c| c.uidvalidity);
 
-        let fetch = match client
-            .fetch_new_messages(&target.server_name, limit, &known)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Graph sync failed for {}: {}", target.role, e);
-                // A target that did not sync at all is the strongest form of
-                // partial pass: the copy that would justify another target's
-                // deletion may be exactly what this fetch failed to bring in.
-                coverage.push((false, false));
-                continue;
+        // The folder id, read fresh. An id we could not read is not evidence
+        // that the folder is the same one, so it counts as a mismatch and the
+        // pass enumerates; the *stored* identity is kept, because a failed
+        // lookup is no evidence of a change either.
+        let observed_identity = if dry_run {
+            None
+        } else {
+            match client.folder_identity(&target.server_name).await {
+                Ok(id) => Some(folder_identity_hash(&id)),
+                Err(e) => {
+                    warn!("Could not read the folder id of {}: {e:#}", target.role);
+                    None
+                }
             }
         };
-        let FolderFetch { new_emails, skipped, enumeration, download_incomplete } = fetch;
-        let complete = enumeration.complete;
-        let server = enumeration.entries;
-        result.skipped += skipped;
+        let identity_matches =
+            observed_identity.is_some() && observed_identity == stored_identity;
+        let identity = observed_identity.or(stored_identity);
+
+        // A dry run writes nothing, and every delta branch below is a write:
+        // it either drops a token or mints one. So a dry run takes the
+        // pre-#0042 pass, unchanged.
+        let verdict = if dry_run {
+            DeltaVerdict::FullSync
+        } else {
+            delta_verdict(limit, stored_token.as_deref(), identity_matches)
+        };
+        if let DeltaVerdict::Discard(reason) = verdict {
+            info!("Graph delta token for {} dropped ({reason:?})", target.role);
+            crate::ingest::clear_mailbox_deltalink(&store, account_name, mailbox);
+        }
+        if verdict == DeltaVerdict::FolderChanged {
+            info!(
+                "Graph folder id for {} is not the one its delta token was minted against; \
+                 dropping the token and enumerating",
+                target.role
+            );
+            crate::ingest::clear_mailbox_deltalink(&store, account_name, mailbox);
+        }
+
+        // The delta half. `None` here means this pass enumerates, for any of
+        // the reasons above or because the walk itself was in doubt.
+        let mut delta_fetch: Option<DeltaFetch> = None;
+        if verdict == DeltaVerdict::Use {
+            let link = stored_token.clone().unwrap_or_default();
+            match client
+                .fetch_delta(&target.server_name, limit, &known, &link)
+                .await
+            {
+                Ok(Some(d)) => delta_fetch = Some(d),
+                Ok(None) => info!(
+                    "Graph delta for {} reported removals; enumerating the folder so the \
+                     prune can resolve them",
+                    target.role
+                ),
+                Err(reason) => {
+                    info!(
+                        "Graph delta for {} abandoned ({reason:?}); dropping the token and \
+                         enumerating",
+                        target.role
+                    );
+                    crate::ingest::clear_mailbox_deltalink(&store, account_name, mailbox);
+                }
+            }
+        }
+
+        // What the pass saw, in the two shapes it can come in. `server` is a
+        // whole folder listing and may be diffed against the store; `changed`
+        // is a change set and may not.
+        let (new_emails, server, complete, download_incomplete, token, used_delta) = match delta_fetch
+        {
+            Some(d) => (
+                d.new_emails,
+                d.changed,
+                // A delta pass covers the folder in the sense the prune gate
+                // asks about: its token asserts the store held everything the
+                // folder listed at token time, and this walk brought in every
+                // change since, so nothing another target's prune might need
+                // is missing. It contributes no prunes of its own.
+                true,
+                d.download_incomplete,
+                Some(d.delta_link),
+                true,
+            ),
+            None => {
+                // Minted before the enumeration, never after: a token taken
+                // afterwards would silently swallow the window between the two.
+                let minted = if dry_run {
+                    None
+                } else {
+                    client.mint_delta_token(&target.server_name).await
+                };
+                let fetch = match client
+                    .fetch_new_messages(&target.server_name, limit, &known)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Graph sync failed for {}: {}", target.role, e);
+                        // A target that did not sync at all is the strongest
+                        // form of partial pass: the copy that would justify
+                        // another target's deletion may be exactly what this
+                        // fetch failed to bring in.
+                        coverage.push((false, false));
+                        continue;
+                    }
+                };
+                let FolderFetch { new_emails, skipped, enumeration, download_incomplete } = fetch;
+                result.skipped += skipped;
+                (
+                    new_emails,
+                    enumeration.entries,
+                    enumeration.complete,
+                    download_incomplete,
+                    minted,
+                    false,
+                )
+            }
+        };
         span.mark(&format!("fetch:{}", target.role));
 
         if dry_run {
@@ -1305,31 +1866,62 @@ pub async fn sync_mailboxes_graph(
         // The other half of the same diff: what the store holds here and the
         // server does not. Held back until every target has been ingested (see
         // the second pass below).
-        let vanished = vanished_graph_uids(&known, &server);
-        if !vanished.is_empty() {
-            prunes.push((target.role.clone(), vanished));
+        //
+        // Only a full enumeration may compute it. `server` on a delta pass is
+        // a change set, so `known − server` would name every message that did
+        // not happen to change since the token: the entire mailbox (#0042).
+        if !used_delta {
+            let vanished = vanished_graph_uids(&known, &server);
+            if !vanished.is_empty() {
+                prunes.push((target.role.clone(), vanished));
+            }
         }
 
-        // Only a complete enumeration knows how many messages the folder
-        // holds; a short one would record a count the UI shows as truth, so
-        // the last known-good stays instead.
-        if complete {
+        // The resume point is only minted by a pass that saw the whole folder
+        // and wrote every message it found, and only alongside the folder id
+        // it is bound to: a token with no identity could never be validated
+        // again (#0042).
+        let earned = may_record_delta_token(complete, download_incomplete, ingest_failed);
+        let minted_a_token = token.is_some();
+        let token_to_store = if earned { token } else { None };
+
+        if used_delta {
+            // A delta pass observed no folder listing, so it writes the token
+            // and nothing else: `exists` and the rest are observations it did
+            // not make, and `record_mailbox_cursor` would null them.
+            if let (Some(identity), Some(link)) = (identity, token_to_store.as_deref()) {
+                crate::ingest::record_delta_token(&store, account_name, mailbox, identity, link);
+            }
+        } else if complete {
+            // Only a complete enumeration knows how many messages the folder
+            // holds; a short one would record a count the UI shows as truth,
+            // so the last known-good stays instead.
             crate::ingest::record_mailbox_cursor(
                 &store,
                 account_name,
-                target.role.as_str(),
+                mailbox,
                 &crate::ingest::MailboxCursor {
-                    uidvalidity: None,
+                    // The Graph analogue of UIDVALIDITY: the folder id its
+                    // delta token is bound to, hashed into the column.
+                    uidvalidity: identity,
                     last_uid: None,
                     uidnext: None,
                     exists: Some(server.len() as i64),
                     highest_modseq: None,
-                    deltalink: None,
+                    deltalink: if identity.is_some() { token_to_store } else { None },
                     // IMAP-only: the Graph pull downloads by id, so it has no
                     // positional window that can leave an arrival behind.
                     arrival_mark: None,
                 },
             )?;
+            if earned && stored_token.is_some() && !minted_a_token {
+                // This pass covered the folder but could not mint a token, so
+                // the stored one is older than a listing that has just been
+                // fully consumed. Keeping it would replay the same changes
+                // (and, if they included removals, escalate to this same
+                // enumeration) on every pass for good.
+                crate::ingest::clear_mailbox_deltalink(&store, account_name, mailbox);
+            }
         }
     }
 
@@ -2477,5 +3069,286 @@ mod tests {
             1,
             "the next failure starts the count over"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #0042: /messages/delta
+    // -----------------------------------------------------------------
+
+    fn delta_page(json: serde_json::Value) -> GraphDeltaPage {
+        serde_json::from_value(json).expect("a delta page must parse")
+    }
+
+    #[test]
+    fn the_delta_decision_matrix() {
+        let token = format!("{GRAPH_BASE}/me/mailFolders('AAA')/messages/delta?$deltatoken=t1");
+
+        // No token: the bootstrap pass enumerates and mints one.
+        assert_eq!(delta_verdict(100, None, false), DeltaVerdict::NoToken);
+        assert_eq!(delta_verdict(usize::MAX, None, true), DeltaVerdict::NoToken);
+
+        // A full sync always relists: it is the periodic whole-folder
+        // observation the prune and the token both lean on.
+        assert_eq!(
+            delta_verdict(usize::MAX, Some(&token), true),
+            DeltaVerdict::FullSync
+        );
+
+        // A quick sync with a token minted against this folder is the only
+        // branch that takes the delta.
+        assert_eq!(delta_verdict(100, Some(&token), true), DeltaVerdict::Use);
+
+        // The Graph analogue of a UIDVALIDITY change: a folder that is not the
+        // one the token was minted against invalidates it, whatever the sync.
+        assert_eq!(
+            delta_verdict(100, Some(&token), false),
+            DeltaVerdict::FolderChanged
+        );
+        assert_eq!(
+            delta_verdict(usize::MAX, Some(&token), false),
+            DeltaVerdict::FolderChanged
+        );
+
+        // Anything that is not a delta URL this client would have stored is
+        // thrown away rather than sent to the server.
+        for junk in ["", "not a url", "https://evil.example/me/messages/delta"] {
+            assert_eq!(
+                delta_verdict(100, Some(junk), true),
+                DeltaVerdict::Discard(DeltaDiscard::Malformed),
+                "{junk:?} is not a token"
+            );
+        }
+        let no_delta = format!("{GRAPH_BASE}/me/mailFolders('AAA')/messages?$top=200");
+        assert_eq!(
+            delta_verdict(100, Some(&no_delta), true),
+            DeltaVerdict::Discard(DeltaDiscard::Malformed)
+        );
+    }
+
+    #[test]
+    fn an_expired_delta_link_is_discarded_and_anything_else_unusual_with_it() {
+        use reqwest::StatusCode;
+        assert_eq!(delta_status_discard(StatusCode::OK), None);
+        // The documented expiry: 410 Gone / resyncRequired.
+        assert_eq!(
+            delta_status_discard(StatusCode::GONE),
+            Some(DeltaDiscard::Expired)
+        );
+        // The folder went out from under the token.
+        assert_eq!(
+            delta_status_discard(StatusCode::NOT_FOUND),
+            Some(DeltaDiscard::Expired)
+        );
+        // Everything else is a failure, and a failed walk is indistinguishable
+        // from one that skipped a message, so it drops the token too.
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                delta_status_discard(status),
+                Some(DeltaDiscard::Failed),
+                "{status} must not be trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_entry_is_counted_and_never_mistaken_for_a_message() {
+        let page = delta_page(serde_json::json!({
+            "value": [
+                {
+                    "id": "AAA",
+                    "internetMessageId": " <kept@example.com> ",
+                    "isRead": true,
+                    "receivedDateTime": "2026-01-01T00:00:00Z"
+                },
+                // A removal carries the Graph id and nothing else: no
+                // internetMessageId, which is the identity the store keys on.
+                { "id": "BBB", "@removed": { "reason": "deleted" } },
+                { "id": "CCC", "@removed": { "reason": "changed" } },
+                // No usable identity: dropped, as in a full enumeration.
+                { "id": "DDD", "isRead": false }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/x/delta?$deltatoken=t2"
+        }));
+        let mut changed = HashMap::new();
+        let mut removed = 0usize;
+        absorb_delta_page(&mut changed, &mut removed, page.value);
+
+        assert_eq!(removed, 2, "both removal reasons count");
+        assert_eq!(changed.len(), 1);
+        let entry = changed.get("<kept@example.com>").expect("keyed on the trimmed id");
+        assert_eq!(entry.graph_id, "AAA");
+        assert!(entry.is_read);
+
+        let delta = FolderDelta {
+            changed,
+            removed,
+            delta_link: page.delta_link.unwrap(),
+            pages: 1,
+        };
+        assert!(
+            delta.forces_full_enumeration(),
+            "a delta that reports removals hands the pass to the enumeration, because the \
+             prune resolves a deletion by listing the folder and not from @removed"
+        );
+        assert!(!FolderDelta::default().forces_full_enumeration());
+    }
+
+    #[test]
+    fn a_change_set_is_never_a_folder_listing() {
+        // Why the orchestrator only computes the prune on a full enumeration:
+        // fed a delta's change set, the same diff calls every message that
+        // simply did not change since the token a deletion.
+        let known = known(&["<a@x>", "<b@x>", "<c@x>"]);
+        let change_set = folder(&[("<b@x>", "BBB", Some("2026-01-01T00:00:00Z"))]);
+        let vanished = vanished_graph_uids(&known, &change_set);
+        assert_eq!(
+            vanished.len(),
+            2,
+            "which would be a mass prune, so `used_delta` gates the call"
+        );
+    }
+
+    #[test]
+    fn a_resume_point_is_only_minted_by_a_pass_that_covered_the_folder() {
+        // covered, nothing left behind, everything written.
+        assert!(may_record_delta_token(true, false, false));
+        // An enumeration that did not see the whole folder.
+        assert!(!may_record_delta_token(false, false, false));
+        // A pass that left new messages undownloaded.
+        assert!(!may_record_delta_token(true, true, false));
+        // A message downloaded and not written is as absent as one never
+        // fetched, so the token would over-claim.
+        assert!(!may_record_delta_token(true, false, true));
+    }
+
+    #[test]
+    fn a_poisoned_message_cannot_wedge_the_delta_chain_for_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let uid = crate::ingest::graph_uid("<poison@example.com>");
+
+        // The #0074 bound applies identically on the delta path: while the
+        // message is still owed the token does not advance, so the next pass
+        // replays the same changes...
+        for pass in 1..=2 {
+            let ingest_failed = crate::ingest::note_ingest_failure(
+                &store, "acct", "inbox", "Inbox", uid, "the store will not take it",
+            );
+            assert!(
+                !may_record_delta_token(true, false, ingest_failed),
+                "pass {pass} has not written everything, so it mints no token"
+            );
+        }
+        // ...and once the message is given up on, the chain moves again.
+        let ingest_failed = crate::ingest::note_ingest_failure(
+            &store, "acct", "inbox", "Inbox", uid, "the store will not take it",
+        );
+        assert!(!ingest_failed);
+        assert!(
+            may_record_delta_token(true, false, ingest_failed),
+            "a message the store will never accept must not freeze the delta for ever"
+        );
+    }
+
+    #[test]
+    fn the_delta_token_survives_a_full_window_pass_and_only_a_clear_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let link = format!("{GRAPH_BASE}/me/mailFolders('AAA')/messages/delta?$deltatoken=t1");
+        let identity = folder_identity_hash("AAA");
+
+        crate::ingest::record_delta_token(&store, "acct", "inbox", identity, &link);
+        let stored = crate::ingest::load_mailbox_cursor(&store, "acct", "inbox")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.deltalink.as_deref(), Some(link.as_str()));
+        assert_eq!(stored.uidvalidity, Some(identity));
+
+        // The #0054 carry-forward hazard, pinned for `deltalink` the way #0041
+        // pinned it for `highest_modseq`: a full-window pass says nothing about
+        // the token and must not wipe it.
+        crate::ingest::record_mailbox_cursor(
+            &store,
+            "acct",
+            "inbox",
+            &crate::ingest::MailboxCursor {
+                uidvalidity: Some(identity),
+                exists: Some(42),
+                deltalink: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stored = crate::ingest::load_mailbox_cursor(&store, "acct", "inbox")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.deltalink.as_deref(),
+            Some(link.as_str()),
+            "a pass with nothing to say about the token leaves it alone"
+        );
+
+        // A folder identity change is what makes the token meaningless, and
+        // the only way out is the explicit clear.
+        let observed = folder_identity_hash("BBB");
+        assert_ne!(observed, identity);
+        assert_eq!(
+            delta_verdict(100, stored.deltalink.as_deref(), observed == identity),
+            DeltaVerdict::FolderChanged
+        );
+        crate::ingest::clear_mailbox_deltalink(&store, "acct", "inbox");
+        let stored = crate::ingest::load_mailbox_cursor(&store, "acct", "inbox")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.deltalink, None, "the token cannot survive the reset");
+        assert_eq!(
+            delta_verdict(100, stored.deltalink.as_deref(), true),
+            DeltaVerdict::NoToken,
+            "and the next pass enumerates and mints a fresh one"
+        );
+    }
+
+    #[test]
+    fn the_delta_url_has_a_listing_form_and_a_mint_form() {
+        let listing = delta_url("inbox", false);
+        assert!(listing.starts_with(&format!("{GRAPH_BASE}/me/mailFolders/inbox/messages/delta?")));
+        assert!(listing.contains("$select=id,internetMessageId,isRead,receivedDateTime"));
+        assert!(
+            !listing.contains("$deltatoken"),
+            "the listing form asks for the folder's state, not for a bare token"
+        );
+        // No `$top`: the delta endpoint takes its page size from the `Prefer`
+        // header, which `walk_delta` sends.
+        assert!(!listing.contains("$top"));
+        assert!(delta_url("inbox", true).ends_with("&$deltatoken=latest"));
+    }
+
+    #[test]
+    fn a_delta_page_chain_ends_in_a_resume_point() {
+        // The two shapes `walk_delta` branches on: a page that continues, and
+        // a page that closes the chain.
+        let middle = delta_page(serde_json::json!({
+            "value": [],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"
+        }));
+        assert_eq!(middle.next_link.as_deref(), Some("https://graph.microsoft.com/v1.0/next"));
+        assert_eq!(middle.delta_link, None);
+
+        let last = delta_page(serde_json::json!({
+            "value": [],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/d?$deltatoken=t2"
+        }));
+        assert_eq!(last.next_link, None);
+        assert!(last.delta_link.is_some());
+
+        // A chain that simply stops has no resume point and no proof it was
+        // complete; `walk_delta` answers `NoResumePoint` and the token goes.
+        let orphan = delta_page(serde_json::json!({ "value": [] }));
+        assert!(orphan.next_link.is_none() && orphan.delta_link.is_none());
     }
 }
