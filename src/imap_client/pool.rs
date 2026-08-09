@@ -363,6 +363,51 @@ async fn connect_with_backoff(config: &ImapConfig) -> Result<(ImapSession, Serve
 mod tests {
     use super::*;
 
+    fn config(port: u16) -> ImapConfig {
+        ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "nobody@example.com".into(),
+            password: "unused".into(),
+            auth_method: crate::config::AuthMethod::Password,
+            accept_invalid_certs: false,
+            fetch_concurrency: 4,
+        }
+    }
+
+    /// The reconnect half of the pool, over the one failure that is instant and
+    /// deterministic offline: a refused connection.
+    ///
+    /// What is pinned is that a checkout retries rather than failing on the
+    /// first refusal, and pauses between attempts. A laptop's link coming back,
+    /// a Bridge mid-restart and a server shedding load all look like this, and
+    /// before #0041 each of them failed the whole sync pass.
+    #[test]
+    fn a_refused_connection_is_retried_with_backoff_before_it_fails() {
+        // Port 1 is reserved and nothing listens on it, so `connect` returns
+        // ECONNREFUSED immediately and the elapsed time is the backoff itself.
+        let started = Instant::now();
+        let err = match futures::executor::block_on(checkout(&config(1))) {
+            Ok(_) => panic!("nothing is listening on port 1"),
+            Err(e) => e,
+        };
+        let waited = started.elapsed();
+
+        let total: Duration = CONNECT_BACKOFF.iter().sum();
+        assert!(
+            waited >= total,
+            "every backoff pause must have been taken: waited {waited:?}, expected >= {total:?}"
+        );
+        assert!(
+            waited < total + Duration::from_secs(10),
+            "and it must give up rather than retry forever: {waited:?}"
+        );
+        assert!(
+            err.to_string().contains("Failed to connect"),
+            "the surfaced error is the last real one, not a retry wrapper: {err}"
+        );
+    }
+
     /// Two sessions are interchangeable when they are the same user on the same
     /// server, and the credential is not part of that: an OAuth2 token refresh
     /// must not orphan a live connection.

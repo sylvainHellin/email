@@ -1165,6 +1165,19 @@ pub struct KnownUids {
     /// A recorded top of 0 is history too, so this is `Some(0)` rather than
     /// `None` when the cursor exists but recorded no UID.
     pub prior_high_water: Option<u32>,
+    /// The CONDSTORE `HIGHESTMODSEQ` a previous pass recorded for this mailbox,
+    /// which is what a `CHANGEDSINCE` flag fetch resumes from (#0041).
+    ///
+    /// `None` means "no delta is possible", and every path that cannot vouch
+    /// for a modseq produces it: no cursor row, a server without CONDSTORE, a
+    /// pass whose window did not cover the whole mailbox, or a UIDVALIDITY
+    /// reset (which clears the column outright). The fetch then does the full
+    /// window, which is the #0004-safe behaviour.
+    ///
+    /// A stored 0 is treated as absent: RFC 7162 mod-sequences start at 1, so
+    /// 0 is either a server that answered nothing or a column that was never
+    /// written, and neither is a resume point.
+    pub highest_modseq: Option<u64>,
 }
 
 impl KnownUids {
@@ -1208,6 +1221,11 @@ pub fn known_uids_with_cursor(store: &Store, account: &str, mailbox: &str) -> Re
                 .and_then(|uid| u32::try_from(uid).ok())
                 .unwrap_or(0)
         }),
+        highest_modseq: cursor
+            .as_ref()
+            .and_then(|c| c.highest_modseq)
+            .and_then(|m| u64::try_from(m).ok())
+            .filter(|&m| m > 0),
     })
 }
 

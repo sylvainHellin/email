@@ -155,6 +155,12 @@ pub async fn run_sync(
             // that no longer holds that UID, so it is dropped with the mark and
             // the skip list the refetch already discards (#0074 review).
             ingest::clear_mailbox_ingest_failures(store, account, target.role.as_str());
+            // The CONDSTORE resume point goes with them, and has to go from
+            // here: the cursor UPSERT carries a modseq forward precisely so an
+            // ordinary full-window pass cannot erase it (#0041), which leaves
+            // this as the one path that may. A modseq recorded under the old
+            // UIDVALIDITY describes a mailbox that no longer exists.
+            ingest::clear_mailbox_modseq(store, account, target.role.as_str());
         }
 
         if dry_run {
@@ -279,7 +285,11 @@ pub async fn run_sync(
                 last_uid: highest_uid.or_else(|| state.uid_next.map(|n| n as i64 - 1)),
                 uidnext: state.uid_next.map(|v| v as i64),
                 exists: Some(state.exists as i64),
-                highest_modseq: None,
+                // `None` here means "this pass has nothing to say about the
+                // modseq", not "clear it": the UPSERT COALESCEs, so a
+                // full-window pass leaves a CONDSTORE pass's resume point
+                // alone (#0041).
+                highest_modseq: fetched.highest_modseq,
                 deltalink: None,
                 // What this pass owes the next one: the mark below which the
                 // gate must stay shut because an arrival the server lists is
@@ -424,6 +434,10 @@ mod tests {
             enumeration_complete: true,
             download_incomplete: false,
             pending_arrival_mark: None,
+            // #0041 added this field; the fake backend is a non-CONDSTORE
+            // server, which is what every existing engine test assumed and
+            // still asserts.
+            highest_modseq: None,
         }
     }
 
@@ -485,6 +499,12 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
             out
+        }
+
+        fn modseq(&self, mailbox: &str) -> Option<i64> {
+            ingest::load_mailbox_cursor(&self.store, "acct", mailbox)
+                .unwrap()
+                .and_then(|c| c.highest_modseq)
         }
 
         fn cursor_mark(&self, mailbox: &str) -> Option<u32> {
@@ -741,6 +761,65 @@ mod tests {
             )
             .unwrap();
         assert!(flags.contains("\\Seen") && flags.contains("\\Answered"));
+    }
+
+    /// #0041, end to end through the engine: the CONDSTORE resume point
+    /// survives the passes that know nothing about it, and dies with a
+    /// UIDVALIDITY reset.
+    ///
+    /// This is the loop's half of the carry-forward hazard. The engine writes
+    /// whatever the fetch reported, `None` included, and `None` has to mean
+    /// "nothing to say" rather than "clear it": a quick sync reports `None` on
+    /// every mailbox bigger than its window, so the unconditional write would
+    /// have erased the resume point on the very next pass and the delta would
+    /// have flapped in and out of use forever, silently.
+    #[test]
+    fn a_condstore_modseq_survives_the_passes_that_cannot_vouch_for_one() {
+        let fx = Fixture::new();
+        let targets = vec![SyncTarget { role: MailboxRole::Inbox, server_name: "INBOX".into() }];
+        let mut backend = FakeBackend::default();
+
+        // Pass 1 is a full pass over a CONDSTORE server: it records a modseq.
+        let mut condstore = fetch(vec![(101, raw("one"))]);
+        condstore.highest_modseq = Some(90_060_115_205_545_359);
+        // Pass 2 is an ordinary capped pass, which reports no modseq at all.
+        let quick = fetch(vec![(102, raw("two"))]);
+        // Pass 3 is the renumbering.
+        let mut renumbered = fetch(vec![(1, raw("three"))]);
+        renumbered.uidvalidity_reset = true;
+        backend.script("INBOX", vec![Ok(condstore), Ok(quick), Ok(renumbered)]);
+
+        fx.run(&mut backend, &targets);
+        assert_eq!(
+            fx.modseq("inbox"),
+            Some(90_060_115_205_545_359),
+            "the CONDSTORE pass records its resume point"
+        );
+
+        fx.run(&mut backend, &targets);
+        assert_eq!(
+            fx.modseq("inbox"),
+            Some(90_060_115_205_545_359),
+            "and a pass with nothing to say about it must not erase it"
+        );
+        // ...and the next fetch is handed it back as its resume point.
+        let known = ingest::known_uids_with_cursor(&fx.store, "acct", "inbox").unwrap();
+        assert_eq!(known.highest_modseq, Some(90_060_115_205_545_359));
+
+        fx.run(&mut backend, &targets);
+        assert_eq!(
+            fx.modseq("inbox"),
+            None,
+            "a UIDVALIDITY reset is the one thing that clears it: the modseq \
+             described a mailbox that no longer exists"
+        );
+        assert!(
+            ingest::known_uids_with_cursor(&fx.store, "acct", "inbox")
+                .unwrap()
+                .highest_modseq
+                .is_none(),
+            "so the next pass does the full window rather than a delta"
+        );
     }
 
     // -----------------------------------------------------------------------

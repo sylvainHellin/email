@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
 use log::{info, warn};
 
-use super::{ImapSession, pool, search::{FetchCriteria, build_imap_search_query}};
+use super::{ImapSession, pool, pool::ServerCaps, search::{FetchCriteria, build_imap_search_query}};
 use crate::config::ImapConfig;
 use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
@@ -295,6 +295,123 @@ fn ceiling(uid_next: Option<u32>, listed: &[u32]) -> u32 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// CONDSTORE flag deltas (#0041)
+// ---------------------------------------------------------------------------
+
+/// How pass 1 should ask the server for the window's flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlagPass {
+    /// `UID FETCH <window> (UID FLAGS)`: every flag in the window, restated.
+    /// The only behaviour before #0041, and still the answer for every server
+    /// without CONDSTORE, which includes Proton Bridge, the daily driver.
+    Full,
+    /// `UID FETCH <window> (UID FLAGS) (CHANGEDSINCE n)`: only what the server
+    /// says has changed since mod-sequence `n`.
+    ChangedSince(u64),
+}
+
+/// The RFC 7162 fetch-modifier form, confirmed against async-imap 0.11.2 in the
+/// ticket's spike: `uid_fetch` interpolates the query verbatim after the UID
+/// set, so the modifier is simply the tail of the query string.
+///
+/// A free function with a test rather than a `format!` at the call site,
+/// because getting this string wrong is not a compile error and not a runtime
+/// error either: a server that cannot parse it answers `BAD`, and one that
+/// parses it differently answers with the wrong set of messages.
+pub(crate) fn flag_query(pass: FlagPass) -> String {
+    match pass {
+        FlagPass::Full => "(UID FLAGS)".to_string(),
+        FlagPass::ChangedSince(modseq) => format!("(UID FLAGS) (CHANGEDSINCE {modseq})"),
+    }
+}
+
+/// Whether this pass may ask for a flag delta instead of the whole window.
+///
+/// Every condition is a reason the delta could *miss a flag change*, and a
+/// missed flag change is #0004: a message marked read in webmail that never
+/// comes back unread locally, silently, with no error anywhere. So the gate is
+/// unanimous rather than best-effort:
+///
+/// - `condstore` is the strict CAPABILITY gate. Advertise is not correctness,
+///   but not advertising is conclusive.
+/// - `server` is the `HIGHESTMODSEQ` this SELECT reported. A server that
+///   advertised CONDSTORE and then said nothing is not one to hand a
+///   `CHANGEDSINCE` to.
+/// - `stored` is the resume point. Absent means no previous pass could vouch
+///   for one, so there is nothing to be a delta *from*.
+/// - `uidvalidity_reset` invalidates the mailbox's whole numbering; the modseq
+///   recorded under the old one describes a different mailbox.
+/// - `server < stored` is the server having gone backwards (a restore from
+///   backup, a rebuilt index). RFC 7162 requires the server to bump
+///   UIDVALIDITY in that case, so seeing it means the server is not keeping the
+///   contract that makes the delta safe.
+pub(crate) fn flag_pass(
+    condstore: bool,
+    stored: Option<u64>,
+    server: Option<u64>,
+    uidvalidity_reset: bool,
+) -> FlagPass {
+    if !condstore || uidvalidity_reset {
+        return FlagPass::Full;
+    }
+    match (stored, server) {
+        (Some(stored), Some(server)) if stored > 0 && server >= stored => {
+            FlagPass::ChangedSince(stored)
+        }
+        _ => FlagPass::Full,
+    }
+}
+
+/// The modseq this pass may leave behind as the next one's resume point, or
+/// `None` to keep whatever is stored (the cursor UPSERT carries it forward).
+///
+/// The load-bearing condition is `window_is_whole_mailbox`. A recorded modseq
+/// asserts "every flag in this mailbox was correct as of `n`", and only a pass
+/// that looked at every message can assert that. A quick sync sees the last 50
+/// UIDs; recording its modseq would tell the next pass not to ask about changes
+/// that predate it on the 8000 messages below the window, and a later full sync
+/// would skip exactly the flag changes it exists to catch.
+///
+/// The consequence is deliberate and worth stating: on a large mailbox the
+/// delta only starts working after a full sync, and quick syncs consume the
+/// resume point without advancing it. Correctness over speed, which is the
+/// ticket's own ranking. Advancing it on a capped pass is [#0084].
+///
+/// `enumeration_complete` is the second half: if `UID SEARCH ALL` came back
+/// short, "the window is the whole mailbox" is a statement about a listing that
+/// is already known to be untrustworthy.
+///
+/// [#0084]: ../../docs/tickets/0084-qresync-uidplus.md
+pub(crate) fn modseq_to_record(
+    server: Option<u64>,
+    window_is_whole_mailbox: bool,
+    enumeration_complete: bool,
+) -> Option<i64> {
+    if !window_is_whole_mailbox || !enumeration_complete {
+        return None;
+    }
+    server.filter(|&m| m > 0).and_then(|m| i64::try_from(m).ok())
+}
+
+/// Which UIDs in the window the store does not hold.
+///
+/// The full pass reads this off the `FETCH` response, which restates every
+/// message. A delta cannot: it answers only for messages whose flags changed,
+/// so an untouched message the store has never seen is simply absent from it,
+/// and taking "absent" for "already held" would stop new mail from downloading.
+/// The window and the skip list are both already in hand and say it exactly.
+pub(crate) fn new_uids_in_window(
+    window: &[u32],
+    known: &std::collections::HashSet<i64>,
+) -> Vec<u32> {
+    window
+        .iter()
+        .copied()
+        .filter(|uid| !known.contains(&(*uid as i64)))
+        .collect()
+}
+
 /// Two-pass fetch for the store ingest path.
 ///
 /// Pass 1 fetches `UID FLAGS` over the whole window, pass 2 downloads
@@ -316,13 +433,21 @@ pub async fn fetch_new_raw_on_session(
     mailbox: &str,
     limit: Option<usize>,
     known: KnownUids,
+    caps: ServerCaps,
 ) -> Result<MailboxFetch> {
     let mut span = TimingSpan::with_context("fetch_new_raw", mailbox.to_string());
 
-    let imap_mailbox = session
-        .select(mailbox)
-        .await
-        .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
+    // `SELECT (CONDSTORE)` only where the server advertised CONDSTORE: it is
+    // the command that makes the server report HIGHESTMODSEQ, and a server that
+    // never heard of it answers BAD. Proton Bridge takes the plain SELECT it
+    // always took.
+    let imap_mailbox = if caps.condstore {
+        session.select_condstore(mailbox).await
+    } else {
+        session.select(mailbox).await
+    }
+    .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
+    let server_modseq = imap_mailbox.highest_modseq;
     span.mark("select");
     let state = MailboxState {
         uid_validity: imap_mailbox.uid_validity,
@@ -333,6 +458,7 @@ pub async fn fetch_new_raw_on_session(
     let stored_uidvalidity = known.uidvalidity;
     let stored_arrival_mark = known.arrival_mark;
     let stored_prior_high_water = known.prior_high_water;
+    let stored_modseq = known.highest_modseq;
     let (known_uids, uidvalidity_reset) = known.resolve(state.uid_validity);
     // A mark and a recorded top are both UIDs, so a renumbering makes them
     // meaningless: they are dropped with the skip list they travelled with.
@@ -341,6 +467,9 @@ pub async fn fetch_new_raw_on_session(
     } else {
         (stored_arrival_mark, stored_prior_high_water)
     };
+    // ...and so is a mod-sequence, for the same reason; the engine clears the
+    // stored column on the same branch.
+    let known_modseq = if uidvalidity_reset { None } else { stored_modseq };
     if uidvalidity_reset {
         warn!(
             "UIDVALIDITY for '{}' changed from {:?} to {:?}: refetching the whole window, \
@@ -381,6 +510,10 @@ pub async fn fetch_new_raw_on_session(
         );
     }
 
+    // The delta gate, decided before anything is fetched so the reason is one
+    // readable expression rather than a condition spread over the two passes.
+    let pass = flag_pass(caps.condstore, known_modseq, server_modseq, uidvalidity_reset);
+
     // A pass that downloads nothing still has to answer the coverage question:
     // `mp sync -n 0` computes a whole vanished set and returns through here, so
     // hardcoding "complete" would force the gate open on a prune-only pass
@@ -404,6 +537,10 @@ pub async fn fetch_new_raw_on_session(
             enumeration_complete,
             download_incomplete: coverage.incomplete,
             pending_arrival_mark: coverage.pending_mark,
+            // Nothing in the window means every flag in it was looked at, so
+            // the modseq may advance: this is the `mp sync -n 0` and
+            // empty-mailbox path.
+            highest_modseq: modseq_to_record(server_modseq, true, enumeration_complete),
         }
     };
 
@@ -420,10 +557,10 @@ pub async fn fetch_new_raw_on_session(
         return Ok(empty(state));
     }
 
-    // Pass 1: UID + FLAGS over the whole window (~40 bytes per message).
+    // Pass 1: flags over the window (~40 bytes per message on the full form).
     let window_set = compress_uid_set(&window);
     let flagged: Vec<_> = session
-        .uid_fetch(&window_set, "(UID FLAGS)")
+        .uid_fetch(&window_set, flag_query(pass))
         .await
         .map_err(|e| anyhow!("Failed to fetch flags: {}", e))?
         .try_collect()
@@ -441,7 +578,25 @@ pub async fn fetch_new_raw_on_session(
             new_uids.push(uid);
         }
     }
-    let skipped = known_flags.len();
+    let skipped = if matches!(pass, FlagPass::ChangedSince(_)) {
+        // A delta answers only for messages whose flags changed, so what came
+        // back says nothing about which UIDs are new: an unchanged message the
+        // store has never seen would look like an absence. The window and the
+        // skip list, both of which this pass already holds, say it exactly.
+        // Getting this backwards would silently stop downloading new mail.
+        new_uids = new_uids_in_window(&window, &known_uids);
+        info!(
+            "Store fetch for '{}': CONDSTORE delta since {:?} returned {} changed flag(s)",
+            mailbox,
+            known_modseq,
+            known_flags.len()
+        );
+        window.len() - new_uids.len()
+    } else {
+        known_flags.len()
+    };
+    let recordable_modseq =
+        modseq_to_record(server_modseq, window.len() == listed.len(), enumeration_complete);
 
     if new_uids.is_empty() {
         let coverage = arrival_coverage(
@@ -462,6 +617,7 @@ pub async fn fetch_new_raw_on_session(
             enumeration_complete,
             download_incomplete: coverage.incomplete,
             pending_arrival_mark: coverage.pending_mark,
+            highest_modseq: recordable_modseq,
         });
     }
     info!(
@@ -512,6 +668,7 @@ pub async fn fetch_new_raw_on_session(
         enumeration_complete,
         download_incomplete: coverage.incomplete,
         pending_arrival_mark: coverage.pending_mark,
+        highest_modseq: recordable_modseq,
     })
 }
 
@@ -839,6 +996,113 @@ mod tests {
     #[test]
     fn the_ceiling_is_uidnext_minus_one() {
         assert_eq!(ceiling(Some(84), &[1, 2, 3]), 83);
+    }
+
+    // -----------------------------------------------------------------------
+    // The CONDSTORE gate (#0041)
+    // -----------------------------------------------------------------------
+
+    /// The wire form the ticket's spike pinned. Wrong here is not a compile
+    /// error and not a runtime error: a server that cannot parse it answers
+    /// `BAD`, and one that parses it differently answers about the wrong
+    /// messages.
+    #[test]
+    fn the_changedsince_modifier_is_the_tail_of_the_fetch_query() {
+        assert_eq!(flag_query(FlagPass::Full), "(UID FLAGS)");
+        assert_eq!(
+            flag_query(FlagPass::ChangedSince(90_060_115_205_545_359)),
+            "(UID FLAGS) (CHANGEDSINCE 90060115205545359)"
+        );
+        // `uid_fetch` interpolates as `UID FETCH <set> <query>`, so this is the
+        // command that goes out:
+        assert_eq!(
+            format!("UID FETCH {} {}", "1:50", flag_query(FlagPass::ChangedSince(7))),
+            "UID FETCH 1:50 (UID FLAGS) (CHANGEDSINCE 7)"
+        );
+    }
+
+    /// The capability gate, strictly. Everything that is not an unambiguous
+    /// yes is the full window, because the cost of a needless full window is
+    /// latency and the cost of a wrong delta is #0004: a read/unread change
+    /// made in webmail that never arrives, with no error anywhere.
+    #[test]
+    fn the_delta_needs_every_condition_and_falls_back_to_the_full_window() {
+        let stored = Some(1_000u64);
+        let server = Some(1_500u64);
+
+        assert_eq!(
+            flag_pass(true, stored, server, false),
+            FlagPass::ChangedSince(1_000),
+            "the only case that may skip the full window"
+        );
+
+        // No CAPABILITY: Proton Bridge and Outlook-IMAP live here, and the
+        // heuristic + full-window path must stay exactly what it was.
+        assert_eq!(flag_pass(false, stored, server, false), FlagPass::Full);
+        // Advertised, but this SELECT reported no HIGHESTMODSEQ: advertise is
+        // not correctness, and a silent server is not one to hand a resume
+        // point to.
+        assert_eq!(flag_pass(true, stored, None, false), FlagPass::Full);
+        // No stored resume point: the first CONDSTORE pass is a full one.
+        assert_eq!(flag_pass(true, None, server, false), FlagPass::Full);
+        // A stored 0 is a column that was never written, not modseq zero.
+        assert_eq!(flag_pass(true, Some(0), server, false), FlagPass::Full);
+        // The renumbering invalidates the modseq with everything else.
+        assert_eq!(flag_pass(true, stored, server, true), FlagPass::Full);
+        // The server went backwards without bumping UIDVALIDITY (a restore
+        // from backup, a rebuilt index): it is not keeping the contract the
+        // delta rests on, so nothing is assumed about what changed.
+        assert_eq!(flag_pass(true, Some(1_500), Some(1_000), false), FlagPass::Full);
+        // Equal is fine and is the common case: nothing has changed since.
+        assert_eq!(flag_pass(true, Some(1_500), Some(1_500), false), FlagPass::ChangedSince(1_500));
+    }
+
+    /// What a pass may leave behind. The claim a stored modseq makes is "every
+    /// flag in this mailbox was correct as of n", so only a pass that looked at
+    /// every message may make it; a quick sync that saw the last 50 of 8000
+    /// must not, or the next full sync would skip exactly the old-message flag
+    /// changes it exists to catch (#0004 again).
+    #[test]
+    fn only_a_pass_that_saw_the_whole_mailbox_may_record_a_modseq() {
+        let server = Some(90_060_115_205_545_359u64);
+        assert_eq!(
+            modseq_to_record(server, true, true),
+            Some(90_060_115_205_545_359),
+            "a full pass over a completely enumerated mailbox"
+        );
+        assert_eq!(
+            modseq_to_record(server, false, true),
+            None,
+            "a capped window may not vouch for the messages below it"
+        );
+        assert_eq!(
+            modseq_to_record(server, true, false),
+            None,
+            "nor may a pass whose own enumeration came back short"
+        );
+        // Nothing to record is not a failure; the cursor UPSERT carries the
+        // stored value forward on None.
+        assert_eq!(modseq_to_record(None, true, true), None);
+        assert_eq!(modseq_to_record(Some(0), true, true), None);
+        // A modseq beyond i64 is a server the store cannot represent; it gets
+        // the full window forever rather than a truncated resume point.
+        assert_eq!(modseq_to_record(Some(u64::MAX), true, true), None);
+    }
+
+    /// The delta's other half, and the one that breaks new mail rather than
+    /// flags if it is wrong: a CHANGEDSINCE response says nothing about
+    /// messages whose flags did not change, so which UIDs are new has to come
+    /// from the window and the skip list.
+    #[test]
+    fn new_uids_come_from_the_window_and_not_from_a_delta_response() {
+        let known: HashSet<i64> = HashSet::from([10, 11, 12]);
+        assert_eq!(new_uids_in_window(&[10, 11, 12, 13, 14], &known), vec![13, 14]);
+        // The case that matters: a brand-new message nobody touched, so it is
+        // absent from the delta response entirely. It is still new.
+        assert_eq!(new_uids_in_window(&[13], &known), vec![13]);
+        assert!(new_uids_in_window(&[10, 11], &known).is_empty());
+        // A UIDVALIDITY reset empties the skip list, so everything is new.
+        assert_eq!(new_uids_in_window(&[10, 11], &HashSet::new()), vec![10, 11]);
     }
 
     /// A server that withholds `UIDNEXT` leaves the highest UID it did list,
