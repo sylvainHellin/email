@@ -31,7 +31,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0069 Delete the file-era invite rewriters (set_event_rsvp, InboxFrontmatter)](docs/tickets/0069-drop-file-era-invite-rewriters.md) -- chore _(from the #0057 review)_
 - [#0070 Audit the website for file-era claims](docs/tickets/0070-website-file-era-claims.md) -- chore _(website; from the #0057 review)_
 - [#0074 An ingest failure is not carried by the arrival mark](docs/tickets/0074-arrival-mark-misses-ingest-failures.md) -- bug _(from the #0072 sweep review)_
-- [#0076 The post-send flag write opens one IMAP session per mailbox](docs/tickets/0076-post-send-flag-write-opens-a-session-per-mailbox.md) -- perf _(from the #TKT-0051 review; not subsumed by #0039, but its direction 2 could ride the queue now that the consumer wiring has landed)_
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_
 - [#0079 Local filter/sort for flagged messages](docs/tickets/0079-flagged-filter.md) -- feature _(from #0007; the flag round-trip and marker shipped, the local filtered view did not)_

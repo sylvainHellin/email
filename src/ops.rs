@@ -3,7 +3,7 @@
 //! A flag, a move, an archive or a delete is one local store write and one
 //! remote op. The local half lives in [`crate::store::write`]; this module owns
 //! the remote half: [`ServerOp`] names what the server has to do, and
-//! [`run_ops`] / [`run_op`] execute it against IMAP or Graph.
+//! [`run_op`] executes it against IMAP or Graph.
 //!
 //! It sits in the library rather than in `tui/` on purpose. The TUI's mutation
 //! pairing ([`crate::tui::mutations`]) built these types first, but the durable
@@ -103,6 +103,22 @@ pub enum ServerOp {
         mailbox: String,
         flagged: bool,
     },
+    /// The post-send bookkeeping bit on the source of a reply or a forward:
+    /// `\Answered` when `answered`, `$Forwarded` otherwise (#TKT-0051, #0076).
+    ///
+    /// The one multi-mailbox op, because a source is one store row per mailbox
+    /// (inbox, archive, sent) and the same server message in each: naming the
+    /// whole list lets the drain write them over a single IMAP session instead
+    /// of one login per mailbox, which is the cost #0076 exists to remove.
+    ///
+    /// Idempotent by construction (`+FLAGS` on a flag that may already be set)
+    /// and not-found tolerant per mailbox, so a replay after a crash converges
+    /// rather than failing.
+    SetAnswered {
+        message_id: String,
+        mailboxes: Vec<String>,
+        answered: bool,
+    },
 }
 
 impl ServerOp {
@@ -116,6 +132,7 @@ impl ServerOp {
             ServerOp::Delete { .. } => "delete",
             ServerOp::SetRead { .. } => "set_read",
             ServerOp::SetFlagged { .. } => "set_flagged",
+            ServerOp::SetAnswered { .. } => "set_answered",
         }
     }
 
@@ -125,7 +142,8 @@ impl ServerOp {
             ServerOp::Move { message_id, .. }
             | ServerOp::Delete { message_id, .. }
             | ServerOp::SetRead { message_id, .. }
-            | ServerOp::SetFlagged { message_id, .. } => message_id,
+            | ServerOp::SetFlagged { message_id, .. }
+            | ServerOp::SetAnswered { message_id, .. } => message_id,
         }
     }
 }
@@ -152,40 +170,6 @@ impl Backend {
         } else {
             Ok(Backend::Imap(Box::new(ImapConfig::load(account)?)))
         }
-    }
-}
-
-/// Run one op, index-aligned results for a whole batch.
-///
-/// IMAP batches a homogeneous list over a single connection, which is what the
-/// pre-store build did for archive and delete; Graph has no session to share,
-/// so it runs them in order.
-pub async fn run_ops(backend: &Backend, ops: &[ServerOp]) -> Vec<Result<()>> {
-    match backend {
-        Backend::Graph(config) => {
-            let mut out = Vec::with_capacity(ops.len());
-            for op in ops {
-                out.push(run_graph(config, op).await);
-            }
-            out
-        }
-        Backend::Imap(config) => match homogeneous(ops) {
-            Some(Homogeneous::Move { source, dest }) if ops.len() > 1 => {
-                let ids: Vec<String> = ops.iter().map(message_id_of).collect();
-                crate::imap_client::batch_move_on_server(config, &ids, source, dest).await
-            }
-            Some(Homogeneous::Delete { source }) if ops.len() > 1 => {
-                let ids: Vec<String> = ops.iter().map(message_id_of).collect();
-                crate::imap_client::batch_delete_on_server(config, &ids, source).await
-            }
-            _ => {
-                let mut out = Vec::with_capacity(ops.len());
-                for op in ops {
-                    out.push(run_imap(config, op).await);
-                }
-                out
-            }
-        },
     }
 }
 
@@ -240,6 +224,18 @@ async fn run_imap(config: &ImapConfig, op: &ServerOp) -> Result<()> {
                 crate::imap_client::remove_flag_on_server(config, message_id, mailbox, flag).await
             }
         }
+        ServerOp::SetAnswered {
+            message_id,
+            mailboxes,
+            answered,
+        } => {
+            let flag = if *answered {
+                crate::types::FLAG_ANSWERED
+            } else {
+                crate::types::FLAG_FORWARDED
+            };
+            crate::imap_client::add_flag_in_mailboxes(config, message_id, mailboxes, flag).await
+        }
     }
 }
 
@@ -263,44 +259,17 @@ async fn run_graph(config: &GraphConfig, op: &ServerOp) -> Result<()> {
             log::debug!("[graph] flag parked locally for {message_id}; Graph is seen-only");
             Ok(())
         }
+        // Graph exposes the answered state only through extended MAPI
+        // properties and the backend is parked (#0042, #0055), so the local
+        // write stands alone; `ingest::apply_seen_flags` is what keeps a Graph
+        // sync from erasing it. `Ok`, not an error: this op must never fail a
+        // send's bookkeeping (#0076). The queue-side guard is that the send
+        // path enqueues nothing on a Graph account at all.
+        ServerOp::SetAnswered { message_id, .. } => {
+            log::debug!("[graph] answered/forwarded parked locally for {message_id}");
+            Ok(())
+        }
     }
-}
-
-/// A batch that can share one IMAP session: same kind, same folders.
-pub(crate) enum Homogeneous<'a> {
-    Move { source: &'a str, dest: &'a str },
-    Delete { source: &'a str },
-}
-
-pub(crate) fn homogeneous(ops: &[ServerOp]) -> Option<Homogeneous<'_>> {
-    let first = ops.first()?;
-    match first {
-        ServerOp::Move {
-            source_mailbox,
-            dest_mailbox,
-            ..
-        } => ops
-            .iter()
-            .all(|op| {
-                matches!(op, ServerOp::Move { source_mailbox: s, dest_mailbox: d, .. }
-                    if s == source_mailbox && d == dest_mailbox)
-            })
-            .then_some(Homogeneous::Move {
-                source: source_mailbox,
-                dest: dest_mailbox,
-            }),
-        ServerOp::Delete { source_mailbox, .. } => ops
-            .iter()
-            .all(|op| matches!(op, ServerOp::Delete { source_mailbox: s, .. } if s == source_mailbox))
-            .then_some(Homogeneous::Delete {
-                source: source_mailbox,
-            }),
-        ServerOp::SetRead { .. } | ServerOp::SetFlagged { .. } => None,
-    }
-}
-
-pub(crate) fn message_id_of(op: &ServerOp) -> String {
-    op.message_id().to_string()
 }
 
 #[cfg(test)]
@@ -322,46 +291,6 @@ mod tests {
         }
     }
 
-    /// A uniform batch of moves is runnable over one IMAP connection: same
-    /// source, same destination.
-    #[test]
-    fn a_uniform_move_batch_is_homogeneous() {
-        let ops = vec![
-            mv("<1@x>", "INBOX", "Archive"),
-            mv("<2@x>", "INBOX", "Archive"),
-        ];
-        assert!(matches!(
-            homogeneous(&ops),
-            Some(Homogeneous::Move { source: "INBOX", dest: "Archive" })
-        ));
-    }
-
-    /// Two moves out of different mailboxes cannot share one SELECT.
-    #[test]
-    fn a_mixed_move_batch_is_not_homogeneous() {
-        let ops = vec![
-            mv("<1@x>", "INBOX", "Archive"),
-            mv("<2@x>", "Archive", "INBOX"),
-        ];
-        assert!(homogeneous(&ops).is_none());
-    }
-
-    /// A uniform delete batch shares a connection; a read toggle never does.
-    #[test]
-    fn delete_batches_but_flags_do_not() {
-        let dels = vec![del("<1@x>", "INBOX"), del("<2@x>", "INBOX")];
-        assert!(matches!(
-            homogeneous(&dels),
-            Some(Homogeneous::Delete { source: "INBOX" })
-        ));
-        let flags = vec![ServerOp::SetRead {
-            message_id: "<1@x>".to_string(),
-            mailbox: "INBOX".to_string(),
-            read: true,
-        }];
-        assert!(homogeneous(&flags).is_none());
-    }
-
     /// The kind strings are the `pending_ops.kind` column values (#0039), and
     /// every op names its message.
     #[test]
@@ -377,7 +306,25 @@ mod tests {
             .kind(),
             "set_read"
         );
+        assert_eq!(
+            ServerOp::SetAnswered {
+                message_id: "<1@x>".to_string(),
+                mailboxes: vec!["INBOX".to_string()],
+                answered: true,
+            }
+            .kind(),
+            "set_answered"
+        );
         assert_eq!(mv("<abc@x>", "INBOX", "Archive").message_id(), "<abc@x>");
+        assert_eq!(
+            ServerOp::SetAnswered {
+                message_id: "<abc@x>".to_string(),
+                mailboxes: Vec::new(),
+                answered: false,
+            }
+            .message_id(),
+            "<abc@x>"
+        );
     }
 
     /// The op round-trips through JSON, which is what the durable queue stores
@@ -396,6 +343,11 @@ mod tests {
                 message_id: "<4@x>".to_string(),
                 mailbox: "INBOX".to_string(),
                 flagged: false,
+            },
+            ServerOp::SetAnswered {
+                message_id: "<5@x>".to_string(),
+                mailboxes: vec!["INBOX".to_string(), "Archive".to_string()],
+                answered: true,
             },
         ] {
             let json = serde_json::to_string(&op).unwrap();

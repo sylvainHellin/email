@@ -100,8 +100,16 @@ pub enum Rollback {
     /// Restore a row's full flag string (read and starred toggles both ride the
     /// same column, so the whole string is what round-trips cleanly).
     Flags { id: i64, flags: String },
-    /// A delete has nothing to restore: the row is gone and the server still
-    /// holds the message, so the next sync refetches it.
+    /// Nothing to undo. Two cases:
+    ///
+    /// - a delete cannot be restored: the row is gone and the server still
+    ///   holds the message, so the next sync refetches it;
+    /// - the post-send answered/forwarded bit (#0076) must **not** be undone.
+    ///   It records something that actually happened, the user's reply left the
+    ///   building, and no server refusal makes that untrue. Rolling it back
+    ///   would replace a true local statement the next sync can correct with a
+    ///   false one, and this is the one op kind whose local half is written on
+    ///   the tail of a delivered send.
     None,
 }
 
@@ -282,6 +290,96 @@ fn apply_flag_change(
     tx.commit().context("committing the flag change and its op")?;
     info!("[pending_ops] queued a {} for row {id} as op {op_id}", op.kind());
     Ok(Some(op_id))
+}
+
+/// What [`apply_post_send_flag`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostSendFlag {
+    /// Local rows whose answered/forwarded bit was written.
+    pub rows: usize,
+    /// The queued op, when there was a server half to owe. `None` for a Graph
+    /// account, or when nothing local matched.
+    pub op_id: Option<i64>,
+}
+
+/// Write the post-send `\Answered` / `$Forwarded` bit on every local copy of a
+/// source message and enqueue the single multi-mailbox server op, atomically
+/// (#TKT-0051, #0076).
+///
+/// The send path's op: it runs after a message has already been delivered, so
+/// it is called for its effect and its error is only ever logged. What the
+/// queue buys over the old inline per-mailbox `UID STORE` is that the server
+/// half is durable and retried by the background drain instead of being lost
+/// with the process, and that it costs the send path one `COMMIT` rather than N
+/// IMAP logins.
+///
+/// `server_mailboxes` is empty for a Graph account (answered lives in extended
+/// MAPI properties and the backend is parked, #0042/#0055), which writes the
+/// local half and queues nothing.
+///
+/// The op's rollback is [`Rollback::None`] on purpose; see that variant.
+pub fn apply_post_send_flag(
+    store: &Store,
+    account: &str,
+    message_id: &str,
+    answered: bool,
+    server_mailboxes: &[String],
+) -> Result<PostSendFlag> {
+    let tx = store
+        .immediate_transaction()
+        .context("opening the post-send flag transaction")?;
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id FROM messages WHERE account = ?1 AND message_id = ?2")?;
+        let rows = stmt.query_map(rusqlite::params![account, message_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()
+            .context("listing the local copies of a sent message's source")?
+    };
+    if ids.is_empty() {
+        return Ok(PostSendFlag::default());
+    }
+    for id in &ids {
+        let current: Option<String> = tx
+            .query_row("SELECT flags FROM messages WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("reading a message's flags")?
+            .flatten();
+        let old = crate::types::MessageFlags::parse(current.as_deref().unwrap_or_default());
+        let new = if answered {
+            crate::types::MessageFlags { answered: true, ..old }
+        } else {
+            crate::types::MessageFlags { forwarded: true, ..old }
+        };
+        tx.execute(
+            "UPDATE messages SET flags = ?2 WHERE id = ?1",
+            rusqlite::params![id, new.to_flag_string()],
+        )
+        .context("writing the post-send flag")?;
+    }
+    let op_id = if server_mailboxes.is_empty() {
+        None
+    } else {
+        Some(enqueue(
+            &tx,
+            account,
+            ids.first().copied(),
+            &ServerOp::SetAnswered {
+                message_id: message_id.to_string(),
+                mailboxes: server_mailboxes.to_vec(),
+                answered,
+            },
+            &Rollback::None,
+        )?)
+    };
+    tx.commit().context("committing the post-send flag and its op")?;
+    if let Some(op_id) = op_id {
+        info!("[pending_ops] queued a set_answered for {message_id} as op {op_id}");
+    }
+    Ok(PostSendFlag {
+        rows: ids.len(),
+        op_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1111,133 @@ mod tests {
             "Email with Message-ID <inbox-1@example.com> not found in INBOX on server"
         );
         assert!(read::find_by_id(&fx.store, id).unwrap().is_none(), "a delete has nothing to restore");
+        assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
+    }
+
+    /// The post-send flag write (#0076) commits the local bit and one
+    /// multi-mailbox server op together, and the op names every folder the
+    /// source is filed in, so the drain spends one IMAP session where the old
+    /// inline path spent one login per mailbox.
+    #[test]
+    fn a_post_send_flag_writes_every_copy_and_queues_one_op() {
+        let fx = fixture();
+        let inbox = fx.ingest_plain("inbox", 1, "Question");
+        fx.store
+            .conn()
+            .execute(
+                "INSERT INTO messages (account, mailbox, uid, message_id, subject)
+                 SELECT account, 'archive', 99, message_id, subject FROM messages WHERE id = ?1",
+                [inbox],
+            )
+            .unwrap();
+
+        let outcome = apply_post_send_flag(
+            &fx.store,
+            "alice",
+            "<inbox-1@example.com>",
+            true,
+            &["INBOX".to_string(), "Archive".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.rows, 2);
+        for row in read::find_by_message_id(&fx.store, "alice", "<inbox-1@example.com>").unwrap() {
+            assert!(row.is_answered(), "{} was not flagged", row.mailbox);
+        }
+        let queued = queued_ops(&fx.store, "alice").unwrap();
+        assert_eq!(queued.len(), 1, "N mailboxes are one op, not N");
+        assert_eq!(queued[0].kind, "set_answered");
+        assert_eq!(queued[0].rollback, Rollback::None);
+    }
+
+    /// The #0076 durability contract, offline: a send that succeeded and whose
+    /// flag bookkeeping then fails for good must leave the message **sent**.
+    ///
+    /// The outbox row keeps its post-delivery state and its exactly-once
+    /// submission marker, so the startup sweep finds nothing to resubmit; the
+    /// answered bit stays true, because it records something that happened and
+    /// [`Rollback::None`] is the right undo for it; and the refusal is visible
+    /// as a `failed` queue row rather than a silent loss.
+    #[tokio::test]
+    async fn a_refused_post_send_flag_never_re_sends_the_message() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 1, "Question");
+        let envelope = crate::outbox::Envelope {
+            from: "me@example.com".to_string(),
+            recipients: vec![("bob@example.com".to_string(), crate::send::RecipientRole::To)],
+            ..Default::default()
+        };
+        let row_id = crate::outbox::enqueue(
+            &fx.store,
+            &fx.blobs,
+            "alice",
+            None,
+            "<sent-1@example.com>",
+            b"From: me\r\n\r\nbody",
+            &envelope,
+        )
+        .unwrap();
+        crate::outbox::mark_submission_started(&fx.store, row_id).unwrap();
+        let state = crate::outbox::record_submission(
+            &fx.store,
+            &fx.blobs,
+            row_id,
+            &crate::outbox::SubmitOutcome::Accepted,
+        )
+        .unwrap();
+        assert!(!state.is_open(), "the message is out and its row is settled");
+
+        // The bookkeeping the send owes, and a server that refuses it forever.
+        apply_post_send_flag(
+            &fx.store,
+            "alice",
+            "<inbox-1@example.com>",
+            true,
+            &["INBOX".to_string()],
+        )
+        .unwrap();
+        let base = unix_now();
+        for tick in 0..MAX_ATTEMPTS {
+            let mut exec = FakeExecutor::scripted(vec![Err(anyhow::anyhow!("STORE rejected"))]);
+            drain(&fx.store, &fx.blobs, "alice", &mut exec, base + (tick + 1) * 10_000_000)
+                .await
+                .unwrap();
+        }
+
+        // The send is untouched: same row, same terminal state, nothing the
+        // startup sweep would submit again.
+        let sent = crate::outbox::load(&fx.store, row_id).unwrap().unwrap();
+        assert_eq!(sent.state, state);
+        let sweep = crate::outbox::sweep_pending_sends(&fx.store, "alice").unwrap();
+        assert!(sweep.resubmittable.is_empty(), "a failed flag op must never re-send");
+        assert!(sweep.stranded.is_empty());
+        assert_eq!(crate::outbox::unfinished_rows(&fx.store, "alice").unwrap().len(), 0);
+
+        // The bit stands, and the refusal is visible.
+        assert!(read::find_by_id(&fx.store, id).unwrap().unwrap().is_answered());
+        assert_eq!(failed_ops(&fx.store, "alice").unwrap().len(), 1);
+    }
+
+    /// A post-send flag op that already landed before a crash replays and
+    /// converges: the drain retires it and the answered bit stays.
+    #[tokio::test]
+    async fn a_post_send_flag_replay_converges() {
+        let fx = fixture();
+        let id = fx.ingest_plain("inbox", 1, "Question");
+        apply_post_send_flag(
+            &fx.store,
+            "alice",
+            "<inbox-1@example.com>",
+            false,
+            &["INBOX".to_string()],
+        )
+        .unwrap();
+
+        let mut exec = FakeExecutor::scripted(vec![not_found("<inbox-1@example.com>")]);
+        let r = drain(&fx.store, &fx.blobs, "alice", &mut exec, unix_now() + 10).await.unwrap();
+
+        assert_eq!((r.completed, r.failed), (1, 0));
+        assert!(read::find_by_id(&fx.store, id).unwrap().unwrap().is_forwarded());
         assert!(queued_ops(&fx.store, "alice").unwrap().is_empty());
     }
 

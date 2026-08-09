@@ -101,8 +101,11 @@ The synchronous settle deliberately does *not* converge a not-found, because a C
 `send::send_draft(&EmailDraft, &SendContext) -> SentDraft` is the one orchestration behind `mp send`, `mp send-approved` and both TUI send keys: it builds the bytes, commits the outbox row, submits over SMTP or Graph depending on which the context names, and retires the draft file.
 Callers keep only what differs between them, the confirmation prompt, the wording of the result and the exit code.
 
-A reply or forward draft names its source in `in_reply_to:` / `forwarded_from:`, and `send::mark_source_after_send` is the one reader: after a successful submission it flags every local copy of that source `\Answered` or `$Forwarded` and then issues `UID STORE +FLAGS` per mailbox (#TKT-0051).
-Local first, server second, best effort throughout: nothing there may fail a send that already went out, and a `UID STORE` that never landed is corrected by the next sync rather than retried.
+A reply or forward draft names its source in `in_reply_to:` / `forwarded_from:`, and `send::mark_source_after_send` is the one reader: after a successful submission it flags every local copy of that source `\Answered` or `$Forwarded` and enqueues the server half on the durable queue as a single `ServerOp::SetAnswered` naming every server folder the source is filed in (#TKT-0051, #0076).
+The send path opens no IMAP session for this: it costs one `COMMIT`, and the drain writes the flag in every named folder over one session (`imap_client::add_flag_in_mailboxes`) at the next resume point.
+Best effort throughout, which here is a durability statement: the enqueue happens strictly after delivery, touches no `outbox` row, and every error is logged and swallowed, so bookkeeping can neither fail nor re-send a message that already went out.
+The op's rollback is `Rollback::None` on purpose: the answered bit records something that happened, so a server refusal is not a reason to un-say it; the next sync restates whatever the server holds.
+A Graph account writes the local bit and queues nothing (answered lives in extended MAPI properties, #0042/#0055).
 
 `src/send.rs` builds the message, then `DurableSend::begin` commits the raw bytes as a blob and a `pending_send` outbox row *before* SMTP opens.
 Submission is per recipient: each recipient gets an individual envelope while the visible To and Cc headers are preserved for all, which gives per-recipient success and failure tracking.
@@ -165,7 +168,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/draft.rs` | Draft parsing and validation, reply and forward creation (`create_draft_from_source`), `source_from_row`, status transitions, `settle_sent_draft` |
 | `src/send.rs` | `markdown_to_html`, message building, `send_draft` + `SendContext`, per-recipient submission, `DurableSend`, `resume_outbox` |
 | `src/outbox.rs` | The durable send state machine and its blob refcounting |
-| `src/ops.rs` | `ServerOp` (the remote half of a mutation) and its IMAP/Graph execution seam `run_ops` / `run_op`, at library layer so the durable queue and the CLI can drive it without depending on `tui/` |
+| `src/ops.rs` | `ServerOp` (the remote half of a mutation) and its IMAP/Graph execution seam `run_op`, at library layer so the durable queue and the CLI can drive it without depending on `tui/` |
 | `src/pending_ops.rs` | The durable mutation queue (#0039): atomic local-write-plus-enqueue, the drain with backoff and per-kind rollback, crash-replay, `resume_account` (sync-tick drain) and `run_and_settle` (the CLI's synchronous single-op path) |
 | `src/engine_lock.rs` | One engine per account across processes (#0061): a non-blocking `flock` on `<account_dir>/store.lock`, released on exit or crash |
 | `src/graph.rs` | Microsoft Graph REST client: folders, fetch, sync, send, move, delete, read flags, search |

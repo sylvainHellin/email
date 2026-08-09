@@ -3,8 +3,9 @@ id: 0076
 title: The post-send flag write opens one IMAP session per mailbox
 type: perf
 priority: later
-status: open
+status: done
 created: 2026-08-08
+closed: 2026-08-11
 ---
 
 Deferred note (N4) from the fresh-context review of [#TKT-0051](TKT-0051-email-status.md), commit `04d311c`, not a regression of it.
@@ -68,3 +69,24 @@ Still open; revisit alongside the #0039 TUI/CLI wiring.
 - One IMAP session for a source held in N mailboxes, pinned by whatever the chosen direction makes testable offline.
 - A send still cannot be failed, delayed past delivery, or retried by the flag write.
 - `cargo test` green; the #0063 outbox invariants unchanged.
+
+## Implementation (2026-08-11): direction 2, on the #0039 queue
+
+Both directions landed, because direction 2 needs a server op and the cheapest correct one is direction 1's multi-mailbox form.
+
+- **The op.** `ServerOp::SetAnswered { message_id, mailboxes, answered }` (`src/ops.rs`), kind `set_answered`, the one multi-mailbox op: a source is one store row per mailbox and the same server message in each, so naming the list lets the drain write them all over a single session.
+  `imap_client::add_flag_in_mailboxes` (`src/imap_client/batch.rs`) is that session: open once, SELECT/SEARCH/`UID STORE +FLAGS` per folder, logout.
+  Idempotent (`+FLAGS` on a flag that may already be set is a no-op) and not-found tolerant per folder, so a crash replay converges; the drain's typed `NotFoundOnServer` convergence covers the rest.
+  Graph enqueues nothing at all: the send path passes an empty mailbox list, and the Graph arm of `run_op` is a logged `Ok` for safety.
+- **The rollback is `Rollback::None`, and that is the considered answer.** The answered bit records something that happened: the reply left the building. A server that refuses the `UID STORE` does not make that untrue, so rolling the local bit back would replace a true statement the next sync can correct with a false one. This is also the one op kind whose local half is written on the tail of a delivered send, so an automatic undo there is the last thing wanted. Convergence is the sync, which restates every flag the server holds over the whole window.
+- **The send path.** `send::mark_source_after_send` now reads the source's rows, deduplicates their server folders (`server_mailboxes_of`) and calls `pending_ops::apply_post_send_flag`, which commits the local flag on every copy and the single op in one transaction. No IMAP session is opened on the send path at all; the cost is one `COMMIT`. Every error is still logged and swallowed, the function still returns `()`, and the enqueue happens strictly after delivery and touches no `outbox` row, so the #0063 exactly-once submission marker is untouched by this path.
+
+### Acceptance
+
+- One IMAP session for a source held in N mailboxes: `pending_ops::a_post_send_flag_writes_every_copy_and_queues_one_op` pins two folders on one op; `send::the_server_mailbox_list_is_deduplicated` pins the dedup.
+- A send cannot be failed, delayed or retried by the flag write: `pending_ops::a_refused_post_send_flag_never_re_sends_the_message` drives the flag op past its retry budget after a recorded submission and asserts the outbox row keeps its terminal state, `sweep_pending_sends` finds nothing resubmittable, the answered bit stands and the refusal is visible as a `failed` queue row.
+- `a_post_send_flag_replay_converges` pins the crash replay.
+
+### Known gap N5 unchanged
+
+Replying to a server-search hit with no local row still flags nothing: `apply_post_send_flag` finds no rows and queues nothing, exactly as the old path returned early. Closing it still needs a draft-frontmatter key, still a decision rather than a sweep fix.

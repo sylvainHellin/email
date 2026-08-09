@@ -6,7 +6,7 @@ mod sent;
 mod store_sync;
 mod watch;
 
-pub use batch::{batch_delete_on_server, batch_move_on_server};
+pub use batch::{add_flag_in_mailboxes, batch_delete_on_server, batch_move_on_server};
 pub use fetch::{
     fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, vanished_uids, FetchedRaw,
     MailboxState,

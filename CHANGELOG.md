@@ -31,6 +31,18 @@ All notable changes to this project are documented in this file.
   error, so deleting a message the server no longer holds still reports it.
 
 ### Changed
+- **The post-send `\Answered` / `$Forwarded` write is off the send path and
+  durable (#0076).** Flagging the source of a reply or a forward used to open a
+  full IMAP session per mailbox the source was filed in, on the tail of a
+  successful send: three logins for a message held in inbox, archive and sent,
+  multiplied per draft by `mp send-approved`. It now commits the local flag and
+  a single multi-mailbox `set_answered` op on the `pending_ops` queue in one
+  transaction, and the background drain writes every folder over one IMAP
+  session at the next sync or startup. The send path spends no network at all
+  on bookkeeping, and a flag write that fails is retried instead of lost. The
+  durability rules are unchanged: the enqueue happens after delivery and touches
+  no outbox row, so bookkeeping still cannot fail, delay or re-send a message,
+  and a refused flag op is never rolled back, because the reply did go out.
 - **Archive, delete, move and flag toggles are now durable, in the TUI and the
   CLI alike (#0039).** Both frontends route every mutation through the
   `pending_ops` queue: the local change and the server op it owes commit in one

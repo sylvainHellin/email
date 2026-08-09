@@ -470,12 +470,49 @@ mod tests {
             .unwrap()
             .unwrap()
             .message_id;
-        let flagged = mark_source_locally(&fx.store, "alice", &message_id, true);
-        assert_eq!(flagged.len(), 2, "both copies are found by Message-ID");
+        let rows =
+            crate::store::read::find_by_message_id(&fx.store, "alice", &message_id).unwrap();
+        let mailboxes = server_mailboxes_of(&crate::config::AccountConfig::default(), &rows);
+        let outcome = crate::pending_ops::apply_post_send_flag(
+            &fx.store,
+            "alice",
+            &message_id,
+            true,
+            &mailboxes,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.rows, 2, "both copies are found by Message-ID");
         for row in crate::store::read::find_by_message_id(&fx.store, "alice", &message_id).unwrap() {
             assert!(row.is_answered(), "{} was not flagged", row.mailbox);
             assert!(!row.is_forwarded());
         }
+        // Two mailboxes, one queued op: the whole point of #0076 is that the
+        // server half is one multi-mailbox op rather than one session each.
+        let queued = crate::pending_ops::queued_ops(&fx.store, "alice").unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, "set_answered");
+        match &queued[0].op {
+            crate::ops::ServerOp::SetAnswered { mailboxes, .. } => {
+                assert_eq!(mailboxes.len(), 2, "both server folders ride one op");
+            }
+            other => panic!("unexpected op {other:?}"),
+        }
+    }
+
+    /// The distinct server folders are what ride the op: two local rows in the
+    /// same server folder are one `SELECT`, not two.
+    #[test]
+    fn the_server_mailbox_list_is_deduplicated() {
+        let fx = crate::reconcile::tests::fixture();
+        let a = fx.ingest_plain("inbox", 1, "One");
+        let b = fx.ingest_plain("inbox", 2, "Two");
+        let rows: Vec<_> = [a, b]
+            .into_iter()
+            .map(|id| crate::store::read::find_by_id(&fx.store, id).unwrap().unwrap())
+            .collect();
+        let mailboxes = server_mailboxes_of(&crate::config::AccountConfig::default(), &rows);
+        assert_eq!(mailboxes.len(), 1, "one server folder, one SELECT");
     }
 
     /// A forward sets the other bit, and neither write disturbs the read bit
@@ -490,12 +527,17 @@ mod tests {
             .unwrap()
             .unwrap()
             .message_id;
-        mark_source_locally(&fx.store, "alice", &message_id, false);
+        crate::pending_ops::apply_post_send_flag(&fx.store, "alice", &message_id, false, &[])
+            .unwrap();
 
         let row = crate::store::read::find_by_id(&fx.store, id).unwrap().unwrap();
         assert!(row.is_forwarded());
         assert!(!row.is_answered());
         assert!(row.is_read(), "the read bit survives a history write");
+        assert!(
+            crate::pending_ops::queued_ops(&fx.store, "alice").unwrap().is_empty(),
+            "no server mailboxes (a Graph account) queues nothing"
+        );
     }
 
     /// A source the store does not hold flags nothing and says so, which is
@@ -504,7 +546,17 @@ mod tests {
     #[test]
     fn a_source_the_store_does_not_hold_flags_nothing() {
         let fx = crate::reconcile::tests::fixture();
-        assert!(mark_source_locally(&fx.store, "alice", "<gone@example.com>", true).is_empty());
+        let outcome = crate::pending_ops::apply_post_send_flag(
+            &fx.store,
+            "alice",
+            "<gone@example.com>",
+            true,
+            &["INBOX".to_string()],
+        )
+        .unwrap();
+        assert_eq!(outcome.rows, 0);
+        assert_eq!(outcome.op_id, None, "nothing local means nothing owed");
+        assert!(crate::pending_ops::queued_ops(&fx.store, "alice").unwrap().is_empty());
     }
 
     /// The key is the frontmatter id when there is one, because that is what
@@ -1730,57 +1782,51 @@ fn source_to_flag(draft: &EmailDraft) -> Option<(&str, bool)> {
     (!message_id.is_empty()).then_some((message_id, answered))
 }
 
-/// Flag every local copy of the source and hand back the rows that were found.
+/// The distinct server mailboxes the local copies of a source live in, in a
+/// stable order (#0076).
 ///
-/// Every copy, because the same message is one row per mailbox and the user is
-/// as likely to be looking at the archived one as at the inbox one. A row that
-/// refuses the write is logged and the rest still go: this runs after a
-/// message has already left, and nothing here may turn a successful send into
-/// a failure.
-fn mark_source_locally(
-    store: &crate::store::Store,
-    account: &str,
-    message_id: &str,
-    answered: bool,
-) -> Vec<crate::store::read::MessageRow> {
-    let rows = match crate::store::read::find_by_message_id(store, account, message_id) {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("[send] could not look {message_id} up to flag it: {e:#}");
-            return Vec::new();
-        }
-    };
-    for row in &rows {
-        let written = if answered {
-            crate::store::write::set_answered(store, row.id)
-        } else {
-            crate::store::write::set_forwarded(store, row.id)
-        };
-        if let Err(e) = written {
-            warn!("[send] could not flag message row {}: {e:#}", row.id);
+/// One store row per mailbox is one server folder to flag; the same folder
+/// twice is one `SELECT`, so the list is deduplicated before it rides the op.
+fn server_mailboxes_of(
+    account: &crate::config::AccountConfig,
+    rows: &[crate::store::read::MessageRow],
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let server_mailbox = crate::config::find_server_name_for_role(account, &row.mailbox);
+        if seen.insert(server_mailbox.clone()) {
+            out.push(server_mailbox);
         }
     }
-    rows
+    out
 }
 
 /// The second status axis, written after the message actually went out
-/// (#TKT-0051).
+/// (#TKT-0051, moved onto the durable queue by #0076).
 ///
 /// A reply draft carries `in_reply_to:` and a forward carries
 /// `forwarded_from:`, both the source's `Message-ID`; this is the one reader
-/// of either. The order is local first, server second, because the local write
-/// is what the list redraws from and the server op is the half that can fail.
+/// of either. The local flag write and the server op's queue row commit in one
+/// transaction ([`crate::pending_ops::apply_post_send_flag`]), and that commit
+/// is the whole cost on the send path: **no IMAP session is opened here**. The
+/// server half is one multi-mailbox op that
+/// [`crate::pending_ops::resume_account`] drains over a single session on the
+/// next tick or at the next startup.
 ///
-/// Best effort throughout: nothing here may fail a send that already
-/// succeeded, and nothing here is retried. The self-heal is the sync itself,
-/// which restates every flag the server holds over the whole window, so a
-/// `UID STORE` that never landed is corrected on the next pass rather than
-/// leaving the store claiming something the server denies.
+/// Best effort throughout, and that is a durability statement, not a shrug:
+/// nothing here may fail, delay or retry a send that already succeeded, so
+/// every error is logged and swallowed, and the function returns `()`. The
+/// enqueue happens strictly after the delivery and touches no `outbox` row, so
+/// the exactly-once submission marker (#0063) is untouched by this path: a
+/// message can never be re-sent because its bookkeeping failed. A queue row
+/// that can never be written is still self-healed by the sync, which restates
+/// every flag the server holds over the whole window.
 ///
-/// The Graph path writes locally and stops: Graph exposes the answered state
-/// only through extended MAPI properties, and the backend is parked (#0042,
-/// #0055). Its flag merge (`ingest::apply_seen_flags`) is what keeps a Graph
-/// sync from erasing what is written here.
+/// The Graph path writes locally and queues nothing: Graph exposes the answered
+/// state only through extended MAPI properties, and the backend is parked
+/// (#0042, #0055). Its flag merge (`ingest::apply_seen_flags`) is what keeps a
+/// Graph sync from erasing what is written here.
 async fn mark_source_after_send(draft: &EmailDraft, ctx: &SendContext) {
     let Some((message_id, answered)) = source_to_flag(draft) else {
         return;
@@ -1793,40 +1839,40 @@ async fn mark_source_after_send(draft: &EmailDraft, ctx: &SendContext) {
             return;
         }
     };
-    let rows = mark_source_locally(&store, &ctx.account.name, message_id, answered);
-    drop(store);
+    let rows = match crate::store::read::find_by_message_id(&store, &ctx.account.name, message_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("[send] could not look {message_id} up to flag it: {e:#}");
+            return;
+        }
+    };
     if rows.is_empty() {
         debug!("[send] nothing local to flag for {message_id}");
         return;
     }
-
-    if ctx.graph.is_some() {
-        return;
-    }
-    let imap_config = match crate::config::ImapConfig::load(&ctx.account) {
-        Ok(config) => config,
-        Err(e) => {
-            debug!("[send] no IMAP config to flag {message_id} on the server: {e:#}");
-            return;
-        }
-    };
-    let flag = if answered {
-        crate::types::FLAG_ANSWERED
+    // A Graph account, or an account with no usable IMAP config, has no server
+    // half to owe: write the local bit and queue nothing.
+    let server_mailboxes = if ctx.graph.is_some() {
+        Vec::new()
+    } else if let Err(e) = crate::config::ImapConfig::load(&ctx.account) {
+        debug!("[send] no IMAP config to flag {message_id} on the server: {e:#}");
+        Vec::new()
     } else {
-        crate::types::FLAG_FORWARDED
+        server_mailboxes_of(&ctx.account, &rows)
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    for row in &rows {
-        let server_mailbox = crate::config::find_server_name_for_role(&ctx.account, &row.mailbox);
-        if !seen.insert(server_mailbox.clone()) {
-            continue;
-        }
-        if let Err(e) =
-            crate::imap_client::add_flag_on_server(&imap_config, message_id, &server_mailbox, flag)
-                .await
-        {
-            warn!("[send] could not set {flag} on {message_id} in {server_mailbox}: {e:#}");
-        }
+
+    match crate::pending_ops::apply_post_send_flag(
+        &store,
+        &ctx.account.name,
+        message_id,
+        answered,
+        &server_mailboxes,
+    ) {
+        Ok(outcome) => debug!(
+            "[send] flagged {} local row(s) for {message_id}, server op {:?}",
+            outcome.rows, outcome.op_id
+        ),
+        Err(e) => warn!("[send] could not flag {message_id}: {e:#}"),
     }
 }
 

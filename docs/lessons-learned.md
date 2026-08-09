@@ -733,3 +733,22 @@ The resolution is that the CLI does not use the converging drain at all.
 `pending_ops::run_and_settle` enqueues, runs the single owed op, and returns its raw result, retiring on success and rolling the local half back on any failure including not-found, because a synchronous caller runs the op once in the process that enqueued it and so is never a crash-replay.
 So the queue is one seam with two settle policies (`drain` converges, `run_and_settle` reports), and the discriminator is which entry point the caller picked, not what the backend returned.
 Keep `run_and_settle` testable offline by splitting the settle decision (`settle(store, blobs, row, outcome)`) from the one `await` that produces the outcome; the decision is what a not-found regression needs to exercise, and it needs no live backend.
+
+## Not every queued op has a rollback, and the post-send flag is the one that must not
+
+The durable queue's failure policy is "roll the local half back to the server's truth and park the row as `failed`", which is right for a move or a read toggle: the user asserted a wish, the server refused it, so the wish is withdrawn.
+The post-send `\Answered` / `$Forwarded` bit (#0076) is a different kind of statement.
+It does not assert a wish; it records a fact, that the reply left the building, and no `UID STORE` refusal makes that fact untrue.
+Rolling it back would replace a true local statement that the next sync can correct with a false one, on the tail of a delivered send, which is the last place an automatic undo belongs.
+So its rollback is `Rollback::None` and its convergence is the sync, which restates every flag the server holds over the whole window.
+The generalisation: pick a queued op's rollback by asking what the local write *means*, not by copying the neighbouring kind's.
+A wish-shaped write rolls back; a fact-shaped write never does.
+
+## Bookkeeping that rides the send path must be enqueued, never dialled
+
+The same #0076 pass moved that flag write off the send path entirely, and the reason is worth keeping.
+The old shape opened a connect-TLS-login-SELECT IMAP session per mailbox the source was filed in, inline, after a successful `send_draft`, so a message held in inbox, archive and sent cost three sequential logins on the tail of every reply, multiplied per draft by `mp send-approved`.
+The invariant it had to preserve is narrow and absolute: bookkeeping may never fail, delay or re-send a delivered message.
+Inline best-effort satisfies it only by swallowing every error, which also means the write is simply lost when it fails.
+Enqueuing satisfies it better: one `COMMIT` on the send path, no network at all, no `outbox` row touched so the exactly-once submission marker (#0063) cannot be reached from here, and the failure is retried by the drain instead of dropped.
+The offline pin for "a failed flag never re-sends" is to record a real submission, drive the flag op past its retry budget, and assert the outbox row keeps its terminal state and `sweep_pending_sends` finds nothing resubmittable.
