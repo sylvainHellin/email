@@ -394,6 +394,20 @@ pub(crate) fn modseq_to_record(
     server.filter(|&m| m > 0).and_then(|m| i64::try_from(m).ok())
 }
 
+/// Did this pass's window cover the whole listing?
+///
+/// The one rule both return paths ask, so neither can answer it its own way.
+/// The subtlety is the empty window: `mp sync -n 0` computes a whole vanished
+/// set and returns before pass 1 with `window.len() == 0` while `listed` is the
+/// entire (non-empty) mailbox, so it saw *no* flags and must not vouch for any.
+/// Hardcoding `true` there recorded the server's HIGHESTMODSEQ off a pass that
+/// fetched nothing, and the next `CHANGEDSINCE` skipped every flag change in
+/// between (#0041 review blocker). A genuinely empty mailbox is `0 == 0` and
+/// still records, which is correct: there is nothing to have missed.
+pub(crate) fn window_is_whole_mailbox(window_len: usize, listed_len: usize) -> bool {
+    window_len == listed_len
+}
+
 /// Which UIDs in the window the store does not hold.
 ///
 /// The full pass reads this off the `FETCH` response, which restates every
@@ -537,10 +551,14 @@ pub async fn fetch_new_raw_on_session(
             enumeration_complete,
             download_incomplete: coverage.incomplete,
             pending_arrival_mark: coverage.pending_mark,
-            // Nothing in the window means every flag in it was looked at, so
-            // the modseq may advance: this is the `mp sync -n 0` and
-            // empty-mailbox path.
-            highest_modseq: modseq_to_record(server_modseq, true, enumeration_complete),
+            // An empty window covers the mailbox only when the mailbox is
+            // itself empty. `mp sync -n 0` over a populated mailbox fetched no
+            // flags and may not advance the resume point (#0041 review).
+            highest_modseq: modseq_to_record(
+                server_modseq,
+                window_is_whole_mailbox(0, listed.len()),
+                enumeration_complete,
+            ),
         }
     };
 
@@ -595,8 +613,11 @@ pub async fn fetch_new_raw_on_session(
     } else {
         known_flags.len()
     };
-    let recordable_modseq =
-        modseq_to_record(server_modseq, window.len() == listed.len(), enumeration_complete);
+    let recordable_modseq = modseq_to_record(
+        server_modseq,
+        window_is_whole_mailbox(window.len(), listed.len()),
+        enumeration_complete,
+    );
 
     if new_uids.is_empty() {
         let coverage = arrival_coverage(
@@ -1087,6 +1108,55 @@ mod tests {
         // A modseq beyond i64 is a server the store cannot represent; it gets
         // the full window forever rather than a truncated resume point.
         assert_eq!(modseq_to_record(Some(u64::MAX), true, true), None);
+    }
+
+    /// The #0041 review blocker, scripted at the only level `fetch_new_raw` is
+    /// testable without a live socket: `mp sync -n 0` against a CONDSTORE
+    /// server takes the empty-window return, having fetched no flags at all,
+    /// and must leave the stored resume point alone. Recording the server's
+    /// HIGHESTMODSEQ there would make the next `CHANGEDSINCE` start past every
+    /// flag change made in between and lose them silently (#0004's failure).
+    #[test]
+    fn an_n0_pass_over_a_populated_mailbox_may_not_advance_the_modseq() {
+        let stored = Some(1_000u64);
+        let server = Some(2_000u64);
+        // The mailbox has 12 messages; `-n 0` gives `limit == Some(0)`, so the
+        // window is empty and the pass returns before pass 1.
+        let listed_len = 12usize;
+        let window_len = 0usize;
+
+        // The delta is engaged (this is the dangerous configuration): a
+        // CONDSTORE server, a prior recorded modseq, no UIDVALIDITY reset.
+        assert_eq!(
+            flag_pass(true, stored, server, false),
+            FlagPass::ChangedSince(1_000),
+            "a CONDSTORE server with a stored resume point runs the delta"
+        );
+
+        // The pass fetched nothing, so it vouches for nothing.
+        assert!(
+            !window_is_whole_mailbox(window_len, listed_len),
+            "an empty window over 12 listed messages is not whole-mailbox coverage"
+        );
+        assert_eq!(
+            modseq_to_record(server, window_is_whole_mailbox(window_len, listed_len), true),
+            None,
+            "`mp sync -n 0` must leave the stored modseq where it is"
+        );
+
+        // A genuinely empty mailbox still may advance: nothing was missed.
+        assert!(window_is_whole_mailbox(0, 0));
+        assert_eq!(
+            modseq_to_record(server, window_is_whole_mailbox(0, 0), true),
+            Some(2_000),
+            "an empty mailbox has no flags to have skipped"
+        );
+
+        // And an uncapped pass over the same populated mailbox still records.
+        assert_eq!(
+            modseq_to_record(server, window_is_whole_mailbox(listed_len, listed_len), true),
+            Some(2_000)
+        );
     }
 
     /// The delta's other half, and the one that breaks new mail rather than

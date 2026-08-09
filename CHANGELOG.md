@@ -109,6 +109,19 @@ All notable changes to this project are documented in this file.
   exactly the path it took before, unchanged. QRESYNC and UIDPLUS are split
   out to #0081.
 
+  Review follow-up: "saw the whole mailbox" had one hole. The early return for
+  an empty window asserted whole-mailbox coverage unconditionally, so
+  `mp sync -n 0`, a prune-only pass that fetches no flags at all, recorded
+  the server's `HIGHESTMODSEQ` anyway, and the next `CHANGEDSINCE` started past
+  every flag change made in between. Both return paths now ask one function,
+  `window_is_whole_mailbox(window_len, listed_len)`: an empty window covers
+  only an empty mailbox. Confirmed live against Gmail, where a `-n 0` pass with
+  a stale stored resume point left it stale (the pre-fix binary advanced it).
+  Separately, a batch move or delete whose trailing `EXPUNGE` fails now poisons
+  the pooled session: the caller's ops still succeeded, but a half-read EXPUNGE
+  leaves bytes in the stream that the next borrower inside the 20 s probe
+  window would read as its own answer.
+
 - **The sync orchestration moved behind a `SyncBackend` trait (#0059).** The
   loop that ingests a pass, keeps the #0074 arrival mark, applies flags,
   records cursors and defers the prune used to live between the IMAP calls in

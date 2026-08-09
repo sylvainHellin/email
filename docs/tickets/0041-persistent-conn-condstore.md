@@ -102,6 +102,28 @@ Post-LOGIN, read by the client and logged on every new connection.
 - tum (`xmail.mwn.de`, read-only `--dry-run` smoke): `UIDPLUS IDLE`, i.e. **neither CONDSTORE nor QRESYNC**, contradicting the matrix's prediction that tum is Dovecot with the full ladder. It takes the full-window path. This removes the only QRESYNC test target the client had; see the note in [#0081](0081-qresync-uidplus.md) and the live-probe section of the capability matrix.
 - Proton Bridge was not probed: the `perso` account was out of scope for this pass. The Gluon-source verdict (no CONDSTORE, no QRESYNC) stands, and the strict gate means an unprobed server simply takes the unchanged full-window path.
 
+## Review follow-up (2026-08-10)
+
+The #0041 review found one blocker and one should-fix; both are closed.
+
+Blocker: the whole-mailbox gate had a hole on the empty-window return path.
+`fetch.rs` returned early with `window_is_whole_mailbox` hardcoded to `true`, which is right for an empty mailbox and wrong for `mp sync -n 0`, where the window is empty because the cap is zero while the mailbox is full.
+That pass fetches no flags, yet it recorded the server's `HIGHESTMODSEQ`, and the next `CHANGEDSINCE` skipped every flag change in between: the #0004 failure the gate exists to prevent.
+Both return paths now go through one function, `window_is_whole_mailbox(window_len, listed_len)`, so an empty window vouches for the mailbox only when the mailbox is empty too.
+There are no other callers; the two `modseq_to_record` call sites are the whole surface.
+
+Confirmed live against Gmail (`assistant`), by setting the stored `inbox` resume point back to 15000 while the server sat at 15367:
+
+- full sync: all three mailboxes at 15367,
+- `-n 0` with the fixed binary: `inbox` stayed at 15000, the other two untouched,
+- `-n 0` with the pre-fix binary (same DB state): `inbox` jumped to 15367, reproducing the blocker,
+- third normal sync: back to 15367 legitimately, on a full window.
+
+Should-fix: `run_batch` returned the session to the pool unpoisoned when every per-message op succeeded but the trailing `EXPUNGE` or its `try_collect` failed.
+The failure stays non-fatal to the caller, whose moves or deletes did happen, but the connection is no longer trustworthy: a half-read EXPUNGE can leave untagged lines in the stream and a borrower within the 20 s `PROBE_AFTER` window skips the NOOP that would have caught it.
+Any EXPUNGE failure now poisons.
+The decision is factored into `must_poison`, which is the only part of `run_batch` testable without a live socket.
+
 ## Unblocks
 
 - [#0042](0042-graph-delta-sync.md) (Graph delta shares the cursor + engine).

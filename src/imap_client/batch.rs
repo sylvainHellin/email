@@ -231,22 +231,60 @@ async fn run_batch(
         });
     }
 
+    // Non-fatal to the *caller* — the moves or deletes already happened — but
+    // not to the connection: a half-read EXPUNGE leaves untagged lines and
+    // possibly the tagged OK in the stream, and the next borrower inside the
+    // 20s probe window skips the NOOP and reads them as its own answer
+    // (#0041 review). So the batch still succeeds and the session still dies.
+    let mut expunge_failed = false;
     if results.iter().any(Result::is_ok) {
         match session.expunge().await {
             Ok(stream) => {
                 if let Err(e) = stream.try_collect::<Vec<_>>().await {
-                    info!("Batch EXPUNGE collect failed (non-fatal): {}", e);
+                    info!("Batch EXPUNGE collect failed (non-fatal to the batch): {}", e);
+                    expunge_failed = true;
                 }
             }
-            Err(e) => info!("Batch EXPUNGE failed (non-fatal): {}", e),
+            Err(e) => {
+                info!("Batch EXPUNGE failed (non-fatal to the batch): {}", e);
+                expunge_failed = true;
+            }
         }
     }
     // Returned to the pool rather than logged out, unless a per-message op
     // failed: those leave a SEARCH or STORE response that may not have been
     // read to the end (#0041).
-    if results.iter().any(Result::is_err) {
+    if must_poison(results.iter().any(Result::is_err), expunge_failed) {
         pooled.poison();
     }
 
     results
+}
+
+/// Whether the session is safe to hand back to the pool.
+///
+/// Split out because it is the whole of the #0041 poison discipline and the
+/// only part of [`run_batch`] testable without a live socket: any failure that
+/// may have left an unread response in the stream kills the session, including
+/// the EXPUNGE the caller is told is non-fatal.
+fn must_poison(any_op_failed: bool, expunge_failed: bool) -> bool {
+    any_op_failed || expunge_failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::must_poison;
+
+    /// The review finding: all per-message ops succeeding does not clear the
+    /// session if the trailing EXPUNGE (or its collect) failed, because a
+    /// borrower reusing it within the 20s probe window would misread the
+    /// leftover bytes as its own answer.
+    #[test]
+    fn a_failed_expunge_poisons_even_when_every_op_succeeded() {
+        assert!(must_poison(false, true), "EXPUNGE failure alone must poison");
+        assert!(must_poison(true, false), "a failed op still poisons");
+        assert!(must_poison(true, true));
+        // The only clean case: everything succeeded, stream fully read.
+        assert!(!must_poison(false, false));
+    }
 }
