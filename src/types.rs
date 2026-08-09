@@ -269,13 +269,91 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Read `id:` strictly: a YAML string (or an absent / bare key) is accepted,
+/// anything else is an error naming what was found (#0083).
+///
+/// The failure this exists to stop is silent: a hand-written `id: 123e456` or
+/// `id: 1234567890123456` is a YAML number, not a string, so a lenient
+/// `Option<String>` read it as `None` and the next drafts-index refresh minted
+/// a *replacement* id into the file. The draft's identity changed under every
+/// selector and index row, with no error anywhere (#0077's root cause). Making
+/// it an error routes the file through the existing skipped-draft path
+/// ([`crate::store::drafts::SkippedDraft`]), which names the file and the
+/// reason instead of re-identifying it behind the user's back.
+///
+/// Nothing is coerced: a number is not read as its digits, because the digits
+/// a YAML float round-trips to are not the digits the user typed.
+fn strict_optional_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    use std::fmt;
+
+    struct IdVisitor;
+
+    const EXPECTING: &str = "a quoted string id (an unquoted YAML number or boolean is not an id; wrap it in quotes)";
+
+    impl<'de> Visitor<'de> for IdVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str(EXPECTING)
+        }
+
+        fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(IdVisitor)
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Signed(v), &EXPECTING))
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Unsigned(v), &EXPECTING))
+        }
+
+        fn visit_f64<E: Error>(self, v: f64) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Float(v), &EXPECTING))
+        }
+
+        fn visit_bool<E: Error>(self, v: bool) -> Result<Self::Value, E> {
+            Err(E::invalid_type(Unexpected::Bool(v), &EXPECTING))
+        }
+    }
+
+    deserializer.deserialize_any(IdVisitor)
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EmailFrontmatter {
     /// Stable identity of a draft (#0050, DAL decision C). `mp new` writes it,
     /// the drafts index assigns one to any agent-written file that lacks it,
     /// and it is the key of every `mp://<account>/drafts/<key>` selector. It
     /// survives a rename, which is exactly what the filename cannot do.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Read strictly: see [`strict_optional_id`]. A non-string scalar here is
+    /// a loud per-draft error, never a silent re-mint (#0083).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "strict_optional_id")]
     pub id: Option<String>,
     #[serde(default)]
     pub to: Option<String>,

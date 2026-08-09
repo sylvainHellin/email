@@ -44,8 +44,12 @@ pub fn new_draft_skeleton_with_id(from: &str, date: &str, id: &str) -> String {
 /// This is the drafts index's only write to a draft file: a file an agent
 /// created without an `id:` is assigned one on the first refresh, so that the
 /// selector it is listed under is the selector the file itself carries.
+/// The id is written double-quoted (#0083): minted ids start with a letter, so
+/// nothing we write today could be misread as a YAML number, but the quoting
+/// makes the round-trip shape-stable regardless of what the id contains rather
+/// than resting on that property of the minter.
 pub fn set_draft_id(path: &Path, id: &str) -> Result<()> {
-    rewrite_frontmatter_scalars_at(path, &[("id", FieldWrite::Set(id.to_string()))])
+    rewrite_frontmatter_scalars_at(path, &[("id", FieldWrite::Set(yaml_dq_escape(id)))])
 }
 
 /// The message a reply or a forward is built from, independent of where it
@@ -950,6 +954,34 @@ fn rewrite_frontmatter_scalars_at(path: &Path, updates: &[(&str, FieldWrite)]) -
         .with_context(|| format!("Failed to write file: {}", path.display()))
 }
 
+/// Refuse an `id:` that YAML did not read as a string, before the frontmatter
+/// is deserialised (#0083).
+///
+/// [`crate::types::EmailFrontmatter`]'s own `id` deserialiser rejects the same
+/// thing, but it cannot see all of it: `gray_matter` coerces its `Pod` through
+/// `serde_json` on the way to the struct, and `id: 8808e70039225152` is a YAML
+/// float whose value is infinity, which JSON has no representation for and so
+/// flattens to `null` -- indistinguishable, by the time serde sees it, from a
+/// bare `id:` key. That is exactly the #0077 shape that used to be silently
+/// re-minted, so the check that catches it has to run on the `Pod` itself.
+fn reject_non_string_id(data: &gray_matter::Pod) -> Result<()> {
+    let gray_matter::Pod::Hash(map) = data else { return Ok(()) };
+    match map.get("id") {
+        None | Some(gray_matter::Pod::Null) | Some(gray_matter::Pod::String(_)) => Ok(()),
+        Some(other) => {
+            let kind = match other {
+                gray_matter::Pod::Integer(_) | gray_matter::Pod::Float(_) => "a number",
+                gray_matter::Pod::Boolean(_) => "a boolean",
+                gray_matter::Pod::Array(_) => "a list",
+                _ => "a mapping",
+            };
+            Err(anyhow!(
+                "frontmatter 'id:' is {kind}, not a string: quote it (id: \"...\") so the draft keeps its identity"
+            ))
+        }
+    }
+}
+
 pub fn parse_email_draft(path: &Path) -> Result<EmailDraft> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -957,9 +989,9 @@ pub fn parse_email_draft(path: &Path) -> Result<EmailDraft> {
     let matter = Matter::<YAML>::new();
     let parsed = matter.parse(&content);
 
-    let frontmatter: EmailFrontmatter = parsed
-        .data
-        .ok_or_else(|| anyhow!("No frontmatter found in file"))?
+    let data = parsed.data.ok_or_else(|| anyhow!("No frontmatter found in file"))?;
+    reject_non_string_id(&data)?;
+    let frontmatter: EmailFrontmatter = data
         .deserialize()
         .context("Failed to parse frontmatter")?;
 

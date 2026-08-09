@@ -484,7 +484,8 @@ mod tests {
         assert_eq!(id.len(), 16);
 
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains(&format!("id: {id}")), "{content}");
+        // Quoted on write (#0083): the shape is stable whatever the id holds.
+        assert!(content.contains(&format!("id: \"{id}\"")), "{content}");
 
         // A second refresh keeps the same id: it is read back, not re-minted.
         let again = refresh(&store, "work", &dir).unwrap();
@@ -531,26 +532,57 @@ mod tests {
         }
     }
 
-    /// The two shapes that broke, pinned as the reason the mint is
-    /// constrained: neither reads back as the id that was written.
+    /// The two #0077 shapes, now both loud (#0083).
+    ///
+    /// A hand-written `id:` that YAML reads as a number is not an id we can
+    /// carry: what must never happen is the float shape's old behaviour, where
+    /// it read back as `None` and the next refresh minted a *replacement* into
+    /// the file, changing the draft's identity with no error anywhere. Both
+    /// shapes now fail to deserialise, so both take the skipped-draft path
+    /// that names the file and the reason.
     #[test]
-    fn a_number_shaped_id_does_not_survive_the_frontmatter_round_trip() {
+    fn a_number_shaped_id_is_rejected_loudly_and_never_re_minted() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("drafts");
 
         let float_shaped = write_draft(&dir, "float.md", "id: 8808e70039225152\n");
-        let parsed = parse_email_draft(&float_shaped).unwrap();
-        assert_eq!(parsed.frontmatter.id, None, "a float-shaped id reads back as no id at all");
+        let err = parse_email_draft(&float_shaped).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("id"), "the error names the field: {message}");
 
         let int_shaped = write_draft(&dir, "int.md", "id: 1234567890123456\n");
         assert!(parse_email_draft(&int_shaped).is_err(), "an int-shaped id fails to deserialise");
 
-        // And the index sees exactly that: one draft re-minted, one skipped.
+        // The index skips both and names both, and neither file is rewritten.
+        let before_float = fs::read_to_string(&float_shaped).unwrap();
+        let before_int = fs::read_to_string(&int_shaped).unwrap();
         let (_tmp2, store) = store();
         let (rows, _collisions, skipped) = refresh_reporting(&store, "work", &dir).unwrap();
-        assert_eq!(skipped.len(), 1, "the int-shaped draft is skipped: {skipped:?}");
-        assert_eq!(rows.len(), 1);
-        assert_ne!(rows[0].id.as_str(), "8808e70039225152", "the float-shaped id was re-minted");
+        assert!(rows.is_empty(), "neither draft is indexed under a minted id: {rows:?}");
+        assert_eq!(skipped.len(), 2, "both drafts are skipped: {skipped:?}");
+        let named: Vec<PathBuf> = skipped.iter().map(|s| s.path.clone()).collect();
+        assert!(named.contains(&float_shaped) && named.contains(&int_shaped), "{named:?}");
+        for skip in &skipped {
+            let line = skip.to_string();
+            assert!(line.contains(&skip.path.display().to_string()), "{line}");
+            assert!(line.contains("string"), "the reason says a string was expected: {line}");
+        }
+
+        assert_eq!(fs::read_to_string(&float_shaped).unwrap(), before_float);
+        assert_eq!(fs::read_to_string(&int_shaped).unwrap(), before_int);
+    }
+
+    /// A quoted number-shaped id is a string and is honoured verbatim: the
+    /// rejection is of the YAML *shape*, not of digits.
+    #[test]
+    fn a_quoted_number_shaped_id_is_a_perfectly_good_id() {
+        let (tmp, store) = store();
+        let dir = tmp.path().join("drafts");
+        write_draft(&dir, "quoted.md", "id: \"1234567890123456\"\n");
+
+        let (rows, _collisions, skipped) = refresh_reporting(&store, "work", &dir).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(rows[0].id, "1234567890123456");
     }
 
     #[test]

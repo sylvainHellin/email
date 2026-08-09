@@ -213,6 +213,21 @@ All notable changes to this project are documented in this file.
   IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
 
 ### Fixed
+- **A hand-written numeric `id:` in a draft is rejected loudly instead of
+  silently re-identifying the draft (#0083).** `id: 123e456` or
+  `id: 1234567890123456` typed into frontmatter by `$EDITOR` or an agent is a
+  YAML *number*, not a string, so the field read back as absent and the next
+  drafts-index refresh minted a replacement into the file: the draft's identity
+  changed under every selector and index row, with no error anywhere (this was
+  #0077's root cause). Such a file is now skipped with the reason named --
+  `frontmatter 'id:' is a number, not a string: quote it (id: "...")` -- through
+  the existing #0080 skipped-draft path, so `mp list` prints the path and the
+  TUI Drafts list shows the broken file rather than a re-identified one. The
+  file is not rewritten. A quoted `id: "1234567890123456"` is a string and is
+  honoured verbatim; nothing is coerced. `set_draft_id` now also writes the id
+  double-quoted, so the round trip is shape-stable whatever the id contains.
+
+### Fixed
 - **The hint bar no longer truncates mid-word, and `d Delete` is back on the
   default-width frame (#0078).** The bar lays every hinted binding of the
   context out end to end on one line and ratatui clipped whatever did not fit,

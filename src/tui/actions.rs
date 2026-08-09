@@ -2990,7 +2990,7 @@ mod store_backed_drafts {
         assert_eq!(indexed.path, path);
         assert_eq!(indexed.status, "draft");
         assert!(
-            content.contains(&format!("id: {}", indexed.id)),
+            content.contains(&format!("id: \"{}\"", indexed.id)),
             "the file carries the id it is indexed under: {content}"
         );
     }
