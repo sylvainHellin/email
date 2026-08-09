@@ -37,6 +37,13 @@ impl App {
             return self.handle_search_key(key);
         }
 
+        // Jump-to-date input (#0017): armed by `g d`, it owns the keyboard
+        // until Enter or Esc, the same hand-dispatched shape as the two
+        // free-text inputs above.
+        if self.jump_date_input.is_some() {
+            return self.handle_jump_date_key(key);
+        }
+
         // Contacts view fuzzy-search input (#0033): free-text, hand-dispatched
         // like the metadata-search input, once armed by `/`.
         if self.view == super::View::Contacts && self.contacts_view.searching {
@@ -423,6 +430,11 @@ impl App {
             A::ListBottom => {
                 self.pending_prefix = None;
                 self.list_index = self.visible.len().saturating_sub(1);
+            }
+            A::JumpToDate => {
+                // Reached only with `g` pending (the leader continuation).
+                self.pending_prefix = None;
+                self.jump_date_input = Some(String::new());
             }
             A::OpenEditor => {
                 self.pending_prefix = None;
@@ -2000,6 +2012,48 @@ impl App {
             KeyCode::Backspace => {
                 self.search_query.pop();
                 self.apply_search_filter(false);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Jump-to-date input (#0017).
+    ///
+    /// `Enter` resolves the typed date and moves the cursor, `Esc` abandons
+    /// it, and an unreadable date leaves the prompt armed with the reason on
+    /// the status line -- a typo costs a correction, not a re-arm.
+    ///
+    /// `now()` is read here, at the moment the user commits, and passed into
+    /// the pure grammar: `last week` means a week before the keypress, and
+    /// nothing below this line knows what day it is.
+    fn handle_jump_date_key(&mut self, key: KeyEvent) -> Option<Message> {
+        match key.code {
+            KeyCode::Enter => {
+                let input = self.jump_date_input.clone().unwrap_or_default();
+                let today = chrono::Local::now().date_naive();
+                match super::jump_date::parse_jump_date(&input, today) {
+                    Ok(target) => {
+                        self.jump_date_input = None;
+                        self.jump_to_date(target);
+                    }
+                    Err(reason) => {
+                        self.set_status_level(reason, crate::tui::app::StatusLevel::Warning);
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.jump_date_input = None;
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = self.jump_date_input.as_mut() {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = self.jump_date_input.as_mut() {
+                    buf.pop();
+                }
             }
             _ => {}
         }
@@ -3886,5 +3940,117 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('/')));
         assert_ne!(app.focus, Focus::Search, "/ must not arm the mail filter");
         assert_eq!(app.view, View::Calendar);
+    }
+
+    // -----------------------------------------------------------------------
+    // Jump to date (#0017)
+    // -----------------------------------------------------------------------
+
+    /// A dated list, newest first, the way `store::read` orders one.
+    fn dated_emails(days: &[&str]) -> Vec<EmailEntry> {
+        days.iter()
+            .map(|day| {
+                let mut e = entry(day, "Alice");
+                e.date_display = (*day).to_string();
+                e.date_sort = format!("{day}T09:00:00");
+                e
+            })
+            .collect()
+    }
+
+    fn app_on_dates() -> App {
+        let mut app = App::default_for_tests();
+        app.emails = std::sync::Arc::new(dated_emails(&[
+            "2026-08-10", "2026-08-01", "2026-07-15", "2026-06-30", "2025-12-24",
+        ]));
+        app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
+        app.mailbox_counts = vec![app.emails.len()];
+        app.rebuild_visible();
+        app
+    }
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    /// The cursor lands on the newest row that is not after the target, and
+    /// the list itself does not move: this is navigation, not a filter.
+    #[test]
+    fn a_jump_lands_on_the_newest_row_on_or_before_the_date() {
+        let mut app = app_on_dates();
+        let before = app.visible.clone();
+
+        app.jump_to_date(day("2026-07-20"));
+        assert_eq!(app.list_index, 2, "2026-07-15 is the newest row on or before it");
+        assert_eq!(app.visible, before, "nothing is filtered out");
+
+        // An exact hit lands on that row, not past it.
+        app.jump_to_date(day("2026-08-01"));
+        assert_eq!(app.list_index, 1);
+
+        // A date newer than everything lands on the newest row.
+        app.jump_to_date(day("2026-12-31"));
+        assert_eq!(app.list_index, 0);
+    }
+
+    /// A date older than the whole mailbox parks on the oldest row and says
+    /// so, rather than silently pretending it found it.
+    #[test]
+    fn a_jump_past_the_oldest_row_says_where_it_stopped() {
+        let mut app = app_on_dates();
+        app.jump_to_date(day("2020-01-01"));
+        assert_eq!(app.list_index, 4);
+        let status = app.status_message.clone().unwrap();
+        assert!(status.contains("Nothing on or before 2020-01-01"), "{status}");
+    }
+
+    /// `g t` arms the prompt, typing edits it, Enter jumps and disarms, and a
+    /// date the grammar cannot read keeps the prompt up with the reason shown.
+    #[test]
+    fn the_prompt_is_armed_typed_and_committed_by_the_keyboard() {
+        let mut app = app_on_dates();
+        app.handle_key(KeyEvent::from(KeyCode::Char('g')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(app.jump_date_input.as_deref(), Some(""), "the prompt is armed");
+
+        for c in "2026-07-20".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.jump_date_input.as_deref(), Some("2026-07-20"));
+        app.handle_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.jump_date_input.as_deref(), Some("2026-07-2"));
+        app.handle_key(KeyEvent::from(KeyCode::Char('0')));
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.jump_date_input.is_none(), "committing disarms the prompt");
+        assert_eq!(app.list_index, 2);
+    }
+
+    /// While the prompt is armed it owns the keyboard: `d` types a character,
+    /// it does not delete the message under the cursor.
+    #[test]
+    fn the_armed_prompt_swallows_the_keys_that_would_otherwise_act() {
+        let mut app = app_on_dates();
+        app.jump_date_input = Some(String::new());
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.jump_date_input.as_deref(), Some("d"));
+        assert!(app.pending_actions.is_empty(), "{:?}", app.pending_actions);
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.jump_date_input.is_none(), "Esc abandons the prompt");
+        assert_eq!(app.list_index, 0, "an abandoned prompt moves nothing");
+    }
+
+    /// An unreadable date is a correction, not a re-arm: the prompt stays up
+    /// and the status line names the forms that would have worked.
+    #[test]
+    fn an_unreadable_date_keeps_the_prompt_and_explains() {
+        let mut app = app_on_dates();
+        app.jump_date_input = Some("tomorrow".to_string());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.jump_date_input.as_deref(), Some("tomorrow"));
+        assert_eq!(app.list_index, 0, "nothing moved");
+        let status = app.status_message.clone().unwrap();
+        assert!(status.contains("YYYY-MM-DD"), "{status}");
     }
 }

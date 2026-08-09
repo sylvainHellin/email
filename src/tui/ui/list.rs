@@ -179,7 +179,13 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let search_visible = app.focus == Focus::Search || !app.search_query.is_empty();
+    // The jump-to-date prompt (#0017) borrows the same one-line slot as the
+    // search input: it is a transient input over the same list, only one of
+    // the two can be armed (each owns the keyboard while it is), and giving it
+    // its own row would move the list under the user for the two seconds a
+    // date is typed.
+    let search_visible =
+        app.focus == Focus::Search || !app.search_query.is_empty() || app.jump_date_input.is_some();
     let (search_area, list_area) = if search_visible {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -191,17 +197,23 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     if let Some(search_rect) = search_area {
-        let prefix = if app.search_includes_body { "\\" } else { "/" };
-        let cursor_reserve = if app.focus == Focus::Search { 1 } else { 0 };
+        let jumping = app.jump_date_input.as_deref();
+        let prefix = match (jumping, app.search_includes_body) {
+            (Some(_), _) => "date: ",
+            (None, true) => "\\",
+            (None, false) => "/",
+        };
+        let typed = jumping.unwrap_or(app.search_query.as_str());
+        let cursor_reserve = if app.focus == Focus::Search || jumping.is_some() { 1 } else { 0 };
         let avail = (search_rect.width as usize)
             .saturating_sub(super::util::display_width(prefix))
             .saturating_sub(cursor_reserve);
-        let value = super::util::scrolled_input_value(&app.search_query, avail);
+        let value = super::util::scrolled_input_value(typed, avail);
         let mut spans = vec![
             Span::styled(prefix, Style::default().fg(theme::active().accent)),
             Span::styled(value, Style::default().fg(theme::active().text)),
         ];
-        if app.focus == Focus::Search {
+        if app.focus == Focus::Search || jumping.is_some() {
             spans.push(Span::styled(
                 "\u{2588}",
                 Style::default().fg(theme::active().accent),

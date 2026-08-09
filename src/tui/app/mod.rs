@@ -1,4 +1,5 @@
 pub(crate) mod calendar_view;
+pub(crate) mod jump_date;
 mod keymap;
 mod keys;
 mod types;
@@ -90,6 +91,17 @@ pub struct App {
     /// state: it survives a mailbox or account switch, the way a filter the
     /// user armed deliberately should.
     pub flagged_only: bool,
+    /// The jump-to-date prompt's buffer while it is armed, `None` when it is
+    /// not (#0017).
+    ///
+    /// Session state like `flagged_only`, and deliberately not a `Focus`
+    /// variant: the prompt takes the keyboard for the two seconds a date is
+    /// typed and changes nothing about which pane is focused, so a `Focus`
+    /// would have to be restored afterwards and every pane-border rule would
+    /// have to learn about it. The `Option` is the whole state machine:
+    /// `Some` means armed, and the key handler and the list renderer both
+    /// read exactly that.
+    pub jump_date_input: Option<String>,
     pub watcher_active: bool,
     pub imap_config: Option<crate::config::ImapConfig>,
     pub smtp_config: Option<crate::config::SmtpConfig>,
@@ -208,6 +220,7 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             flagged_only: false,
+            jump_date_input: None,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,
@@ -300,6 +313,7 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             flagged_only: false,
+            jump_date_input: None,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,
@@ -892,6 +906,66 @@ impl App {
                 self.status_message = None;
             }
         }
+    }
+
+    /// Move the cursor to the first visible row dated on or before `target`
+    /// (#0017), and say on the status line where it landed.
+    ///
+    /// The list is newest first (`date_sort DESC`, see `store::read`), so
+    /// "jump to 2024-03" means the newest message that is not after it, and
+    /// stepping further back is `j`. Nothing is filtered: the rows above and
+    /// below stay exactly where they were, which is the difference between
+    /// this and `/`.
+    ///
+    /// A binary search over the visible rows rather than a scan, because the
+    /// mailboxes this key exists for are the ones with thousands of rows. Rows
+    /// with no usable date sort last in SQL and are treated here as older than
+    /// everything, which keeps the sequence the search needs monotone.
+    pub fn jump_to_date(&mut self, target: chrono::NaiveDate) {
+        if self.visible.is_empty() {
+            self.set_status("No emails to jump through".to_string());
+            return;
+        }
+        // `true` once the row is at or before the target: false...false,
+        // true...true over a newest-first list, so `partition_point` is the
+        // first row on or before it.
+        let at_or_before = |i: usize| -> bool {
+            let Some(entry) = self.emails.get(self.visible[i]) else {
+                return true;
+            };
+            match jump_date::day_of_sort_key(&entry.date_sort) {
+                Some(day) => day <= target,
+                None => true,
+            }
+        };
+        let mut lo = 0usize;
+        let mut hi = self.visible.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if at_or_before(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+
+        let human = target.format("%Y-%m-%d");
+        if lo == self.visible.len() {
+            // Every row is newer than the target: the oldest is as far back as
+            // this mailbox goes, so land there and say why it is not the date
+            // that was asked for.
+            self.list_index = self.visible.len() - 1;
+            self.set_status(format!("Nothing on or before {human}; oldest message instead"));
+        } else {
+            self.list_index = lo;
+            let landed = self
+                .selected_email()
+                .map(|e| e.date_display.clone())
+                .unwrap_or_default();
+            self.set_status(format!("Jumped to {human} ({landed})"));
+        }
+        self.headers_scroll = 0;
+        self.preview_scroll = 0;
     }
 
     pub fn selected_email(&self) -> Option<&EmailEntry> {

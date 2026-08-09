@@ -245,6 +245,8 @@ pub enum KeyAction {
     ListUp,
     ListTop,
     ListBottom,
+    /// Leader `g d`: arm the jump-to-date prompt on the mail list (#0017).
+    JumpToDate,
     ToggleSelect,
     SelectAllVisible,
     ClearSelection,
@@ -471,6 +473,12 @@ pub static KEYMAP: &[KeyBinding] = &[
     row("", Chord::PrefixLeader('g'), None, KeyCtx::List, Guard::NonEmptyList, KeyAction::Manual, "", false),
     row("", Chord::Char('g'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListTop, "", false),
     bg("gg / G", Chord::Char('G'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListBottom, "Jump to top / bottom", false),
+    // `g t` ("go to") rather than the ticket's suggested `D`: `D` is taken
+    // (mark approved as draft), and `g d` would resolve ambiguously against
+    // the unprefixed `d` (delete), which `no_duplicate_live_dispatch_per_context`
+    // refuses for exactly the right reason -- a reordered table would turn a
+    // mistyped jump into a delete.
+    row("g t", Chord::Char('t'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::JumpToDate, "Jump to date (e.g. last week)", false),
     short(bg("v", Chord::Char('v'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true), "Select"),
     bg("Ctrl+a", Chord::CtrlChar('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SelectAllVisible, "Select all visible", false),
     bg("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::List, Guard::NonEmptyList, KeyAction::ClearSelection, "Clear selection", false),

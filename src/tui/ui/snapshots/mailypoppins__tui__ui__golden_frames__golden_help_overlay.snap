@@ -30,18 +30,18 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 24 |│                                  │  EMAIL LIST                                    │                                  │
 25 |│                                  │  j/k         Navigate emails                   │                                  │
 26 |│                                  │  gg / G      Jump to top / bottom              │                                  │
-27 |│                                  │  v           Toggle selection                  │                                  │
-28 |╰──────────────────────────────────│  Ctrl+a      Select all visible                │                                  │
-29 |╭ Activity ────────────────────────│  Esc         Clear selection                   │                                  │
-30 |│  No activity yet                 │  Enter / e   Open in editor (mail read-only)   │                                  │
-31 |│                                  │  r / R       Reply / Reply-all                 │                                  │
-32 |│                                  │  w           Forward                           │                                  │
-33 |│                                  │  c           Edit recipients (Drafts only)     │                                  │
-34 |╰──────────────────────────────────│  a           Archive                           │                                  │
-35 |╭ View ────────────────────────────│  d           Delete                            │                                  │
-36 |│     mail  |  contacts  |  calenda│  m           Toggle read/unread                │                                  │
-37 |╰──────────────────────────────────│  *           Toggle flag/star                  │──────────────────────────────────╯
-38 | HELP                              ╰─────────────────── 1-36/97 ────────────────────╯
+27 |│                                  │  g t         Jump to date (e.g. last week)     │                                  │
+28 |╰──────────────────────────────────│  v           Toggle selection                  │                                  │
+29 |╭ Activity ────────────────────────│  Ctrl+a      Select all visible                │                                  │
+30 |│  No activity yet                 │  Esc         Clear selection                   │                                  │
+31 |│                                  │  Enter / e   Open in editor (mail read-only)   │                                  │
+32 |│                                  │  r / R       Reply / Reply-all                 │                                  │
+33 |│                                  │  w           Forward                           │                                  │
+34 |╰──────────────────────────────────│  c           Edit recipients (Drafts only)     │                                  │
+35 |╭ View ────────────────────────────│  a           Archive                           │                                  │
+36 |│     mail  |  contacts  |  calenda│  d           Delete                            │                                  │
+37 |╰──────────────────────────────────│  m           Toggle read/unread                │──────────────────────────────────╯
+38 | HELP                              ╰─────────────────── 1-36/98 ────────────────────╯
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 02 |bold@36..44

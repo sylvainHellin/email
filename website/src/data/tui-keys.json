@@ -32,6 +32,7 @@
     "bindings": [
       { "key": "j/k", "action": "Navigate emails" },
       { "key": "gg / G", "action": "Jump to top / bottom" },
+      { "key": "g t", "action": "Jump to date (e.g. last week)" },
       { "key": "v", "action": "Toggle selection" },
       { "key": "Ctrl+a", "action": "Select all visible" },
       { "key": "Esc", "action": "Clear selection" },

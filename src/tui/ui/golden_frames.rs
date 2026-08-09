@@ -581,6 +581,18 @@ fn golden_mail_view_flagged_filter() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The jump-to-date prompt armed (#0017): the `date:` input row the list pane
+/// borrows from the search slot, with the typed text and the block cursor,
+/// over an unfiltered list. Nothing else moves, which is the property that
+/// distinguishes this from `/`: the rows are the same rows in the same order.
+#[test]
+fn golden_mail_view_jump_date_prompt() {
+    let mut app = mail_fixture();
+    app.jump_date_input = Some("last week".to_string());
+    app.prime_preview_body(BODY_ROW_2);
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The calendar agenda plus the shared event card.
 #[test]
 fn golden_calendar_view() {

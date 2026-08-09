@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Jump to a date in the mailbox list (#0017).** `g t` arms an inline
+  `date:` prompt over the list and Enter moves the cursor to the newest
+  message on or before what was typed: `2024-03-07`, `2024-03`, `2024`,
+  `today`, `yesterday`, `last week`, `2 months ago`. Nothing is filtered --
+  the rows above and below stay exactly where they were, which is the
+  difference between this and `/` -- and the jump is a binary search over the
+  already date-sorted list, so a mailbox with thousands of rows costs the same
+  as one with ten. A date older than the whole mailbox parks on the oldest
+  message and says so; a date the grammar cannot read leaves the prompt up
+  with the accepted forms on the status line. The grammar is closed on
+  purpose: no natural-language date library, because a wrong guess would
+  silently land the cursor in the wrong year.
+
+### Added
 - **`o` opens a draft's attachments (#0016).** The key only ever worked on
   received mail; on a draft it declined with a status line pointing at the
   `attachments:` list it would not read. It reads it now: the paths in the
