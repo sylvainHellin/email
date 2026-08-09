@@ -831,3 +831,21 @@ The rule of thumb: pick contentless when the content has another home and the fi
 By the time it was implemented the `\` path no longer streamed files: it was an incremental, case-insensitive *substring* filter over the loaded mailbox, and `src/tui/app/types.rs` carried a written rationale for why it must not be served by FTS5 (token matching changes the result set for exactly the queries that mode exists for, a fragment inside a word, punctuation, a partial address, and none of it survives translation to a MATCH expression per keystroke).
 Implementing the sentence would have regressed a deliberate decision to satisfy a ticket whose premise had expired.
 The habit: when a ticket's scope item names the *mechanism* of a surface, re-read that surface before believing the item, and when the code disagrees with the ticket, the one with the dated reasoning next to it wins; the ticket close-out then records which item was superseded and by what, so the next reader does not re-litigate it.
+
+## A random hex id written into YAML is a number once every thousand drafts
+
+`drafts::new_id` minted 16 random hex characters and the index wrote them into the draft's frontmatter unquoted.
+`8808e70039225152` is a valid YAML float in scientific notation, so the `Option<String>` field deserialised to `None` and the next refresh minted a *different* id, silently changing the draft's identity; a 16-digit id is an integer, which fails deserialisation and drops the draft from the index entirely.
+About one id in a thousand has one of those shapes, so it surfaced as three unrelated-looking tests failing intermittently on unrelated commits, and the standing hypothesis for two years of it was a temp-dir/env-var race between parallel tests (#0077's own title).
+The tell that it was not a race: every symptom was reproducible from a *single* file with no concurrency at all, once the id was chosen rather than sampled.
+The rule: any identifier that will be written into a schemaless text format has to be constrained so it cannot be read back as another type, at the point it is minted rather than at every point it is written -- a leading letter costs two bits and closes the whole class ([src/store/drafts.rs](../src/store/drafts.rs), #0077).
+And when a flake resists reproduction under load, look for a value-dependent bug before an interleaving one: a 1-in-1000 input is indistinguishable from a rare race until you ask which inputs fail.
+
+## `std::env::set_var` in a test fixture is a data race, and a mutex over the writers does not fix it
+
+The test harness pointed `MAILYPOPPINS_DATA_DIR`, `TMPDIR`, `HOME` and `MAILYPOPPINS_CONFIG_DIR` at a tempdir with `set_var` and restored them on drop, serialised by a crate-wide `data_dir_lock`.
+The lock made the *writers* mutually exclusive and did nothing about the readers: every `tempfile::tempdir()` on another test thread calls `getenv("TMPDIR")` without it, and glibc's `setenv` can reallocate `environ` underneath that read.
+This is why Rust 2024 made `set_var` `unsafe`; it is not a tidiness point.
+It also cost the suite its parallelism, because every data-dir test queued behind one mutex.
+The fix is to remove the shared state rather than guard it: `config::test_env` keeps the overrides in thread-locals, and since libtest runs each test on its own thread a fixture's paths are invisible to every other test -- no lock, no serialisation, no environment mutation anywhere in the binary ([src/config.rs](../src/config.rs), #0077).
+The seam has to cover *every* reader inside the binary to help, which is why `parse::materialisation_root` moved too.

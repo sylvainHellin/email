@@ -132,6 +132,20 @@ All notable changes to this project are documented in this file.
   build on.
 
 ### Changed
+- **The test harness no longer mutates the process environment (#0077).**
+  Fixtures pointed `MAILYPOPPINS_DATA_DIR`, `TMPDIR`, `HOME` and
+  `MAILYPOPPINS_CONFIG_DIR` at a tempdir with `std::env::set_var` and restored
+  them on drop, guarded by a crate-wide mutex. The mutex only serialised the
+  *writers*: every other test thread was concurrently reading the same
+  environment through `getenv` (`tempfile::tempdir()` reads `$TMPDIR`), which
+  is a data race on `environ` in a multi-threaded process rather than merely an
+  unsynchronised read, and it forced every data-dir test to run one at a time.
+  The overrides are thread-local now (`config::test_env`), so a fixture's paths
+  are invisible to every other test, no lock is needed and the tests stay
+  parallel. Materialised message files resolve through `parse::test_temp_root`
+  instead of an overridden `$TMPDIR`. No shipped code path changed: the seams
+  are `#[cfg(test)]`.
+
 - **IMAP sessions are persistent and shared, not one per operation (#0041).**
   Every IMAP operation used to open its own connection: archiving three
   messages meant three TCP handshakes, three TLS handshakes and three LOGINs,
@@ -199,6 +213,21 @@ All notable changes to this project are documented in this file.
   IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
 
 ### Fixed
+- **A draft id is no longer occasionally read back as a number, silently
+  changing the draft's identity (#0077).** `drafts::new_id` minted 16 random
+  hex characters and the drafts index writes them into YAML frontmatter
+  unquoted, but a plain hex string is not always a YAML string:
+  `8808e70039225152` is a float in scientific notation and a 16-digit id is an
+  integer. About one id in a thousand had one of those shapes. A float-shaped
+  id deserialised the `id:` field to `None`, so the next refresh minted a
+  *different* id, the old selector stopped resolving and the draft's preview
+  and index row went with it; an integer-shaped one failed deserialisation
+  outright and the draft was dropped from the index as unparseable. Minted ids
+  now start with a letter, which no YAML number can, and the round trip is
+  pinned by a test over 2000 ids. This was the mechanism behind all three
+  intermittent test failures in #0077, none of which was a temp-dir or env-var
+  race after all.
+
 - **A full sync no longer wipes the delta resume point a delta sync recorded
   (#0041).** `record_mailbox_cursor` wrote `highest_modseq` and `deltalink`
   unconditionally from the caller's struct, and every path that is not a delta
