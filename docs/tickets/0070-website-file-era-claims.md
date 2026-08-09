@@ -3,8 +3,9 @@ id: 0070
 title: Audit the website for file-era claims (per-mailbox local directories, and the rest)
 type: chore
 priority: later
-status: open
+status: done
 created: 2026-08-06
+closed: 2026-08-11
 ---
 
 Deferred note from the fresh-context review of [#0057](0057-dead-file-era-code-deletion.md).
@@ -30,3 +31,14 @@ The published documentation still describes the old layout, so the site now tell
 - No page claims a per-mailbox local directory.
 - Every path shown on the site exists after a fresh `mp init` on this version.
 - `cd website && pnpm build` clean.
+
+## Resolution (2026-08-11)
+
+The `[mailboxes]` prose had already been rewritten against the store; what still described the file era was the layout block above it and three other pages.
+
+- `config.astro`: the data-directory tree now shows `store.sqlite3`, `blobs/`, `drafts/`, the per-message forward-attachment mirror and `contacts-cache.json`, i.e. exactly the three paths `mp config show` prints plus the two it does not. The Obsidian advice now points at `drafts/`, the half that is still files, instead of at a mail tree that no longer exists.
+- `getting-started.astro`: first sync writes rows and blobs, not a `.md` plus a companion `.html` plus a `_attachments/` sibling.
+- `faq.astro`: attachments and HTML answers rewritten (blobs beside the row; `o` opens through a private temp copy, `O` and `mp save` write where the user asks); "directories" in the multi-account answer became "local store".
+- `draft-format.astro`: the attachments section was entirely about the receive path. It now says what is true of a draft (`attachments:` takes any readable path) and what a forward does (materialises the source's blobs into `accounts/<name>/attachments/<message-id>/` and writes those paths in), and points at `o` / `O` / `mp save` for reading one.
+
+Verified the paths against `mp config show` under a scratch `MAILYPOPPINS_DATA_DIR`, and `pnpm build` is clean. The `Hero`/`Features` components keep the "plaintext files" framing, which is about drafts and is still true.

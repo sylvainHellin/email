@@ -38,6 +38,15 @@ All notable changes to this project are documented in this file.
   build on.
 
 ### Fixed
+- **The website no longer describes the file era (#0070, docs).** The published
+  pages still showed a per-mailbox local directory tree, a `.md` plus companion
+  `.html` per received message and a `_attachments/` sibling directory, none of
+  which the binary has written since the store cutover. The data-directory
+  layout, the first-sync walkthrough, the attachment and HTML answers in the FAQ
+  and the draft-format attachments section now describe rows and blobs, and say
+  which paths are still real: drafts, and the per-message directory a forward
+  materialises its source's attachments into.
+
 - **Contacts rebuilds are deterministic and no longer erode a populated corpus
   (#0067).** A message whose `Date:` header is absent or unparseable used to be
   stamped with the wall clock, so it floated to the top of its frecency tier and

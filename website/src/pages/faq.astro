@@ -138,25 +138,28 @@ import AccordionItem from '../components/AccordionItem.astro';
         <AccordionItem question="Can I use mailypoppins with multiple accounts?">
           <p>
             Yes. Use the <code>[[accounts]]</code> array in <code>config.toml</code>. Each account
-            has its own SMTP/IMAP settings, directories, and mailboxes. Switch between accounts in
+            has its own SMTP/IMAP settings, local store, and mailboxes. Switch between accounts in
             the TUI with the backtick key (<code>`</code>) or <code>Ctrl+1-9</code>.
           </p>
         </AccordionItem>
 
         <AccordionItem question="How are attachments handled?">
           <p>
-            Incoming attachments are saved in a <code>_attachments/</code> subdirectory next to the
-            email's <code>.md</code> file. Frontmatter records filenames. Use <code>o</code> in the
-            TUI to open an attachment, or <code>O</code> to save it to a chosen directory. For
-            outgoing drafts, list file paths in the <code>attachments:</code> frontmatter field.
+            Incoming attachments are stored as blobs beside the message row, not as files you
+            browse. Use <code>o</code> in the TUI to open one (it is written to a private temp
+            directory first), <code>O</code> to save it to a directory you choose, or
+            <code>mp save</code> from the CLI. For outgoing drafts, list file paths in the
+            <code>attachments:</code> frontmatter field; forwarding a message
+            materialises its attachments under the account's
+            <code>attachments/</code> directory and lists those paths for you.
           </p>
         </AccordionItem>
 
         <AccordionItem question="Does it support HTML emails?">
           <p>
             Outgoing emails are written in Markdown and converted to HTML for sending, with a
-            plaintext fallback. Incoming emails are stored as plaintext (<code>.md</code>) with the
-            original HTML saved as a companion <code>.html</code> file. Press <code>b</code> in the
+            plaintext fallback. For incoming mail both parts are kept: the text the TUI shows and
+            the original HTML, each as a blob beside the message row. Press <code>b</code> in the
             TUI to open the HTML version in your browser.
           </p>
         </AccordionItem>

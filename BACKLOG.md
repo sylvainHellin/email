@@ -27,7 +27,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0043 FTS5 full-text search](docs/tickets/0043-fts5-search.md) -- feature _(data layer, Stage 5)_
 - [#0060 Enforce the retention policy](docs/tickets/0060-retention-enforcement.md) -- feature
 - [#0062 CLI read surface over the store (mp show, mp list-messages)](docs/tickets/0062-cli-store-read-surface.md) -- feature
-- [#0070 Audit the website for file-era claims](docs/tickets/0070-website-file-era-claims.md) -- chore _(website; from the #0057 review)_
 - [#0074 An ingest failure is not carried by the arrival mark](docs/tickets/0074-arrival-mark-misses-ingest-failures.md) -- bug _(from the #0072 sweep review)_
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_

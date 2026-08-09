@@ -85,9 +85,10 @@ cargo install --path .`}
       <CodeBlock lang="bash" code="mp sync" />
       <p>
         This syncs all configured mailboxes (inbox, archive, sent, plus any extras).
-        Each email is saved as a <code>.md</code> file with YAML frontmatter and an
-        accompanying <code>.html</code> file. Attachments are saved in a sibling
-        <code>_attachments/</code> directory.
+        Each message becomes a row in the account's local store
+        (<code>store.sqlite3</code>), with its text, its HTML and its attachments kept
+        beside it as content-addressed blobs. Nothing is written as a mail file tree:
+        the Markdown you read in the TUI is rendered from the row on demand.
       </p>
       <p>
         Sync is additive by default: it only downloads new messages, deduplicating by

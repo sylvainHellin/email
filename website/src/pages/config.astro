@@ -177,15 +177,21 @@ fetch_concurrency = 4       # Parallel mailbox fetches per sync (1-8)`} />
       </ul>
       <p>Layout under the data directory:</p>
       <ConfigExample code={`mailypoppins/
-  accounts/<name>/{inbox,archive,sent,drafts,<extra>}/   # mail tree
-  accounts/<name>/contacts-cache.json                    # contacts index
-  tokens/<name>.enc                                      # OAuth2 tokens
+  accounts/<name>/store.sqlite3          # synced mail: one row per message
+  accounts/<name>/blobs/                 # message bodies and attachments, by hash
+  accounts/<name>/drafts/                # your drafts, one .md file each
+  accounts/<name>/attachments/<msg-id>/  # attachments a forward carries into a draft
+  accounts/<name>/contacts-cache.json    # contacts index
+  tokens/<name>.enc                      # OAuth2 tokens
   logs/mailypoppins-YYYY-MM-DD.log`} />
       <p>
-        The location is not user-configurable per account. To make the mail tree visible
-        inside an Obsidian vault, symlink <code>accounts/&lt;name&gt;/</code> into the desired
-        location. Override the entire data root with <code>MAILYPOPPINS_DATA_DIR=/some/path</code>
-        for tests or portable installs.
+        <code>mp config show</code> prints the first three paths for every configured account.
+        Synced mail is not a file tree: a message is a row in <code>store.sqlite3</code> plus
+        content-addressed blobs, and what you read in the TUI is rendered from those. Drafts are
+        the half that is still files, which is what you would symlink into an Obsidian vault:
+        <code>accounts/&lt;name&gt;/drafts/</code>. The location is not user-configurable per
+        account; override the entire data root with
+        <code>MAILYPOPPINS_DATA_DIR=/some/path</code> for tests or portable installs.
       </p>
 
       <!-- [mailboxes] -->

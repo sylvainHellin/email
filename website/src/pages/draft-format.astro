@@ -77,19 +77,17 @@ your.name@example.com
 </p>
 </div>`;
 
-const attachmentStructure = `inbox/2024-01-01-1200_sender_subject.md
-inbox/2024-01-01-1200_sender_subject.html
-inbox/2024-01-01-1200_sender_subject_attachments/
+const attachmentStructure = `accounts/<name>/attachments/<message-id>/
   document.pdf
   image.png`;
 
 const attachmentFrontmatter = `---
-from: sender@example.com
-subject: "Document delivery"
-has_attachments: true
+to: recipient@example.com
+subject: "Fwd: Document delivery"
+status: draft
 attachments:
-  - "document.pdf"
-  - "image.png"
+  - "/home/you/.local/share/mailypoppins/accounts/work/attachments/abc@example.com/document.pdf"
+  - "/home/you/Documents/cover-letter.pdf"
 ---`;
 
 const sentExample = `---
@@ -223,18 +221,19 @@ Email body here.`;
     <section>
       <h2 id="attachments">Attachments</h2>
       <p>
-        Incoming attachments are saved next to the <code>.md</code> file in a
-        <code>_attachments/</code> subdirectory. The frontmatter records filenames only (not paths),
-        and a <code>has_attachments</code> flag is set to <code>true</code>.
+        A draft's <code>attachments:</code> field holds file paths, and any readable path works.
+        Received attachments are not files: they live as blobs beside the message row in the
+        account's store. Forwarding a message therefore materialises its attachments once, into a
+        stable per-message directory under the account, and writes those paths into the draft, so
+        the forward still resolves them after the original has been archived.
       </p>
       <Code code={attachmentStructure} lang="text" theme="catppuccin-mocha" />
       <Code code={attachmentFrontmatter} lang="yaml" theme="catppuccin-mocha" />
       <p>
-        The <code>_attachments/</code> directory is moved or deleted alongside the
-        <code>.md</code> and <code>.html</code> companion files during archive, delete, sync
-        move, and reconciliation operations. In the TUI, press <code>o</code> to open
-        an attachment in the default app, or <code>O</code> to save attachments to a
-        chosen directory.
+        To read an attachment of a received message rather than forward it: in the TUI press
+        <code>o</code> to open one in the default app (it is written to a private temp directory
+        first) or <code>O</code> to save it to a directory you choose, and from the CLI use
+        <code>mp save &lt;selector&gt; --output &lt;dir&gt;</code>.
       </p>
     </section>
   </main>
