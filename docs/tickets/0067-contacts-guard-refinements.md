@@ -3,8 +3,9 @@ id: 0067
 title: Contacts guard refinements (nondeterministic observed_at, corrupt cache, partial erosion)
 type: bug
 priority: later
-status: open
+status: done
 created: 2026-08-06
+closed: 2026-08-11
 ---
 
 Deferred notes from the fresh-context review of [#0053](0053-contacts-rebuild-data-loss.md) (commit `f7dd645`).
@@ -45,3 +46,14 @@ All small, none urgent, batched because they live in three files.
 - A corrupt `contacts-cache.json` does not make `mp contacts rebuild` fail on an empty store.
 - A rebuild that finds a fraction of the previous corpus refuses or merges rather than replacing, and says which.
 - A `Name <addr>` `default_from` filters the user's own address out.
+
+## Resolution (2026-08-11)
+
+All six scope items landed, one of them differently than the ticket imagined.
+
+1. **Deterministic `observed_at`.** The ticket's premise was stale: `messages.mtime` was dropped from the schema by the v4 bundle (#0054), so there is no ingest mtime left to expose on `MessageRow`. Instead the fallback is a constant, `extractor::UNDATED_OBSERVED_AT` (the epoch), which is the same rule the store applies to the same rows (`date_sort = 0` sorts undated mail last). Undated mail now sinks in the frecency tiebreaker instead of floating, and it is identical on every rebuild.
+2. **Corrupt cache degrades.** `cache::cached_count` turns a read or parse error into a `warn!` plus zero kept, so `mp contacts rebuild` repairs an unparseable `contacts-cache.json` instead of failing on it.
+3. **Partial-erosion guard.** `CacheSave::RefusedShrunk { kept, rebuilt }` refuses a rebuild that finds under `SHRINK_REFUSE_RATIO` (20%) of the cached corpus, and both the CLI and the TUI say which numbers they saw. A modest shrink still writes.
+4. **Save errors are visible.** `App::refresh_contacts` returns on the `Err` arm rather than falling through to the success status, and `contacts_cmd::load_or_build` surfaces a refusal and returns what the disk holds rather than the refused rebuild.
+5. **Missing-store branch covered** by `an_account_with_no_store_builds_an_empty_index`.
+6. **`default_from` is parsed as an address** (`extractor::self_address`), so a `Name <addr>` config filters the user's own address out. Configured aliases are still not consulted: the config has no alias field today, so there was nothing to read.

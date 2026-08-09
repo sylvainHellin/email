@@ -84,6 +84,13 @@ pub fn handle_rebuild(config: &GlobalConfig, account_name: Option<String>) -> Re
                 kept.to_string().bold(),
                 cache_path(&root).display()
             ),
+            CacheSave::RefusedShrunk { kept, rebuilt } => println!(
+                "{} Rebuild found only {} contacts against {} cached; kept the cache at {}",
+                "⚠".yellow(),
+                rebuilt.to_string().bold(),
+                kept.to_string().bold(),
+                cache_path(&root).display()
+            ),
         }
     }
     Ok(())
@@ -154,8 +161,19 @@ fn load_or_build(account: &AccountConfig, root: &Path) -> Result<ContactIndex> {
     }
     // No cache yet — build on demand.
     let idx = build_index_for_account(account)?;
-    save_rebuilt_cache(root, &idx)?;
-    Ok(idx)
+    match save_rebuilt_cache(root, &idx)? {
+        CacheSave::Written => Ok(idx),
+        // The guard kept something on disk, so the caller must be shown what
+        // the disk holds and not the rebuild that was just refused (#0067).
+        refused => {
+            eprintln!(
+                "{} Contacts rebuild refused ({refused:?}); showing the cache at {}",
+                "⚠".yellow(),
+                cache_path(root).display()
+            );
+            Ok(load_cache(root)?.unwrap_or(idx))
+        }
+    }
 }
 
 fn tier_indicator(c: &Contact) -> colored::ColoredString {

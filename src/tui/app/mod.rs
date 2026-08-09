@@ -464,11 +464,23 @@ impl App {
                         );
                         return;
                     }
+                    Ok(crate::contacts::CacheSave::RefusedShrunk { kept, rebuilt }) => {
+                        self.set_status_level(
+                            format!("Contacts rebuild found only {rebuilt}, kept {kept} cached"),
+                            StatusLevel::Warning,
+                        );
+                        return;
+                    }
                     Ok(crate::contacts::CacheSave::Written) => {}
-                    Err(e) => self.set_status_level(
-                        format!("Contacts cache save failed: {e}"),
-                        StatusLevel::Error,
-                    ),
+                    // Return, or the success status two lines down overwrites
+                    // the error and the failed save is invisible (#0067).
+                    Err(e) => {
+                        self.set_status_level(
+                            format!("Contacts cache save failed: {e}"),
+                            StatusLevel::Error,
+                        );
+                        return;
+                    }
                 }
                 let count = index.contacts.len();
                 self.contacts_view.index = Some(index);

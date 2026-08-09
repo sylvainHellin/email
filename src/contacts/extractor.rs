@@ -44,13 +44,24 @@ pub fn build_index_for_account(account: &AccountConfig) -> Result<ContactIndex> 
     }
 }
 
+/// The `observed_at` a row with an absent or unparseable `Date:` header gets.
+///
+/// It has to be a constant rather than "now": `last_seen` is the frecency
+/// tiebreaker inside a tier, so stamping undated mail with the wall clock made
+/// it float to the top of its tier and gave it a different value on every
+/// rebuild, i.e. a nondeterministic index (#0067). The epoch is the same rule
+/// the store applies to the same rows — ingest marks an unparseable date with
+/// `date_sort = 0` and the listings sort those last — so undated mail sinks in
+/// both stacks instead of floating in one of them.
+const UNDATED_OBSERVED_AT: &str = "1970-01-01T00:00:00+00:00";
+
 /// Build a full `ContactIndex` from an already-open store.
 pub(crate) fn build_index_from_store(
     store: &Store,
     account: &AccountConfig,
 ) -> Result<ContactIndex> {
     let mut index = empty_index(account);
-    let self_addr = account.default_from.to_ascii_lowercase();
+    let self_addr = self_address(account);
 
     for row in read::list_account(store, &account.name)? {
         let role = MailboxRole::from(row.mailbox.as_str());
@@ -58,7 +69,7 @@ pub(crate) fn build_index_from_store(
             .date_display
             .as_deref()
             .and_then(parse_date_to_rfc3339)
-            .unwrap_or_else(|| Utc::now().to_rfc3339());
+            .unwrap_or_else(|| UNDATED_OBSERVED_AT.to_string());
         for (field, raw) in header_fields(&row) {
             let Some(raw) = raw else { continue };
             if raw.trim().is_empty() {
@@ -76,6 +87,26 @@ pub(crate) fn build_index_from_store(
     }
 
     Ok(index)
+}
+
+/// The account's own address, lowercased, for self-filtering.
+///
+/// `default_from` is a config string a user is free to write as
+/// `Name <addr@host>`, and comparing that verbatim against a parsed header
+/// address never matched, so the user's own address stayed in their own
+/// contact corpus (#0067). Parse it the same way the headers are parsed and
+/// fall back to the raw string when it does not parse as an address.
+fn self_address(account: &AccountConfig) -> String {
+    let raw = account.default_from.trim();
+    match addrparse(raw).ok().and_then(|addrs| {
+        addrs.iter().find_map(|info| match info {
+            mailparse::MailAddr::Single(s) => Some(s.addr.clone()),
+            mailparse::MailAddr::Group(g) => g.addrs.first().map(|s| s.addr.clone()),
+        })
+    }) {
+        Some(addr) => addr.to_ascii_lowercase(),
+        None => raw.to_ascii_lowercase(),
+    }
 }
 
 fn empty_index(account: &AccountConfig) -> ContactIndex {
@@ -356,6 +387,75 @@ mod tests {
     fn an_empty_store_builds_an_empty_index() {
         let fx = fixture();
         let index = build_index_from_store(&fx.store, &account()).unwrap();
+        assert!(index.contacts.is_empty());
+        assert_eq!(index.account, "alice");
+    }
+
+    /// #0067: an unparseable `Date:` gets a constant `observed_at`, so two
+    /// rebuilds of the same undated mail produce byte-identical contacts.
+    #[test]
+    fn undated_mail_rebuilds_to_the_same_index_every_time() {
+        let fx = fixture();
+        ingest(
+            &fx,
+            "inbox",
+            1,
+            &email("Frank <frank@example.com>", "me@example.com", None, ""),
+        );
+
+        let first = build_index_from_store(&fx.store, &account()).unwrap();
+        let second = build_index_from_store(&fx.store, &account()).unwrap();
+
+        let frank = first.contacts.get("frank@example.com").expect("frank");
+        assert_eq!(frank.last_seen, UNDATED_OBSERVED_AT);
+        assert_eq!(frank.first_seen, UNDATED_OBSERVED_AT);
+        assert_eq!(
+            serde_json::to_string(&first.contacts).unwrap(),
+            serde_json::to_string(&second.contacts).unwrap()
+        );
+    }
+
+    /// #0067: `default_from` written as `Name <addr>` still filters the
+    /// user's own address out of their own corpus.
+    #[test]
+    fn a_display_name_default_from_still_filters_self() {
+        let fx = fixture();
+        let mut account = account();
+        account.default_from = "Me Myself <ME@example.com>".into();
+        ingest(
+            &fx,
+            "inbox",
+            1,
+            &email(
+                "Alice <alice@example.com>",
+                "me@example.com",
+                None,
+                "Mon, 05 Jan 2026 12:00:00 +0000",
+            ),
+        );
+
+        let index = build_index_from_store(&fx.store, &account).unwrap();
+
+        assert!(!index.contacts.contains_key("me@example.com"));
+        assert!(index.contacts.contains_key("alice@example.com"));
+    }
+
+    /// #0067: the account-level entry point, whose missing-store branch the
+    /// store-level tests never reach. An account that has never synced has no
+    /// `store.db`, and that is an empty index, not an error.
+    #[test]
+    fn an_account_with_no_store_builds_an_empty_index() {
+        let _guard = crate::config::data_dir_lock();
+        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("MAILYPOPPINS_DATA_DIR", tmp.path());
+
+        let index = build_index_for_account(&account()).unwrap();
+
+        match prev {
+            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
+            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
+        }
         assert!(index.contacts.is_empty());
         assert_eq!(index.account, "alice");
     }

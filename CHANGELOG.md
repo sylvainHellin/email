@@ -30,6 +30,20 @@ All notable changes to this project are documented in this file.
   build on.
 
 ### Fixed
+- **Contacts rebuilds are deterministic and no longer erode a populated corpus
+  (#0067).** A message whose `Date:` header is absent or unparseable used to be
+  stamped with the wall clock, so it floated to the top of its frecency tier and
+  got a different value on every rebuild; it now gets a constant timestamp and
+  sinks, the same rule the store's `date_sort = 0` marker applies to those rows.
+  A rebuild that comes back with under a fifth of the cached corpus is refused
+  as a partial read (the zero case was already refused, #0053), and both `mp
+  contacts rebuild` and the TUI say how many they found against how many they
+  kept. A corrupt `contacts-cache.json` no longer makes a rebuild fail: it warns
+  and counts as empty, so rebuilding repairs it. A cache-save failure in the TUI
+  refresh is no longer overwritten by the success status one line later. And a
+  `default_from` written as `Name <addr>` now filters the user's own address out
+  of their own contact list.
+
 - **The mutation queue converges a crash-replay instead of surfacing a false
   failure (#0039 review, internal).** A move, delete or mark-read whose server
   half landed just before a crash used to replay against a message the source
