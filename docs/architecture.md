@@ -134,6 +134,7 @@ TUI actions branch on `app.is_graph()`.
 The shared half is `src/sync/` (#0059): the sync types (`SyncTarget`, `SyncResult`, `FreshObservation`, `MailboxFetch`), the `SyncBackend` trait, and `sync::engine::run_sync`, which is the orchestration itself: skip lists, ingest, arrival marks, the #0074 ingest-failure bound, flags, cursors and the deferred prune pass.
 `SyncBackend` has one method, `fetch_targets`, and takes `&mut self`, which is where a backend keeps what outlives a mailbox (a persistent session and its `HIGHESTMODSEQ`, #0041; a `deltaLink`, #0042).
 The seam's first payoff is that the engine is driven by a fake backend in `src/sync/engine.rs`'s tests, offline, over the properties that used to be verifiable only against a live server.
+`SyncBackend::fetch_targets` is a native async fn in the trait, so its future is not `Send`; callers await it in place, and spawning a sync onto another task would need a `Send` bound first (noted in #0041).
 The parity half of #0059 is parked with the Graph backend: `graph.rs` still runs its own loop rather than the engine.
 
 ### IMAP

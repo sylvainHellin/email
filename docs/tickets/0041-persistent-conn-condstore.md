@@ -39,6 +39,11 @@ The same trap is already latent for `deltalink` and [#0042](0042-graph-delta-syn
 Fix it here, before writing the first modseq: load the existing cursor and carry the value forward, or write `COALESCE(excluded.highest_modseq, highest_modseq)` (and the same for `deltalink`) into the `ON CONFLICT` clause.
 A test that records a modseq, then records a full-window cursor with `None`, then asserts the modseq survived, pins it.
 
+## Constraint from #0059 (added 2026-08-09)
+
+`SyncBackend::fetch_targets` is an AFIT (native async-fn-in-trait, no `async-trait` crate), so the returned future carries no `Send` bound.
+Every current caller awaits it in place (`main.rs`, `tui/helpers.rs`), which is fine; a persistent-session implementation that wants to `tokio::spawn` a sync must first add a `Send` bound or box the future.
+
 ## Acceptance criteria
 
 - Quick-sync `[TIMING]` drops sharply; no fresh LOGIN per op.
