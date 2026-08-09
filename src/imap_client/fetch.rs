@@ -6,6 +6,7 @@ use super::{ImapSession, search::{FetchCriteria, build_imap_search_query}, open_
 use crate::config::ImapConfig;
 use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
+use crate::sync::{FetchedRaw, MailboxFetch, MailboxState};
 use crate::timing::TimingSpan;
 use crate::types::MessageFlags;
 
@@ -108,58 +109,9 @@ pub async fn fetch_emails(
 // Store ingest fetch
 // ---------------------------------------------------------------------------
 
-/// One message downloaded for ingest, with the identity the store keys on.
-pub struct FetchedRaw {
-    pub uid: u32,
-    pub raw: Vec<u8>,
-    /// What the server says has happened to it: read, answered, forwarded.
-    pub flags: MessageFlags,
-}
-
-/// What the SELECT response said about the mailbox.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MailboxState {
-    pub uid_validity: Option<u32>,
-    pub uid_next: Option<u32>,
-    pub exists: u32,
-}
-
-/// What one store fetch brought back.
-pub struct StoreFetch {
-    /// Messages the store does not hold yet, with their bodies.
-    pub messages: Vec<FetchedRaw>,
-    /// How many UIDs in the window the store already held.
-    pub skipped: usize,
-    /// The flags of those already-held UIDs, the only server-to-local channel
-    /// for the second status axis (#0004, #TKT-0051): read, answered and
-    /// forwarded all arrive here and nowhere else.
-    pub known_flags: Vec<(u32, MessageFlags)>,
-    /// What SELECT said about the mailbox.
-    pub state: MailboxState,
-    /// UIDs the store holds for this mailbox that the server no longer lists.
-    /// See [`vanished_uids`].
-    pub vanished: Vec<u32>,
-    /// True when the server's UIDVALIDITY no longer matches the stored one, so
-    /// this fetch deliberately skipped nothing and redownloaded the window.
-    pub uidvalidity_reset: bool,
-    /// True when `UID SEARCH ALL` listed at least as many UIDs as `SELECT`
-    /// announced in `EXISTS`, i.e. the enumeration [`vanished`] was computed
-    /// from is the whole mailbox rather than a short answer.
-    ///
-    /// [`vanished`]: StoreFetch::vanished
-    pub enumeration_complete: bool,
-    /// True when this pass did not ingest every message that arrived in the
-    /// mailbox since the store last saw it: the `limit` window cut some off,
-    /// a body did not come back, or the caller failed to ingest one. Backlog
-    /// *older* than what the store already holds does not count; see
-    /// [`arrival_coverage`].
-    pub download_incomplete: bool,
-    /// The arrival mark to persist for this mailbox: `Some(mark)` while an
-    /// arrival above it is still missing, `None` once every arrival is in.
-    /// Carried back in by the next fetch so the gate cannot open on a mark that
-    /// this pass's own ingest raised (#0072).
-    pub pending_arrival_mark: Option<u32>,
-}
+// The store fetch's result types live in `crate::sync` since #0059: they are
+// the engine's contract with every backend, not this module's private shape.
+// See `MailboxFetch`, `FetchedRaw` and `MailboxState`.
 
 /// The UIDs the store holds that the server did not list, up to `ceiling`.
 ///
@@ -185,7 +137,7 @@ pub struct StoreFetch {
 ///   message is the one that was deleted.
 ///
 /// Whether the result may be *applied* is a separate question, answered by the
-/// coverage flags on [`StoreFetch`] and by [`crate::ingest::pass_may_prune`].
+/// coverage flags on [`MailboxFetch`] and by [`crate::ingest::pass_may_prune`].
 pub fn vanished_uids(
     known: &std::collections::HashSet<i64>,
     listed: &[u32],
@@ -313,34 +265,6 @@ fn arrival_coverage(
     }
 }
 
-/// The arrival mark a pass must persist once ingest is done, given the mark the
-/// download reported and the UIDs the ingest failed to write (#0074).
-///
-/// [`arrival_coverage`] measures what the pass *downloaded*, which is one step
-/// short of what it owes the next pass: a message fetched and then not written
-/// is as absent from the store as one never fetched, yet it reads as covered,
-/// the pass reports itself complete, persists no mark, and the next pass stands
-/// on a floor above a message the server still lists. The mark is therefore
-/// lowered here to just under the lowest unwritten UID, which is what makes
-/// that message an arrival again next pass and keeps the gate shut until some
-/// pass writes it.
-///
-/// `unmet` holds only the failures still worth retrying;
-/// [`crate::ingest::record_ingest_failure`] drops a UID out of it once it has
-/// failed [`crate::ingest::MAX_INGEST_ATTEMPTS`] times, so a message the store
-/// rejects deterministically cannot hold the mark down for good.
-///
-/// Saturating at 0 rather than wrapping: a UID of 1 that will not ingest leaves
-/// a mark of 0, meaning every listed UID is an arrival, which is the correct
-/// reading when the very bottom of the mailbox is missing.
-pub(crate) fn mark_below_unmet(pending: Option<u32>, unmet: &[u32]) -> Option<u32> {
-    let Some(lowest) = unmet.iter().copied().min() else {
-        return pending;
-    };
-    let owed = lowest.saturating_sub(1);
-    Some(pending.map_or(owed, |mark| mark.min(owed)))
-}
-
 /// Whether the `UID SEARCH ALL` listing is the whole mailbox.
 ///
 /// A listing shorter than the `EXISTS` the same SELECT announced is a partial
@@ -393,7 +317,7 @@ pub async fn fetch_new_raw_on_session(
     mailbox: &str,
     limit: Option<usize>,
     known: KnownUids,
-) -> Result<StoreFetch> {
+) -> Result<MailboxFetch> {
     let mut span = TimingSpan::with_context("fetch_new_raw", mailbox.to_string());
 
     let imap_mailbox = session
@@ -471,7 +395,7 @@ pub async fn fetch_new_raw_on_session(
             carried_mark,
             prior_high_water,
         );
-        StoreFetch {
+        MailboxFetch {
             messages: Vec::new(),
             skipped: 0,
             known_flags: Vec::new(),
@@ -529,7 +453,7 @@ pub async fn fetch_new_raw_on_session(
             carried_mark,
             prior_high_water,
         );
-        return Ok(StoreFetch {
+        return Ok(MailboxFetch {
             messages: Vec::new(),
             skipped,
             known_flags,
@@ -579,7 +503,7 @@ pub async fn fetch_new_raw_on_session(
         carried_mark,
         prior_high_water,
     );
-    Ok(StoreFetch {
+    Ok(MailboxFetch {
         messages: out,
         skipped,
         known_flags,
@@ -872,26 +796,6 @@ mod tests {
         // same ceiling that keeps a placeholder out of the high-water mark.
         assert_eq!(arrival_mark(&known, 100, None, Some(10)), Some(40));
         assert_eq!(arrival_mark(&known, 100, None, Some(4_000_000)), Some(100));
-    }
-
-    /// #0074: what the download covered is not what the pass wrote. A UID that
-    /// was fetched and not ingested pulls the persisted mark under itself, even
-    /// when the download reported the pass complete.
-    #[test]
-    fn an_unwritten_uid_pulls_the_mark_below_itself() {
-        // The complete-looking case the bug lived in: no mark, so the next pass
-        // would have derived a floor above the message it never wrote.
-        assert_eq!(mark_below_unmet(None, &[105]), Some(104));
-        // The lowest one wins; everything above it is an arrival again too.
-        assert_eq!(mark_below_unmet(None, &[110, 105, 107]), Some(104));
-        // A mark the download already reported can only be lowered.
-        assert_eq!(mark_below_unmet(Some(100), &[105]), Some(100));
-        assert_eq!(mark_below_unmet(Some(200), &[105]), Some(104));
-        // Nothing unwritten changes nothing, which is how the gate reopens.
-        assert_eq!(mark_below_unmet(None, &[]), None);
-        assert_eq!(mark_below_unmet(Some(100), &[]), Some(100));
-        // The bottom of the mailbox: every listed UID is an arrival.
-        assert_eq!(mark_below_unmet(None, &[1]), Some(0));
     }
 
     /// `mp sync -n 0` computes a full vanished set and downloads nothing. It

@@ -13,7 +13,7 @@ use log::{debug, info, warn};
 use serde::Deserialize;
 
 use crate::config::GraphConfig;
-use crate::imap_client::{FreshObservation, SyncResult, SyncTarget};
+use crate::sync::{FreshObservation, SyncResult, SyncTarget};
 use crate::ingest::pass_may_prune;
 use crate::types::MailboxRole;
 use crate::parse::{sanitize_attachment_filename, AttachmentData, FetchedEmail};

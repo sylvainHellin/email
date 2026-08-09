@@ -7,7 +7,7 @@
 
 use crate::config::{account_dir, AccountConfig};
 use crate::contacts::{load_cache, observe, save_cache, ObservedIn};
-use crate::imap_client::FreshObservation;
+use crate::sync::FreshObservation;
 use crate::types::EmailDraft;
 use chrono::{DateTime, Utc};
 use log::{debug, warn};

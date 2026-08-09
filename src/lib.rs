@@ -26,5 +26,6 @@ pub mod outbox;
 pub mod pending_ops;
 pub mod send;
 pub mod store;
+pub mod sync;
 pub mod sync_health;
 pub mod tui;
