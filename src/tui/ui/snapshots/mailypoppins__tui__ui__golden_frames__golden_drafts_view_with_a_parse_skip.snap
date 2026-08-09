@@ -1,5 +1,6 @@
 ---
 source: src/tui/ui/golden_frames.rs
+assertion_line: 605
 expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 ---
 == text 120x40 (trailing spaces trimmed) ==
@@ -41,7 +42,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 35 |╭ View ──────────────────────────────────╮│                                                                            │
 36 |│     mail  |  contacts  |  calendar     ││                                                                            │
 37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
-38 | MAIL   j/k Navigate emails  v Toggle selection  Enter / e Open in editor (mail read-only)  r / R Reply / Reply-all  a A
+38 | MAIL   j/k Navigate  v Select  Enter / e Open (read-only)  r / R Reply / Reply-all  a Archive  d Delete  n New draft …
 39 | ? help                                                                                                      Drafts 1/2
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 01 |bold@43..50
@@ -50,5 +51,5 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 04 |bold@43..50
 09 |bg:surface+fg:selection+bold@1..41
 36 |bold@5..11
-38 |bold@0..6 bg:surface@6..8 bg:surface+bold@8..11 bg:surface@11..29 bg:surface+bold@29..30 bg:surface@30..49 bg:surface+bold@49..58 bg:surface@58..92 bg:surface+bold@92..97 bg:surface@97..117 bg:surface+bold@117..118 bg:surface@118..120
+38 |bold@0..6 bg:surface@6..8 bg:surface+bold@8..11 bg:surface@11..22 bg:surface+bold@22..23 bg:surface@23..32 bg:surface+bold@32..41 bg:surface@41..60 bg:surface+bold@60..65 bg:surface@65..85 bg:surface+bold@85..86 bg:surface@86..96 bg:surface+bold@96..97 bg:surface@97..106 bg:surface+bold@106..107 bg:surface@107..120
 39 |bg:surface@0..120

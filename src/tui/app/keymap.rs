@@ -351,8 +351,28 @@ pub struct KeyBinding {
     pub action: KeyAction,
     /// Human description for the help overlay / website.
     pub desc: &'static str,
+    /// Short label for the hint bar only, `""` to reuse [`Self::desc`] (#0078).
+    ///
+    /// The hint bar is one line that lays every hinted binding of the context
+    /// out end to end, so one long description silently costs the bindings to
+    /// its right. The help overlay and `mp dump-keys` (hence the website
+    /// table) have a column each and always show `desc`, so the short form
+    /// never becomes the only wording a user can find.
+    pub short: &'static str,
     /// Whether to surface this binding in the hint bar's "next keys" row.
     pub hint: bool,
+}
+
+impl KeyBinding {
+    /// What the hint bar prints: the short label when there is one, else the
+    /// full description.
+    pub fn hint_label(&self) -> &'static str {
+        if self.short.is_empty() {
+            self.desc
+        } else {
+            self.short
+        }
+    }
 }
 
 /// Full constructor.
@@ -367,7 +387,13 @@ const fn row(
     desc: &'static str,
     hint: bool,
 ) -> KeyBinding {
-    KeyBinding { keys, chord, prefix, ctx, guard, action, desc, hint }
+    KeyBinding { keys, chord, prefix, ctx, guard, action, desc, short: "", hint }
+}
+
+/// Give a binding a hint-bar-only short label (#0078). Wraps any of the
+/// constructors below, so only the rows that need one carry one.
+const fn short(kb: KeyBinding, short: &'static str) -> KeyBinding {
+    KeyBinding { short, ..kb }
 }
 
 /// Plain live binding.
@@ -440,15 +466,15 @@ pub static KEYMAP: &[KeyBinding] = &[
     // -- EMAIL LIST -------------------------------------------------------
     // Most list actions require a non-empty list (matching the old empty-list
     // early-return that only allowed s/S/f/n). Only s/S/f/n are exempt.
-    bg("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListDown, "Navigate emails", true),
+    short(bg("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListDown, "Navigate emails", true), "Navigate"),
     bg("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListUp, "", false),
     row("", Chord::PrefixLeader('g'), None, KeyCtx::List, Guard::NonEmptyList, KeyAction::Manual, "", false),
     row("", Chord::Char('g'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListTop, "", false),
     bg("gg / G", Chord::Char('G'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListBottom, "Jump to top / bottom", false),
-    bg("v", Chord::Char('v'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true),
+    short(bg("v", Chord::Char('v'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true), "Select"),
     bg("Ctrl+a", Chord::CtrlChar('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SelectAllVisible, "Select all visible", false),
     bg("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::List, Guard::NonEmptyList, KeyAction::ClearSelection, "Clear selection", false),
-    bg("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenEditor, "Open in editor (mail read-only)", true),
+    short(bg("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenEditor, "Open in editor (mail read-only)", true), "Open (read-only)"),
     bg("r / R", Chord::Char('r'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Reply, "Reply / Reply-all", true),
     bg("", Chord::Char('R'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ReplyAll, "", false),
     bg("w", Chord::Char('w'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Forward, "Forward", false),
@@ -472,14 +498,14 @@ pub static KEYMAP: &[KeyBinding] = &[
     bg("O", Chord::Char('O'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SaveAttachment, "Save attachment to disk", false),
     bg("b", Chord::Char('b'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenInBrowser, "Open HTML in browser", false),
     b("n", Chord::Char('n'), KeyCtx::List, KeyAction::NewDraft, "New draft", true),
-    b("s / S", Chord::Char('s'), KeyCtx::List, KeyAction::QuickSync, "Quick sync / Full sync", true),
+    short(b("s / S", Chord::Char('s'), KeyCtx::List, KeyAction::QuickSync, "Quick sync / Full sync", true), "Sync"),
     b("", Chord::Char('S'), KeyCtx::List, KeyAction::FullSync, "", false),
     b("f", Chord::Char('f'), KeyCtx::List, KeyAction::ServerSearch, "Search (IMAP)", true),
     // -- SERVER SEARCH (overlay-internal; hand-dispatched) ----------------
     manual("j/k", KeyCtx::ServerSearch, "Navigate results", true),
     manual("gg / G", KeyCtx::ServerSearch, "Jump to top / bottom", false),
     manual("d/u", KeyCtx::ServerSearch, "Half-page down / up", false),
-    manual("Enter / e", KeyCtx::ServerSearch, "Open in editor (mail read-only)", true),
+    short(manual("Enter / e", KeyCtx::ServerSearch, "Open in editor (mail read-only)", true), "Open (read-only)"),
     manual("r / R", KeyCtx::ServerSearch, "Reply / Reply-all", false),
     manual("w", KeyCtx::ServerSearch, "Forward", false),
     manual("a", KeyCtx::ServerSearch, "Archive", false),
@@ -498,13 +524,13 @@ pub static KEYMAP: &[KeyBinding] = &[
     row("", Chord::Char('g'), Some('g'), KeyCtx::Contacts, Guard::None, KeyAction::ContactsTop, "", false),
     b("gg / G", Chord::Char('G'), KeyCtx::Contacts, KeyAction::ContactsBottom, "Jump to top / bottom", false),
     b("/", Chord::Char('/'), KeyCtx::Contacts, KeyAction::ContactsSearch, "Fuzzy search", true),
-    b("Enter / n", Chord::Code(SpecialCode::Enter), KeyCtx::Contacts, KeyAction::ContactsCompose, "Compose to contact", true),
+    short(b("Enter / n", Chord::Code(SpecialCode::Enter), KeyCtx::Contacts, KeyAction::ContactsCompose, "Compose to contact", true), "Compose"),
     b("", Chord::Char('n'), KeyCtx::Contacts, KeyAction::ContactsCompose, "", false),
-    b("v", Chord::Char('v'), KeyCtx::Contacts, KeyAction::ContactsVcard, "Send contact as vCard", true),
+    short(b("v", Chord::Char('v'), KeyCtx::Contacts, KeyAction::ContactsVcard, "Send contact as vCard", true), "Send vCard"),
     // `c` is free in this context: the Global `c` is a leader continuation
     // (`Space c`), and the mail-list `c` (edit recipients) is KeyCtx::List.
-    b("c", Chord::Char('c'), KeyCtx::Contacts, KeyAction::ContactsCopyEmail, "Copy email address", true),
-    b("r", Chord::Char('r'), KeyCtx::Contacts, KeyAction::ContactsRefresh, "Refresh contact index", true),
+    short(b("c", Chord::Char('c'), KeyCtx::Contacts, KeyAction::ContactsCopyEmail, "Copy email address", true), "Copy email"),
+    short(b("r", Chord::Char('r'), KeyCtx::Contacts, KeyAction::ContactsRefresh, "Refresh contact index", true), "Refresh"),
     // -- CALENDAR (#0034) -------------------------------------------------
     // Local-first agenda over the invites on disk. Live only in the Calendar
     // view; dispatched via the pane context like the Contacts list. `V` is the
@@ -514,10 +540,10 @@ pub static KEYMAP: &[KeyBinding] = &[
     row("", Chord::PrefixLeader('g'), None, KeyCtx::Calendar, Guard::None, KeyAction::Manual, "", false),
     row("", Chord::Char('g'), Some('g'), KeyCtx::Calendar, Guard::None, KeyAction::CalendarTop, "", false),
     b("gg / G", Chord::Char('G'), KeyCtx::Calendar, KeyAction::CalendarBottom, "Jump to top / bottom", false),
-    b("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::Calendar, KeyAction::CalendarOpenSource, "Open the invite email in $EDITOR", true),
-    b("V", Chord::Char('V'), KeyCtx::Calendar, KeyAction::CalendarRsvp, "RSVP to invitation (Accept/Tentative/Decline)", true),
-    b("t", Chord::Char('t'), KeyCtx::Calendar, KeyAction::CalendarToggleScope, "Show past events / upcoming only", true),
-    b("r", Chord::Char('r'), KeyCtx::Calendar, KeyAction::CalendarRefresh, "Refresh events from disk", true),
+    short(b("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::Calendar, KeyAction::CalendarOpenSource, "Open the invite email in $EDITOR", true), "Open invite email"),
+    short(b("V", Chord::Char('V'), KeyCtx::Calendar, KeyAction::CalendarRsvp, "RSVP to invitation (Accept/Tentative/Decline)", true), "RSVP"),
+    short(b("t", Chord::Char('t'), KeyCtx::Calendar, KeyAction::CalendarToggleScope, "Show past events / upcoming only", true), "Past / upcoming"),
+    short(b("r", Chord::Char('r'), KeyCtx::Calendar, KeyAction::CalendarRefresh, "Refresh events from disk", true), "Refresh"),
     // -- HEADERS ----------------------------------------------------------
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Headers, KeyAction::HeadersDown, "Scroll headers", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Headers, KeyAction::HeadersUp, "", false),
@@ -708,6 +734,76 @@ mod tests {
     }
     fn allow(_: Guard) -> bool {
         true
+    }
+
+    /// #0078: a binding with no short label falls back to `desc`, so only the
+    /// rows that need one carry one and no row can end up label-less.
+    #[test]
+    fn a_binding_without_a_short_label_falls_back_to_its_description() {
+        let plain = b("q", Chord::Char('q'), KeyCtx::Global, KeyAction::Quit, "Quit", true);
+        assert_eq!(plain.short, "");
+        assert_eq!(plain.hint_label(), "Quit");
+
+        let labelled = short(plain, "Bye");
+        assert_eq!(labelled.desc, "Quit", "the long description is untouched");
+        assert_eq!(labelled.hint_label(), "Bye");
+
+        for kb in KEYMAP {
+            if kb.desc.is_empty() {
+                continue;
+            }
+            assert!(!kb.hint_label().is_empty(), "{:?} has no hint label", kb.keys);
+            assert!(
+                kb.short.is_empty() || kb.short.len() < kb.desc.len(),
+                "{:?}: the short label {:?} is not shorter than {:?}",
+                kb.keys,
+                kb.short,
+                kb.desc
+            );
+        }
+    }
+
+    /// The short label is the hint bar's alone: the help overlay and
+    /// `mp dump-keys` (hence the website table) read `desc` (#0078).
+    #[test]
+    fn only_hinted_rows_carry_a_short_label() {
+        for kb in KEYMAP {
+            assert!(
+                kb.short.is_empty() || kb.hint,
+                "{:?} carries a short label but is never hinted",
+                kb.keys
+            );
+        }
+    }
+
+    /// No line of hints can exceed the golden 120-column width, which is what
+    /// used to make ratatui clip the last binding mid-word (#0078).
+    #[test]
+    fn every_contexts_hint_row_fits_the_golden_width_after_the_short_labels() {
+        for ctx in [
+            KeyCtx::Global,
+            KeyCtx::Sidebar,
+            KeyCtx::List,
+            KeyCtx::Headers,
+            KeyCtx::Preview,
+            KeyCtx::ServerSearch,
+            KeyCtx::Contacts,
+            KeyCtx::Calendar,
+            KeyCtx::Activity,
+            KeyCtx::Help,
+        ] {
+            // ` 2 SELECTED ` is the widest badge, plus its two trailing
+            // spaces; the hint bar renders after it.
+            let mut width = " 2 SELECTED ".len() + 2;
+            for (i, kb) in hint_bindings(ctx).enumerate() {
+                width += usize::from(i > 0) * 2 + kb.keys.len() + 1 + kb.hint_label().len();
+            }
+            // `List` is still over budget at 120 and is truncated cleanly by
+            // the renderer; every other context now fits outright.
+            if ctx != KeyCtx::List {
+                assert!(width <= 120, "{ctx:?} hint row is {width} columns");
+            }
+        }
     }
 
     /// No two live bindings share the same (context, keys, prefix) triple:

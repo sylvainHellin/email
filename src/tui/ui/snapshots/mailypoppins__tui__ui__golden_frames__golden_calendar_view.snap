@@ -1,5 +1,6 @@
 ---
 source: src/tui/ui/golden_frames.rs
+assertion_line: 588
 expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 ---
 == text 120x40 (trailing spaces trimmed) ==
@@ -41,7 +42,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 35 |╭ View ──────────────────────────────────╮│                                                                            │
 36 |│     mail  |  contacts  |  calendar     ││                                                                            │
 37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
-38 | CALENDAR   j/k Navigate events  Enter / e Open the invite email in $EDITOR  V RSVP to invitation (Accept/Tentative/Decl
+38 | CALENDAR   j/k Navigate events  Enter / e Open invite email  V RSVP  t Past / upcoming  r Refresh
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 01 |bg:surface+fg:selection+bold@1..41 bold@43..61
@@ -50,5 +51,5 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 04 |bold@43..54
 05 |bold@43..54 fg:selection@54..62
 36 |bold@27..37
-38 |bold@0..10 bg:surface@10..12 bg:surface+bold@12..15 bg:surface@15..33 bg:surface+bold@33..42 bg:surface@42..77 bg:surface+bold@77..78 bg:surface@78..120
+38 |bold@0..10 bg:surface@10..12 bg:surface+bold@12..15 bg:surface@15..33 bg:surface+bold@33..42 bg:surface@42..62 bg:surface+bold@62..63 bg:surface@63..70 bg:surface+bold@70..71 bg:surface@71..89 bg:surface+bold@89..90 bg:surface@90..120
 39 |bg:surface@0..120

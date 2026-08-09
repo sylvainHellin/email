@@ -33,11 +33,11 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         // alongside the pane's own continuations whenever we are not already
         // in Global.
         let mut conts: Vec<(&str, &str)> = prefix_continuations(ctx, p)
-            .map(|kb| (kb.keys, kb.desc))
+            .map(|kb| (kb.keys, kb.hint_label()))
             .collect();
         if ctx != KeyCtx::Global {
             for kb in prefix_continuations(KeyCtx::Global, p) {
-                conts.push((kb.keys, kb.desc));
+                conts.push((kb.keys, kb.hint_label()));
             }
         }
         // The leader badge: a printable name for Space, otherwise the
@@ -53,22 +53,40 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         let off_mail = app.view != View::Mail;
         let hs: Vec<(&str, &str)> = hint_bindings(ctx)
             .filter(|kb| !(off_mail && ctx == KeyCtx::Global && !kb.action.is_view_agnostic()))
-            .map(|kb| (kb.keys, kb.desc))
+            .map(|kb| (kb.keys, kb.hint_label()))
             .collect();
         (mode_label(app, ctx).to_string(), hs)
     };
 
-    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 2 + 2);
+    let badge_text = format!(" {} ", badge);
+    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4 + 3);
     // Mode badge: bold, accent background, contrasting fg.
+    let mut used = display_width(&badge_text) + 2;
     spans.push(Span::styled(
-        format!(" {} ", badge),
+        badge_text,
         Style::default()
             .fg(theme::active().bg)
             .bg(theme::active().accent)
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled("  ", Style::default().bg(bg)));
-    for (i, (keys, desc)) in hints.iter().enumerate() {
+
+    // Drop whole `keys` + label pairs that do not fit and mark the cut with an
+    // ellipsis, rather than letting ratatui clip the last one mid-word
+    // (#0078). The help overlay (`?`) still lists every binding in full, so
+    // nothing dropped here is unreachable.
+    let total = usize::from(area.width);
+    let mut truncated = false;
+    for (i, (keys, label)) in hints.iter().enumerate() {
+        let sep = usize::from(i > 0) * 2;
+        let width = sep + display_width(keys) + 1 + display_width(label);
+        // The ellipsis needs a cell of its own unless this is the last pair.
+        let reserve = if i + 1 == hints.len() { 0 } else { 2 };
+        if used + width + reserve > total {
+            truncated = true;
+            break;
+        }
+        used += width;
         if i > 0 {
             spans.push(Span::styled("  ", Style::default().bg(bg)));
         }
@@ -81,9 +99,12 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
         spans.push(Span::styled(" ", Style::default().bg(bg)));
         spans.push(Span::styled(
-            *desc,
+            *label,
             Style::default().fg(theme::active().text_muted).bg(bg),
         ));
+    }
+    if truncated {
+        spans.push(Span::styled(" …", Style::default().fg(theme::active().text_muted).bg(bg)));
     }
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bg));
