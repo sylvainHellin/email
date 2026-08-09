@@ -21,7 +21,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
 - [#0081 QRESYNC, UIDPLUS, and advancing the modseq on a capped pass](docs/tickets/0081-qresync-uidplus.md) -- perf _(the split-out half of #0041, which shipped the session pool and the CONDSTORE delta)_
-- [#0043 FTS5 full-text search](docs/tickets/0043-fts5-search.md) -- feature _(data layer, Stage 5)_
 - [#0060 Enforce the retention policy](docs/tickets/0060-retention-enforcement.md) -- feature
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_

@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`mp search --local`, ranked full-text search over the store (#0043).**
+  Search is a `SELECT` now, not a stream over files: `mp search --local
+  <query>` answers from the store's FTS5 index, offline, over every synced
+  mailbox of the account at once, best match first. `--mailbox` narrows it to
+  one mailbox, `-n` caps the hits and `--full` prints the bodies. The
+  server-side `mp search` is untouched and stays the default; the TUI's `\`
+  body filter is also untouched, and stays the substring filter it has been
+  since #0038 (the reasoning is in `src/tui/app/types.rs`).
+
+  The query is translated rather than passed through: every term becomes a
+  quoted FTS5 literal, so `c++`, `(draft)` and a stray quote are searched as
+  the text they are instead of failing as syntax. `"a phrase"` matches
+  adjacency, a trailing `*` is a prefix, and `subject:`, `from:` and `body:`
+  restrict a term to one column. Ranking is bm25 with the subject weighted
+  above the sender and the sender above the body, so a word in a subject line
+  outranks the same word buried in a quoted reply chain.
+
+  No schema change and no new maintenance: the index has been written inside
+  the same transaction as the `messages` row since #0038 and removed by every
+  delete path (re-ingest, `mp delete`, the TUI's `d`, the sync prune), which
+  the new tests now assert from the query side, through
+  `store::search::index_drift`. A whole-account search over a 712-message
+  store answers in ~20 ms.
+
 - **Microsoft Graph incremental sync via `/messages/delta` (#0042).** A Graph
   account used to enumerate every message in every folder on every pass, just
   to work out what was new. A quick sync now walks `/messages/delta` from a

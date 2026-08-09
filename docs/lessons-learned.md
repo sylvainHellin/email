@@ -806,3 +806,28 @@ A Graph delta token is bound to a folder *id*, while the config names a role (`a
 Those are different identities: an `Archive` deleted and recreated in Outlook is the same name and a different folder, and a stored token that outlived that is a token for a mailbox that no longer exists.
 Graph would answer it with a 404 or a 410, which the fallback catches, but depending on a server error for a local invariant is how the #0004 class of bug gets in, so #0042 reads the folder id (`$select=id`, one small GET per target) and stores its hash in the `uidvalidity` column, which is the analogous column on purpose.
 Whenever a backend gains an incremental path, the question to ask before the token is designed is "what renumbering or re-creation makes this meaningless", and the answer belongs in a column the client checks itself.
+
+## A contentless FTS5 index is a query surface waiting for a translator, not a search feature
+
+`messages_fts` shipped with #0038 and was maintained correctly from day one: written in the same transaction as the `messages` row, deleted from every delete path (`delete_row`, `apply_delete`, the prune through `delete_by_uid`).
+So #0043, "FTS5 full-text search", found scope items 1 and 3 already done and the whole of the remaining work sitting in the two things nobody writes down: how a user's typing becomes a MATCH expression, and how the answer is ranked.
+Both are traps if skipped.
+Handing user input straight to `MATCH` makes ordinary typing a syntax error (`c++`, `(draft)`, a trailing `AND`, one stray quote), and the fix is not escaping but wrapping: every term becomes a double-quoted FTS5 string literal, in which only `"` is special and is escaped by doubling, and the terms are joined by whitespace because FTS5's implicit operator is already `AND`.
+Ranking is the same shape of omission: without an explicit `bm25()` in the `ORDER BY` the rows come back in rowid order, which reads as "sorted by nothing", and the weights are where the product decision lives (subject 10, sender 5, body 1: a word in the subject outranks the same word buried in a quoted reply chain).
+The generalisation: an index is not a feature until something translates a question into it and orders the answer.
+
+## Contentless FTS5 constrains the API more than the storage
+
+`content=''` with `contentless_delete=1` buys the delete-by-rowid that external-content could not give us, and it takes three things away that a search feature usually assumes.
+`snippet()` and `highlight()` fail outright, so the result rendering has to come from the joined `messages` row (its stored `snippet` column) rather than from the index.
+`SELECT`ing an indexed column fails too, so a `MATCH` query is only ever a rowid producer, and the join is mandatory.
+And there is nothing to rebuild the index *from*: the body text lives in a blob and the index keeps no copy, so `INSERT INTO t(t) VALUES('rebuild')` is not available and no repair path can exist.
+That last one is only acceptable because the store is a cache with a drop-and-rebuild contract; what #0043 added instead of a repair is `store::search::index_drift`, two `NOT IN` counts that make the row/index invariant *checkable* in a test rather than merely asserted in a comment.
+The rule of thumb: pick contentless when the content has another home and the file is disposable, and expect to pay for it at the API boundary, not in the writer.
+
+## The literal words of an old ticket lose to a documented decision made after it
+
+#0043 was written before #0038 and says "the `\` search path queries FTS5 instead of streaming files".
+By the time it was implemented the `\` path no longer streamed files: it was an incremental, case-insensitive *substring* filter over the loaded mailbox, and `src/tui/app/types.rs` carried a written rationale for why it must not be served by FTS5 (token matching changes the result set for exactly the queries that mode exists for, a fragment inside a word, punctuation, a partial address, and none of it survives translation to a MATCH expression per keystroke).
+Implementing the sentence would have regressed a deliberate decision to satisfy a ticket whose premise had expired.
+The habit: when a ticket's scope item names the *mechanism* of a surface, re-read that surface before believing the item, and when the code disagrees with the ticket, the one with the dated reasoning next to it wins; the ticket close-out then records which item was superseded and by what, so the next reader does not re-litigate it.

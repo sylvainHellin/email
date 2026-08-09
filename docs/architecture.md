@@ -57,6 +57,8 @@ The `messages_message_id` index is deliberately non-unique: it serves threading,
 Refcounts live in the database so a reference can be taken in the same transaction as the row that carries the hash.
 - `messages_fts` is a contentless FTS5 index (`content=''`, `contentless_delete=1`) over subject, from and body text.
 Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, and nothing needs to be, because a store that loses its index is dropped.
+It is written inside the same transaction as the `messages` row it describes and removed by every delete path, so it needs no reconcile pass; `store::search::index_drift` is the check that says so rather than the comment claiming it.
+`store::search` is the query side (#0043), behind `mp search --local`.
 - `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (the Graph `/messages/delta` resume point, #0042; on a Graph account `uidvalidity` holds the hashed folder id that token is bound to, which is the analogous column on purpose).
 The two were one column until #0054, which stored a UID where a modseq was read back.
 `arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
@@ -184,7 +186,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/ingest.rs` | The receive-path writer: fetched message to one `messages` row plus blobs, FTS maintenance, cursors, `prune_vanished`, `apply_seen_flags`, `graph_uid` |
 | `src/selector.rs` | The `mp://account/mailbox/key` grammar: parse, resolve, format. Namespace fixed by the command, never sniffed. |
 | `src/dump.rs` | `mp dump-mailbox`: path-free NDJSON envelope dump of the store, the parity harness for the data-layer rewrite |
-| `src/read_cmd.rs` | `mp show` and `mp list-messages` (#0062): the human read surface over `store::read`, offline, rendering to a `String` so the layout is testable. Not the dump: that is an oracle with a pinned record shape. |
+| `src/read_cmd.rs` | `mp show`, `mp list-messages` (#0062) and the `mp search --local` listing (#0043): the human read surface over `store::read` and `store::search`, offline, rendering to a `String` so the layout is testable. Not the dump: that is an oracle with a pinned record shape. |
 | `src/cutover.rs` | `mp cutover` (#0040): the end of the file-era transition. Mints an `id:` into any draft that has none (the one-time draft "import"; the drafts directory never moved) and reports the dead file-era mailbox directories. Deletes nothing, by design. |
 | `src/reconcile.rs` | iMIP invite reconciliation, folded over the rows at display time and never persisted |
 | `src/parse.rs` | RFC822 parsing, attachment extraction and sanitisation, `open_file_with_system()`, `materialisation_dir()`, `stable_attachments_dir()`, `ensure_utf8_charset()` |
@@ -209,6 +211,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
 | `schema.rs` | Schema v6 SQL, version stamping, required-table validation, and the identity notes |
 | `read.rs` | Listings, counts, Message-ID lookup, body and HTML loading, `materialise_attachments` |
+| `search.rs` | Full-text search over `messages_fts` (#0043): the user-query-to-MATCH translation, the bm25 ranking and `index_drift` |
 | `write.rs` | The optimistic local half of a flag, move or delete |
 | `drafts.rs` | The derived index over `<account_dir>/drafts/` |
 | `blobs.rs` | The content-addressed blob store and its refcount discipline |
@@ -348,12 +351,12 @@ It was `email-cli` before #0022, and `get` falls back to that name so a user who
 
 ## Testing
 
-- **1011 tests**, run by `cargo test`.
+- **1059 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
 `cargo insta review` approves changes; a diff there is a decision, not an approval reflex.
-- The store side is fixture-driven: `tests/store_ingest_integration.rs` ingests real RFC822 bytes and asserts rows, blobs, refcounts and FTS state; `tests/outbox_integration.rs` drives the state machine against a fake Sent mailbox.
+- The store side is fixture-driven: `tests/store_ingest_integration.rs` ingests real RFC822 bytes and asserts rows, blobs, refcounts and FTS state; `tests/store_search_integration.rs` asserts the search itself (ranking, phrases, prefixes, unicode, mailbox and account scope) and that the index does not drift across re-ingest, a UIDVALIDITY rebind, a move, a delete and a prune; `tests/outbox_integration.rs` drives the state machine against a fake Sent mailbox.
 - The sync engine (`src/sync/engine.rs`) is tested offline against a fake `SyncBackend` (#0059): ingest and cursor advance, the #0074 arrival mark and its give-up bound, the UIDVALIDITY reset, the deferred prune pass and its account-wide coverage gate, `dry_run`, and the flag application.
   `ops.rs` and `batch.rs` still have none: their seam is `ops::run_op`, not this one.
   The Graph orchestrator still has none either, because it does not run on the engine yet.

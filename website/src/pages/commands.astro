@@ -48,6 +48,7 @@ const imapCommands = [
 const storeCommands = [
   { command: 'mp list-messages [--mailbox <name>] [-n N]', description: 'List received messages from the local store (offline)' },
   { command: 'mp show <selector> [--json]', description: 'Print one received message -- headers, attachments and body -- from the local store (offline)' },
+  { command: 'mp search --local <query> [--mailbox <name>] [-n N] [--full]', description: 'Ranked full-text search over the local store (offline, every synced mailbox at once)' },
 ];
 
 const storeOptions = [
@@ -104,6 +105,16 @@ const inviteOptions = [
   { command: '--duration <dur>', description: 'Duration instead of --end: PT1H30M or 1h30m' },
   { command: '--location <text>', description: 'Optional event location' },
   { command: '--description <text>', description: 'Optional event description / body' },
+];
+
+const localSearchSyntax = [
+  { command: 'word', description: 'Matches the whole word in subject, sender or body; several words all have to match' },
+  { command: '"a phrase"', description: 'Matches the words adjacent, in that order' },
+  { command: 'word*', description: 'Prefix match (invoi* finds invoicing)' },
+  { command: 'subject:', description: 'Restrict the term to the subject' },
+  { command: 'from:', description: 'Restrict the term to the sender' },
+  { command: 'body:', description: 'Restrict the term to the body text' },
+  { command: '--mailbox <name>', description: 'Restrict the search to one mailbox (default: the whole account)' },
 ];
 
 const searchSyntax = [
@@ -335,6 +346,19 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         mailboxes are searched in sequence.
       </p>
       <CommandTable commands={searchSyntax} />
+
+      <h3 id="local-search-syntax">Local full-text search (<code>--local</code>)</h3>
+      <p>
+        <code>mp search --local &lt;query&gt;</code> answers from the local store's
+        FTS5 index instead of the server: offline, ranked best match first, and
+        covering every synced mailbox of the account at once. A subject hit
+        outranks the same word buried in a quoted reply. The index is written in
+        the same transaction as the message it describes, so it is never stale
+        with respect to what <code>mp sync</code> has pulled -- and it holds only
+        what has been synced, which is what the server-side search is still for.
+        Punctuation is searched as text, not as query syntax.
+      </p>
+      <CommandTable commands={localSearchSyntax} />
     </section>
 
     <section>
