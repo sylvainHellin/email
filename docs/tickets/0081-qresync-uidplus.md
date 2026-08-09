@@ -27,7 +27,10 @@ That is a schema change, so it wants the next schema bump rather than a migratio
 
 `SELECT ... (QRESYNC (uidvalidity modseq))` folds the vanished set and the changed flags into the SELECT response, which would replace the `UID SEARCH ALL` enumeration on the one account that can use it.
 
-Only `tum` (Dovecot) advertises it; Gmail never implemented it and Proton Bridge (Gluon) does not have it either, so it benefits exactly one account, which is why it lost to the rest of #0041 on effort.
+The case for it got worse during #0041, not better.
+The capability matrix predicted that tum runs Dovecot and advertises the full ladder; the live probe says `xmail.mwn.de` advertises `UIDPLUS IDLE` and neither CONDSTORE nor QRESYNC.
+Gmail never implemented QRESYNC and Proton Bridge (Gluon) does not have it, so as of today **no account this client is configured for can exercise QRESYNC at all**, which means it would ship untested against any real server.
+Do not pick this up without a server that advertises it.
 `async-imap` 0.11.2 has no typed `select_qresync`, so it needs the raw `run_command`/`read_response` path plus `ENABLE QRESYNC`, and the `VANISHED (EARLIER)` response has to be reconciled with the existing `vanished_uids` diff and its #0072 coverage gate.
 That reconciliation, not the wire format, is the real work: the prune gate currently rests on "the listing accounted for every message SELECT announced", and a QRESYNC pass never produces a listing.
 

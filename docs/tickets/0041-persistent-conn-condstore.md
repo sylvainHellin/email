@@ -94,6 +94,14 @@ The pool covers sync, ops, batches and searches; the `&mut self` slot #0059 buil
 - A CONDSTORE resume point is recorded only by a pass whose window covered the whole mailbox.
 The reasoning is in `modseq_to_record`'s doc comment; the cost, that the delta only starts working after a full sync on a large mailbox, is item 1 of #0081.
 
+## Capabilities observed live (2026-08-09)
+
+Post-LOGIN, read by the client and logged on every new connection.
+
+- Gmail (`imap.gmail.com`, the `assistant` account): `CONDSTORE UIDPLUS IDLE`. Matches the research matrix. `mp sync` took the CONDSTORE path: the full pass recorded `HIGHESTMODSEQ 15367` for all three mailboxes and the next quick sync issued `(UID FLAGS) (CHANGEDSINCE 15367)`, which came back with 0 changed flags in 1.6 s.
+- tum (`xmail.mwn.de`, read-only `--dry-run` smoke): `UIDPLUS IDLE`, i.e. **neither CONDSTORE nor QRESYNC**, contradicting the matrix's prediction that tum is Dovecot with the full ladder. It takes the full-window path. This removes the only QRESYNC test target the client had; see the note in [#0081](0081-qresync-uidplus.md) and the live-probe section of the capability matrix.
+- Proton Bridge was not probed: the `perso` account was out of scope for this pass. The Gluon-source verdict (no CONDSTORE, no QRESYNC) stands, and the strict gate means an unprobed server simply takes the unchanged full-window path.
+
 ## Unblocks
 
 - [#0042](0042-graph-delta-sync.md) (Graph delta shares the cursor + engine).
