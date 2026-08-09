@@ -606,9 +606,8 @@ fn blob_text(blobs: &BlobStore, id: i64, hash: Option<&str>) -> String {
 /// The frontmatter of a message rendered back to Markdown.
 ///
 /// The key names and their order are the file era's: this is what ingest
-/// wrote at the head of every received `.md` before #0037 deleted the files,
-/// and it is what [`crate::types::InboxFrontmatter`] still deserialises. Three
-/// keys differ. `answered` and `forwarded` are new, because the axis they
+/// wrote at the head of every received `.md` before #0037 deleted the files.
+/// Three keys differ. `answered` and `forwarded` are new, because the axis they
 /// belong to did not exist when the files did (#TKT-0051), and `mailbox`
 /// replaces the file era's `status:`, which named the directory a message sat
 /// in and is now the store's mailbox key.
@@ -1172,9 +1171,30 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
         );
     }
 
+    /// The file era's received-message frontmatter, as a parse target.
+    ///
+    /// This used to be `types::InboxFrontmatter`, a production type with no
+    /// production caller; #0069 deleted it and left the one assertion that
+    /// wanted it here, where it is what it always was: a fixture (#0069).
+    #[derive(Debug, serde::Deserialize)]
+    struct FileEraFrontmatter {
+        from: String,
+        to: String,
+        #[serde(default)]
+        cc: Option<String>,
+        subject: String,
+        #[serde(default)]
+        date: Option<String>,
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        attachments: Option<Vec<String>>,
+        #[serde(default)]
+        read: Option<bool>,
+    }
+
     /// Format parity with the file era: what is rendered is what the pre-store
-    /// build wrote, so the type that still parses those files parses this
-    /// (#0075). A message with no cc, no attachments and no flags omits the
+    /// build wrote, so a reader of those files reads this (#0075). A message with no cc, no attachments and no flags omits the
     /// keys it has nothing to say about, exactly as `serde_yaml` did then.
     #[test]
     fn the_rendition_parses_as_the_file_era_frontmatter() {
@@ -1188,7 +1208,7 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
             .unwrap()
             .split_once("---\n")
             .unwrap();
-        let parsed: crate::types::InboxFrontmatter = serde_yaml::from_str(front).unwrap();
+        let parsed: FileEraFrontmatter = serde_yaml::from_str(front).unwrap();
 
         assert_eq!(parsed.from, "Ada Lovelace <ada@example.com>");
         assert_eq!(parsed.to, "b@example.com");

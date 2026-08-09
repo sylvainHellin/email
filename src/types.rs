@@ -338,33 +338,6 @@ pub struct EmailDraft {
     pub body_markdown: String,
 }
 
-/// Frontmatter of a received message written as a `.md` file.
-///
-/// The receive path stopped writing these files at the store cutover, so
-/// nothing in the crate parses one in production any more. It survives as the
-/// deserialization target the `draft::set_event_rsvp` and
-/// `draft::set_event_attendee_status` tests read their rewritten invite back
-/// through; those two rewriters are themselves file-era leftovers (see #0057),
-/// and this type goes when they do.
-#[derive(Debug, Deserialize)]
-pub struct InboxFrontmatter {
-    pub from: String,
-    pub to: String,
-    #[serde(default)]
-    pub cc: Option<String>,
-    pub subject: String,
-    #[serde(default)]
-    pub date: Option<String>,
-    #[serde(default)]
-    pub message_id: Option<String>,
-    #[serde(default)]
-    pub attachments: Option<Vec<String>>,
-    #[serde(default)]
-    pub read: Option<bool>,
-    #[serde(default)]
-    pub event: Option<EventFrontmatter>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,77 +504,5 @@ mod tests {
         assert_eq!(back.from, fm.from);
         assert_eq!(back.attachments, fm.attachments);
         assert_eq!(back.message_id, fm.message_id);
-    }
-
-    #[test]
-    fn test_inbox_frontmatter_deserialize() {
-        let yaml = r#"
-from: "alice@example.com"
-to: "bob@example.com"
-cc: "carol@example.com"
-subject: "Meeting notes"
-date: "Mon, 01 Jan 2024 12:00:00 +0000"
-message_id: "<abc123@example.com>"
-attachments:
-  - "notes.pdf"
-"#;
-        let fm: InboxFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(fm.from, "alice@example.com");
-        assert_eq!(fm.to, "bob@example.com");
-        assert_eq!(fm.cc, Some("carol@example.com".to_string()));
-        assert_eq!(fm.subject, "Meeting notes");
-        assert_eq!(fm.date, Some("Mon, 01 Jan 2024 12:00:00 +0000".to_string()));
-        assert_eq!(fm.message_id, Some("<abc123@example.com>".to_string()));
-        assert_eq!(fm.attachments, Some(vec!["notes.pdf".to_string()]));
-    }
-
-    #[test]
-    fn test_inbox_frontmatter_minimal() {
-        let yaml = r#"
-from: "alice@example.com"
-to: "bob@example.com"
-subject: "Hi"
-"#;
-        let fm: InboxFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(fm.from, "alice@example.com");
-        assert!(fm.cc.is_none());
-        assert!(fm.date.is_none());
-        assert!(fm.message_id.is_none());
-        assert!(fm.attachments.is_none());
-    }
-
-    #[test]
-    fn test_inbox_frontmatter_read_true() {
-        let yaml = r#"
-from: "alice@example.com"
-to: "bob@example.com"
-subject: "Hi"
-read: true
-"#;
-        let fm: InboxFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(fm.read, Some(true));
-    }
-
-    #[test]
-    fn test_inbox_frontmatter_read_false() {
-        let yaml = r#"
-from: "alice@example.com"
-to: "bob@example.com"
-subject: "Hi"
-read: false
-"#;
-        let fm: InboxFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(fm.read, Some(false));
-    }
-
-    #[test]
-    fn test_inbox_frontmatter_read_missing_is_none() {
-        let yaml = r#"
-from: "alice@example.com"
-to: "bob@example.com"
-subject: "Hi"
-"#;
-        let fm: InboxFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(fm.read, None);
     }
 }

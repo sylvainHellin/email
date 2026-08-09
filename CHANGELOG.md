@@ -19,6 +19,14 @@ All notable changes to this project are documented in this file.
   user-visible behaviour changed.
 
 ### Removed
+- **The file-era invite rewriters (#0069, internal).** `draft::set_event_rsvp`
+  and `draft::set_event_attendee_status` edited an invite's `.md` frontmatter in
+  place, which is the shape of the receive path the store cutover deleted; RSVP
+  state has come from store rows since #0038, and neither function had a caller
+  outside its own tests. They are gone with `AttendeeUpdate`, the two YAML
+  helpers only they used, and `types::InboxFrontmatter`, whose one surviving
+  reader (the Markdown-rendition format-parity test) now owns it as a fixture.
+  The TUI RSVP flow is unchanged.
 - **Two dead seams left by the mutation-queue wiring (internal).** `App`'s
   always-zero `bg_mutations` field and its per-account save/restore are gone:
   mutations stopped being background jobs when #0039 wired the queue, so the

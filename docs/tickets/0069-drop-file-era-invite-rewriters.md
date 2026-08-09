@@ -3,8 +3,9 @@ id: 0069
 title: Delete the file-era invite rewriters (set_event_rsvp, set_event_attendee_status, InboxFrontmatter)
 type: chore
 priority: later
-status: open
+status: done
 created: 2026-08-06
+closed: 2026-08-11
 ---
 
 Adjacent finding from the fresh-context review of [#0057](0057-dead-file-era-code-deletion.md), left out of that ticket's enumerated scope.
@@ -35,3 +36,11 @@ Check for a remaining caller once more before deleting, and check the iMIP ticke
 - `rg 'set_event_rsvp|set_event_attendee_status|InboxFrontmatter'` returns nothing in `src/`.
 - `cargo test` green, with the deleted tests gone rather than ignored.
 - The TUI RSVP flow (`c` view, accept / tentative / decline on an invite) behaves identically.
+
+## Resolution (2026-08-11)
+
+Deleted, with one deviation.
+
+- `draft::set_event_rsvp`, `draft::set_event_attendee_status`, `draft::AttendeeUpdate` and their fifteen tests are gone, along with the two YAML helpers only they used (`split_yaml_key`, `unquote_yaml`). `rg` confirms no remaining reference in `src/`, and no caller existed outside the deleted tests. #0031 does not plan to reuse them: it names no rewriter.
+- `types::InboxFrontmatter` is gone from the production API, but not simply deleted: since this ticket was written, #0075 gave it a second and non-circular use as the parse target of `store::read`'s Markdown-rendition format-parity assertion, which pins something a user can see (`mp show`'s rendition still reads as the file-era frontmatter). The struct therefore moved into that test module as `FileEraFrontmatter`, i.e. it became the fixture it always was. Its own five serde tests in `types.rs` went with it: they exercised derives on a type with no production role.
+- The lessons-learned entries that describe the deleted rewriters (#0029, #0030) are left as written: they are a record of what was learned when, not a description of current code.
