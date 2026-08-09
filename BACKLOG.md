@@ -27,6 +27,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature
 - [#0016 Open attachments for drafts (`o`)](docs/tickets/0016-attachment-open-for-drafts.md) -- feature
 - [#0017 Jump-to-date in mailbox list](docs/tickets/0017-jump-to-date.md) -- feature
+- [#0083 Reject non-string `id:` scalars in draft frontmatter loudly](docs/tickets/0083-strict-draft-id-deserialiser.md) -- bug _(follow-up to #0077's root cause; hand-written numeric-looking ids still silently re-mint)_
 
 ### Distribution / cross-platform (adoption track)
 
