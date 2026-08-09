@@ -173,37 +173,18 @@ mod tests {
     use crate::types::{EmailFrontmatter, EmailStatus};
     use std::path::PathBuf;
 
-    /// Serialize tests that mutate `MAILYPOPPINS_DATA_DIR`. Crate-wide, so it
-    /// also serialises against the other modules that do it.
-    use crate::config::data_dir_lock;
-    use std::sync::MutexGuard;
-
-    /// Test fixture: point `MAILYPOPPINS_DATA_DIR` at a tempdir for the
-    /// duration of the returned guard, and create the account directory.
+    /// Test fixture: point the data dir at a tempdir for this thread only
+    /// (#0077), and create the account directory.
     struct DataDirFixture {
-        _guard: MutexGuard<'static, ()>,
-        prev: Option<String>,
         pub account_root: PathBuf,
-        pub _tmp: tempfile::TempDir,
-    }
-
-    impl Drop for DataDirFixture {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-            }
-        }
+        pub _tmp: crate::config::test_env::TestDataDir,
     }
 
     fn fixture(account_name: &str) -> DataDirFixture {
-        let guard = data_dir_lock();
-        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", tmp.path());
+        let tmp = crate::config::test_env::TestDataDir::new();
         let account_root = account_dir(account_name);
         std::fs::create_dir_all(&account_root).unwrap();
-        DataDirFixture { _guard: guard, prev, account_root, _tmp: tmp }
+        DataDirFixture { account_root, _tmp: tmp }
     }
 
     fn mk_account() -> AccountConfig {

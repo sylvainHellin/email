@@ -386,9 +386,54 @@ pub fn stable_attachments_dir(account_dir: &Path, message_id: &str) -> PathBuf {
 /// user, and a loose mode left by an older build is tightened rather than
 /// used.
 pub fn materialisation_dir(stem: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("mailypoppins-{stem}"));
+    let dir = materialisation_root().join(format!("mailypoppins-{stem}"));
     create_private_dir(&dir)?;
     Ok(dir)
+}
+
+/// The directory message files are materialised under: `$TMPDIR` in a real
+/// run, a per-thread directory in a test binary.
+///
+/// The test seam is here rather than in `$TMPDIR` (#0077): overriding the
+/// variable is a process-global write that every parallel `tempfile::tempdir()`
+/// reads, and the per-row directory name is otherwise the very path a live
+/// `mp open` of that row uses. Keying the root on the test thread also keeps
+/// two tests that materialise the same row id off each other's files.
+fn materialisation_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        test_temp_root()
+    }
+    #[cfg(not(test))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+/// Per-process, per-thread materialisation root for the test binary.
+///
+/// Never removed while the process runs: another thread may still be reading
+/// under it. Everything lands under one `mailypoppins-tests/` parent, so a
+/// run's leftovers are `rm -rf "${TMPDIR:-/tmp}/mailypoppins-tests"`.
+#[cfg(test)]
+pub(crate) fn test_temp_root() -> PathBuf {
+    let thread = std::thread::current();
+    let key = match thread.name() {
+        Some(name) => name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>(),
+        None => format!("{:?}", thread.id())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>(),
+    };
+    let dir = std::env::temp_dir()
+        .join("mailypoppins-tests")
+        .join(std::process::id().to_string())
+        .join(key);
+    std::fs::create_dir_all(&dir).expect("test temp root");
+    dir
 }
 
 #[cfg(unix)]

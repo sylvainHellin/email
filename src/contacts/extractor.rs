@@ -445,17 +445,10 @@ mod tests {
     /// `store.db`, and that is an empty index, not an error.
     #[test]
     fn an_account_with_no_store_builds_an_empty_index() {
-        let _guard = crate::config::data_dir_lock();
-        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-        let tmp = TempDir::new().unwrap();
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", tmp.path());
+        let _tmp = crate::config::test_env::TestDataDir::new();
 
         let index = build_index_for_account(&account()).unwrap();
 
-        match prev {
-            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-        }
         assert!(index.contacts.is_empty());
         assert_eq!(index.account, "alice");
     }

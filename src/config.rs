@@ -529,6 +529,10 @@ pub fn init_secrets_backend(config: &GlobalConfig) -> std::result::Result<(), cr
 pub const CONFIG_DIR_ENV: &str = "MAILYPOPPINS_CONFIG_DIR";
 
 fn home_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_env::home() {
+        return p;
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
 
@@ -544,12 +548,21 @@ fn legacy_config_dir() -> PathBuf {
 /// Return the config directory: `$MAILYPOPPINS_CONFIG_DIR`, else
 /// `~/.config/mailypoppins`.
 pub fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var(CONFIG_DIR_ENV) {
+    if let Some(p) = config_dir_env() {
         if !p.is_empty() {
             return PathBuf::from(shellexpand::tilde(&p).into_owned());
         }
     }
     home_dir().join(".config").join("mailypoppins")
+}
+
+/// The value of `$MAILYPOPPINS_CONFIG_DIR`, through the test seam.
+fn config_dir_env() -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = test_env::config_dir() {
+        return v;
+    }
+    std::env::var(CONFIG_DIR_ENV).ok()
 }
 
 /// Return the path to the global config file: ~/.config/mailypoppins/config.toml
@@ -576,7 +589,7 @@ pub fn config_path() -> PathBuf {
 /// filesystem in practice; a rename that fails anyway names both paths and the
 /// exact `mv` to run.
 pub fn migrate_legacy_config_dir() -> Result<()> {
-    if std::env::var_os(CONFIG_DIR_ENV).is_some() {
+    if config_dir_env().is_some() {
         return Ok(());
     }
     let old = legacy_config_dir();
@@ -887,22 +900,124 @@ impl ImapConfig {
 // Override with the `MAILYPOPPINS_DATA_DIR` env var (for tests, or for power
 // users running mailypoppins from a portable location).
 
-/// Serialise tests that mutate `MAILYPOPPINS_DATA_DIR`.
+/// Thread-local overrides for the process-global inputs the path resolvers
+/// read (#0077).
 ///
-/// One lock for the whole crate: several modules point the data dir at a
-/// tempdir for the duration of a test, and per-module locks do not serialise
-/// against each other.
+/// `std::env::set_var` mutates the process environment, which every other test
+/// thread is concurrently reading through `getenv` (`tempfile::tempdir()` reads
+/// `$TMPDIR`, `dirs::data_dir()` reads `$HOME`, every `config::` path helper
+/// read `$MAILYPOPPINS_DATA_DIR`). That is a data race on `environ` in a
+/// multi-threaded process -- unsound, not merely unsynchronised -- and it is
+/// what produced the one-off failures in #0077. A crate-wide mutex only
+/// serialises the *writers*; the readers never took it.
+///
+/// A thread-local override removes the shared state instead of guarding it:
+/// libtest runs each test on its own thread, so a fixture's value is invisible
+/// to every other test, no lock is needed, and tests stay parallel.
 #[cfg(test)]
-pub(crate) fn data_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+pub(crate) mod test_env {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static DATA_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        /// `None` = no override (read the real env); `Some(v)` = override,
+        /// where `v` is `None` for "explicitly unset".
+        static CONFIG_DIR: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn data_dir() -> Option<PathBuf> {
+        DATA_DIR.with(|c| c.borrow().clone())
+    }
+
+    pub(crate) fn home() -> Option<PathBuf> {
+        HOME.with(|c| c.borrow().clone())
+    }
+
+    pub(crate) fn config_dir() -> Option<Option<String>> {
+        CONFIG_DIR.with(|c| c.borrow().clone())
+    }
+
+    /// Points the data dir at `path` for this thread, restoring the previous
+    /// override on drop.
+    pub(crate) struct DataDirOverride {
+        previous: Option<PathBuf>,
+    }
+
+    impl DataDirOverride {
+        pub(crate) fn set(path: impl Into<PathBuf>) -> Self {
+            let previous = DATA_DIR.with(|c| c.borrow_mut().replace(path.into()));
+            Self { previous }
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            DATA_DIR.with(|c| *c.borrow_mut() = previous);
+        }
+    }
+
+    /// A tempdir the data dir points at for the lifetime of the value.
+    ///
+    /// The override is dropped before the directory is removed, so nothing
+    /// resolves into a tree that is going away.
+    pub(crate) struct TestDataDir {
+        _override: DataDirOverride,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestDataDir {
+        pub(crate) fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            Self {
+                _override: DataDirOverride::set(dir.path()),
+                _dir: dir,
+            }
+        }
+    }
+
+    /// Points `$HOME` at `home` and clears `$MAILYPOPPINS_CONFIG_DIR`, for
+    /// this thread only.
+    pub(crate) struct ConfigDirOverride {
+        prev_home: Option<PathBuf>,
+        prev_config: Option<Option<String>>,
+    }
+
+    impl ConfigDirOverride {
+        pub(crate) fn new(home: &Path) -> Self {
+            let prev_home = HOME.with(|c| c.borrow_mut().replace(home.to_path_buf()));
+            let prev_config = CONFIG_DIR.with(|c| c.borrow_mut().replace(None));
+            Self {
+                prev_home,
+                prev_config,
+            }
+        }
+
+        /// Set `$MAILYPOPPINS_CONFIG_DIR` to `value` for this thread.
+        pub(crate) fn set_config_dir(&self, value: &Path) {
+            let value = value.to_string_lossy().into_owned();
+            CONFIG_DIR.with(|c| *c.borrow_mut() = Some(Some(value)));
+        }
+    }
+
+    impl Drop for ConfigDirOverride {
+        fn drop(&mut self) {
+            let prev_home = self.prev_home.take();
+            let prev_config = self.prev_config.clone();
+            HOME.with(|c| *c.borrow_mut() = prev_home);
+            CONFIG_DIR.with(|c| *c.borrow_mut() = prev_config);
+        }
+    }
 }
 
 /// Root data directory for all app-owned files.
 pub fn mailypoppins_data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_env::data_dir() {
+        return p;
+    }
     if let Ok(p) = std::env::var("MAILYPOPPINS_DATA_DIR") {
         if !p.is_empty() {
             return PathBuf::from(shellexpand::tilde(&p).into_owned());
@@ -1583,41 +1698,11 @@ name = "test"
     // -----------------------------------------------------------------------
     // config_dir + the one-time #0022 legacy move
     //
-    // These mutate HOME and MAILYPOPPINS_CONFIG_DIR, which are process-global,
-    // so they take the same env guard the data-dir tests use.
+    // These override HOME and MAILYPOPPINS_CONFIG_DIR through the thread-local
+    // test seam rather than the process environment (#0077).
     // -----------------------------------------------------------------------
 
-    /// Save HOME and MAILYPOPPINS_CONFIG_DIR, point HOME at `home`, clear the
-    /// override, and restore both on drop.
-    struct ConfigEnv {
-        prev_home: Option<String>,
-        prev_override: Option<String>,
-    }
-
-    impl ConfigEnv {
-        fn new(home: &Path) -> Self {
-            let saved = ConfigEnv {
-                prev_home: std::env::var("HOME").ok(),
-                prev_override: std::env::var(CONFIG_DIR_ENV).ok(),
-            };
-            std::env::set_var("HOME", home);
-            std::env::remove_var(CONFIG_DIR_ENV);
-            saved
-        }
-    }
-
-    impl Drop for ConfigEnv {
-        fn drop(&mut self) {
-            match self.prev_home.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match self.prev_override.take() {
-                Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
-                None => std::env::remove_var(CONFIG_DIR_ENV),
-            }
-        }
-    }
+    use test_env::ConfigDirOverride as ConfigEnv;
 
     fn seed_legacy_dir(home: &Path) -> PathBuf {
         let legacy = home.join(".config").join("email");
@@ -1631,12 +1716,11 @@ name = "test"
     /// pull a directory out from under another install.
     #[test]
     fn legacy_move_is_skipped_when_the_override_is_set() {
-        let _g = data_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let _env = ConfigEnv::new(tmp.path());
+        let env = ConfigEnv::new(tmp.path());
         let legacy = seed_legacy_dir(tmp.path());
         let elsewhere = tmp.path().join("chosen");
-        std::env::set_var(CONFIG_DIR_ENV, &elsewhere);
+        env.set_config_dir(&elsewhere);
 
         migrate_legacy_config_dir().unwrap();
 
@@ -1649,7 +1733,6 @@ name = "test"
     /// must not merge into it.
     #[test]
     fn legacy_move_never_overwrites_an_existing_config_dir() {
-        let _g = data_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ConfigEnv::new(tmp.path());
         let legacy = seed_legacy_dir(tmp.path());
@@ -1670,7 +1753,6 @@ name = "test"
     /// loudly rather than be served from `~/.config/email` forever.
     #[test]
     fn config_and_secrets_paths_never_resolve_into_the_legacy_dir() {
-        let _g = data_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ConfigEnv::new(tmp.path());
         seed_legacy_dir(tmp.path());
@@ -1738,7 +1820,6 @@ other = "/srv/.config/email/thing"
 
     #[test]
     fn legacy_move_relocates_the_whole_directory_once() {
-        let _g = data_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ConfigEnv::new(tmp.path());
         let legacy = seed_legacy_dir(tmp.path());
@@ -1761,7 +1842,6 @@ other = "/srv/.config/email/thing"
     /// What a process that lost the rename race sees: old gone, new there.
     #[test]
     fn legacy_move_is_a_no_op_with_nothing_to_move() {
-        let _g = data_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ConfigEnv::new(tmp.path());
 
@@ -1782,24 +1862,16 @@ other = "/srv/.config/email/thing"
 
     #[test]
     fn data_dir_env_override() {
-        let _g = data_dir_lock();
-        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", "/tmp/mailypoppins-test");
+        let _o = test_env::DataDirOverride::set("/tmp/mailypoppins-test");
         assert_eq!(
             mailypoppins_data_dir(),
             PathBuf::from("/tmp/mailypoppins-test")
         );
-        match prev {
-            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-        }
     }
 
     #[test]
     fn account_dir_layout() {
-        let _g = data_dir_lock();
-        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", "/tmp/x");
+        let _o = test_env::DataDirOverride::set("/tmp/x");
         assert_eq!(account_dir("alice"), PathBuf::from("/tmp/x/accounts/alice"));
         assert_eq!(
             drafts_dir("alice"),
@@ -1819,23 +1891,13 @@ other = "/srv/.config/email/thing"
         );
         assert_eq!(tokens_dir(), PathBuf::from("/tmp/x/tokens"));
         assert_eq!(logs_dir(), PathBuf::from("/tmp/x/logs"));
-        match prev {
-            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-        }
     }
 
     #[test]
     fn latest_log_file_picks_newest_and_handles_missing_dir() {
-        let _g = data_dir_lock();
-        let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-
-        let tmp = std::env::temp_dir().join(format!(
-            "mailypoppins-latest-log-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&tmp);
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", &tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().join("data");
+        let _o = test_env::DataDirOverride::set(&tmp);
 
         // Missing logs dir -> None, no crash.
         assert_eq!(latest_log_file(), None);
@@ -1853,12 +1915,6 @@ other = "/srv/.config/email/thing"
             latest_log_file(),
             Some(logs_dir().join("mailypoppins-2026-05-03.log"))
         );
-
-        let _ = fs::remove_dir_all(&tmp);
-        match prev {
-            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-        }
     }
 
     #[test]

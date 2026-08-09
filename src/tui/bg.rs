@@ -371,30 +371,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Point the data directory at a temp dir so `recount_all_mailboxes`
-    /// resolves its store inside the fixture. Serialised against the other
-    /// data-dir tests by `config::data_dir_lock`.
+    /// resolves its store inside the fixture. Thread-local, so no other test
+    /// can observe it (#0077).
     struct DataDir {
-        _dir: tempfile::TempDir,
-        _guard: std::sync::MutexGuard<'static, ()>,
-        previous: Option<String>,
+        _dir: crate::config::test_env::TestDataDir,
     }
 
     impl DataDir {
         fn new() -> Self {
-            let guard = crate::config::data_dir_lock();
-            let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-            let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
-            Self { _dir: dir, _guard: guard, previous }
-        }
-    }
-
-    impl Drop for DataDir {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-            }
+            Self { _dir: crate::config::test_env::TestDataDir::new() }
         }
     }
 

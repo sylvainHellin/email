@@ -2870,52 +2870,20 @@ mod store_backed_drafts {
     use crate::store::Store;
 
     /// Point the data directory at a tempdir so every `config::` path resolves
-    /// inside the fixture, serialised against the other data-dir tests.
+    /// inside the fixture.
+    ///
+    /// Thread-local (#0077): no process environment is mutated, so no other
+    /// test can observe this fixture's data dir and no lock is needed.
+    /// Materialised message files land under `parse::test_temp_root()` for the
+    /// same reason -- see the note there.
     pub(super) struct Fixture {
-        _dir: tempfile::TempDir,
-        _guard: std::sync::MutexGuard<'static, ()>,
-        previous: Option<String>,
-        previous_tmp: Option<String>,
-    }
-
-    /// The temp directory this test process materialises message files into.
-    ///
-    /// `parse::materialisation_dir` keys off `$TMPDIR`, so without the
-    /// override the file tests would write `/tmp/mailypoppins-<row id>` --
-    /// the very path a real `mp open` of that row uses, and the path a
-    /// parallel test run uses too.
-    ///
-    /// One directory per process rather than one per fixture, and never
-    /// removed while the process runs: a `tempfile::tempdir()` on another
-    /// test thread resolves `$TMPDIR` too, and a fixture that deleted its own
-    /// tree would pull that directory out from under it. Everything lands
-    /// under one `mailypoppins-tests/` parent, so the run's leftovers are
-    /// `rm -rf "${TMPDIR:-/tmp}/mailypoppins-tests"` rather than a scatter
-    /// among real ones.
-    fn test_temp_dir() -> &'static std::path::Path {
-        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join("mailypoppins-tests")
-                .join(std::process::id().to_string());
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        })
+        _dir: crate::config::test_env::TestDataDir,
     }
 
     impl Fixture {
         pub(super) fn new() -> Self {
-            let guard = crate::config::data_dir_lock();
-            let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-            let previous_tmp = std::env::var("TMPDIR").ok();
-            let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
-            std::env::set_var("TMPDIR", test_temp_dir());
             Self {
-                _dir: dir,
-                _guard: guard,
-                previous,
-                previous_tmp,
+                _dir: crate::config::test_env::TestDataDir::new(),
             }
         }
 
@@ -2960,19 +2928,6 @@ mod store_backed_drafts {
                 crate::selector::parse_in(&selector.to_string(), Namespace::Drafts, "alice", None)
                     .unwrap();
             crate::selector::resolve_draft(&store, &query).unwrap().0
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-                None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-            }
-            match &self.previous_tmp {
-                Some(v) => std::env::set_var("TMPDIR", v),
-                None => std::env::remove_var("TMPDIR"),
-            }
         }
     }
 
@@ -3627,7 +3582,7 @@ mod store_backed_files {
         assert_eq!(files.len(), 2, "{files:?}");
         // The name `mp open` uses, spelled out rather than read back off the
         // helper: it is the CLI/TUI parity this test exists to pin.
-        let expected = std::env::temp_dir().join(format!("mailypoppins-{}", row.id));
+        let expected = crate::parse::test_temp_root().join(format!("mailypoppins-{}", row.id));
         assert_eq!(files[0].parent().unwrap(), expected);
         // And it is private to this user (0700), because `$TMPDIR` is not.
         #[cfg(unix)]
@@ -3793,7 +3748,7 @@ mod store_backed_files {
 
         assert_eq!(
             path,
-            std::env::temp_dir()
+            crate::parse::test_temp_root()
                 .join(format!("mailypoppins-{}", row.id))
                 .join("render")
                 .join("quarterly-report-q3.md"),

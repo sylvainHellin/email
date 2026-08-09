@@ -1083,10 +1083,7 @@ mod tests {
     /// batch action would then act on a different message.
     #[test]
     fn a_search_hit_carries_a_ref_only_when_the_store_holds_it() {
-        let _guard = crate::config::data_dir_lock();
-        let previous = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("MAILYPOPPINS_DATA_DIR", dir.path());
+        let _dir = crate::config::test_env::TestDataDir::new();
 
         let mut local = fetched("Mon, 01 Jan 2024 12:00:00 +0000");
         local.message_id = Some("<local@example.de>".to_string());
@@ -1129,11 +1126,6 @@ mod tests {
             None,
             "a hit without a Message-ID cannot be resolved"
         );
-
-        match previous {
-            Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-            None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-        }
     }
 
     /// known-bug. The row keeps the raw `From:` header, address included,

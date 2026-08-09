@@ -239,10 +239,7 @@ fn test_build_init_toml_password_no_oauth2_section() {
 /// directory the store and its blobs are written into.
 #[test]
 fn account_data_paths_creates_the_directory_it_prints() {
-    let _guard = crate::config::data_dir_lock();
-    let prev = std::env::var("MAILYPOPPINS_DATA_DIR").ok();
-    let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("MAILYPOPPINS_DATA_DIR", tmp.path());
+    let _tmp = crate::config::test_env::TestDataDir::new();
 
     let acct_dir = crate::config::account_dir("wizard");
     assert!(!acct_dir.exists());
@@ -252,9 +249,4 @@ fn account_data_paths_creates_the_directory_it_prints() {
     assert_eq!(crate::config::store_path("wizard").parent(), Some(acct_dir.as_path()));
     assert_eq!(crate::config::blobs_dir("wizard").parent(), Some(acct_dir.as_path()));
     assert_eq!(crate::config::drafts_dir("wizard").parent(), Some(acct_dir.as_path()));
-
-    match prev {
-        Some(v) => std::env::set_var("MAILYPOPPINS_DATA_DIR", v),
-        None => std::env::remove_var("MAILYPOPPINS_DATA_DIR"),
-    }
 }
