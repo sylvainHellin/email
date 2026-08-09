@@ -9,9 +9,111 @@ use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
 use log::info;
 
-use super::open_imap_session;
 use super::search::message_id_search_term;
+use super::{pool, ImapSession};
 use crate::config::ImapConfig;
+
+/// Run one op on a session borrowed from the persistent pool (#0041).
+///
+/// Every public entry point below is this wrapper around an `_on_session`
+/// function, which is what stopped each queued mutation from paying its own
+/// TCP + TLS + LOGIN. The three rules the wrapper enforces once, so no call
+/// site has to remember them:
+///
+/// - the op always `SELECT`s: the connection arrives selected on whatever the
+///   previous borrower was doing, or on nothing at all;
+/// - a failed op poisons the session rather than returning it, because a
+///   command whose response was not read to the end leaves bytes in the stream
+///   that the next borrower would misread as its own answer;
+/// - the session is *not* logged out; dropping the guard returns it.
+///
+/// The typed [`crate::ops::NotFoundOnServer`] travels through as an ordinary
+/// error. That does poison a perfectly healthy connection, which costs one
+/// reconnect on a path that is already rare (a replayed op whose target has
+/// moved), and is the conservative side of the trade.
+async fn with_pooled<F, T>(imap_config: &ImapConfig, op: F) -> Result<T>
+where
+    F: AsyncFnOnce(&mut ImapSession) -> Result<T>,
+{
+    let mut pooled = pool::checkout(imap_config).await?;
+    let out = op(pooled.session()).await;
+    pooled.check(out)
+}
+
+/// Move an email to a different mailbox on the IMAP server (#0018).
+pub async fn move_email_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    source_mailbox: &str,
+    dest_mailbox: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        move_email_on_session(s, message_id, source_mailbox, dest_mailbox).await
+    })
+    .await
+}
+
+/// Delete an email on the server: SELECT, find by Message-ID, \Deleted, EXPUNGE.
+pub async fn delete_email_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    source_mailbox: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        delete_email_on_session(s, message_id, source_mailbox).await
+    })
+    .await
+}
+
+/// Mark an email as read (`\Seen`) on the IMAP server.
+pub async fn mark_read_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        mark_read_on_session(s, message_id, mailbox).await
+    })
+    .await
+}
+
+/// Mark an email as unread (remove `\Seen`) on the IMAP server.
+pub async fn mark_unread_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        mark_unread_on_session(s, message_id, mailbox).await
+    })
+    .await
+}
+
+/// Add one flag to a message on the server, by `Message-ID` (#TKT-0051).
+pub async fn add_flag_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+    flag: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        add_flag_on_session(s, message_id, mailbox, flag).await
+    })
+    .await
+}
+
+/// Remove one flag from a message on the server, by `Message-ID` (#0007).
+pub async fn remove_flag_on_server(
+    imap_config: &ImapConfig,
+    message_id: &str,
+    mailbox: &str,
+    flag: &str,
+) -> Result<()> {
+    with_pooled(imap_config, async |s: &mut ImapSession| {
+        remove_flag_on_session(s, message_id, mailbox, flag).await
+    })
+    .await
+}
 
 /// Move an email to a different mailbox on the IMAP server (#0018).
 ///
@@ -20,8 +122,8 @@ use crate::config::ImapConfig;
 /// (which is a move with a fixed destination). COPY+EXPUNGE is used
 /// instead of MOVE so servers without the MOVE extension work too;
 /// COPY preserves flags, so read/unread state survives the move.
-pub async fn move_email_on_server(
-    imap_config: &ImapConfig,
+async fn move_email_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     source_mailbox: &str,
     dest_mailbox: &str,
@@ -30,8 +132,6 @@ pub async fn move_email_on_server(
         "Moving email on server: Message-ID={} {} -> {}",
         message_id, source_mailbox, dest_mailbox
     );
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(source_mailbox)
         .await
@@ -44,7 +144,6 @@ pub async fn move_email_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         // A typed not-found, so the durable queue's drain can converge a
         // replay whose move already landed (#0039 review); a direct CLI/TUI
         // caller still sees the same message through `Display`.
@@ -79,7 +178,6 @@ pub async fn move_email_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect expunge response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }
 
@@ -89,14 +187,12 @@ pub async fn move_email_on_server(
 /// hardcoded to `INBOX`, which was only ever right because the file build could
 /// not tell where a message lived; the store row knows its mailbox, so the
 /// caller passes the folder it maps to.
-pub async fn delete_email_on_server(
-    imap_config: &ImapConfig,
+async fn delete_email_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     source_mailbox: &str,
 ) -> Result<()> {
     info!("Deleting email on server: Message-ID={}", message_id);
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(source_mailbox)
         .await
@@ -109,7 +205,6 @@ pub async fn delete_email_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         // Typed not-found: the queue drain converges a replay whose delete
         // already landed (#0039 review), while a direct caller still errors.
         return Err(crate::ops::NotFoundOnServer {
@@ -138,7 +233,6 @@ pub async fn delete_email_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect expunge response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }
 
@@ -147,14 +241,12 @@ pub async fn delete_email_on_server(
 // ---------------------------------------------------------------------------
 
 /// Mark an email as read (\Seen) on the IMAP server.
-pub async fn mark_read_on_server(
-    imap_config: &ImapConfig,
+async fn mark_read_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     mailbox: &str,
 ) -> Result<()> {
     info!("Marking email as read on server: Message-ID={}", message_id);
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(mailbox)
         .await
@@ -167,7 +259,6 @@ pub async fn mark_read_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         return Ok(()); // Not found on server -- not an error
     }
 
@@ -180,7 +271,6 @@ pub async fn mark_read_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }
 
@@ -195,15 +285,13 @@ pub async fn mark_read_on_server(
 /// A server that refuses the keyword (`PERMANENTFLAGS` without `\*`) fails
 /// here, which the caller logs and lives with: the next sync overwrites the
 /// local bit with what the server believes, so the two never drift silently.
-pub async fn add_flag_on_server(
-    imap_config: &ImapConfig,
+async fn add_flag_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     mailbox: &str,
     flag: &str,
 ) -> Result<()> {
     info!("Adding {flag} on server: Message-ID={message_id} in {mailbox}");
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(mailbox)
         .await
@@ -216,7 +304,6 @@ pub async fn add_flag_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         return Ok(());
     }
 
@@ -229,7 +316,6 @@ pub async fn add_flag_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }
 
@@ -239,15 +325,13 @@ pub async fn add_flag_on_server(
 /// so only the named flag is touched. A message the search does not find is not
 /// an error, same as the add: the row may have moved or been deleted elsewhere,
 /// and the next sync restates whatever the server holds either way.
-pub async fn remove_flag_on_server(
-    imap_config: &ImapConfig,
+async fn remove_flag_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     mailbox: &str,
     flag: &str,
 ) -> Result<()> {
     info!("Removing {flag} on server: Message-ID={message_id} in {mailbox}");
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(mailbox)
         .await
@@ -260,7 +344,6 @@ pub async fn remove_flag_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         return Ok(());
     }
 
@@ -273,19 +356,16 @@ pub async fn remove_flag_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }
 
 /// Mark an email as unread (remove \Seen) on the IMAP server.
-pub async fn mark_unread_on_server(
-    imap_config: &ImapConfig,
+async fn mark_unread_on_session(
+    session: &mut ImapSession,
     message_id: &str,
     mailbox: &str,
 ) -> Result<()> {
     info!("Marking email as unread on server: Message-ID={}", message_id);
-    let mut session = open_imap_session(imap_config).await?;
-
     session
         .select(mailbox)
         .await
@@ -298,7 +378,6 @@ pub async fn mark_unread_on_server(
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
     if uids.is_empty() {
-        session.logout().await.ok();
         return Ok(());
     }
 
@@ -311,6 +390,5 @@ pub async fn mark_unread_on_server(
         .await
         .map_err(|e| anyhow!("Failed to collect store response: {}", e))?;
 
-    session.logout().await.ok();
     Ok(())
 }

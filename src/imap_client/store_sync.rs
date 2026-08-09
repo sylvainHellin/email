@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use log::info;
 
 use super::fetch::fetch_new_raw_on_session;
-use super::open_imap_session;
+use super::pool;
 use crate::config::ImapConfig;
 use crate::ingest::KnownUids;
 use crate::store::{BlobStore, Store};
@@ -32,10 +32,11 @@ use crate::timing::TimingSpan;
 /// The IMAP transport behind [`crate::sync::SyncBackend`] (#0059).
 ///
 /// It owns what a fetch needs and nothing the engine owns: no store handle, no
-/// cursors, no ingest bookkeeping. Today that is only the config, because every
-/// pass opens fresh sessions and drops them; the struct exists so #0041 has
-/// somewhere to keep a session and its `HIGHESTMODSEQ` across mailboxes and
-/// across passes without touching the engine.
+/// cursors, no ingest bookkeeping. That is still only the config, because
+/// #0041 put the sessions themselves in [`super::pool`] rather than in this
+/// struct: they have to outlive the backend (a `mp sync` builds one per call,
+/// and the queued-op drain has no backend at all), and the pool is what every
+/// IMAP path in the process borrows from.
 pub struct ImapBackend<'a> {
     config: &'a ImapConfig,
 }
@@ -66,12 +67,15 @@ impl SyncBackend for ImapBackend<'_> {
         let concurrency = self.config.fetch_concurrency.clamp(1, 8);
         let config = self.config;
         futures::stream::iter(targets.iter().zip(knowns).map(|(target, known)| async move {
-            let mut session = open_imap_session(config).await?;
+            // One borrowed session per mailbox, not one shared one: IMAP allows
+            // a single SELECTed mailbox per connection, so N mailboxes need N
+            // connections to overlap their latency. What #0041 changed is that
+            // they are borrowed and returned rather than opened and logged out.
+            let mut pooled = pool::checkout(config).await?;
             let out =
-                fetch_new_raw_on_session(&mut session, &target.server_name, Some(limit), known)
+                fetch_new_raw_on_session(pooled.session(), &target.server_name, Some(limit), known)
                     .await;
-            session.logout().await.ok();
-            out
+            pooled.check(out)
         }))
         .buffered(concurrency)
         .collect()
@@ -132,20 +136,25 @@ pub async fn sync_mailboxes(
 pub async fn list_mailboxes(imap_config: &ImapConfig) -> Result<Vec<String>> {
     use futures::TryStreamExt;
 
-    let mut session = open_imap_session(imap_config).await?;
+    let mut pooled = pool::checkout(imap_config).await?;
+    let session = pooled.session();
 
-    let mailboxes: Vec<_> = session
-        .list(None, Some("*"))
-        .await
-        .map_err(|e| anyhow!("Failed to list mailboxes: {}", e))?
-        .try_collect()
-        .await
-        .map_err(|e| anyhow!("Failed to collect mailboxes: {}", e))?;
+    let listed = async {
+        let names: Vec<String> = session
+            .list(None, Some("*"))
+            .await
+            .map_err(|e| anyhow!("Failed to list mailboxes: {}", e))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| anyhow!("Failed to collect mailboxes: {}", e))?
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        Ok(names)
+    }
+    .await;
 
-    let names: Vec<String> = mailboxes.iter().map(|m| m.name().to_string()).collect();
-
-    session.logout().await.ok();
-    Ok(names)
+    pooled.check(listed)
 }
 
 #[cfg(test)]

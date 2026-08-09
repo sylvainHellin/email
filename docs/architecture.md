@@ -140,7 +140,13 @@ The parity half of #0059 is parked with the Graph backend: `graph.rs` still runs
 ### IMAP
 
 The backend is `ImapBackend` in `src/imap_client/store_sync.rs`, and `sync_mailboxes()` is now the wiring that hands it and the store to `sync::engine::run_sync`.
-IMAP allows one SELECTed mailbox per connection, so the mailboxes are fetched in parallel, each on its own session, up to `imap.fetch_concurrency` at once (default 4, clamped to [1, 8]); #0005.
+
+IMAP sessions are persistent and shared, not one per operation (#0041, owner-approved rewrite of the old invariant).
+`src/imap_client/pool.rs` keeps authenticated sessions for the life of the process, keyed by `host:port/username`; every IMAP path borrows one with `pool::checkout()` and returns it by dropping the guard, so a sync, a queued archive and a post-send flag write no longer each pay TCP + TLS + LOGIN.
+What makes reuse safe: every borrower `SELECT`s (a borrowed connection's selected mailbox is whatever the last one left), a session idle over 20 s is `NOOP`-probed on checkout and one idle over 10 min is dropped rather than probed, connecting retries with backoff, and a borrower whose op failed poisons the session instead of returning it, because a half-read response would be misread as the next borrower's answer.
+The IDLE watcher (`watch.rs`) is deliberately unpooled: IDLE blocks its connection for its whole duration, so it takes a dedicated one, which is the ticket's second connection.
+
+IMAP allows one SELECTed mailbox per connection, so the mailboxes are fetched in parallel, each on its own borrowed session, up to `imap.fetch_concurrency` at once (default 4, clamped to [1, 8]); #0005.
 The store reads that seed each fetch happen serially first, the network fetches overlap, and ingest runs serially in target order afterwards, so `buffered` (which preserves input order) keeps the #0072 prune ordering and the single-writer SQLite discipline intact.
 Per mailbox, `UID SEARCH ALL` gives the UID list, the last `limit` UIDs are the window, pass 1 fetches `(UID FLAGS)` over the whole window and pass 2 downloads `BODY.PEEK[]` only for UIDs the store does not hold.
 The store answers "which UIDs do I hold" with one query, so there is no local scan and no dedup pass.
@@ -202,6 +208,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `blobs.rs` | The content-addressed blob store and its refcount discipline |
 | **`src/imap_client/`** | |
 | `mod.rs` | `ImapStream` wrapper, `open_imap_session()`, re-exports |
+| `pool.rs` | The persistent session pool (`checkout`, `PooledSession`) and `ServerCaps`, the strict post-LOGIN capability gate (#0041) |
 | `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, the arrival-coverage arithmetic |
 | `store_sync.rs` | `ImapBackend` (the `SyncBackend` impl: the parallel per-mailbox fetch), `sync_mailboxes()`, `list_mailboxes()` |
 | `search.rs` | `parse_search_query()`, `build_imap_search_query()`, `FetchCriteria` |

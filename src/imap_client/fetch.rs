@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
 use log::{info, warn};
 
-use super::{ImapSession, search::{FetchCriteria, build_imap_search_query}, open_imap_session};
+use super::{ImapSession, pool, search::{FetchCriteria, build_imap_search_query}};
 use crate::config::ImapConfig;
 use crate::ingest::KnownUids;
 use crate::parse::{compress_uid_set, parse_rfc822_to_fetched_email, FetchedEmail};
@@ -99,10 +99,9 @@ pub async fn fetch_emails(
         "Fetching emails from mailbox '{}' (limit: {:?})",
         mailbox, limit
     );
-    let mut session = open_imap_session(imap_config).await?;
-    let emails = fetch_emails_on_session(&mut session, criteria, mailbox, limit).await?;
-    session.logout().await.ok();
-    Ok(emails)
+    let mut pooled = pool::checkout(imap_config).await?;
+    let emails = fetch_emails_on_session(pooled.session(), criteria, mailbox, limit).await;
+    pooled.check(emails)
 }
 
 // ---------------------------------------------------------------------------

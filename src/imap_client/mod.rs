@@ -1,6 +1,7 @@
 mod batch;
 mod fetch;
 mod ops;
+pub mod pool;
 pub mod search;
 mod sent;
 mod store_sync;
@@ -12,6 +13,7 @@ pub use ops::{
     add_flag_on_server, delete_email_on_server, mark_read_on_server, mark_unread_on_server,
     move_email_on_server, remove_flag_on_server,
 };
+pub use pool::{checkout, PooledSession, ServerCaps};
 pub use sent::ImapSentMailbox;
 pub use search::{
     bracketed_message_id, normalize_message_id, parse_search_query, retain_exact_message_id,

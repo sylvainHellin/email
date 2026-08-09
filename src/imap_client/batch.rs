@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
 use log::info;
 
-use super::{open_imap_session, ImapSession};
+use super::{pool, ImapSession};
 use crate::config::ImapConfig;
 
 /// SEARCH + UID COPY + UID STORE \Deleted on an existing session.
@@ -128,19 +128,21 @@ pub async fn add_flag_in_mailboxes(
     if mailboxes.is_empty() {
         return Ok(());
     }
-    let mut session = open_imap_session(imap_config)
+    let mut pooled = pool::checkout(imap_config)
         .await
         .map_err(|e| anyhow!("IMAP connection failed: {}", e))?;
+    let session = pooled.session();
 
     let mut outcome = Ok(());
     for mailbox in mailboxes {
-        if let Err(e) = add_flag_on_session(&mut session, message_id, mailbox, flag).await {
+        if let Err(e) = add_flag_on_session(session, message_id, mailbox, flag).await {
             outcome = Err(e);
             break;
         }
     }
-    session.logout().await.ok();
-    outcome
+    // A half-finished walk down the mailbox list leaves the session in a state
+    // this call cannot vouch for, so it is not handed on (#0041).
+    pooled.check(outcome)
 }
 
 /// SELECT + SEARCH + UID STORE `+FLAGS` on an existing session.
@@ -204,8 +206,8 @@ async fn run_batch(
         return Vec::new();
     }
 
-    let mut session = match open_imap_session(imap_config).await {
-        Ok(session) => session,
+    let mut pooled = match pool::checkout(imap_config).await {
+        Ok(pooled) => pooled,
         Err(e) => {
             return message_ids
                 .iter()
@@ -213,20 +215,19 @@ async fn run_batch(
                 .collect()
         }
     };
+    let session = pooled.session();
 
     if let Err(e) = session.select(source_mailbox).await {
         let msg = format!("Failed to select {}: {}", source_mailbox, e);
-        session.logout().await.ok();
+        pooled.poison();
         return message_ids.iter().map(|_| Err(anyhow!("{}", msg))).collect();
     }
 
     let mut results: Vec<Result<()>> = Vec::with_capacity(message_ids.len());
     for message_id in message_ids {
         results.push(match op {
-            BatchOp::Move { dest } => {
-                move_single_on_session(&mut session, message_id, dest).await
-            }
-            BatchOp::Delete => delete_single_on_session(&mut session, message_id).await,
+            BatchOp::Move { dest } => move_single_on_session(session, message_id, dest).await,
+            BatchOp::Delete => delete_single_on_session(session, message_id).await,
         });
     }
 
@@ -240,7 +241,12 @@ async fn run_batch(
             Err(e) => info!("Batch EXPUNGE failed (non-fatal): {}", e),
         }
     }
-    session.logout().await.ok();
+    // Returned to the pool rather than logged out, unless a per-message op
+    // failed: those leave a SEARCH or STORE response that may not have been
+    // read to the end (#0041).
+    if results.iter().any(Result::is_err) {
+        pooled.poison();
+    }
 
     results
 }
