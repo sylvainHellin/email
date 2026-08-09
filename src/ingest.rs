@@ -583,6 +583,25 @@ pub struct MailboxCursor {
 /// reappear under new UIDs and ingest rebinds each row through the
 /// `message_id` index, which is what keeps thread assignments and blob
 /// references across a renumbering.
+///
+/// # The two carried columns
+///
+/// `highest_modseq` and `deltalink` are written with `COALESCE(excluded.x, x)`
+/// rather than unconditionally, because they are *resume tokens owned by one
+/// path*, not observations every pass makes. The CONDSTORE fetch produces a
+/// modseq; the full-window fallback and the Graph backend pass `None`. With an
+/// unconditional `SET`, the first non-CONDSTORE pass after a CONDSTORE one, and
+/// on IMAP that is every quick sync that could not cover the whole mailbox,
+/// would wipe the token, the next pass would find NULL, silently fall back to
+/// the full window with no error, and #0041's whole delta path would flap
+/// between working and not (#0054 review, deferred note 4). The same trap was
+/// latent for `deltalink` and [#0042](../../docs/tickets/0042-graph-delta-sync.md).
+///
+/// `None` therefore means "this pass has nothing to say about the token", and
+/// the only way to *clear* one is [`clear_mailbox_modseq`], which the engine
+/// calls when a UIDVALIDITY reset makes the stored modseq meaningless. Every
+/// other column keeps its unconditional `SET`: they are observations, and an
+/// absent one is genuinely absent.
 pub fn record_mailbox_cursor(
     store: &Store,
     account: &str,
@@ -608,8 +627,8 @@ pub fn record_mailbox_cursor(
          ON CONFLICT (account, mailbox) DO UPDATE SET
             uidvalidity = excluded.uidvalidity,
             last_uid = excluded.last_uid,
-            highest_modseq = excluded.highest_modseq,
-            deltalink = excluded.deltalink,
+            highest_modseq = COALESCE(excluded.highest_modseq, highest_modseq),
+            deltalink = COALESCE(excluded.deltalink, deltalink),
             arrival_mark = excluded.arrival_mark",
         rusqlite::params![
             account,
@@ -623,6 +642,25 @@ pub fn record_mailbox_cursor(
     )
     .context("recording the sync cursor")?;
     Ok(())
+}
+
+/// Drop the CONDSTORE resume token for `(account, mailbox)`.
+///
+/// The counterpart to the `COALESCE` above: a modseq is only meaningful
+/// alongside the UIDVALIDITY it was observed under, so a renumbering has to be
+/// able to clear it, and `record_mailbox_cursor` deliberately cannot. Called by
+/// the sync engine on the same branch that drops the skip list and the ingest
+/// failure counts.
+///
+/// Best-effort: a mailbox with no cursor row updates nothing, and a store error
+/// here costs a full-window pass, not correctness.
+pub fn clear_mailbox_modseq(store: &Store, account: &str, mailbox: &str) {
+    if let Err(e) = store.conn().execute(
+        "UPDATE sync_cursors SET highest_modseq = NULL WHERE account = ?1 AND mailbox = ?2",
+        (account, mailbox),
+    ) {
+        log::warn!("could not clear the modseq for {account}/{mailbox}: {e}");
+    }
 }
 
 /// The cursor a previous fetch left for `(account, mailbox)`, if any.

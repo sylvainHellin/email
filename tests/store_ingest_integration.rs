@@ -1527,3 +1527,109 @@ fn a_pass_of_server_read_flags_applies_in_one_transaction() {
         .collect();
     assert_eq!(flags, vec!["\\Seen".to_string(), "\\Seen".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// The cursor's carry-forward columns (#0041)
+// ---------------------------------------------------------------------------
+
+/// A cursor carrying nothing but the columns this test cares about.
+fn cursor(
+    last_uid: i64,
+    highest_modseq: Option<i64>,
+    deltalink: Option<&str>,
+) -> mailypoppins::ingest::MailboxCursor {
+    mailypoppins::ingest::MailboxCursor {
+        uidvalidity: Some(1),
+        last_uid: Some(last_uid),
+        uidnext: Some(last_uid + 1),
+        exists: Some(1),
+        highest_modseq,
+        deltalink: deltalink.map(str::to_string),
+        arrival_mark: None,
+    }
+}
+
+/// The #0041 carry-forward hazard, pinned.
+///
+/// `record_mailbox_cursor` used to `SET highest_modseq = excluded.highest_modseq`
+/// unconditionally, and every non-CONDSTORE path passes `None`. So the first
+/// full-window pass after a CONDSTORE one wiped the resume token, the next pass
+/// read NULL, fell back to the full window with no error at all, and the
+/// CONDSTORE path would have flapped in and out of use forever, which is
+/// exactly the silent-degradation shape of #0004.
+///
+/// `deltalink` is the same column for #0042 and is pinned beside it.
+#[test]
+fn a_full_window_cursor_does_not_wipe_the_modseq_a_delta_pass_recorded() {
+    let f = Fixture::new();
+
+    // A CONDSTORE pass records a real modseq (and a Graph pass a deltaLink).
+    mailypoppins::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &cursor(10, Some(90_060_115_205_545_359), Some("https://graph/delta?$t=abc")),
+    )
+    .unwrap();
+
+    // ...then an ordinary full-window pass, which knows nothing about either
+    // token and says so by passing `None`.
+    mailypoppins::ingest::record_mailbox_cursor(&f.store, "acct", "inbox", &cursor(12, None, None))
+        .unwrap();
+
+    let after = mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox")
+        .unwrap()
+        .expect("the cursor row exists");
+    assert_eq!(
+        after.highest_modseq,
+        Some(90_060_115_205_545_359),
+        "a pass with nothing to say about the modseq must not erase it"
+    );
+    assert_eq!(
+        after.deltalink.as_deref(),
+        Some("https://graph/delta?$t=abc"),
+        "and the same for the Graph deltaLink (#0042)"
+    );
+    assert_eq!(after.last_uid, Some(12), "the observed columns still advance");
+
+    // A later delta pass overwrites the token with its own value: carrying
+    // forward must not mean freezing.
+    mailypoppins::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &cursor(12, Some(90_060_115_205_545_400), Some("https://graph/delta?$t=def")),
+    )
+    .unwrap();
+    let after = mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.highest_modseq, Some(90_060_115_205_545_400));
+    assert_eq!(after.deltalink.as_deref(), Some("https://graph/delta?$t=def"));
+}
+
+/// The only way out of the carry-forward, and why it has to exist: a modseq is
+/// meaningless under a new UIDVALIDITY, and `record_mailbox_cursor` can no
+/// longer clear it by writing `None`.
+#[test]
+fn a_uidvalidity_reset_can_still_clear_the_modseq() {
+    let f = Fixture::new();
+    mailypoppins::ingest::record_mailbox_cursor(
+        &f.store,
+        "acct",
+        "inbox",
+        &cursor(10, Some(4242), None),
+    )
+    .unwrap();
+
+    mailypoppins::ingest::clear_mailbox_modseq(&f.store, "acct", "inbox");
+
+    let after = mailypoppins::ingest::load_mailbox_cursor(&f.store, "acct", "inbox")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.highest_modseq, None);
+    assert_eq!(after.last_uid, Some(10), "and nothing else is disturbed");
+
+    // A mailbox with no cursor row at all is a no-op, not an error.
+    mailypoppins::ingest::clear_mailbox_modseq(&f.store, "acct", "archive");
+}
