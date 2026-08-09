@@ -126,17 +126,22 @@ impl MessageRow {
 /// The last one is not a column: it is the invite predicate, evaluated by the
 /// `message_blobs` primary key rather than by a blob read. It is spelled once
 /// here so every listing answers the same question the same way.
-fn row_columns() -> String {
+/// Every name is qualified with `messages.`, because [`super::search`]
+/// joins this list against `messages_fts`, which has `subject` and `from_`
+/// columns of its own.
+pub(super) fn row_columns() -> String {
     format!(
-        "id, mailbox, uid, message_id, from_, to_, cc, subject, \
-         date_display, flags, has_attachments, body_blob, thread_id, \
+        "messages.id, messages.mailbox, messages.uid, messages.message_id, \
+         messages.from_, messages.to_, messages.cc, messages.subject, \
+         messages.date_display, messages.flags, messages.has_attachments, \
+         messages.body_blob, messages.thread_id, \
          EXISTS (SELECT 1 FROM message_blobs b \
                  WHERE b.message_row = messages.id AND b.kind = 'attachment' \
                    AND b.filename = '{CALENDAR_SIDECAR_NAME}')"
     )
 }
 
-fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+pub(super) fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
         mailbox: row.get(1)?,

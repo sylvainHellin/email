@@ -253,6 +253,72 @@ pub fn render_list(account: &str, groups: &[(String, usize, Vec<MessageRow>)]) -
     out
 }
 
+/// `mp search --local`: the ranked hits of the FTS5 index (#0043).
+///
+/// Flat and best-first rather than grouped by mailbox, because the ranking is
+/// the answer: a full-tree search that regrouped its hits would hide which of
+/// them the index thought was the closest. Each hit prints the two lines
+/// `mp list-messages` prints, with the mailbox in front of the sender so the
+/// scope of a hit is readable without parsing the selector, plus the body when
+/// `bodies` carries one (`--full`).
+pub fn render_search(
+    account: &str,
+    query: &str,
+    hits: &[(MessageRow, Option<String>)],
+) -> String {
+    let mut out = String::new();
+    let mut line = |text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+
+    if hits.is_empty() {
+        return format!("No local matches for {query:?} in {account}\n");
+    }
+
+    line(String::new());
+    line(format!(
+        "{} in {} ({} hit{}):",
+        format!("{query:?}").bold(),
+        account,
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" }
+    ));
+    line("\u{2500}".repeat(RULE));
+    for (row, body) in hits {
+        let flags = row.flags();
+        let status = if flags.seen {
+            "read".dimmed()
+        } else {
+            "unread".yellow()
+        };
+        line(format!(
+            "[{}] {} \u{2192} {}",
+            status,
+            Selector::for_message(account, row),
+            row.from.as_deref().unwrap_or("(unknown sender)")
+        ));
+        let mut second = String::new();
+        if let Some(date) = present(row.date_display.as_deref()) {
+            second.push_str(&date);
+            second.push_str("  ");
+        }
+        second.push_str(row.subject.as_deref().unwrap_or("(no subject)"));
+        if row.has_attachments {
+            second.push_str("  [attachments]");
+        }
+        line(format!("      {}", second.dimmed()));
+        if let Some(body) = body {
+            line("\u{2500}".repeat(RULE));
+            line(body.trim_end().to_string());
+            line("\u{2500}".repeat(RULE));
+        }
+    }
+    line("\u{2500}".repeat(RULE));
+    line(format!("Shown: {} (best match first)", hits.len()));
+    out
+}
+
 /// A byte count in the units a person reads attachment sizes in.
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -408,6 +474,40 @@ mod tests {
         );
         assert!(text.contains("[unread]"));
         assert!(text.contains("Shown: 2 | In the store: 3"));
+    }
+
+    /// `mp search --local` prints its hits best-first, each addressable by the
+    /// selector the next command takes, and shows the body only with `--full`.
+    #[test]
+    fn the_search_listing_is_ranked_selectors_and_optional_bodies() {
+        colored::control::set_override(false);
+        let fx = fixture();
+        let first = ingest(&fx, "inbox", 1, &email("ledger", "the quarterly ledger"));
+        let second = ingest(&fx, "archive", 2, &email("lunch", "ledger of pizzas"));
+
+        let text = render_search(
+            "acct",
+            "ledger",
+            &[(first.clone(), None), (second.clone(), None)],
+        );
+        assert!(text.contains("\"ledger\" in acct (2 hits):"));
+        let at_first = text.find(&Selector::for_message("acct", &first).to_string());
+        let at_second = text.find(&Selector::for_message("acct", &second).to_string());
+        assert!(at_first < at_second, "hits print in the order they are ranked");
+        assert!(text.contains("Shown: 2 (best match first)"));
+        assert!(!text.contains("quarterly ledger"), "no body without --full");
+
+        let full = render_search("acct", "ledger", &[(first, Some("the quarterly ledger".into()))]);
+        assert!(full.contains("the quarterly ledger"));
+        assert!(full.contains("(1 hit):"));
+    }
+
+    /// A query nothing matches says so rather than printing an empty frame.
+    #[test]
+    fn an_empty_search_says_so() {
+        colored::control::set_override(false);
+        let text = render_search("acct", "nothing", &[]);
+        assert_eq!(text, "No local matches for \"nothing\" in acct\n");
     }
 
     /// An account with rows in no listed mailbox says so instead of printing an

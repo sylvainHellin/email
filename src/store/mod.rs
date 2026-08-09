@@ -51,6 +51,7 @@ pub mod blobs;
 pub mod drafts;
 pub mod read;
 pub mod rebuild;
+pub mod search;
 pub mod schema;
 pub mod write;
 

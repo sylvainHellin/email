@@ -30,7 +30,7 @@ Commands:
   save            Save a received email's attachment(s) to a directory
   show            Print one received message from the local store (offline)
   list-messages   List received messages from the local store (offline)
-  search          Search emails on the IMAP server
+  search          Search emails on the IMAP server, or locally with --local
   config          Manage configuration
   contacts        Contact index operations
   calendar        Calendar / iMIP invite operations
@@ -429,17 +429,18 @@ Options:
   -h, --help                   Print help
 
 $ mp search --help
-Search emails on the IMAP server
+Search emails on the IMAP server, or locally with --local
 
 Usage: mp search [OPTIONS] <QUERY>
 
 Arguments:
-  <QUERY>  Search query (supports from:, to:, subject:, body:, since:, before:, message-id:, in: prefixes). message-id: matches the RFC 5322 Message-ID exactly, with or without angle brackets
+  <QUERY>  Search query (supports from:, to:, subject:, body:, since:, before:, message-id:, in: prefixes). message-id: matches the RFC 5322 Message-ID exactly, with or without angle brackets. With --local: full-text words, "a phrase", a trailing * for a prefix, and the from:, subject:, body: field filters
 
 Options:
       --mailbox <MAILBOX>      Mailbox to search (default: all configured mailboxes)
   -n, --limit <LIMIT>          Max results (default: 20) [default: 20]
       --full                   Show full body instead of preview
+      --local                  Search the local store's full-text index instead of the server (offline, ranked, covers every synced mailbox at once)
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

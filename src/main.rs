@@ -305,11 +305,13 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
     },
-    /// Search emails on the IMAP server
+    /// Search emails on the IMAP server, or locally with --local
     Search {
         /// Search query (supports from:, to:, subject:, body:, since:, before:,
         /// message-id:, in: prefixes). message-id: matches the RFC 5322
         /// Message-ID exactly, with or without angle brackets.
+        /// With --local: full-text words, "a phrase", a trailing * for a
+        /// prefix, and the from:, subject:, body: field filters.
         query: String,
         /// Mailbox to search (default: all configured mailboxes)
         #[arg(long)]
@@ -320,6 +322,10 @@ enum Commands {
         /// Show full body instead of preview
         #[arg(long)]
         full: bool,
+        /// Search the local store's full-text index instead of the server
+        /// (offline, ranked, covers every synced mailbox at once)
+        #[arg(long)]
+        local: bool,
     },
     /// Manage configuration
     Config {
@@ -1023,6 +1029,33 @@ fn is_drafts_selector(selector: &str, mailbox: Option<&str>) -> Result<bool> {
 }
 
 /// Resolve a received selector to its message row plus the canonical selector.
+/// The mailbox key (`MailboxRole` id) a `--mailbox` argument names.
+///
+/// Matches a role id or a sidebar label case-insensitively, the same rule
+/// `mp dump-mailbox` and `mp list-messages` apply, and an unknown name is an
+/// error naming what it could have been rather than an empty result.
+fn resolve_mailbox_key(account: &AccountConfig, want: &str) -> Result<String> {
+    let mailboxes: Vec<_> = mailypoppins::tui::app::build_mailboxes(account)
+        .into_iter()
+        .filter(|m| m.id != mailypoppins::selector::DRAFTS_MAILBOX)
+        .collect();
+    if let Some(hit) = mailboxes
+        .iter()
+        .find(|m| want.eq_ignore_ascii_case(&m.id) || want.eq_ignore_ascii_case(&m.label))
+    {
+        return Ok(hit.id.clone());
+    }
+    let known = mailboxes
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "'{want}' is not a mailbox of {} (known: {known})",
+        account.name
+    ))
+}
+
 /// The `(label, total, first `limit` rows)` groups `mp list-messages` prints.
 ///
 /// One group per configured mailbox, in sidebar order, so a whole-account
@@ -2392,7 +2425,45 @@ async fn main() -> Result<()> {
             mailbox,
             limit,
             full,
+            local,
         }) => {
+            if local {
+                let store = received_store(&account_config.name)?;
+                let mailbox_key = match mailbox.as_deref() {
+                    Some(want) => Some(resolve_mailbox_key(&account_config, want)?),
+                    None => None,
+                };
+                let span = mailypoppins::timing::TimingSpan::with_context(
+                    "search-local",
+                    account_config.name.clone(),
+                );
+                let hits = mailypoppins::store::search::search(
+                    &store,
+                    &account_config.name,
+                    &query,
+                    mailbox_key.as_deref(),
+                    limit,
+                )?;
+                drop(span);
+                let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
+                let rows: Vec<_> = hits
+                    .into_iter()
+                    .map(|hit| {
+                        let body = full
+                            .then(|| {
+                                mailypoppins::store::read::load_body(&store, &blobs, hit.row.id)
+                            })
+                            .flatten();
+                        (hit.row, body)
+                    })
+                    .collect();
+                print!(
+                    "{}",
+                    mailypoppins::read_cmd::render_search(&account_config.name, &query, &rows)
+                );
+                return Ok(());
+            }
+
             let mut criteria = parse_search_query(&query);
 
             // Resolve mailbox scope: --mailbox flag > in: prefix > all
