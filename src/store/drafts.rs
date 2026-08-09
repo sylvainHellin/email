@@ -424,14 +424,28 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Mint a draft id: 16 random hex characters.
+/// Mint a draft id: 16 hex characters, the first one a letter.
 ///
 /// Random rather than derived from the filename or the subject, because the
 /// whole point of the field is to survive a rename and a subject edit. Short
 /// enough to type, wide enough that two agents creating drafts in the same
 /// second do not collide.
+///
+/// The leading letter is load-bearing, not cosmetic (#0077). The id is written
+/// into YAML frontmatter unquoted, and a plain hex string is not always a YAML
+/// string: `8808e70039225152` is a float in scientific notation, and a
+/// 16-digit id is an integer. Both shapes round-trip as something other than
+/// the id that was written -- the float deserialises the `id:` field to
+/// `None`, so the next refresh mints a *different* id and the draft's identity
+/// silently changes; the integer fails deserialisation outright and the draft
+/// is skipped from the index. About one in a thousand plain hex strings has
+/// one of those shapes, which is exactly the rate at which the drafts tests
+/// were failing. A first character in `a..=f` cannot start a YAML number, so
+/// the id is always read back as the string that was written.
 pub fn new_id() -> String {
-    format!("{:016x}", rand::random::<u64>())
+    let n = rand::random::<u64>();
+    let first = b"abcdef"[(n >> 60) as usize % 6] as char;
+    format!("{first}{:015x}", n & 0x0fff_ffff_ffff_ffff)
 }
 
 #[cfg(test)]
@@ -475,6 +489,68 @@ mod tests {
         // A second refresh keeps the same id: it is read back, not re-minted.
         let again = refresh(&store, "work", &dir).unwrap();
         assert_eq!(again[0].id, id);
+    }
+
+    /// #0077: the flake behind three intermittent failures.
+    ///
+    /// A minted id is written into YAML frontmatter unquoted, so it has to be
+    /// a YAML *string* on the way back. `8808e70039225152` is a float in
+    /// scientific notation (the `id:` field then reads back as `None` and the
+    /// next refresh mints a different id) and `1234567890123456` is an integer
+    /// (the frontmatter fails to deserialise and the draft is skipped). Both
+    /// shapes are reachable from 16 random hex characters about once every
+    /// thousand ids.
+    #[test]
+    fn a_minted_id_is_never_a_yaml_number_and_round_trips_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("drafts");
+
+        for i in 0..2000 {
+            let id = new_id();
+            assert!(
+                id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()),
+                "{id} is not 16 hex characters"
+            );
+            assert!(
+                id.as_bytes()[0].is_ascii_alphabetic(),
+                "{id} starts with a digit, so YAML may read it as a number"
+            );
+            assert!(
+                id.parse::<f64>().is_err() && id.parse::<i64>().is_err(),
+                "{id} parses as a number"
+            );
+
+            // Every 200th one goes through the real writer and reader, which
+            // is where the loss actually happened.
+            if i % 200 == 0 {
+                let path = write_draft(&dir, &format!("rt-{i}.md"), "");
+                crate::draft::set_draft_id(&path, &id).unwrap();
+                let back = crate::draft::parse_email_draft(&path).unwrap();
+                assert_eq!(back.frontmatter.id.as_deref(), Some(id.as_str()));
+            }
+        }
+    }
+
+    /// The two shapes that broke, pinned as the reason the mint is
+    /// constrained: neither reads back as the id that was written.
+    #[test]
+    fn a_number_shaped_id_does_not_survive_the_frontmatter_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("drafts");
+
+        let float_shaped = write_draft(&dir, "float.md", "id: 8808e70039225152\n");
+        let parsed = parse_email_draft(&float_shaped).unwrap();
+        assert_eq!(parsed.frontmatter.id, None, "a float-shaped id reads back as no id at all");
+
+        let int_shaped = write_draft(&dir, "int.md", "id: 1234567890123456\n");
+        assert!(parse_email_draft(&int_shaped).is_err(), "an int-shaped id fails to deserialise");
+
+        // And the index sees exactly that: one draft re-minted, one skipped.
+        let (_tmp2, store) = store();
+        let (rows, _collisions, skipped) = refresh_reporting(&store, "work", &dir).unwrap();
+        assert_eq!(skipped.len(), 1, "the int-shaped draft is skipped: {skipped:?}");
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].id.as_str(), "8808e70039225152", "the float-shaped id was re-minted");
     }
 
     #[test]
@@ -702,3 +778,4 @@ mod tests {
         assert_eq!(empty, fingerprint(&dir));
     }
 }
+
