@@ -313,6 +313,34 @@ fn arrival_coverage(
     }
 }
 
+/// The arrival mark a pass must persist once ingest is done, given the mark the
+/// download reported and the UIDs the ingest failed to write (#0074).
+///
+/// [`arrival_coverage`] measures what the pass *downloaded*, which is one step
+/// short of what it owes the next pass: a message fetched and then not written
+/// is as absent from the store as one never fetched, yet it reads as covered,
+/// the pass reports itself complete, persists no mark, and the next pass stands
+/// on a floor above a message the server still lists. The mark is therefore
+/// lowered here to just under the lowest unwritten UID, which is what makes
+/// that message an arrival again next pass and keeps the gate shut until some
+/// pass writes it.
+///
+/// `unmet` holds only the failures still worth retrying;
+/// [`crate::ingest::record_ingest_failure`] drops a UID out of it once it has
+/// failed [`crate::ingest::MAX_INGEST_ATTEMPTS`] times, so a message the store
+/// rejects deterministically cannot hold the mark down for good.
+///
+/// Saturating at 0 rather than wrapping: a UID of 1 that will not ingest leaves
+/// a mark of 0, meaning every listed UID is an arrival, which is the correct
+/// reading when the very bottom of the mailbox is missing.
+pub(crate) fn mark_below_unmet(pending: Option<u32>, unmet: &[u32]) -> Option<u32> {
+    let Some(lowest) = unmet.iter().copied().min() else {
+        return pending;
+    };
+    let owed = lowest.saturating_sub(1);
+    Some(pending.map_or(owed, |mark| mark.min(owed)))
+}
+
 /// Whether the `UID SEARCH ALL` listing is the whole mailbox.
 ///
 /// A listing shorter than the `EXISTS` the same SELECT announced is a partial
@@ -844,6 +872,26 @@ mod tests {
         // same ceiling that keeps a placeholder out of the high-water mark.
         assert_eq!(arrival_mark(&known, 100, None, Some(10)), Some(40));
         assert_eq!(arrival_mark(&known, 100, None, Some(4_000_000)), Some(100));
+    }
+
+    /// #0074: what the download covered is not what the pass wrote. A UID that
+    /// was fetched and not ingested pulls the persisted mark under itself, even
+    /// when the download reported the pass complete.
+    #[test]
+    fn an_unwritten_uid_pulls_the_mark_below_itself() {
+        // The complete-looking case the bug lived in: no mark, so the next pass
+        // would have derived a floor above the message it never wrote.
+        assert_eq!(mark_below_unmet(None, &[105]), Some(104));
+        // The lowest one wins; everything above it is an arrival again too.
+        assert_eq!(mark_below_unmet(None, &[110, 105, 107]), Some(104));
+        // A mark the download already reported can only be lowered.
+        assert_eq!(mark_below_unmet(Some(100), &[105]), Some(100));
+        assert_eq!(mark_below_unmet(Some(200), &[105]), Some(104));
+        // Nothing unwritten changes nothing, which is how the gate reopens.
+        assert_eq!(mark_below_unmet(None, &[]), None);
+        assert_eq!(mark_below_unmet(Some(100), &[]), Some(100));
+        // The bottom of the mailbox: every listed UID is an arrival.
+        assert_eq!(mark_below_unmet(None, &[1]), Some(0));
     }
 
     /// `mp sync -n 0` computes a full vanished set and downloads nothing. It

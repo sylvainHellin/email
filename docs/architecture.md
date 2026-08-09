@@ -46,7 +46,7 @@ Before the old file is deleted its unfinished rows (`pending_send`, `sent_pendin
 A row that cannot be carried, because its bytes are gone from the blob store or its columns are unreadable, is named in a `store-rebuild-<timestamp>.txt` note written next to the store; nothing about a submitted message is discarded silently.
 The same pass then sweeps the blob tree, deleting every file the rebuilt store holds no refcount row for, so a rebuild cannot leave the blob directory full of orphans that nothing reclaims.
 
-Schema v5 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
+Schema v6 lives in `src/store/schema.rs`, which carries the identity notes in full; the short version:
 
 - `messages` is one row per message per mailbox, with a synthetic `id` and `UNIQUE (account, mailbox, uid)` as the real identity.
 The same message in two mailboxes is two rows.
@@ -60,6 +60,9 @@ Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, a
 - `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (Graph, NULL until #0042).
 The two were one column until #0054, which stored a UID where a modseq was read back.
 `arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
+A message the pass downloaded and then failed to write pulls that mark under itself (v6, #0074), because a message not written is as absent as one never fetched.
+- `ingest_failures` (v6, #0074) counts those failures per `(account, mailbox, uid)` and bounds them: after `ingest::MAX_INGEST_ATTEMPTS` passes the UID is given up on loudly and stops holding the mark down, so a message the store rejects deterministically cannot suspend the prune for the whole account for good.
+A successful ingest deletes the row, so transient failures never accumulate towards the bound.
 - `outbox` carries the durable send state machine described below.
 - `drafts` is the derived index over the drafts directory.
 - `pending_ops` carries the durable mutation queue (#0039): one row per owed server op, with `kind`, the `messages` row id in `target_message_id`, the full `ServerOp` plus its rollback in the JSON `payload`, and a `queued` / `failed` state. `src/pending_ops.rs` owns it, the mutation twin of `outbox`. Like `outbox` its live paths are not the schema's concern, but unlike `outbox` it is a plain cache table: a lost queue row loses a flag change or delays a move, never a message, so it is dropped and rebuilt with the file.
@@ -181,7 +184,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/timing.rs` | `TimingSpan`, which emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
 | **`src/store/`** | |
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
-| `schema.rs` | Schema v5 SQL, version stamping, required-table validation, and the identity notes |
+| `schema.rs` | Schema v6 SQL, version stamping, required-table validation, and the identity notes |
 | `read.rs` | Listings, counts, Message-ID lookup, body and HTML loading, `materialise_attachments` |
 | `write.rs` | The optimistic local half of a flag, move or delete |
 | `drafts.rs` | The derived index over `<account_dir>/drafts/` |

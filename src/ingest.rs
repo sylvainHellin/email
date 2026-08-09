@@ -839,6 +839,84 @@ pub fn pass_may_prune(coverage: &[(bool, bool)]) -> bool {
         .all(|&(complete, truncated)| complete && !truncated)
 }
 
+/// How many passes may download a message and fail to write it before the pass
+/// stops holding the prune gate shut for it (#0074).
+///
+/// Three, because the failures worth retrying are transient (a locked store, a
+/// blob write that lost a race) and clear on the next pass, while the ones that
+/// do not clear -- a MIME the parser rejects, a body the store will not take --
+/// are deterministic and will fail identically for as long as the server keeps
+/// listing the message. Retrying forever is the deadlock #0072 closed from the
+/// other side: one unwritable message would suspend the prune for the whole
+/// account until someone noticed.
+pub const MAX_INGEST_ATTEMPTS: i64 = 3;
+
+/// Count one failed attempt to write `uid`, and answer whether the message is
+/// still owed, i.e. whether it must keep the arrival mark below itself.
+///
+/// `false` is the give-up answer: the message has failed
+/// [`MAX_INGEST_ATTEMPTS`] times, so it stops counting against coverage and the
+/// gate may open over it. The row stays, so the give-up is visible in the file
+/// and a later success still clears it.
+///
+/// A store that cannot even record the failure answers `true`, the conservative
+/// side: an unrecorded attempt can never reach the bound, so the worst case is
+/// the pre-#0074 behaviour of retrying, never a gate opened over a hole.
+pub fn record_ingest_failure(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    uid: i64,
+    error: &str,
+) -> bool {
+    let conn = store.conn();
+    let attempts: rusqlite::Result<i64> = conn.query_row(
+        "INSERT INTO ingest_failures (account, mailbox, uid, attempts, last_error, updated)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5)
+         ON CONFLICT (account, mailbox, uid) DO UPDATE SET
+            attempts = ingest_failures.attempts + 1,
+            last_error = excluded.last_error,
+            updated = excluded.updated
+         RETURNING attempts",
+        rusqlite::params![account, mailbox, uid, error, crate::outbox::unix_now()],
+        |row| row.get(0),
+    );
+    match attempts {
+        Ok(attempts) => attempts < MAX_INGEST_ATTEMPTS,
+        Err(e) => {
+            warn!("Failed to record the ingest failure of UID {uid} in '{mailbox}': {e}");
+            true
+        }
+    }
+}
+
+/// Forget the failure history of `uid`, because a pass has now written it.
+///
+/// Called on every successful ingest rather than only after a known failure:
+/// the row is keyed by UID, and a UIDVALIDITY reset or a rebind can hand the
+/// same UID to a different message, which must not inherit anyone's attempts.
+pub fn clear_ingest_failure(store: &Store, account: &str, mailbox: &str, uid: i64) {
+    if let Err(e) = store.conn().execute(
+        "DELETE FROM ingest_failures WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+        rusqlite::params![account, mailbox, uid],
+    ) {
+        warn!("Failed to clear the ingest failure of UID {uid} in '{mailbox}': {e}");
+    }
+}
+
+/// How many passes have failed to write `uid`. `0` when nothing is recorded.
+pub fn ingest_failure_attempts(store: &Store, account: &str, mailbox: &str, uid: i64) -> i64 {
+    store
+        .conn()
+        .query_row(
+            "SELECT attempts FROM ingest_failures
+             WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            rusqlite::params![account, mailbox, uid],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+}
+
 /// Of `vanished`, the UIDs whose rows are old enough for the prune to delete.
 ///
 /// This is the answer to a row the server has never listed under the identity

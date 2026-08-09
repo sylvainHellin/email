@@ -26,8 +26,10 @@ use rusqlite::Connection;
 /// `account` column the rest of the schema carries, `pending_ops` gains
 /// `updated`, and the two write-only columns (`messages.mtime`,
 /// `mailboxes.unread_count`) come out. v5 adds `sync_cursors.arrival_mark`, the
-/// one piece of sync state a pass has to hand to the next one (#0072).
-pub const SCHEMA_VERSION: i64 = 5;
+/// one piece of sync state a pass has to hand to the next one (#0072). v6 adds
+/// `ingest_failures`, the per-UID retry counter that bounds how long a message
+/// the store cannot write may hold the prune gate shut (#0074).
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -54,6 +56,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "outbox",
     "sync_cursors",
     "pending_ops",
+    "ingest_failures",
     "messages_fts",
 ];
 
@@ -156,6 +159,17 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   `highest_modseq`: a UID-sized number read as a modseq makes the server
 ///   return nothing and no error, which is the #0004 failure mode with no
 ///   symptom.
+/// - `ingest_failures` counts, per `(account, mailbox, uid)`, how many passes
+///   have downloaded a message and failed to write it (#0074). A message that
+///   was fetched and not written is as absent as one never fetched, so the pass
+///   lowers the arrival mark below its UID and the prune gate stays shut until
+///   some pass writes it. That is a deadlock in the making for a message the
+///   store rejects deterministically, which is what this counter bounds: after
+///   [`crate::ingest::MAX_INGEST_ATTEMPTS`] failed passes the UID is given up
+///   on, stops holding the mark down, and the gate reopens. A successful ingest
+///   deletes the row, so transient failures never accumulate towards the bound.
+///   Losing the table in a rebuild only costs the message its retries again,
+///   which is the conservative direction.
 /// - `pending_ops` is the durable mutation queue #0039 will drain; only its
 ///   shape lives here so far. `updated` is the last-attempt timestamp the
 ///   backoff is a function of (`updated + backoff_secs(attempts) > now`, the
@@ -272,6 +286,16 @@ CREATE TABLE sync_cursors (
     -- not, and on the Graph path.
     arrival_mark   INTEGER,
     PRIMARY KEY (account, mailbox)
+);
+
+CREATE TABLE ingest_failures (
+    account        TEXT NOT NULL,
+    mailbox        TEXT NOT NULL,
+    uid            INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    updated        INTEGER,
+    PRIMARY KEY (account, mailbox, uid)
 );
 
 CREATE TABLE pending_ops (

@@ -29,6 +29,32 @@ use crate::store::{BlobStore, Store};
 use crate::timing::TimingSpan;
 use crate::types::MailboxRole;
 
+/// Record one failed ingest and answer whether it still counts against this
+/// pass, i.e. whether the arrival mark must stay below it (#0074).
+///
+/// `false` is the give-up answer and the only escape from the deadlock the mark
+/// would otherwise be for a message the store rejects deterministically. It is
+/// loud, because it is the one place where the client knowingly leaves a
+/// message the server lists out of the store.
+fn note_ingest_failure(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    server_name: &str,
+    uid: u32,
+    error: &str,
+) -> bool {
+    if ingest::record_ingest_failure(store, account, mailbox, uid as i64, error) {
+        return true;
+    }
+    warn!(
+        "Giving up on UID {uid} in '{server_name}' after {} failed ingest attempts ({error}): it \
+         no longer holds the prune back. The message stays on the server and out of the store.",
+        ingest::MAX_INGEST_ATTEMPTS
+    );
+    false
+}
+
 /// A mailbox to sync: the configured role and the name on the server.
 ///
 /// The local directory and `.md` status the old struct carried are gone: the
@@ -193,14 +219,38 @@ pub async fn sync_mailboxes(
         // A message that was downloaded but not written is as absent from the
         // store as one that was never fetched, so it counts against this
         // target's coverage too.
-        let mut ingest_failed = false;
+        //
+        // The failed UIDs are collected rather than reduced to a flag, because
+        // the pass owes the next one a mark below them (#0074): a flag lives
+        // for this pass only, and the next pass would stand on a floor above
+        // the message this one downloaded and dropped. `record_ingest_failure`
+        // is what keeps that from being permanent for a message the store
+        // rejects every time; a UID it has given up on is left out of `unmet`,
+        // so it neither lowers the mark nor reports the pass short.
+        //
+        // One poisoned message never stops the batch: every failure `continue`s
+        // to the next message, so the rest of the window is ingested normally
+        // and only the prune is held back.
+        let mut unmet: Vec<u32> = Vec::new();
+        let mut note_failure = |uid: u32, error: &str| {
+            if note_ingest_failure(
+                &store,
+                account_name,
+                target.role.as_str(),
+                &target.server_name,
+                uid,
+                error,
+            ) {
+                unmet.push(uid);
+            }
+        };
         for message in &new_messages {
             let Some(mut email) = parse_rfc822_to_fetched_email(&message.raw) else {
                 warn!(
                     "Skipping UID {} in '{}': the message did not parse",
                     message.uid, target.server_name
                 );
-                ingest_failed = true;
+                note_failure(message.uid, "the message did not parse");
                 continue;
             };
             email.flags = message.flags;
@@ -218,6 +268,12 @@ pub async fn sync_mailboxes(
             );
             match outcome {
                 Ok(outcome) => {
+                    ingest::clear_ingest_failure(
+                        &store,
+                        account_name,
+                        target.role.as_str(),
+                        message.uid as i64,
+                    );
                     if outcome.inserted {
                         result.saved += 1;
                     }
@@ -239,18 +295,19 @@ pub async fn sync_mailboxes(
                     });
                 }
                 Err(e) => {
-                    ingest_failed = true;
                     warn!(
                         "Failed to ingest UID {} from '{}': {:#}",
                         message.uid, target.server_name, e
                     );
+                    note_failure(message.uid, &format!("{e:#}"));
                 }
             }
         }
         coverage.push((
             fetched.enumeration_complete,
-            fetched.download_incomplete || ingest_failed,
+            fetched.download_incomplete || !unmet.is_empty(),
         ));
+        let pending_arrival_mark = super::fetch::mark_below_unmet(pending_arrival_mark, &unmet);
 
         // The IMAP server states the whole flag set, so it is truth for all
         // three bits of the second axis (#TKT-0051), not just for `\Seen`.
@@ -362,6 +419,178 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    use super::*;
+    use crate::imap_client::fetch::mark_below_unmet;
+
+    fn raw(name: &str) -> Vec<u8> {
+        format!(
+            "From: a@example.com\r\nTo: b@example.com\r\nSubject: {name}\r\n\
+             Message-ID: <{name}@example.com>\r\nDate: Thu, 7 Aug 2025 10:00:00 +0000\r\n\r\n\
+             {name} body\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// One store write, the way the ingest loop does it.
+    fn ingest(store: &Store, blobs: &BlobStore, uid: i64, bytes: &[u8]) -> bool {
+        let email = parse_rfc822_to_fetched_email(bytes).expect("fixture must parse");
+        let outcome = ingest::ingest_message(
+            store,
+            blobs,
+            &IngestInput {
+                account: "acct",
+                mailbox: "inbox",
+                uid,
+                email: &email,
+                raw: Some(bytes),
+            },
+        )
+        .expect("the fixture ingests");
+        ingest::clear_ingest_failure(store, "acct", "inbox", uid);
+        outcome.inserted
+    }
+
+    fn rows_for(store: &Store, uid: i64) -> i64 {
+        store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM messages WHERE account = 'acct' AND mailbox = 'inbox' \
+                 AND uid = ?1",
+                [uid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn cursor(arrival_mark: Option<u32>) -> MailboxCursor {
+        MailboxCursor {
+            uidvalidity: Some(7),
+            last_uid: Some(106),
+            uidnext: Some(107),
+            exists: Some(106),
+            highest_modseq: None,
+            deltalink: None,
+            arrival_mark: arrival_mark.map(|m| m as i64),
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Store, BlobStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let blobs = BlobStore::new(tmp.path().join("blobs"));
+        (tmp, store, blobs)
+    }
+
+    /// #0074: a pass that downloads a message and fails to write it must hand
+    /// the next pass a mark *below* that UID, not the complete-looking `None`
+    /// its download reported, and the retry must leave exactly one row.
+    ///
+    /// This walks the same three calls the ingest loop makes per target, in the
+    /// same order: `note_ingest_failure` per failure, `mark_below_unmet` over
+    /// what is still owed, `record_mailbox_cursor` with the result.
+    #[test]
+    fn a_failed_ingest_holds_the_mark_down_and_the_retry_writes_the_message_once() {
+        let (_tmp, store, blobs) = fixture();
+
+        // Pass 1: the download covered every arrival (`pending` is None), and
+        // UID 105 then failed to ingest.
+        let mut unmet = Vec::new();
+        assert!(note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "boom"));
+        unmet.push(105);
+        let mark = mark_below_unmet(None, &unmet);
+        assert_eq!(mark, Some(104), "the mark must sit below the message that was not written");
+        assert!(
+            !ingest::pass_may_prune(&[(true, !unmet.is_empty())]),
+            "the failure also holds this pass's own prune back"
+        );
+        ingest::record_mailbox_cursor(&store, "acct", "inbox", &cursor(mark)).unwrap();
+        let known = ingest::known_uids_with_cursor(&store, "acct", "inbox").unwrap();
+        assert_eq!(
+            known.arrival_mark,
+            Some(104),
+            "the next fetch is held to the failed UID, so the gate cannot open over the hole"
+        );
+
+        // Pass 2: the same message is still not in the store, so it is fetched
+        // again, and this time it writes.
+        assert!(ingest(&store, &blobs, 105, &raw("retried")));
+        let mark = mark_below_unmet(None, &[]);
+        assert_eq!(mark, None, "nothing is owed once the message is in");
+        ingest::record_mailbox_cursor(&store, "acct", "inbox", &cursor(mark)).unwrap();
+        assert_eq!(
+            ingest::known_uids_with_cursor(&store, "acct", "inbox").unwrap().arrival_mark,
+            None,
+            "a pass that wrote what it owed reopens the gate"
+        );
+        assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 105), 0);
+
+        // Exactly once: a third pass over the same UID inserts nothing new.
+        assert!(!ingest(&store, &blobs, 105, &raw("retried")));
+        assert_eq!(rows_for(&store, 105), 1, "the retry may not duplicate the message");
+    }
+
+    /// #0074: the mark may not become a deadlock. A message the store rejects
+    /// every time is given up on after [`ingest::MAX_INGEST_ATTEMPTS`] passes,
+    /// which is what stops one unwritable message from suspending the prune for
+    /// the whole account for good (the failure mode #0072 closed).
+    #[test]
+    fn a_permanently_unwritable_message_stops_holding_the_prune_after_three_passes() {
+        let (_tmp, store, _blobs) = fixture();
+
+        for pass in 1..=2 {
+            assert!(
+                note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "does not parse"),
+                "pass {pass} must still retry"
+            );
+            assert_eq!(mark_below_unmet(None, &[105]), Some(104));
+        }
+
+        assert!(
+            !note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "does not parse"),
+            "the third failure gives up on the message"
+        );
+        let unmet: Vec<u32> = Vec::new();
+        assert_eq!(
+            mark_below_unmet(None, &unmet),
+            None,
+            "a given-up UID leaves no mark behind, so the gate reopens"
+        );
+        assert!(
+            ingest::pass_may_prune(&[(true, !unmet.is_empty())]),
+            "and it no longer reports the pass short"
+        );
+        assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 105), 3);
+    }
+
+    /// #0074: one message that will not ingest costs the batch nothing but the
+    /// prune. The loop continues past it, so the messages either side of it are
+    /// written and are `known` to the next pass, and only the failed UID is
+    /// fetched again.
+    #[test]
+    fn a_poisoned_message_does_not_wedge_the_rest_of_the_batch() {
+        let (_tmp, store, blobs) = fixture();
+
+        assert!(ingest(&store, &blobs, 104, &raw("below")));
+        let mut unmet = Vec::new();
+        if note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "boom") {
+            unmet.push(105);
+        }
+        assert!(ingest(&store, &blobs, 106, &raw("above")));
+
+        assert_eq!(rows_for(&store, 104), 1);
+        assert_eq!(rows_for(&store, 106), 1, "a poisoned UID does not stop the ones after it");
+        assert_eq!(rows_for(&store, 105), 0);
+
+        let mark = mark_below_unmet(None, &unmet);
+        assert_eq!(mark, Some(104), "the lowest unwritten UID sets the mark");
+        ingest::record_mailbox_cursor(&store, "acct", "inbox", &cursor(mark)).unwrap();
+        let (known, _) = ingest::known_uids_with_cursor(&store, "acct", "inbox")
+            .unwrap()
+            .resolve(Some(7));
+        assert!(known.contains(&104) && known.contains(&106));
+        assert!(!known.contains(&105), "only the message that was not written comes back");
+    }
 
     /// A future that returns `Poll::Pending` `n` times before resolving to its
     /// value, rescheduling itself each time. Used to make the parallel fetches

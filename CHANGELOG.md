@@ -47,6 +47,20 @@ All notable changes to this project are documented in this file.
   build on.
 
 ### Fixed
+- **A failed ingest now holds the prune gate shut (#0074).** A message the sync
+  downloaded and then failed to write counted as covered, so the pass reported
+  itself complete, persisted no arrival mark, and the next pass stood on a floor
+  above a message the server still lists: the one remaining way the prune gate
+  could open over a hole in the store. The mark is now derived from what the
+  pass actually wrote, so an unwritten UID pulls it under itself and the gate
+  stays shut until some pass writes the message. The retry is bounded by a new
+  `ingest_failures` table (schema v6): after three failed passes the UID is
+  given up on with a loud log line and stops holding the prune back, which keeps
+  a message the store rejects every time from suspending the prune for the whole
+  account for good. One unwritable message never stops the rest of the batch;
+  the ingest loop continues past it as it always did. Schema v6 means existing
+  stores are dropped and refilled on the next open, as every version bump does.
+
 - **The website no longer describes the file era (#0070, docs).** The published
   pages still showed a per-mailbox local directory tree, a `.md` plus companion
   `.html` per received message and a `_attachments/` sibling directory, none of
