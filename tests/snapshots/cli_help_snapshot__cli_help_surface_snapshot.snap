@@ -28,6 +28,8 @@ Commands:
   delete          Delete a received email (server + local) or a local draft
   open            Open a received email's attachment in the default application
   save            Save a received email's attachment(s) to a directory
+  show            Print one received message from the local store (offline)
+  list-messages   List received messages from the local store (offline)
   search          Search emails on the IMAP server
   config          Manage configuration
   contacts        Contact index operations
@@ -391,6 +393,35 @@ Arguments:
 Options:
   -o, --output <OUTPUT>        Output directory (default: current directory)
       --mailbox <MAILBOX>      Mailbox to resolve the selector in
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp show --help
+Print one received message from the local store (offline)
+
+Usage: mp show [OPTIONS] <SELECTOR>
+
+Arguments:
+  <SELECTOR>  Received selector: mp://<account>/<mailbox>/<message-id>, <mailbox>/<message-id> or <message-id>
+
+Options:
+      --mailbox <MAILBOX>      Mailbox to resolve the selector in
+      --json                   Emit one JSON object (headers, attachments and body) instead
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp list-messages --help
+List received messages from the local store (offline)
+
+Usage: mp list-messages [OPTIONS]
+
+Options:
+      --mailbox <MAILBOX>      Mailbox to list (role, slug or sidebar label). Default: every mailbox of the account, grouped
+  -n, --limit <LIMIT>          Max messages per mailbox listed (default: 20) [default: 20]
   -s, --signature <SIGNATURE>  Signature to use (overrides config default)
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)

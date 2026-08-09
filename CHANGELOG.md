@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`mp show` and `mp list-messages`, a read surface over the store (#0062).**
+  After a sync, received mail was reachable only through the TUI or through
+  `mp dump-mailbox`, which is a parity oracle emitting NDJSON envelopes rather
+  than something to read. `mp list-messages` prints one line per stored message
+  with its full selector -- one mailbox with `--mailbox`, otherwise every
+  mailbox of the account grouped in sidebar order with `-n/--limit` applied per
+  mailbox -- in the order the TUI list shows. `mp show <selector>` prints the
+  headers, the attachment list and the body of one message, taking the same
+  selector grammar as every other message command (a bare Message-ID is enough
+  when it is unambiguous, and a selector naming another account reads that
+  account's store). Both are offline: they open no connection and answer from
+  the store alone. A body the store no longer holds prints as a note rather
+  than an error, and `mp show --json` emits one object whose body is a JSON
+  string, so a body that opens with `---` cannot be misread as frontmatter.
+
 - **A flagged-only view in the mail list (#0079).** `F` narrows the list to
   starred messages and widens it back, finishing the half of #0007 that shipped
   the `\Flagged` round-trip and its marker but not the filter. It is a local

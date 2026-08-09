@@ -282,6 +282,29 @@ enum Commands {
         #[arg(long)]
         mailbox: Option<String>,
     },
+    /// Print one received message from the local store (offline)
+    Show {
+        /// Received selector: mp://<account>/<mailbox>/<message-id>,
+        /// <mailbox>/<message-id> or <message-id>
+        #[arg(value_name = "SELECTOR")]
+        selector: String,
+        /// Mailbox to resolve the selector in
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Emit one JSON object (headers, attachments and body) instead
+        #[arg(long)]
+        json: bool,
+    },
+    /// List received messages from the local store (offline)
+    ListMessages {
+        /// Mailbox to list (role, slug or sidebar label).
+        /// Default: every mailbox of the account, grouped.
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Max messages per mailbox listed (default: 20)
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+    },
     /// Search emails on the IMAP server
     Search {
         /// Search query (supports from:, to:, subject:, body:, since:, before:,
@@ -985,6 +1008,60 @@ fn is_drafts_selector(selector: &str, mailbox: Option<&str>) -> Result<bool> {
 }
 
 /// Resolve a received selector to its message row plus the canonical selector.
+/// The `(label, total, first `limit` rows)` groups `mp list-messages` prints.
+///
+/// One group per configured mailbox, in sidebar order, so a whole-account
+/// listing reads like the sidebar rather than like a merged stream; the drafts
+/// pseudo-mailbox is skipped, because it is local truth and `mp list` owns it.
+/// The limit is per mailbox for the same reason: a shared budget would let a
+/// busy inbox hide every other mailbox entirely.
+///
+/// `--mailbox` matches a role id or a sidebar label case-insensitively, the
+/// same rule `mp dump-mailbox` applies, and an unknown name is an error naming
+/// what it could have been rather than an empty listing.
+fn list_message_groups(
+    store: &Store,
+    account: &AccountConfig,
+    mailbox: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, usize, Vec<mailypoppins::store::read::MessageRow>)>> {
+    let mailboxes: Vec<_> = mailypoppins::tui::app::build_mailboxes(account)
+        .into_iter()
+        .filter(|m| m.id != mailypoppins::selector::DRAFTS_MAILBOX)
+        .collect();
+    let selected: Vec<_> = match mailbox {
+        Some(want) => {
+            let hit: Vec<_> = mailboxes
+                .iter()
+                .filter(|m| want.eq_ignore_ascii_case(&m.id) || want.eq_ignore_ascii_case(&m.label))
+                .cloned()
+                .collect();
+            if hit.is_empty() {
+                let known = mailboxes
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "'{want}' is not a mailbox of {} (known: {known})",
+                    account.name
+                ));
+            }
+            hit
+        }
+        None => mailboxes,
+    };
+
+    let mut groups = Vec::new();
+    for info in selected {
+        let mut rows = mailypoppins::store::read::list_mailbox(store, &account.name, &info.id)?;
+        let total = rows.len();
+        rows.truncate(limit);
+        groups.push((info.label.clone(), total, rows));
+    }
+    Ok(groups)
+}
+
 fn resolve_received_arg(
     store: &Store,
     selector: &str,
@@ -2259,6 +2336,40 @@ async fn main() -> Result<()> {
             for file in &files {
                 println!("{} {}", "\u{2713}".green(), file.display());
             }
+        }
+
+        // The read surface over the store (#0062): both offline, both reusing
+        // the queries `store::read` already had. `mp show` is the single-message
+        // half, addressed by the same selector grammar every other received
+        // command takes, and resolved through `account_for_selector` first so a
+        // cross-account selector opens the right store (the #0073 follow-up).
+        Some(Commands::Show { selector, mailbox, json }) => {
+            let account_config = account_for_selector(&selector, &account_config, &global_config)?;
+            let store = received_store(&account_config.name)?;
+            let (row, _) =
+                resolve_received_arg(&store, &selector, &account_config.name, mailbox.as_deref())?;
+            let blobs = mailypoppins::store::BlobStore::for_account(&account_config.name);
+            let message =
+                mailypoppins::read_cmd::shown_message(&store, &blobs, &account_config.name, &row);
+            if json {
+                println!("{}", mailypoppins::read_cmd::to_json(&message)?);
+            } else {
+                print!("{}", mailypoppins::read_cmd::render_show(&message));
+            }
+        }
+
+        Some(Commands::ListMessages { mailbox, limit }) => {
+            let store = received_store(&account_config.name)?;
+            let groups = list_message_groups(
+                &store,
+                &account_config,
+                mailbox.as_deref(),
+                limit,
+            )?;
+            print!(
+                "{}",
+                mailypoppins::read_cmd::render_list(&account_config.name, &groups)
+            );
         }
 
         Some(Commands::Search {

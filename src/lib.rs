@@ -18,6 +18,7 @@ pub mod ingest;
 pub mod draft;
 pub mod selector;
 pub mod dump;
+pub mod read_cmd;
 pub mod engine_lock;
 pub mod ops;
 pub mod outbox;

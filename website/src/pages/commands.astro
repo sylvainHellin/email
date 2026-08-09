@@ -45,6 +45,18 @@ const imapCommands = [
   { command: 'mp save <selector> [--output]', description: 'Save attachment(s) to directory' },
 ];
 
+const storeCommands = [
+  { command: 'mp list-messages [--mailbox <name>] [-n N]', description: 'List received messages from the local store (offline)' },
+  { command: 'mp show <selector> [--json]', description: 'Print one received message -- headers, attachments and body -- from the local store (offline)' },
+];
+
+const storeOptions = [
+  { command: '--mailbox <name>', description: 'Mailbox to list (role, slug or sidebar label). Default: every mailbox of the account, grouped' },
+  { command: '-n, --limit <N>', description: 'Max messages per mailbox listed (default: 20)' },
+  { command: '-A, --account <name>', description: 'Account to read (default: first in config)' },
+  { command: '--json', description: 'mp show only: emit one JSON object instead of the human layout' },
+];
+
 const configCommands = [
   { command: 'mp config init', description: 'Interactive setup wizard' },
   { command: 'mp config show', description: 'Display config (passwords masked)' },
@@ -159,6 +171,37 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
     <section>
       <h2 id="imap-commands">IMAP Commands</h2>
       <CommandTable commands={imapCommands} />
+    </section>
+
+    <section>
+      <h2 id="store-commands">Local Store Commands</h2>
+      <p>
+        Two offline reads over what <code>mp sync</code> already brought down. Neither opens a
+        connection: they answer from the per-account store, so they work on a plane and cost
+        nothing.
+      </p>
+      <CommandTable commands={storeCommands} />
+      <CommandTable commands={storeOptions} />
+      <p>
+        <code>mp list-messages</code> prints one line per message with its full selector, which
+        pastes straight into <code>mp show</code>, <code>mp reply</code> or <code>mp archive</code>.
+        With no <code>--mailbox</code> it lists every mailbox of the account, grouped, and the
+        limit applies per mailbox so a busy inbox cannot hide the others. The order is the one the
+        TUI list shows.
+      </p>
+      <p>
+        <code>mp show</code> takes the same selector grammar as every other message command, so
+        the bare Message-ID is enough when it is unambiguous, and an
+        <code>mp://&lt;account&gt;/...</code> selector reads that account's store rather than the
+        default one. A body the store no longer holds (evicted, or never ingested) prints as a
+        note under the headers instead of failing. <code>--json</code> is the parseable form:
+        one object with the envelope, the attachment list and the body as a JSON string.
+      </p>
+      <p>
+        <code>mp dump-mailbox --json</code> is a different tool with a similar shape: it is the
+        parity oracle, emits newline-delimited envelopes without bodies for every account, and its
+        record shape is pinned. Read mail with these two; diff stores with that one.
+      </p>
     </section>
 
     <section>
