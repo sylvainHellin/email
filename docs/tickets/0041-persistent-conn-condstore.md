@@ -23,6 +23,32 @@ async-imap 0.11.2 surface is confirmed (see plan "Resolved unknowns"): typed `se
 4. QRESYNC where advertised: `SELECT ... (QRESYNC (uidvalidity modseq))` folds vanished + changed into SELECT. Gate strictly on CAPABILITY; fall back to CONDSTORE, then to the current heuristic.
 5. UIDPLUS for own writes (APPEND/COPY): capture the returned UID to update the store without a follow-up search.
 
+## Spike answer: the CHANGEDSINCE fetch-modifier form (scope 1, resolved 2026-08-09)
+
+Read off `async-imap` 0.11.2 source (`client.rs:472`) and `imap-proto` 0.16 (`parser/rfc4551.rs`).
+
+`Session::uid_fetch(uid_set, query)` builds the command by plain interpolation:
+
+```rust
+self.run_command(&format!("UID FETCH {} {}", uid_set.as_ref(), query.as_ref()))
+```
+
+There is no validation, escaping or parenthesising of `query`, so the RFC 7162 fetch modifier is simply the tail of the `query` argument:
+
+```rust
+session.uid_fetch("1:*", "(UID FLAGS) (CHANGEDSINCE 90060115205545359)").await
+// wire: UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 90060115205545359)
+```
+
+which is exactly the `fetch-modifiers` production of RFC 7162 s3.1.4. No API addition is needed and nothing has to be dropped down to `run_command`.
+
+Two supporting facts confirmed at the same time:
+
+- the response parser accepts the `MODSEQ (n)` data item CONDSTORE adds to every `FETCH` reply (`imap-proto` `parser/rfc4551.rs:34`), so the extra item does not break the existing `(UID FLAGS)` decode; `async_imap::types::Fetch` exposes no accessor for it, but this ticket does not need per-message modseqs, only the mailbox `HIGHESTMODSEQ`;
+- `Session::select_condstore()` issues `SELECT <mbox> (CONDSTORE)` and `parse_mailbox` fills `Mailbox::highest_modseq: Option<u64>` from the `OK [HIGHESTMODSEQ n]` response code (`client.rs:352`, `client.rs:1783`).
+
+The wire form is pinned by a unit test on the command builder rather than by a live server, because `async_imap::mock_stream` is a private module (`lib.rs:105`) and `ImapSession` is monomorphic over the crate's own TLS `ImapStream`, so there is no seam to script a fake session through without a wider refactor.
+
 ## Prerequisite (added 2026-08-06)
 
 [#0054](0054-schema-bump-bundle.md) must land first.
