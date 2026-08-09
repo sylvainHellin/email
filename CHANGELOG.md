@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Microsoft Graph incremental sync via `/messages/delta` (#0042).** A Graph
+  account used to enumerate every message in every folder on every pass, just
+  to work out what was new. A quick sync now walks `/messages/delta` from a
+  `deltaLink` persisted per folder in `sync_cursors`, downloads only the
+  messages that changed, and applies read-status from the same change set.
+
+  The token asserts one thing, "at the moment it was minted, the store held
+  every message the folder listed", and every rule around it exists to keep
+  that true: it is minted with `$deltatoken=latest` *before* the enumeration it
+  is stored alongside, only by a pass that saw the whole folder and wrote every
+  message in it, and only together with the folder id it is bound to (Graph's
+  UIDVALIDITY equivalent, so a folder deleted and recreated under the same name
+  drops its token). A full `mp sync` always relists, which is the periodic
+  whole-folder observation the prune leans on; a 410, a 404, an unparseable
+  page, a page cap and a chain that ends without a resume point all throw the
+  token away and enumerate in the same pass. Deletions are deliberately not
+  taken from the delta: a `@removed` entry names the message by Graph id and
+  the store keys Graph rows on `internetMessageId`, so a pass whose delta
+  reports a removal escalates to the full enumeration and the prune keeps its
+  existing source of truth with the #0065/#0072/#0074 coverage gates on
+  unchanged inputs. The #0074 ingest bound applies to the token as well as to
+  the prune, so a message the store cannot write cannot wedge the delta chain.
+
+  Not yet verified against a live tenant: no Graph account is configured on the
+  machine this shipped from, and the acceptance run is split out as #0082. Every
+  fallback above is the pre-#0042 pass, so an assumption that turns out wrong
+  costs a full enumeration rather than a missed message.
+
 - **`mp cutover`, the end of the file-era `.md` layout (#0040).** Received mail
   used to be one Markdown file per message under the account directory; it has
   lived in the SQLite store since the data-layer rewrite, and the old

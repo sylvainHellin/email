@@ -784,3 +784,25 @@ Those two are produced by one path and passed as `None` by every other, so the f
 The tell is the type: an `Option` column whose `None` is produced by callers that *have no opinion* rather than callers that *observed nothing*, which means `None` cannot mean the same thing as it does for the columns beside it.
 `COALESCE(excluded.x, x)` fixes it, and then a second, explicit path has to exist for the one case that must genuinely clear the token, here a UIDVALIDITY reset invalidating the modseq.
 Caught in review before a real modseq was ever written; a bug of this shape is invisible once shipped, because its symptom is a fast path quietly not being taken.
+
+## A delta that cannot name what it deleted must hand the deletion back, not guess
+
+Microsoft Graph's `/messages/delta` reports a deletion as an entry carrying Graph's own message `id` and `@removed`, and nothing else.
+The store keys a Graph row on `ingest::graph_uid(internetMessageId)`, which that entry does not carry and which the server will not sell back for a message it has just deleted, so the removal cannot be resolved onto a row at all (#0042).
+The two tempting answers are both wrong: dropping removals on the floor makes deleted mail immortal locally, and persisting Graph's id per row to resolve them is a schema column and a store rebuild for every account bought for deletion *latency* rather than correctness.
+What shipped instead is escalation: a pass whose delta reports any removal throws the change set away and enumerates the folder, so the prune keeps its existing `known − enumerated` source of truth and every coverage gate around it sees unchanged inputs.
+The generalisation for any incremental protocol: check early whether its change events carry the identity *your* store is keyed on, because a delta that can add but cannot subtract is only half a sync, and the honest half is the one that falls back.
+
+## What an incremental resume token asserts is a property of the *store*, not of the server
+
+`HIGHESTMODSEQ` and a Graph `deltaLink` both look like server bookmarks, and reading them that way is how a delta path silently skips messages.
+The load-bearing statement is about the local side: "at the moment this token was minted, the store held everything the mailbox listed".
+Once that is the definition, three rules follow mechanically and stop being judgement calls: only a pass that covered the whole mailbox *and* wrote every message it found may mint one (#0041's `modseq_to_record`, #0042's `may_record_delta_token`), a token minted with a `$deltatoken=latest`-style shortcut must be taken *before* the listing it is stored alongside rather than after, or the window between the two is swallowed for good, and the ingest-failure bound has to reach the token as well as the prune gate (#0074), because a message the store will never accept would otherwise hold the resume point still for ever.
+The same definition is what makes the discard rule trivial to write: any doubt at all, expiry, a page cap, a chain that ends with no resume point, a folder identity that changed under the token, drops it, because a delta that did not complete is indistinguishable from one that skipped a message.
+
+## Every backend's incremental path needs a UIDVALIDITY equivalent, and Graph's is the folder id
+
+A Graph delta token is bound to a folder *id*, while the config names a role (`archive`) and the client resolves it to a well-known name or a path.
+Those are different identities: an `Archive` deleted and recreated in Outlook is the same name and a different folder, and a stored token that outlived that is a token for a mailbox that no longer exists.
+Graph would answer it with a 404 or a 410, which the fallback catches, but depending on a server error for a local invariant is how the #0004 class of bug gets in, so #0042 reads the folder id (`$select=id`, one small GET per target) and stores its hash in the `uidvalidity` column, which is the analogous column on purpose.
+Whenever a backend gains an incremental path, the question to ask before the token is designed is "what renumbering or re-creation makes this meaningless", and the answer belongs in a column the client checks itself.

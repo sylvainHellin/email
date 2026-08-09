@@ -57,7 +57,7 @@ The `messages_message_id` index is deliberately non-unique: it serves threading,
 Refcounts live in the database so a reference can be taken in the same transaction as the row that carries the hash.
 - `messages_fts` is a contentless FTS5 index (`content=''`, `contentless_delete=1`) over subject, from and body text.
 Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, and nothing needs to be, because a store that loses its index is dropped.
-- `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (Graph, NULL until #0042).
+- `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (the Graph `/messages/delta` resume point, #0042; on a Graph account `uidvalidity` holds the hashed folder id that token is bound to, which is the analogous column on purpose).
 The two were one column until #0054, which stored a UID where a modseq was read back.
 `arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
 A message the pass downloaded and then failed to write pulls that mark under itself (v6, #0074), because a message not written is as absent as one never fetched.
@@ -135,7 +135,7 @@ The shared half is `src/sync/` (#0059): the sync types (`SyncTarget`, `SyncResul
 `SyncBackend` has one method, `fetch_targets`, and takes `&mut self`, which is where a backend keeps what outlives a mailbox (a persistent session and its `HIGHESTMODSEQ`, #0041; a `deltaLink`, #0042).
 The seam's first payoff is that the engine is driven by a fake backend in `src/sync/engine.rs`'s tests, offline, over the properties that used to be verifiable only against a live server.
 `SyncBackend::fetch_targets` is a native async fn in the trait, so its future is not `Send`; callers await it in place, and spawning a sync onto another task would need a `Send` bound first (noted in #0041).
-The parity half of #0059 is parked with the Graph backend: `graph.rs` still runs its own loop rather than the engine.
+The parity half of #0059 is parked with the Graph backend: `graph.rs` still runs its own loop rather than the engine, and #0042 deliberately landed the Graph delta in that loop rather than folding first (its "Shape" section carries the reasoning).
 
 ### IMAP
 
@@ -160,6 +160,12 @@ Graph never returns RFC822, so rows get `raw_blob` NULL and the HTML part is sto
 Graph has no UID, so the row's `uid` is a 63-bit hash of the Message-ID (`ingest::graph_uid`), which keeps the `(account, mailbox, uid)` identity meaningful.
 Since #0055 the orchestration mirrors the IMAP one line for line, prune pass included.
 The enumeration is keyed on the trimmed `internetMessageId`, walks the folder newest-first, and reports whether it saw all of it; #0065 turned that report into the prune's precondition.
+
+Since #0042 a quick sync may replace that enumeration with a `/messages/delta` walk from the token in `sync_cursors.deltalink`.
+The token means "at the moment it was minted, the store held every message the folder listed", and every rule around it exists to keep that true: it is minted with `$deltatoken=latest` *before* the enumeration it is stored alongside, only by a pass that saw the whole folder and wrote every message in it, and only together with the folder id it is bound to.
+A full sync always relists, which is the periodic whole-folder observation the prune leans on; a quick sync takes the delta only on an exact match (`delta_verdict`), and 410, 404, an unparseable page, a page-cap and a chain that ends without a `@odata.deltaLink` all throw the token away and enumerate in the same pass.
+Graph's UIDVALIDITY equivalent is the folder id: a token is bound to one, so an `Archive` deleted and recreated under the same config is a different folder and its token is dropped.
+Deletions are the one thing the delta does not resolve: a `@removed` entry names the message by Graph id and the store keys Graph rows on `internetMessageId`, so a pass whose delta reports a removal escalates to the full enumeration and the prune keeps its existing `known − enumerated` source of truth with the #0065/#0072/#0074 gates on unchanged inputs.
 
 ### Watchers
 
