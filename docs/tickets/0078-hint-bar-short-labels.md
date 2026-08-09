@@ -3,7 +3,7 @@ id: 0078
 title: The hint bar truncates mid-word; KeyBinding needs a short label beside the long one
 type: bug
 priority: later
-status: open
+status: done
 created: 2026-08-07
 ---
 
@@ -38,3 +38,26 @@ What is new is that the visible end of the default-width frame reads as broken r
 - `d Delete` is visible in `golden_mail_view_with_selection` at 120 columns.
 - The help overlay and the website table still show the long descriptions, byte-identical to `mp dump-keys --json`.
 - A test pins that a binding with no short label falls back to `desc`.
+
+## Resolution (2026-08-11)
+
+`KeyBinding` gained a `short: &'static str` field, `""` meaning "reuse `desc`", read only through `KeyBinding::hint_label()` and only by the hint bar.
+The constructors are unchanged; a `const fn short(kb, "...")` wraps the rows that need one, so the table stays readable and eleven rows carry a short label out of ~90.
+
+Short labels added: `Enter / e` -> `Open (read-only)` (List and Server-search), `j/k` -> `Navigate` and `v` -> `Select` (List), `s / S` -> `Sync`, Contacts' `Enter / n` -> `Compose`, `v` -> `Send vCard`, `c` -> `Copy email`, `r` -> `Refresh`, Calendar's `Enter / e` -> `Open invite email`, `V` -> `RSVP`, `t` -> `Past / upcoming`, `r` -> `Refresh`.
+
+`render_hint_bar` now measures as it builds and drops whole `keys` + label pairs that do not fit, marking the cut with ` …`; it never hands ratatui a line longer than the pane.
+Contacts and Calendar fit outright at 120 columns now; only the mail List still overflows, and it truncates cleanly.
+
+At 120 columns:
+
+- `golden_mail_view`: `... a Archive  d Delete  n New draft …`
+- `golden_mail_view_with_selection`: `... a Archive  d Delete …` -- `d Delete` is visible, which was the criterion.
+- `golden_calendar_view` and `golden_contacts_view`: complete rows, no ellipsis.
+
+## Acceptance criteria
+
+- No golden frame ends mid-word. **Met** -- seven frames re-accepted, every one ends on a whole label or the ellipsis.
+- `d Delete` is visible in `golden_mail_view_with_selection` at 120 columns. **Met**.
+- The help overlay and the website table still show the long descriptions, byte-identical to `mp dump-keys --json`. **Met** -- `golden_help_overlay` is unchanged, and regenerating `website/src/data/tui-keys.json` produces a byte-identical file.
+- A test pins that a binding with no short label falls back to `desc`. **Met** -- `a_binding_without_a_short_label_falls_back_to_its_description`, plus `only_hinted_rows_carry_a_short_label` and a width budget test per context.

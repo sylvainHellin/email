@@ -213,6 +213,20 @@ All notable changes to this project are documented in this file.
   IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
 
 ### Fixed
+- **The hint bar no longer truncates mid-word, and `d Delete` is back on the
+  default-width frame (#0078).** The bar lays every hinted binding of the
+  context out end to end on one line and ratatui clipped whatever did not fit,
+  so at 120 columns the mail view ended `... Reply / Reply-al` and both
+  `a Archive` and `d Delete` were gone: one long description silently cost the
+  bindings to its right. `KeyBinding` now carries an optional `short` label
+  beside `desc`, used by the hint bar alone -- `Enter / e Open (read-only)`
+  rather than `Open in editor (mail read-only)` -- and the bar drops whole
+  `keys` + label pairs that do not fit, marking the cut with an ellipsis
+  instead of a half word. The help overlay (`?`) and `mp dump-keys` still show
+  the full descriptions, and `website/src/data/tui-keys.json` regenerates
+  byte-identical. The Contacts and Calendar rows now fit at 120 columns
+  outright.
+
 - **A draft id is no longer occasionally read back as a number, silently
   changing the draft's identity (#0077).** `drafts::new_id` minted 16 random
   hex characters and the drafts index writes them into YAML frontmatter
