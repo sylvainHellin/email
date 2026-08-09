@@ -43,6 +43,7 @@
       { "key": "d", "action": "Delete" },
       { "key": "m", "action": "Toggle read/unread" },
       { "key": "*", "action": "Toggle flag/star" },
+      { "key": "F", "action": "Show flagged only (toggle)" },
       { "key": "M", "action": "Move to mailbox (fuzzy picker)" },
       { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
       { "key": "T", "action": "Show conversation (thread)" },

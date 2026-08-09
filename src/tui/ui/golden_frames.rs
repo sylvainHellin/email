@@ -564,6 +564,23 @@ fn golden_mail_view_with_the_status_axis() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The flagged-only view (#0079): the same fixture with two rows flagged and
+/// the filter armed, so the frame carries the title's `(flagged)` marker, the
+/// narrowed list, and the status line's `shown/total` pair.
+#[test]
+fn golden_mail_view_flagged_filter() {
+    let mut app = mail_fixture();
+    let mut emails = (*app.emails).clone();
+    emails[1].flagged = true;
+    emails[3].flagged = true;
+    app.emails = Arc::new(emails);
+    app.email_cache = vec![Some(Arc::clone(&app.emails)), None, None, None];
+    app.flagged_only = true;
+    app.rebuild_visible();
+    app.prime_preview_body(BODY_ROW_2);
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The calendar agenda plus the shared event card.
 #[test]
 fn golden_calendar_view() {

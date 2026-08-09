@@ -81,6 +81,15 @@ pub struct App {
     pub search_bodies: SearchBodies,
     pub search_query: String,
     pub search_includes_body: bool,
+    /// Narrow the list to flagged messages only (#0079).
+    ///
+    /// A read-side view over `EmailEntry::flagged`, which already mirrors
+    /// `messages.flags`: no server call and no queue op is involved, and the
+    /// toggle composes with the `/` search rather than replacing it (the
+    /// visible set is the intersection). It is session state, not per-account
+    /// state: it survives a mailbox or account switch, the way a filter the
+    /// user armed deliberately should.
+    pub flagged_only: bool,
     pub watcher_active: bool,
     pub imap_config: Option<crate::config::ImapConfig>,
     pub smtp_config: Option<crate::config::SmtpConfig>,
@@ -198,6 +207,7 @@ impl App {
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
+            flagged_only: false,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,
@@ -289,6 +299,7 @@ impl App {
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
+            flagged_only: false,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,
@@ -939,6 +950,22 @@ impl App {
         let kind = self.active_kind();
         let bodies = self.search_includes_body.then_some(&self.search_bodies);
         self.visible = keys::filter_visible(&self.emails, &self.search_query, kind, bodies);
+        self.apply_flagged_filter();
+    }
+
+    /// Drop everything unflagged from `visible` when the flagged view is on
+    /// (#0079).
+    ///
+    /// Applied after the search filter rather than inside it, because the two
+    /// are independent narrowings of the same list and every path that rebuilds
+    /// `visible` has to end in the same intersection.
+    pub(crate) fn apply_flagged_filter(&mut self) {
+        if !self.flagged_only {
+            return;
+        }
+        let emails = Arc::clone(&self.emails);
+        self.visible
+            .retain(|&i| emails.get(i).is_some_and(|e| e.flagged));
     }
 
     // ---------------------------------------------------------------

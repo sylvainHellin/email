@@ -257,6 +257,8 @@ pub enum KeyAction {
     Delete,
     ToggleRead,
     ToggleFlag,
+    /// Narrow the list to flagged messages, or widen it back (#0079).
+    ToggleFlaggedFilter,
     MovePicker,
     Rsvp,
     /// Open the conversation (threading) overlay for the cursor message (#0008).
@@ -455,6 +457,9 @@ pub static KEYMAP: &[KeyBinding] = &[
     bg("d", Chord::Char('d'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Delete, "Delete", true),
     bg("m", Chord::Char('m'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleRead, "Toggle read/unread", false),
     bg("*", Chord::Char('*'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleFlag, "Toggle flag/star", false),
+    // No `NonEmptyList` guard, unlike its `*` sibling: the filter itself can
+    // empty the list, and the key that emptied it has to be able to undo that.
+    b("F", Chord::Char('F'), KeyCtx::List, KeyAction::ToggleFlaggedFilter, "Show flagged only (toggle)", false),
     bg("M", Chord::Char('M'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MovePicker, "Move to mailbox (fuzzy picker)", false),
     bg("V", Chord::Char('V'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Rsvp, "RSVP to invitation (Accept/Tentative/Decline)", false),
     bg("T", Chord::Char('T'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenThread, "Show conversation (thread)", false),

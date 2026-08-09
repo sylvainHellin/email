@@ -156,7 +156,7 @@ pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     };
     let mailbox_text = if shown == 0 {
         format!("{} 0 ", app.active_label())
-    } else if !app.search_query.is_empty() && shown != total {
+    } else if (!app.search_query.is_empty() || app.flagged_only) && shown != total {
         format!(
             "{} {}/{} ({}) ",
             app.active_label(),

@@ -152,14 +152,22 @@ fn row_style(is_cursor: bool, is_in_selection: bool, read: bool) -> Style {
 
 pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     let border_style = pane_border_style(app.focus, Focus::List);
-    let title = if !app.search_query.is_empty() && app.focus != Focus::Search {
-        if app.search_includes_body {
-            format!(" {} (content search) ", app.active_label())
+    // Two independent narrowings, so the title names whichever are on (#0079).
+    let mut narrowings: Vec<&str> = Vec::new();
+    if !app.search_query.is_empty() && app.focus != Focus::Search {
+        narrowings.push(if app.search_includes_body {
+            "content search"
         } else {
-            format!(" {} (filtered) ", app.active_label())
-        }
-    } else {
+            "filtered"
+        });
+    }
+    if app.flagged_only {
+        narrowings.push("flagged");
+    }
+    let title = if narrowings.is_empty() {
         format!(" {} ", app.active_label())
+    } else {
+        format!(" {} ({}) ", app.active_label(), narrowings.join(", "))
     };
     let block = Block::default()
         .title(title)
@@ -205,6 +213,8 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     if app.visible.is_empty() {
         let msg = if !app.search_query.is_empty() {
             "  No matching emails".to_string()
+        } else if app.flagged_only {
+            "  No flagged emails (press F to show all)".to_string()
         } else {
             format!(
                 "\n  No emails in {}\n\n  Press f to fetch new emails",

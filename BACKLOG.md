@@ -30,7 +30,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0074 An ingest failure is not carried by the arrival mark](docs/tickets/0074-arrival-mark-misses-ingest-failures.md) -- bug _(from the #0072 sweep review)_
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
 - [#0078 The hint bar truncates mid-word (short label beside the long one in KeyBinding)](docs/tickets/0078-hint-bar-short-labels.md) -- bug _(from the #0075 review)_
-- [#0079 Local filter/sort for flagged messages](docs/tickets/0079-flagged-filter.md) -- feature _(from #0007; the flag round-trip and marker shipped, the local filtered view did not)_
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
 - [#0031 iMIP cancellations/updates (CANCEL / SEQUENCE)](docs/tickets/0031-imip-cancel-update.md) -- feature
 - [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature

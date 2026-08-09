@@ -570,6 +570,23 @@ impl App {
                     self.push_action(Action::ToggleFlag);
                 }
             }
+            A::ToggleFlaggedFilter => {
+                self.pending_prefix = None;
+                self.flagged_only = !self.flagged_only;
+                let anchor = self.cursor_anchor();
+                let fallback = self.list_index;
+                self.selection.clear();
+                self.rebuild_visible();
+                self.restore_cursor(anchor, fallback);
+                self.headers_scroll = 0;
+                self.preview_scroll = 0;
+                let shown = self.visible.len();
+                if self.flagged_only {
+                    self.set_status(format!("Flagged only ({shown})"));
+                } else {
+                    self.set_status("Showing all messages".to_string());
+                }
+            }
             A::MovePicker => {
                 self.pending_prefix = None;
                 self.open_mailbox_picker();
@@ -2045,6 +2062,7 @@ impl App {
                 self.visible = filter_visible(&self.emails, &self.search_query, kind, bodies);
             }
         }
+        self.apply_flagged_filter();
 
         self.list_index = 0;
         self.headers_scroll = 0;
@@ -3054,6 +3072,75 @@ mod tests {
         // No match highlighted: picker stays open, nothing queued.
         assert!(matches!(app.overlay, Overlay::Mailbox(_)));
         assert!(app.pending_actions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Flagged-only view (#0079)
+    // -----------------------------------------------------------------------
+
+    /// `F` narrows the list to flagged rows and widens it back, keeping the
+    /// cursor on the row it was on when that row survives the narrowing.
+    #[test]
+    fn f_toggles_the_flagged_only_view() {
+        let mut app = app_with_emails(sample());
+        let mut emails = (*app.emails).clone();
+        emails[1].flagged = true;
+        app.emails = std::sync::Arc::new(emails);
+        app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
+        app.rebuild_visible();
+        app.list_index = 1;
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+
+        assert!(app.flagged_only);
+        assert_eq!(app.visible, vec![1]);
+        assert_eq!(app.list_index, 0, "cursor followed its row");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+
+        assert!(!app.flagged_only);
+        assert_eq!(app.visible, vec![0, 1, 2, 3]);
+        assert_eq!(app.list_index, 1, "cursor still on the same row");
+    }
+
+    /// The flagged view and the `/` search are independent narrowings: what is
+    /// visible is the intersection, whichever order they were armed in.
+    #[test]
+    fn the_flagged_view_intersects_with_the_search_filter() {
+        let mut app = app_with_emails(sample());
+        let mut emails = (*app.emails).clone();
+        for e in emails.iter_mut() {
+            e.flagged = true;
+        }
+        emails[3].flagged = false;
+        app.emails = std::sync::Arc::new(emails);
+        app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
+        app.rebuild_visible();
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+        assert_eq!(app.visible, vec![0, 1, 2]);
+
+        // The query that alone would match only the one unflagged row.
+        app.search_query = "holiday".to_string();
+        app.apply_search_filter(false);
+        assert!(app.visible.is_empty(), "flagged view still applies");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+        assert_eq!(app.visible, vec![3], "search alone again");
+    }
+
+    /// The toggle is not guarded by a non-empty list: a filter that emptied
+    /// the list must still be undoable with the key that armed it.
+    #[test]
+    fn the_flagged_view_can_be_left_when_it_shows_nothing() {
+        let mut app = app_with_emails(sample());
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+        assert!(app.visible.is_empty(), "no flagged rows in the fixture");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('F')));
+        assert!(!app.flagged_only);
+        assert_eq!(app.visible, vec![0, 1, 2, 3]);
     }
 
     #[test]

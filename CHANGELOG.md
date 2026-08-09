@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **A flagged-only view in the mail list (#0079).** `F` narrows the list to
+  starred messages and widens it back, finishing the half of #0007 that shipped
+  the `\Flagged` round-trip and its marker but not the filter. It is a local
+  read-side view over rows already loaded, so it costs no server call: the flag
+  bit is in the store. It composes with the `/` search rather than replacing it
+  (what you see is the intersection), the list title names whichever narrowings
+  are on, and the status line keeps showing how many of the mailbox's messages
+  are visible.
+
 - **Durable mutation queue and single-engine lock, the #0039 core (internal).**
   Archive, delete, move and mark-read now have a durable home (`src/pending_ops.rs`)
   that commits the local store change and the server op it owes in one
