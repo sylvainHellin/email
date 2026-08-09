@@ -29,13 +29,9 @@ use crate::store::{BlobStore, Store};
 use crate::timing::TimingSpan;
 use crate::types::MailboxRole;
 
-/// Record one failed ingest and answer whether it still counts against this
-/// pass, i.e. whether the arrival mark must stay below it (#0074).
-///
-/// `false` is the give-up answer and the only escape from the deadlock the mark
-/// would otherwise be for a message the store rejects deterministically. It is
-/// loud, because it is the one place where the client knowingly leaves a
-/// message the server lists out of the store.
+/// The IMAP half of [`ingest::note_ingest_failure`]: the same give-up bound,
+/// over this path's `u32` UIDs. `false` means the arrival mark no longer has to
+/// stay below the UID (#0074).
 fn note_ingest_failure(
     store: &Store,
     account: &str,
@@ -44,15 +40,7 @@ fn note_ingest_failure(
     uid: u32,
     error: &str,
 ) -> bool {
-    if ingest::record_ingest_failure(store, account, mailbox, uid as i64, error) {
-        return true;
-    }
-    warn!(
-        "Giving up on UID {uid} in '{server_name}' after {} failed ingest attempts ({error}): it \
-         no longer holds the prune back. The message stays on the server and out of the store.",
-        ingest::MAX_INGEST_ATTEMPTS
-    );
-    false
+    ingest::note_ingest_failure(store, account, mailbox, server_name, uid as i64, error)
 }
 
 /// A mailbox to sync: the configured role and the name on the server.
@@ -208,6 +196,11 @@ pub async fn sync_mailboxes(
         result.skipped += fetched.skipped;
         if fetched.uidvalidity_reset {
             result.uidvalidity_resets += 1;
+            // The retry counters are keyed by UID, and the server has just
+            // renumbered them: every recorded attempt now points at a message
+            // that no longer holds that UID, so it is dropped with the mark and
+            // the skip list the refetch already discards (#0074 review).
+            ingest::clear_mailbox_ingest_failures(&store, account_name, target.role.as_str());
         }
 
         if dry_run {
@@ -561,6 +554,48 @@ mod tests {
             "and it no longer reports the pass short"
         );
         assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 105), 3);
+    }
+
+    /// #0074 review: the retry counters are keyed by UID, so a UIDVALIDITY
+    /// reset makes every one of them name a different message. The pass clears
+    /// them at the reset, which is what gives a fresh message landing on a
+    /// reused UID its full three attempts instead of inheriting a give-up.
+    #[test]
+    fn a_uidvalidity_reset_wipes_the_mailboxs_failure_counts() {
+        let (_tmp, store, _blobs) = fixture();
+
+        // Before the reset: UID 105 has been given up on, UID 106 is part-way
+        // through its retries, and another mailbox has its own count.
+        for _ in 0..ingest::MAX_INGEST_ATTEMPTS {
+            note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "does not parse");
+        }
+        note_ingest_failure(&store, "acct", "inbox", "INBOX", 106, "boom");
+        note_ingest_failure(&store, "acct", "archive", "Archive", 105, "boom");
+        assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 105), 3);
+
+        // The reset, as the sync loop applies it.
+        ingest::clear_mailbox_ingest_failures(&store, "acct", "inbox");
+
+        assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 105), 0);
+        assert_eq!(ingest::ingest_failure_attempts(&store, "acct", "inbox", 106), 0);
+        assert_eq!(
+            ingest::ingest_failure_attempts(&store, "acct", "archive", 105),
+            1,
+            "only the renumbered mailbox is cleared"
+        );
+
+        // The message now holding UID 105 is a different one, and gets the
+        // whole bound to itself rather than being given up on at once.
+        let mut unmet = Vec::new();
+        for pass in 1..=2 {
+            assert!(
+                note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "boom"),
+                "pass {pass} after the reset must still retry the new message"
+            );
+            unmet.push(105);
+        }
+        assert_eq!(mark_below_unmet(None, &unmet), Some(104));
+        assert!(!note_ingest_failure(&store, "acct", "inbox", "INBOX", 105, "boom"));
     }
 
     /// #0074: one message that will not ingest costs the batch nothing but the

@@ -51,4 +51,15 @@ The ingest loop already `continue`s past every failure, so the rest of the windo
 Skipping the message entirely (never retrying) was rejected because a locked store or a lost blob write is transient and a message dropped for it would be invisible until a full sync.
 - Schema v6 drops and refills every existing store on the next open, which is the standing contract for a version bump and costs nothing but a resync.
 
-Pinned by `a_failed_ingest_holds_the_mark_down_and_the_retry_writes_the_message_once` (mark below the failed UID, `pass_may_prune` false, retry writes it, third ingest of the same UID inserts nothing: exactly one row), `a_permanently_unwritable_message_stops_holding_the_prune_after_three_passes` (the give-up, and the gate reopening with it), `a_poisoned_message_does_not_wedge_the_rest_of_the_batch` (the UIDs either side are written and `known` to the next pass) in `src/imap_client/store_sync.rs`, and `an_unwritten_uid_pulls_the_mark_below_itself` in `src/imap_client/fetch.rs`.
+### Review follow-up (2026-08-11)
+
+The fresh-context review of commit `03d5f78` found no blockers and two edges of the give-up counter, both now closed.
+
+- The Graph sync path was outside the original fix and folded `ingest_failed` into its coverage tuple unbounded, so one poisoned message suspended that account's prune forever: the deadlock the bound exists to close, on the path `tum` actually uses.
+`ingest::note_ingest_failure` (moved out of `store_sync` so both paths share one give-up and one warning) now runs on the Graph loop's failure arm, and `clear_ingest_failure` on its success arm, keyed by `graph_uid` of the resolved Message-ID.
+The arrival-mark omission documented at the Graph cursor stands: the pull is by id, with no positional window, so there is no mark to lower and the give-up only releases the prune gate.
+- The counters are keyed by UID, so clearing on success alone left stale rows across a UIDVALIDITY reset: a different message reusing a UID could inherit up to three attempts and be given up on early, and rows for UIDs the server stopped listing were never reclaimed.
+`ingest::clear_mailbox_ingest_failures` now drops the mailbox's rows at the detected reset in `store_sync`, alongside the mark and the skip list the refetch already discards, and the `clear_ingest_failure` docstring no longer claims more than the code guarantees.
+
+Pinned by `a_poisoned_graph_message_stops_holding_the_prune_after_three_passes` and `a_successful_graph_ingest_clears_the_failure_count` in `src/graph.rs`, `a_uidvalidity_reset_wipes_the_mailboxs_failure_counts` in `src/imap_client/store_sync.rs`, and by
+`a_failed_ingest_holds_the_mark_down_and_the_retry_writes_the_message_once` (mark below the failed UID, `pass_may_prune` false, retry writes it, third ingest of the same UID inserts nothing: exactly one row), `a_permanently_unwritable_message_stops_holding_the_prune_after_three_passes` (the give-up, and the gate reopening with it), `a_poisoned_message_does_not_wedge_the_rest_of_the_batch` (the UIDs either side are written and `known` to the next pass) in `src/imap_client/store_sync.rs`, and `an_unwritten_uid_pulls_the_mark_below_itself` in `src/imap_client/fetch.rs`.

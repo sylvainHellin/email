@@ -1223,6 +1223,16 @@ pub async fn sync_mailboxes_graph(
         // A message that was downloaded but not written is as absent from the
         // store as one that was never fetched, so it counts against this
         // target's coverage too (#0065 follow-up).
+        //
+        // Bounded the same way the IMAP path is (#0074 review): without the
+        // bound, one message this store rejects every time would set
+        // `truncated` on every pass and suspend the account's prune for good.
+        // `ingest::note_ingest_failure` counts the attempts per
+        // `(account, mailbox, uid)` and gives up loudly after
+        // `MAX_INGEST_ATTEMPTS`; a success clears the count, so transient
+        // failures never accumulate towards it. The arrival mark has no Graph
+        // half -- the pull is by id, with no positional window (see the cursor
+        // below) -- so the give-up only releases the prune gate.
         let mut ingest_failed = false;
         for email in &new_emails {
             let message_id = crate::ingest::resolve_message_id(email, None);
@@ -1239,6 +1249,12 @@ pub async fn sync_mailboxes_graph(
                 },
             ) {
                 Ok(outcome) => {
+                    crate::ingest::clear_ingest_failure(
+                        &store,
+                        account_name,
+                        target.role.as_str(),
+                        uid,
+                    );
                     if outcome.inserted {
                         result.saved += 1;
                         if target.role.is_inbox() {
@@ -1259,8 +1275,15 @@ pub async fn sync_mailboxes_graph(
                     });
                 }
                 Err(e) => {
-                    ingest_failed = true;
                     warn!("Failed to ingest {} from {}: {:#}", message_id, target.role, e);
+                    ingest_failed |= crate::ingest::note_ingest_failure(
+                        &store,
+                        account_name,
+                        target.role.as_str(),
+                        &target.server_name,
+                        uid,
+                        &format!("{e:#} (message {message_id})"),
+                    );
                 }
             }
         }
@@ -2389,5 +2412,70 @@ mod tests {
         let f = filter.unwrap();
         assert!(f.contains("receivedDateTime ge"));
         assert!(f.contains("receivedDateTime lt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #0074 review: the Graph ingest-failure bound
+    // -----------------------------------------------------------------------
+
+    /// The Graph sync loop folds an ingest failure into `truncated`, which
+    /// suspends the account's prune. Without a bound, a message this store
+    /// rejects every time would do that on every pass, for good: the deadlock
+    /// #0074 closed on the IMAP side.
+    ///
+    /// This walks the two calls the Graph loop makes per failed message, in
+    /// production order (`note_ingest_failure` folded into `ingest_failed`,
+    /// then `pass_may_prune` over the coverage tuple), over the real store.
+    #[test]
+    fn a_poisoned_graph_message_stops_holding_the_prune_after_three_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let uid = crate::ingest::graph_uid("<poison@example.com>");
+
+        for pass in 1..=2 {
+            let ingest_failed = crate::ingest::note_ingest_failure(
+                &store, "acct", "inbox", "Inbox", uid, "the store will not take it",
+            );
+            assert!(ingest_failed, "pass {pass} must still retry");
+            assert!(
+                !crate::ingest::pass_may_prune(&[(true, ingest_failed)]),
+                "pass {pass} still reports itself short, so the prune stays deferred"
+            );
+        }
+
+        let ingest_failed = crate::ingest::note_ingest_failure(
+            &store, "acct", "inbox", "Inbox", uid, "the store will not take it",
+        );
+        assert!(!ingest_failed, "the third failure gives up on the message");
+        assert!(
+            crate::ingest::pass_may_prune(&[(true, ingest_failed)]),
+            "and the Graph account's prune runs again instead of being suspended for good"
+        );
+        assert_eq!(crate::ingest::ingest_failure_attempts(&store, "acct", "inbox", uid), 3);
+    }
+
+    /// The other half of the bound: a success clears the count, so a message
+    /// that fails transiently gets a full three attempts every time, not three
+    /// for its lifetime.
+    #[test]
+    fn a_successful_graph_ingest_clears_the_failure_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path().join("store.sqlite3")).unwrap();
+        let uid = crate::ingest::graph_uid("<flaky@example.com>");
+
+        assert!(crate::ingest::note_ingest_failure(&store, "acct", "inbox", "Inbox", uid, "locked"));
+        assert!(crate::ingest::note_ingest_failure(&store, "acct", "inbox", "Inbox", uid, "locked"));
+        assert_eq!(crate::ingest::ingest_failure_attempts(&store, "acct", "inbox", uid), 2);
+
+        // The success path of the loop's `match`.
+        crate::ingest::clear_ingest_failure(&store, "acct", "inbox", uid);
+        assert_eq!(crate::ingest::ingest_failure_attempts(&store, "acct", "inbox", uid), 0);
+
+        assert!(crate::ingest::note_ingest_failure(&store, "acct", "inbox", "Inbox", uid, "locked"));
+        assert_eq!(
+            crate::ingest::ingest_failure_attempts(&store, "acct", "inbox", uid),
+            1,
+            "the next failure starts the count over"
+        );
     }
 }

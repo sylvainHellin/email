@@ -167,8 +167,12 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[];
 ///   store rejects deterministically, which is what this counter bounds: after
 ///   [`crate::ingest::MAX_INGEST_ATTEMPTS`] failed passes the UID is given up
 ///   on, stops holding the mark down, and the gate reopens. A successful ingest
-///   deletes the row, so transient failures never accumulate towards the bound.
-///   Losing the table in a rebuild only costs the message its retries again,
+///   deletes the row, so transient failures never accumulate towards the bound,
+///   and a detected UIDVALIDITY reset deletes the mailbox's rows, because the
+///   UIDs they are keyed by then name different messages (#0074 review). The
+///   Graph path shares the counter: it has no arrival mark (an id-based pull
+///   has no positional window), so there the bound only releases the prune
+///   gate. Losing the table in a rebuild only costs the message its retries again,
 ///   which is the conservative direction.
 /// - `pending_ops` is the durable mutation queue #0039 will drain; only its
 ///   shape lives here so far. `updated` is the last-attempt timestamp the

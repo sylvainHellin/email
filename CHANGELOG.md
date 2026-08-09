@@ -76,6 +76,18 @@ All notable changes to this project are documented in this file.
   the ingest loop continues past it as it always did. Schema v6 means existing
   stores are dropped and refilled on the next open, as every version bump does.
 
+- **The give-up bound now covers Graph accounts too, and survives a UIDVALIDITY
+  reset honestly (#0074 review).** The Graph sync path folded an ingest failure
+  into its coverage tuple with no bound at all, so one message the store rejects
+  every time kept an Outlook account's prune suspended for good: exactly the
+  deadlock the bound closes on the IMAP side. It now runs the same
+  `ingest_failures` counter, giving up loudly after three failed passes and
+  clearing the count on every success. Separately, the counters are keyed by UID
+  and a UIDVALIDITY reset renumbers every one of them, so the rows for a
+  renumbered mailbox are now dropped at the reset: a fresh message landing on a
+  reused UID gets its own three attempts instead of inheriting a stranger's
+  give-up, and rows for UIDs the server stops listing are reclaimed.
+
 - **The website no longer describes the file era (#0070, docs).** The published
   pages still showed a per-mailbox local directory tree, a `.md` plus companion
   `.html` per received message and a `_attachments/` sibling directory, none of

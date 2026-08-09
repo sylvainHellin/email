@@ -890,17 +890,67 @@ pub fn record_ingest_failure(
     }
 }
 
+/// Record one failed ingest and answer whether it still counts against this
+/// pass, i.e. whether the pass must keep reporting itself short for it (#0074).
+///
+/// `false` is the give-up answer and the only escape from the deadlock the
+/// failure would otherwise be for a message the store rejects
+/// deterministically. It is loud, because it is the one place where the client
+/// knowingly leaves a message the server lists out of the store.
+///
+/// `location` names the mailbox as the user knows it (the IMAP server name, the
+/// Graph folder), and is only ever used in that warning.
+pub fn note_ingest_failure(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    location: &str,
+    uid: i64,
+    error: &str,
+) -> bool {
+    if record_ingest_failure(store, account, mailbox, uid, error) {
+        return true;
+    }
+    warn!(
+        "Giving up on UID {uid} in '{location}' after {MAX_INGEST_ATTEMPTS} failed ingest \
+         attempts ({error}): it no longer holds the prune back. The message stays on the server \
+         and out of the store."
+    );
+    false
+}
+
 /// Forget the failure history of `uid`, because a pass has now written it.
 ///
 /// Called on every successful ingest rather than only after a known failure:
-/// the row is keyed by UID, and a UIDVALIDITY reset or a rebind can hand the
-/// same UID to a different message, which must not inherit anyone's attempts.
+/// the row is keyed by UID, and a rebind can hand the same UID to a different
+/// message, which must not inherit anyone's attempts. The other half of that
+/// guarantee is [`clear_mailbox_ingest_failures`], because a UIDVALIDITY reset
+/// renumbers every UID at once and a success is not enough there: a UID nobody
+/// re-lists, or one whose new message *also* fails, would otherwise keep a
+/// stale count.
 pub fn clear_ingest_failure(store: &Store, account: &str, mailbox: &str, uid: i64) {
     if let Err(e) = store.conn().execute(
         "DELETE FROM ingest_failures WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
         rusqlite::params![account, mailbox, uid],
     ) {
         warn!("Failed to clear the ingest failure of UID {uid} in '{mailbox}': {e}");
+    }
+}
+
+/// Forget every failure this mailbox has recorded, because the UIDs they are
+/// keyed by no longer name the same messages (#0074 review).
+///
+/// Called at a detected UIDVALIDITY reset: the server has renumbered the
+/// mailbox, so a surviving row would charge its attempts to whatever message
+/// lands on that number next -- possibly giving up on a freshly-fetched message
+/// on its first real failure. Dropping the counters costs at most three more
+/// retries of a message that will fail anyway.
+pub fn clear_mailbox_ingest_failures(store: &Store, account: &str, mailbox: &str) {
+    if let Err(e) = store.conn().execute(
+        "DELETE FROM ingest_failures WHERE account = ?1 AND mailbox = ?2",
+        rusqlite::params![account, mailbox],
+    ) {
+        warn!("Failed to clear the ingest failures of '{mailbox}': {e}");
     }
 }
 
