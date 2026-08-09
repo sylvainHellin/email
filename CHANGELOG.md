@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`mp cutover`, the end of the file-era `.md` layout (#0040).** Received mail
+  used to be one Markdown file per message under the account directory; it has
+  lived in the SQLite store since the data-layer rewrite, and the old
+  `inbox/`, `archive/`, `sent/` and slugified-mailbox directories have just
+  been sitting there since. `mp cutover` closes the transition: it mints an
+  `id:` frontmatter field into any draft that has none -- the one-time draft
+  import, and the only thing in the old tree the server cannot give back --
+  so that draft resolves through a selector and shows up in `mp list`, and it
+  then names every dead directory with its `.md` count and size and prints the
+  `rm` line that removes it. It deletes nothing itself and runs only when
+  invoked: there is no migration on startup. Re-running it writes nothing (the
+  ids are already there), and `--dry-run` writes nothing at all.
+
+  This also closes TKT-0047 by construction: the reconcile walk that could be
+  fed a forged `method: REPLY` from a sender-controlled `.md` attachment is
+  gone, invite statuses are folded from `invite.ics` blobs of message rows, and
+  a regression test now pins that a forged attachment cannot move a `PARTSTAT`.
+
 - **`mp show` and `mp list-messages`, a read surface over the store (#0062).**
   After a sync, received mail was reachable only through the TUI or through
   `mp dump-mailbox`, which is a parity oracle emitting NDJSON envelopes rather

@@ -326,8 +326,55 @@ pub(crate) mod tests {
             self.ingest(mailbox, uid, subject, None)
         }
 
+        /// Ingest one ordinary message carrying a named attachment, so a test
+        /// can hand the store sender-controlled bytes (TKT-0047).
+        pub(crate) fn ingest_with_attachment(
+            &self,
+            mailbox: &str,
+            uid: i64,
+            subject: &str,
+            filename: &str,
+            content: &[u8],
+        ) -> i64 {
+            let mut email = self.email(mailbox, uid, subject, None);
+            email.has_attachments = true;
+            email.attachments = vec![crate::parse::AttachmentData {
+                filename: filename.to_string(),
+                content: content.to_vec(),
+                content_id: None,
+            }];
+            self.ingest_email(mailbox, uid, &email)
+        }
+
         fn ingest(&self, mailbox: &str, uid: i64, subject: &str, ics: Option<&str>) -> i64 {
-            let email = FetchedEmail {
+            let email = self.email(mailbox, uid, subject, ics);
+            self.ingest_email(mailbox, uid, &email)
+        }
+
+        fn ingest_email(&self, mailbox: &str, uid: i64, email: &FetchedEmail) -> i64 {
+            ingest_message(
+                &self.store,
+                &self.blobs,
+                &IngestInput {
+                    account: "alice",
+                    mailbox,
+                    uid,
+                    email,
+                    raw: None,
+                },
+            )
+            .unwrap()
+            .row_id
+        }
+
+        fn email(
+            &self,
+            mailbox: &str,
+            uid: i64,
+            subject: &str,
+            ics: Option<&str>,
+        ) -> FetchedEmail {
+            FetchedEmail {
                 from: "Organizer <me@example.com>".into(),
                 to: "a@example.com".into(),
                 cc: None,
@@ -341,20 +388,7 @@ pub(crate) mod tests {
                 flags: Default::default(),
                 calendar_ics: ics.map(|s| s.as_bytes().to_vec()),
                 event: None,
-            };
-            ingest_message(
-                &self.store,
-                &self.blobs,
-                &IngestInput {
-                    account: "alice",
-                    mailbox,
-                    uid,
-                    email: &email,
-                    raw: None,
-                },
-            )
-            .unwrap()
-            .row_id
+            }
         }
     }
 
@@ -584,6 +618,40 @@ pub(crate) mod tests {
         assert_eq!(invites.len(), 1, "the unparseable payload is skipped");
         assert_ne!(invites[0].row_id, broken);
         assert_eq!(invites[0].uid(), Some("u1@x"));
+    }
+
+    /// TKT-0047, closed by construction in [#0040]: a sender-controlled `.md`
+    /// attachment carrying a forged `method: REPLY` used to be walked by
+    /// `build_index` and written into a real invite's `PARTSTAT` on disk.
+    /// There is no walk and no frontmatter writer left: the fold reads
+    /// `invite.ics` blobs of message rows, and an attachment blob is not a
+    /// row. This pins that, so the surface cannot come back unnoticed.
+    ///
+    /// [#0040]: ../docs/tickets/0040-drop-file-layer-cutover.md
+    #[test]
+    fn a_forged_md_attachment_cannot_move_a_partstat() {
+        let fx = fixture();
+        fx.ingest_invite("sent", 1, "Plan", &invite_ics("u1@x", 0, &["a@example.com"]));
+
+        // The exact shape the old walk classified: frontmatter with from/to/
+        // subject and an event: block, method REPLY, the real UID, and a
+        // sequence/dtstamp that would win every tiebreak.
+        let forged = b"---\nfrom: attacker@evil.example\nto: me@example.com\n\
+subject: invoice\nmethod: REPLY\nevent:\n  uid: u1@x\n  sequence: 99\n  \
+dtstamp: 20991231T235959Z\n  attendees:\n    - address: a@example.com\n      \
+status: accepted\n---\n\nsee attached\n";
+        fx.ingest_with_attachment("inbox", 2, "invoice", "forged.md", forged);
+
+        assert_eq!(
+            statuses(&fx, "u1@x"),
+            vec![("a@example.com".to_string(), "needs-action".to_string())],
+            "an attachment blob must not reach the fold"
+        );
+        assert_eq!(
+            reconcile_account(&fx.store, &fx.blobs, "alice").replies_seen,
+            0,
+            "the forged attachment is not a reply"
+        );
     }
 
     /// An account with no invites reconciles to an empty report, not an error.

@@ -3,9 +3,11 @@ id: TKT-0047
 title: reconcile walks attachment .md files, so an attached REPLY can poison PARTSTATs
 type: bug
 priority: next
-status: open
+status: done
 created: 2026-07-29
 ---
+
+**Done 2026-08-09 by [#0040](0040-drop-file-layer-cutover.md)**: the walk and the frontmatter writer are gone (the fold reads `invite.ics` blobs of message rows, and an attachment blob is not a row), and `reconcile::tests::a_forged_md_attachment_cannot_move_a_partstat` pins it. `mp cutover` reports the file-era `.md` files that carried the payload so the owner can remove them.
 
 Parked 2026-07-31 as an accepted risk, resolved by [#0040](0040-drop-file-layer-cutover.md).
 The exposure itself is gone since [#0038](0038-read-path-to-db.md) scope item 6 (2026-08-06): reconcile and the calendar loader read invites from `messages` rows joined to their own `invite.ics` blob, and the fold writes nothing, so neither the walk that classified a sender-controlled attachment nor the frontmatter writer that persisted the forged `PARTSTAT` still exists.

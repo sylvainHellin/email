@@ -57,6 +57,10 @@ const storeOptions = [
   { command: '--json', description: 'mp show only: emit one JSON object instead of the human layout' },
 ];
 
+const maintenanceCommands = [
+  { command: 'mp cutover [--account NAME] [--dry-run]', description: 'End the pre-1.0 file-era layout: give any draft that has none an id: field, and report the old .md mailbox directories nothing reads any more' },
+];
+
 const configCommands = [
   { command: 'mp config init', description: 'Interactive setup wizard' },
   { command: 'mp config show', description: 'Display config (passwords masked)' },
@@ -201,6 +205,27 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
         <code>mp dump-mailbox --json</code> is a different tool with a similar shape: it is the
         parity oracle, emits newline-delimited envelopes without bodies for every account, and its
         record shape is pinned. Read mail with these two; diff stores with that one.
+      </p>
+    </section>
+
+    <section>
+      <h2 id="maintenance-commands">Maintenance Commands</h2>
+      <CommandTable commands={maintenanceCommands} />
+      <p>
+        Mailypoppins used to keep received mail as one Markdown file per message under
+        <code>~/.local/share/mailypoppins/accounts/&lt;account&gt;/</code>. It now keeps it in a
+        SQLite store beside a content-addressed blob store, and those old
+        <code>inbox/</code>, <code>archive/</code> and <code>sent/</code> directories are dead
+        weight. <code>mp cutover</code> is the one-time tidy-up: it lists each dead directory with
+        its size and prints the <code>rm</code> line that removes it.
+      </p>
+      <p>
+        It never deletes anything itself, and there is no migration on startup -- it runs only
+        when you run it. Its one write is the <code>id:</code> frontmatter field, which is how a
+        draft written by the old build becomes addressable by selector; running it again writes
+        nothing, and <code>--dry-run</code> writes nothing at all. Drafts are the only local-only
+        data in the product, so they are the only thing the old directories hold that the server
+        cannot give back -- and they were never in those directories to begin with.
       </p>
     </section>
 

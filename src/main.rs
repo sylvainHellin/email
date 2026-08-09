@@ -341,6 +341,21 @@ enum Commands {
         #[command(subcommand)]
         action: OutboxAction,
     },
+    /// Report what is left of the file-era `.md` tree, and import its drafts.
+    ///
+    /// Assigns an `id:` frontmatter field to any draft that has none, so a
+    /// file-era draft becomes addressable by selector, then names the
+    /// file-era mailbox directories nothing reads any more and prints the
+    /// command that removes them. It deletes nothing itself. `--dry-run`
+    /// writes not even the `id:` field.
+    Cutover {
+        /// Account name (default: all configured accounts)
+        #[arg(long)]
+        account: Option<String>,
+        /// Report only; write nothing at all
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Dump the TUI key bindings from the single KEYMAP source of truth.
     ///
     /// Markdown by default; `--json` emits the section-grouped shape the
@@ -2489,6 +2504,11 @@ async fn main() -> Result<()> {
 
         Some(Commands::Outbox { action }) => {
             cmd_outbox(&account_config, action).await?;
+        }
+
+        Some(Commands::Cutover { account, dry_run }) => {
+            let acct = account.or_else(|| cli.account.clone());
+            mailypoppins::cutover::handle_cutover(&global_config, acct, dry_run)?;
         }
 
         Some(Commands::DumpKeys { json }) => {
