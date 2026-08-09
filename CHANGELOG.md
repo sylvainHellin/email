@@ -80,6 +80,35 @@ All notable changes to this project are documented in this file.
   build on.
 
 ### Changed
+- **IMAP sessions are persistent and shared, not one per operation (#0041).**
+  Every IMAP operation used to open its own connection: archiving three
+  messages meant three TCP handshakes, three TLS handshakes and three LOGINs,
+  and a sync of three mailboxes meant three more. `src/imap_client/pool.rs`
+  now keeps authenticated sessions for the life of the process, keyed by
+  server and user; syncs, queued mutations, batches and searches borrow one
+  and give it back. This rewrites the one-session-per-operation invariant in
+  `docs/architecture.md`, with the owner's approval. Reuse is guarded rather
+  than assumed: every borrower re-`SELECT`s, a session idle over 20s is
+  `NOOP`-probed before it is trusted and one idle over 10 minutes is dropped,
+  connecting retries with backoff, and an operation that failed poisons its
+  session instead of returning it, so a half-read response can never be
+  misread as the next borrower's answer. The IDLE watcher keeps its own
+  dedicated connection, because IDLE blocks the one it runs on.
+
+- **CONDSTORE flag deltas where the server advertises them (#0041).** On a
+  server with CONDSTORE (Gmail, Dovecot), a sync now `SELECT`s with
+  `(CONDSTORE)`, remembers the mailbox's `HIGHESTMODSEQ`, and asks pass 1 for
+  `(UID FLAGS) (CHANGEDSINCE n)` instead of restating every flag in the
+  window. The gate is unanimous and strict, because a missed flag change is
+  invisible: no CAPABILITY, no `HIGHESTMODSEQ` in the SELECT response, no
+  stored resume point, a UIDVALIDITY change, or a server whose modseq went
+  backwards all fall back to the full-window flag fetch, which is what keeps
+  #0004 fixed. A resume point is only recorded by a pass that saw the whole
+  mailbox, so a capped quick sync can never narrow what a later full sync
+  asks about. Proton Bridge advertises neither CONDSTORE nor QRESYNC and takes
+  exactly the path it took before, unchanged. QRESYNC and UIDPLUS are split
+  out to #0081.
+
 - **The sync orchestration moved behind a `SyncBackend` trait (#0059).** The
   loop that ingests a pass, keeps the #0074 arrival mark, applies flags,
   records cursors and defers the prune used to live between the IMAP calls in
@@ -105,6 +134,19 @@ All notable changes to this project are documented in this file.
   IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
 
 ### Fixed
+- **A full sync no longer wipes the delta resume point a delta sync recorded
+  (#0041).** `record_mailbox_cursor` wrote `highest_modseq` and `deltalink`
+  unconditionally from the caller's struct, and every path that is not a delta
+  fetch passes `None` for them. So the first ordinary pass after a CONDSTORE
+  or Graph-delta one erased the token, the next pass found nothing to resume
+  from, silently fell back to the full window with no error anywhere, and the
+  delta would have flapped in and out of use forever. Both columns are now
+  carried forward with `COALESCE`, `None` means "this pass has nothing to say"
+  rather than "clear it", and the one path that must clear a modseq, a
+  UIDVALIDITY reset, does so explicitly. Found in the #0054 review and fixed
+  before the first real modseq was ever written; it protects #0042's
+  `deltaLink` too.
+
 - **A failed ingest now holds the prune gate shut (#0074).** A message the sync
   downloaded and then failed to write counted as covered, so the pass reported
   itself complete, persisted no arrival mark, and the next pass stood on a floor

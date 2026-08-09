@@ -760,3 +760,27 @@ They handed the ingest path bytes like `b"not a message"` to stand in for a mess
 The tests were asserting on a *successful* ingest of nonsense.
 The one shape `parse_rfc822_to_fetched_email` actually rejects is a header block that opens with a continuation line (a leading space), which is what the fixture uses now.
 The generalisation for any fake: assert that the fake's failure path is reached, not merely that the outcome you expected appeared, because a lenient parser turns "this must fail" into a test that pins nothing.
+
+## A pooled IMAP session's real hazard is the response nobody read to the end
+
+Making sessions persistent (#0041) looks like a lifetime problem and is actually a stream-framing problem.
+IMAP is a single ordered byte stream with tagged responses, so a command whose response was abandoned half-read leaves bytes in the socket that the *next* borrower decodes as the answer to its own command: a `SEARCH` result read as a `FETCH`, a `BAD` attributed to the wrong request, or a hang.
+`async-imap` makes this easy to hit because several commands return a `Stream` (`uid_fetch`, `uid_store`, `expunge`, `list`) and dropping it early is silent and legal.
+So the pool's load-bearing rule is not the idle timeout or the `NOOP` probe, both of which only catch a *dead* connection; it is that any borrower whose operation returned `Err` poisons the session instead of returning it.
+Poisoning a healthy connection costs one reconnect, which is exactly what the code did before the pool existed, so the conservative side of that trade is free.
+The generalisation: when you start reusing a protocol connection, the new invariant is "the stream is at a known boundary", and every early return in every call site is a place it can be violated.
+
+## Read a client library's command builder before designing around its API
+
+The `CHANGEDSINCE` spike in #0041 was scoped as "the only unconfirmed detail" and took one `grep`: `async-imap`'s `uid_fetch` is `format!("UID FETCH {} {}", set, query)` with no validation of `query`, so an RFC 7162 fetch modifier is just the tail of the query string and needs no API support at all.
+Two adjacent findings came from the same read: the response parser already decodes the `MODSEQ` item that CONDSTORE adds to every `FETCH` reply, so enabling it does not break the existing decode, and `select_condstore()` exists and fills `Mailbox::highest_modseq`.
+The habit worth keeping is reading the vendored source in `~/.cargo/registry` before designing around a crate's surface, because the answer to "can I express X" is usually visible in one `format!` and is rarely in the docs.
+The corollary is a limit on what that buys: `mock_stream` is private and `ImapSession` is monomorphic over our own TLS stream, so there is no seam to script a fake server through, and the wire form can only be pinned by testing the command builder, not the conversation.
+
+## A resume token is not an observation, and a shared UPSERT must not treat it as one
+
+`record_mailbox_cursor` wrote every column unconditionally from the caller's struct, which is right for `last_uid`, `uidnext` and `exists` (each pass observes them afresh) and wrong for `highest_modseq` and `deltalink`.
+Those two are produced by one path and passed as `None` by every other, so the first full-window sync after a CONDSTORE sync erased the resume point, the next pass found NULL, fell back to the full window with no error, and the delta would have oscillated forever.
+The tell is the type: an `Option` column whose `None` is produced by callers that *have no opinion* rather than callers that *observed nothing*, which means `None` cannot mean the same thing as it does for the columns beside it.
+`COALESCE(excluded.x, x)` fixes it, and then a second, explicit path has to exist for the one case that must genuinely clear the token, here a UIDVALIDITY reset invalidating the modseq.
+Caught in review before a real modseq was ever written; a bug of this shape is invisible once shipped, because its symptom is a fast path quietly not being taken.

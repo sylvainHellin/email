@@ -376,13 +376,13 @@ pub(crate) fn flag_pass(
 /// The consequence is deliberate and worth stating: on a large mailbox the
 /// delta only starts working after a full sync, and quick syncs consume the
 /// resume point without advancing it. Correctness over speed, which is the
-/// ticket's own ranking. Advancing it on a capped pass is [#0084].
+/// ticket's own ranking. Advancing it on a capped pass is [#0081].
 ///
 /// `enumeration_complete` is the second half: if `UID SEARCH ALL` came back
 /// short, "the window is the whole mailbox" is a statement about a listing that
 /// is already known to be untrustworthy.
 ///
-/// [#0084]: ../../docs/tickets/0084-qresync-uidplus.md
+/// [#0081]: ../../docs/tickets/0081-qresync-uidplus.md
 pub(crate) fn modseq_to_record(
     server: Option<u64>,
     window_is_whole_mailbox: bool,

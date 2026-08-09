@@ -3,7 +3,7 @@ id: 0041
 title: Persistent IMAP connection + CONDSTORE/QRESYNC flag-delta sync
 type: perf
 priority: later
-status: open
+status: done
 created: 2026-07-14
 ---
 
@@ -76,6 +76,23 @@ Every current caller awaits it in place (`main.rs`, `tui/helpers.rs`), which is 
 - CRITICAL (#0004): the non-CONDSTORE fallback keeps the full-window pass-1 FLAGS fetch; a webmail read/unread change on an old message still propagates on the next sync. Explicit regression test for both the CONDSTORE and the fallback path.
 - Capability detection is defensive: advertise != correct; the heuristic fallback stays reachable.
 - Proton Bridge CONDSTORE/QRESYNC capability probed and documented.
+
+## Outcome (2026-08-09)
+
+Shipped: scope 1 (the spike, answered above), the cursor carry-forward fix, scope 2 (the persistent session pool) and scope 3 (the CONDSTORE flag delta).
+
+Split into [#0081](0081-qresync-uidplus.md): scope 4 (QRESYNC) and scope 5 (UIDPLUS), neither of which fell out of the work above, plus one limitation of the shipped delta that is honest to record rather than hide.
+
+Deviations from the scope as written, and why:
+
+- Scope 2 asked for "a long-lived engine-owned session".
+It is a pool in `src/imap_client/pool.rs` rather than a session on `ImapBackend`, for two reasons that only became visible while building it.
+IMAP allows one SELECTed mailbox per connection, so the #0005 parallel per-mailbox fetch genuinely needs several at once and a single owned session would have serialised it; and the sessions have to outlive the backend, which is constructed fresh per `sync_mailboxes` call and does not exist at all on the queued-op drain path the ticket also wanted to cover.
+The pool covers sync, ops, batches and searches; the `&mut self` slot #0059 built is still there and still unused.
+- The second connection for IDLE needed no work: `watch.rs` already opens its own session and is deliberately left unpooled, which is the shape the ticket described.
+- The AFIT constraint from #0059 was not hit: nothing here spawns a sync, so no `Send` bound was needed.
+- A CONDSTORE resume point is recorded only by a pass whose window covered the whole mailbox.
+The reasoning is in `modseq_to_record`'s doc comment; the cost, that the delta only starts working after a full sync on a large mailbox, is item 1 of #0081.
 
 ## Unblocks
 

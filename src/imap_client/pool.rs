@@ -93,10 +93,10 @@ pub struct ServerCaps {
     /// RFC 7162 CONDSTORE: `SELECT (CONDSTORE)` reports HIGHESTMODSEQ and
     /// `FETCH ... (CHANGEDSINCE n)` returns only what changed since.
     pub condstore: bool,
-    /// RFC 7162 QRESYNC. Implies CONDSTORE. Not used yet (#0084).
+    /// RFC 7162 QRESYNC. Implies CONDSTORE. Not used yet (#0081).
     pub qresync: bool,
     /// RFC 4315 UIDPLUS: APPENDUID/COPYUID on our own writes. Not used yet
-    /// (#0084).
+    /// (#0081).
     pub uidplus: bool,
     /// RFC 2177 IDLE, which the watcher already relies on.
     pub idle: bool,
