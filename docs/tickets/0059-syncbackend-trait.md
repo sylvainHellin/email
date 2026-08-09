@@ -3,8 +3,9 @@ id: 0059
 title: Extract a SyncBackend trait so sync orchestration is written once
 type: refactor
 priority: later
-status: open
+status: done
 created: 2026-08-06
+closed: 2026-08-11
 ---
 
 From the architecture review synthesis, Tier 2 item 1: [2026-08-06_architecture-review-synthesis](../../.agents/handoff/2026-08-06_architecture-review-synthesis.md).
@@ -51,3 +52,21 @@ Two things the [#0065](0065-graph-prune-batch-hardening.md) hardening could only
 ## Sequencing
 
 Extract this before [#0041](0041-persistent-conn-condstore.md) and [#0042](0042-graph-delta-sync.md), not as a competing refactor: both tickets assume this seam, and both would otherwise widen the duplication they are meant to remove.
+
+## What shipped (2026-08-11)
+
+The seam, not the parity. Reconciling the Scope above against the code as it stands:
+
+- **1 is narrower than written.** `SyncBackend` has one method, `fetch_targets(&mut self, targets, limit, knowns) -> Vec<Result<MailboxFetch>>`, and not the "list folders, move, delete, set read" surface.
+  Those ops already have a seam, `ops::run_op` (#0039), and a second one for them would be generality no consumer asked for.
+  Two contracts a backend owes: one result per target *in target order* (the #0072 prune ordering depends on it), and a per-target failure as an `Err` element rather than an `Err` return.
+  `&mut self` is the state the ticket's sequencing note is about: [#0041](0041-persistent-conn-condstore.md) keeps a session and its `HIGHESTMODSEQ` there, [#0042](0042-graph-delta-sync.md) a `deltaLink`.
+- **2 is half done, on purpose.** The orchestration is written once in `src/sync/engine.rs` (`run_sync` plus `SyncRun`), and `imap_client::store_sync::sync_mailboxes` is now the wiring that builds `ImapBackend` and calls it.
+  `graph.rs` still runs its own loop: the Graph backend is parked, so making it a `SyncBackend` would be a behaviour-risking rewrite of a path no live account exercises, and the shapes still differ (message-ids rather than UIDs, `apply_seen_flags` rather than `apply_flags`, no arrival mark).
+  The parked parity half is what remains of this ticket, and it belongs with the Graph un-parking rather than here.
+- **3 is done.** `SyncTarget`, `SyncResult` and `FreshObservation` live in `crate::sync`, together with `MailboxFetch` (was `imap_client::fetch::StoreFetch`), `FetchedRaw` and `MailboxState`.
+  `imap_client` re-exports them so existing call sites keep compiling; `graph.rs` and `contacts::hooks` now import from `crate::sync` instead of from the other transport's module.
+- **4 is done.** `src/sync/engine.rs` has a `FakeBackend` (a script of per-pass fetches per server name) and nine tests through `run_sync` itself: ingest + cursor advance + what the next pass's skip list is, the #0074 mark under an unwritten UID and its retry, the give-up bound, the UIDVALIDITY reset clearing failure counts, the deferred prune of a moved message, the account-wide coverage gate, `dry_run`, and the flag application.
+  The four #0074 composition tests that re-walked `note_ingest_failure` / `mark_below_unmet` / `record_mailbox_cursor` by hand are gone, replaced by the loop-driven versions: the call order is now pinned by the code rather than asserted about it.
+
+Not done and still open, both carried in from #0065 and neither made worse: a per-message Graph batch-failure count (the IMAP half of that bound is `ingest_failures`, #0074, and the Graph half now uses it too), and a surfaced signal for a suspended prune (`SyncResult::prunes_deferred` exists and no status line reads it).

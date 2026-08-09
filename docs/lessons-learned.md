@@ -752,3 +752,11 @@ The invariant it had to preserve is narrow and absolute: bookkeeping may never f
 Inline best-effort satisfies it only by swallowing every error, which also means the write is simply lost when it fails.
 Enqueuing satisfies it better: one `COMMIT` on the send path, no network at all, no `outbox` row touched so the exactly-once submission marker (#0063) cannot be reached from here, and the failure is retried by the drain instead of dropped.
 The offline pin for "a failed flag never re-sends" is to record a real submission, drive the flag op past its retry budget, and assert the outbox row keeps its terminal state and `sweep_pending_sends` finds nothing resubmittable.
+
+## A fake backend only earns its keep if the failure it fakes is the failure the code has
+
+Extracting the `SyncBackend` seam (#0059) put the sync loop under test, and the first three engine tests passed for the wrong reason.
+They handed the ingest path bytes like `b"not a message"` to stand in for a message that downloads and will not write, and `mailparse` accepted every one of them: garbage with no colon, no headers, invalid UTF-8, even an empty slice all parse into an email with `(unknown)` senders.
+The tests were asserting on a *successful* ingest of nonsense.
+The one shape `parse_rfc822_to_fetched_email` actually rejects is a header block that opens with a continuation line (a leading space), which is what the fixture uses now.
+The generalisation for any fake: assert that the fake's failure path is reached, not merely that the outcome you expected appeared, because a lenient parser turns "this must fail" into a test that pins nothing.

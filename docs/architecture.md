@@ -131,9 +131,14 @@ Every build mints a fresh `Message-ID`, so a second send of the same draft would
 Two transports, one ingest path and one `SyncResult` shape: IMAP/SMTP for password and OAuth2 XOAUTH2 accounts, Microsoft Graph REST for tenants that block IMAP/SMTP (see [auth.md](auth.md)).
 TUI actions branch on `app.is_graph()`.
 
+The shared half is `src/sync/` (#0059): the sync types (`SyncTarget`, `SyncResult`, `FreshObservation`, `MailboxFetch`), the `SyncBackend` trait, and `sync::engine::run_sync`, which is the orchestration itself: skip lists, ingest, arrival marks, the #0074 ingest-failure bound, flags, cursors and the deferred prune pass.
+`SyncBackend` has one method, `fetch_targets`, and takes `&mut self`, which is where a backend keeps what outlives a mailbox (a persistent session and its `HIGHESTMODSEQ`, #0041; a `deltaLink`, #0042).
+The seam's first payoff is that the engine is driven by a fake backend in `src/sync/engine.rs`'s tests, offline, over the properties that used to be verifiable only against a live server.
+The parity half of #0059 is parked with the Graph backend: `graph.rs` still runs its own loop rather than the engine.
+
 ### IMAP
 
-The orchestrator is `src/imap_client/store_sync.rs`.
+The backend is `ImapBackend` in `src/imap_client/store_sync.rs`, and `sync_mailboxes()` is now the wiring that hands it and the store to `sync::engine::run_sync`.
 IMAP allows one SELECTed mailbox per connection, so the mailboxes are fetched in parallel, each on its own session, up to `imap.fetch_concurrency` at once (default 4, clamped to [1, 8]); #0005.
 The store reads that seed each fetch happen serially first, the network fetches overlap, and ingest runs serially in target order afterwards, so `buffered` (which preserves input order) keeps the #0072 prune ordering and the single-writer SQLite discipline intact.
 Per mailbox, `UID SEARCH ALL` gives the UID list, the last `limit` UIDs are the window, pass 1 fetches `(UID FLAGS)` over the whole window and pass 2 downloads `BODY.PEEK[]` only for UIDs the store does not hold.
@@ -184,6 +189,9 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/notify.rs` | Desktop notifications for new mail, shelling out to `osascript` / `notify-send` |
 | `src/sync_health.rs` | `SyncHealth`, the per-account outcome of the last sync, plus the `mp sync` failure summary and exit code (#0071) |
 | `src/timing.rs` | `TimingSpan`, which emits `[TIMING]` log lines with millisecond precision. Filter logs with `rg '\[TIMING\]'`. |
+| **`src/sync/`** | |
+| `mod.rs` | The transport-independent sync types and the `SyncBackend` trait (#0059) |
+| `engine.rs` | `run_sync`: the orchestration every backend is driven through, plus `mark_below_unmet` (#0074) and the fake-backend engine tests |
 | **`src/store/`** | |
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
 | `schema.rs` | Schema v6 SQL, version stamping, required-table validation, and the identity notes |
@@ -193,8 +201,8 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `blobs.rs` | The content-addressed blob store and its refcount discipline |
 | **`src/imap_client/`** | |
 | `mod.rs` | `ImapStream` wrapper, `open_imap_session()`, re-exports |
-| `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, `MailboxState` |
-| `store_sync.rs` | `sync_mailboxes()`, `list_mailboxes()`, `SyncTarget`, `SyncResult` |
+| `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, the arrival-coverage arithmetic |
+| `store_sync.rs` | `ImapBackend` (the `SyncBackend` impl: the parallel per-mailbox fetch), `sync_mailboxes()`, `list_mailboxes()` |
 | `search.rs` | `parse_search_query()`, `build_imap_search_query()`, `FetchCriteria` |
 | `watch.rs` | `watch_mailbox()` (IMAP IDLE) |
 | `ops.rs` | Single-message server ops: move, delete, read flags |
@@ -326,11 +334,13 @@ It was `email-cli` before #0022, and `get` falls back to that name so a user who
 
 ## Testing
 
-- **935 tests**, run by `cargo test`.
+- **1011 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
 `cargo insta review` approves changes; a diff there is a decision, not an approval reflex.
 - The store side is fixture-driven: `tests/store_ingest_integration.rs` ingests real RFC822 bytes and asserts rows, blobs, refcounts and FTS state; `tests/outbox_integration.rs` drives the state machine against a fake Sent mailbox.
-- The sync orchestrators themselves (`store_sync.rs`, `ops.rs`, `batch.rs`) have no tests: they need a server seam, which is #0059.
+- The sync engine (`src/sync/engine.rs`) is tested offline against a fake `SyncBackend` (#0059): ingest and cursor advance, the #0074 arrival mark and its give-up bound, the UIDVALIDITY reset, the deferred prune pass and its account-wide coverage gate, `dry_run`, and the flag application.
+  `ops.rs` and `batch.rs` still have none: their seam is `ops::run_op`, not this one.
+  The Graph orchestrator still has none either, because it does not run on the engine yet.
 - There is no IMAP/SMTP mock server.

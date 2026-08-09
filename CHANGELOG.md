@@ -79,6 +79,31 @@ All notable changes to this project are documented in this file.
   `batch_delete_on_server`) stay, so a future multi-op drain has something to
   build on.
 
+### Changed
+- **The sync orchestration moved behind a `SyncBackend` trait (#0059).** The
+  loop that ingests a pass, keeps the #0074 arrival mark, applies flags,
+  records cursors and defers the prune used to live between the IMAP calls in
+  `imap_client::store_sync`, which is why none of it had a test: driving it
+  meant standing up an IMAP server. It now lives in `sync::engine::run_sync`,
+  the transport is one trait method (`fetch_targets`), and
+  `imap_client::ImapBackend` is its first implementation, with
+  `sync_mailboxes` as the wiring around it. The sync types (`SyncTarget`,
+  `SyncResult`, `FreshObservation`, and the fetch result now called
+  `MailboxFetch`) moved out of `imap_client` into `crate::sync`, so `graph.rs`
+  no longer imports them from the other transport's module.
+
+  Nothing about a sync behaves differently: same phases, same order, same
+  parallel per-mailbox fetch. What is new is that the engine is now driven by a
+  fake backend in tests, offline, and the properties that were previously
+  asserted by re-walking the loop's calls by hand (the arrival mark under an
+  unwritten UID, its three-pass give-up bound, the failure counts a UIDVALIDITY
+  reset clears) are pinned through the real loop instead, alongside new
+  coverage of the deferred prune pass, its account-wide gate, `dry_run` and the
+  flag application.
+
+  The Graph backend is unchanged and still runs its own copy of the loop: the
+  IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
+
 ### Fixed
 - **A failed ingest now holds the prune gate shut (#0074).** A message the sync
   downloaded and then failed to write counted as covered, so the pass reported

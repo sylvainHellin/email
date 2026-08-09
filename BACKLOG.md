@@ -20,8 +20,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
 
-- [#0059 Extract a SyncBackend trait](docs/tickets/0059-syncbackend-trait.md) -- refactor _(the IMAP/Graph parity half is parked; what stands is the testable sync-engine seam #0041 assumes)_
-- [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5; #0054 has landed, sequenced after #0059)_
+- [#0041 Persistent IMAP connection + CONDSTORE/QRESYNC](docs/tickets/0041-persistent-conn-condstore.md) -- perf _(data layer, Stage 5; #0054 and #0059 have landed, so the `SyncBackend` seam it assumes is in place)_
 - [#0043 FTS5 full-text search](docs/tickets/0043-fts5-search.md) -- feature _(data layer, Stage 5)_
 - [#0060 Enforce the retention policy](docs/tickets/0060-retention-enforcement.md) -- feature
 - [#0077 Three intermittent test failures (temp-dir and env-var races)](docs/tickets/0077-flaky-tests.md) -- bug
@@ -47,7 +46,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 
 - [#0035 Graph API admin approval + Azure app verification](docs/tickets/0035-graph-admin-approval.md) -- chore _(blocked; written against the TUM tenant, re-scope for EVOQS on wake)_
 - [#0036 Graph sync backend (calendar + server-side RSVP)](docs/tickets/0036-graph-sync-backend.md) -- feature _(blocked by #0035)_
-- [#0042 Graph /messages/delta + deltaLink](docs/tickets/0042-graph-delta-sync.md) -- perf _(data layer, Stage 5; sequenced after #0059)_
+- [#0042 Graph /messages/delta + deltaLink](docs/tickets/0042-graph-delta-sync.md) -- perf _(data layer, Stage 5; #0059 has landed, and the `deltaLink` state belongs behind its `SyncBackend`)_
 - [#0063 Send durability gaps, Graph half](docs/tickets/0063-send-durability-gaps.md) -- bug _(the SMTP halves shipped; scope item 3, resumable Graph `pending_send` rows, waits with the backend)_
 
-The Graph half of one more active ticket is parked with it: the parity/dedup motivation of [#0059](docs/tickets/0059-syncbackend-trait.md).
+The parity half of [#0059](docs/tickets/0059-syncbackend-trait.md) is parked with it: the trait and the engine shipped, but `graph.rs` still runs its own loop rather than being a second `SyncBackend`.
