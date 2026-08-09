@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`o` opens a draft's attachments (#0016).** The key only ever worked on
+  received mail; on a draft it declined with a status line pointing at the
+  `attachments:` list it would not read. It reads it now: the paths in the
+  draft's own frontmatter, `~` expanded the way the send path expands it, so
+  what `o` opens is the file that will be sent rather than a temp copy of it.
+  Zero, one and many attachments behave as they do for received mail (nothing
+  to show says so, one file skips the picker, several open it), in List,
+  Headers and Preview focus, and `O` saves them for the same reason. A listed
+  path that is no longer on disk is named on the status line instead of being
+  skipped silently -- that stale path is the `mp send` failure the key is being
+  pressed to find out about. No binding changed, so the help overlay and the
+  website key table are untouched.
+
+### Added
 - **`mp search --local`, ranked full-text search over the store (#0043).**
   Search is a `SELECT` now, not a stream over files: `mp search --local
   <query>` answers from the store's FTS5 index, offline, over every synced

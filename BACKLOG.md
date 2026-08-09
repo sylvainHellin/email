@@ -25,7 +25,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
 - [#0031 iMIP cancellations/updates (CANCEL / SEQUENCE)](docs/tickets/0031-imip-cancel-update.md) -- feature
 - [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature
-- [#0016 Open attachments for drafts (`o`)](docs/tickets/0016-attachment-open-for-drafts.md) -- feature
 - [#0017 Jump-to-date in mailbox list](docs/tickets/0017-jump-to-date.md) -- feature
 
 ### Distribution / cross-platform (adoption track)

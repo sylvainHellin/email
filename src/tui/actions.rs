@@ -91,16 +91,18 @@ fn render_temp_file(stem: &str, name: &str) -> Result<PathBuf> {
 /// The message under the cursor for a flow that reads its blobs, or `None`
 /// with the status line saying why there is not one.
 ///
-/// Same shape as [`cursor_message`], different explanation: a draft's
-/// attachments are the paths in its own `attachments:` list, not blobs of a
-/// received message, so there is nothing here to materialise for it.
+/// Same shape as [`cursor_message`], different explanation: what reaches here
+/// with no store row is no longer a draft (a draft answers from its own
+/// `attachments:` list since #0016) but a row with no identity at all -- a
+/// parse-skipped draft file (#0080) or a server-search hit that resolved to
+/// nothing -- and neither has bytes to materialise.
 fn cursor_message_for_files(app: &mut App, what: &str) -> Option<MessageRef> {
     if let Some(msg) = app.selected_email_ref() {
         return Some(msg);
     }
     if app.selected_email().is_some() {
         app.set_status_level(
-            format!("{what} needs a received message; a draft carries its own in `attachments:`"),
+            format!("{what} needs a message or a readable draft; this row has neither"),
             StatusLevel::Warning,
         );
     }
@@ -118,8 +120,67 @@ fn cursor_message_for_files(app: &mut App, what: &str) -> Option<MessageRef> {
 /// An empty vector is a message with no attachments, which is the caller's
 /// status line to write. `None` is a failure already on the status line.
 pub(super) fn cursor_attachment_files(app: &mut App) -> Option<Vec<PathBuf>> {
+    // A draft names its attachments itself, so it answers from its own
+    // frontmatter rather than from blobs it has none of (#0016).
+    if app.selected_email().is_some_and(|e| e.draft_id.is_some()) {
+        return draft_attachment_files(app);
+    }
     let msg = cursor_message_for_files(app, "Attachments")?;
     row_attachment_files(app, msg.row_id())
+}
+
+/// The attachments of the *draft* under the cursor: the paths in its
+/// `attachments:` frontmatter, resolved on disk (#0016).
+///
+/// Nothing is materialised, because nothing has to be: a draft's attachments
+/// are already files, written there by the forward builder (into the stable
+/// per-account mirror, #0006) or named by the user in `$EDITOR`. So this is
+/// the one attachment source that hands the picker the real paths instead of
+/// a private temp copy, and `o` opens the very file that will be sent, which
+/// is the point of the key on a draft.
+///
+/// `~` is expanded the way the send path expands it ([`crate::send`]'s
+/// `draft_attachments`), so a draft that sends is a draft that opens.
+/// A path that is not there is named rather than skipped silently: a stale
+/// entry is precisely what `o` is being pressed to find out about, and it is
+/// the failure `mp send` would hit later (see the forwarded-attachment note in
+/// `docs/lessons-learned.md`).
+fn draft_attachment_files(app: &mut App) -> Option<Vec<PathBuf>> {
+    let (_id, path) = cursor_draft(app, "Attachments needs a draft or a received message")?;
+    let draft = match crate::draft::parse_email_draft(&path) {
+        Ok(draft) => draft,
+        Err(e) => {
+            app.set_status_level(format!("Attachments failed: {e:#}"), StatusLevel::Error);
+            return None;
+        }
+    };
+
+    let listed = draft.frontmatter.attachments.unwrap_or_default();
+    let mut files = Vec::new();
+    let mut missing = Vec::new();
+    for entry in &listed {
+        let expanded = shellexpand::tilde(entry).into_owned();
+        let candidate = PathBuf::from(expanded);
+        if candidate.is_file() {
+            files.push(candidate);
+        } else {
+            missing.push(entry.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        let level = if files.is_empty() { StatusLevel::Error } else { StatusLevel::Warning };
+        let n = missing.len();
+        let noun = if n == 1 { "attachment" } else { "attachments" };
+        app.set_status_level(
+            format!("{n} {noun} missing: {}", missing.join(", ")),
+            level,
+        );
+        if files.is_empty() {
+            return None;
+        }
+    }
+    Some(files)
 }
 
 /// [`cursor_attachment_files`] for a row named directly, which is the
@@ -3612,16 +3673,30 @@ mod store_backed_files {
         assert!(app.status_message.is_none(), "{:?}", app.status_message);
     }
 
-    /// A Drafts row has no `messages` row behind it, so there are no blobs to
-    /// materialise, and the status line says what it does have instead.
+    /// A row that is neither a message nor an indexed draft (a parse-skipped
+    /// draft file, a server-search hit that resolved to nothing) has no
+    /// attachments to reach, and the status line says so.
     #[test]
-    fn a_draft_row_says_where_its_own_attachments_live() {
+    fn a_row_with_no_identity_declines_the_attachment_key() {
         let _fx = Fixture::new();
         let mut app = App::default_for_tests();
         app.account_config.name = "alice".to_string();
-        app.emails = std::sync::Arc::new(vec![EmailEntry {
+        app.emails = std::sync::Arc::new(vec![draft_entry(None)]);
+        app.rebuild_visible();
+
+        assert_eq!(cursor_attachment_files(&mut app), None);
+        assert_eq!(
+            app.status_message.clone().unwrap(),
+            "Attachments needs a message or a readable draft; this row has neither"
+        );
+    }
+
+    /// A list entry for a draft, or (with `None`) for a row that carries no
+    /// identity at all.
+    fn draft_entry(draft_id: Option<&str>) -> EmailEntry {
+        EmailEntry {
             msg: None,
-            draft_id: Some("some-draft".to_string()),
+            draft_id: draft_id.map(str::to_string),
             skip: None,
             from: String::new(),
             to: "alice@example.com".to_string(),
@@ -3636,16 +3711,86 @@ mod store_backed_files {
             forwarded: false,
             flagged: false,
             is_invite: false,
-        }]);
-        app.rebuild_visible();
+        }
+    }
 
-        assert_eq!(cursor_attachment_files(&mut app), None);
+    /// Write a draft naming `attachments` and index it, returning the app with
+    /// the cursor on it.
+    fn app_on_draft(fx: &Fixture, attachments: &[String]) -> App {
+        let dir = crate::config::drafts_dir("alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listed: String = attachments.iter().map(|a| format!("  - \"{a}\"\n")).collect();
+        let body = if listed.is_empty() {
+            "attachments:\n".to_string()
+        } else {
+            format!("attachments:\n{listed}")
+        };
+        std::fs::write(
+            dir.join("note.md"),
+            format!("---\nto: bob@example.com\nsubject: Files\nstatus: draft\n{body}---\n\nBody\n"),
+        )
+        .unwrap();
+        let store = fx.store();
+        let rows = crate::store::drafts::refresh(&store, "alice", &dir).unwrap();
+
+        let mut app = App::default_for_tests();
+        app.account_config.name = "alice".to_string();
+        app.emails = std::sync::Arc::new(vec![draft_entry(Some(&rows[0].id))]);
+        app.rebuild_visible();
+        app
+    }
+
+    /// `o` on a draft opens the files the draft names (#0016): the real paths,
+    /// not a temp copy, because those are the bytes that will be sent.
+    #[test]
+    fn a_draft_answers_the_attachment_key_from_its_own_frontmatter() {
+        let fx = Fixture::new();
+        let files_dir = crate::config::account_dir("alice").join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let one = files_dir.join("report.pdf");
+        let two = files_dir.join("notes.txt");
+        std::fs::write(&one, b"%PDF-1.4").unwrap();
+        std::fs::write(&two, b"notes").unwrap();
+
+        let listed = vec![one.display().to_string(), two.display().to_string()];
+        let mut app = app_on_draft(&fx, &listed);
+
+        assert_eq!(cursor_attachment_files(&mut app), Some(vec![one, two]));
+        assert!(app.status_message.is_none(), "{:?}", app.status_message);
+    }
+
+    /// A draft with no `attachments:` is not an error: the empty list is what
+    /// the picker turns into "No attachments", the same as a bare message.
+    #[test]
+    fn a_draft_without_attachments_resolves_to_an_empty_list() {
+        let fx = Fixture::new();
+        let mut app = app_on_draft(&fx, &[]);
+
+        assert_eq!(cursor_attachment_files(&mut app), Some(Vec::new()));
+        assert!(app.status_message.is_none(), "{:?}", app.status_message);
+    }
+
+    /// A path that is no longer there is named, not skipped: a stale entry is
+    /// exactly what `o` is pressed to find out about before `mp send` hits it.
+    #[test]
+    fn a_missing_draft_attachment_is_named_on_the_status_line() {
+        let fx = Fixture::new();
+        let files_dir = crate::config::account_dir("alice").join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let present = files_dir.join("here.txt");
+        std::fs::write(&present, b"here").unwrap();
+        let gone = files_dir.join("gone.txt").display().to_string();
+
+        let mut app = app_on_draft(&fx, &[present.display().to_string(), gone.clone()]);
+        assert_eq!(cursor_attachment_files(&mut app), Some(vec![present]));
         let status = app.status_message.clone().unwrap();
-        assert_eq!(
-            status,
-            "Attachments needs a received message; a draft carries its own in `attachments:`"
-        );
-        assert!(!status.contains("#0052"), "{status}");
+        assert!(status.starts_with("1 attachment missing: "), "{status}");
+        assert!(status.contains(&gone), "{status}");
+
+        // Every path gone is a failure, not an empty picker saying "none".
+        let mut app = app_on_draft(&fx, std::slice::from_ref(&gone));
+        assert_eq!(cursor_attachment_files(&mut app), None);
+        assert!(app.status_message.clone().unwrap().contains(&gone));
     }
 
     /// Save writes the materialised file into the chosen directory, and a
