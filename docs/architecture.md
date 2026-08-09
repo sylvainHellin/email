@@ -238,6 +238,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `types.rs` | `EmailEntry`, `AccountState`, `BgResult`, `Action`, `Focus`, `MailboxKind`, `open_store`, mailbox builders |
 | `keys.rs` | `handle_key()` dispatch and all `handle_*_key()` methods |
 | `keymap.rs` | The single `KEYMAP` table behind the help overlay, the hint bar and `mp dump-keys` |
+| `jump_date.rs` | The closed date grammar behind jump-to-date (`g t`, #0017): pure, clock-free, `parse_jump_date(input, today)` |
 | `calendar_view.rs` | Agenda rows built from the iMIP messages the store holds |
 | **`src/tui/ui/`** | |
 | `mod.rs` | `view()`, the top-level layout dispatch |
@@ -351,7 +352,7 @@ It was `email-cli` before #0022, and `get` falls back to that name so a user who
 
 ## Testing
 
-- **1059 tests**, run by `cargo test`.
+- **1080 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
