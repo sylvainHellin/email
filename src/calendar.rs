@@ -26,6 +26,12 @@ pub struct ParsedAttendee {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedEvent {
     pub uid: Option<String>,
+    /// `RECURRENCE-ID` when the payload addresses a single occurrence of a
+    /// recurring series rather than the whole series (#0031). Normalised the
+    /// same way `DTSTART` is, so a CANCEL naming the instance in UTC matches a
+    /// REQUEST naming it with a `TZID`. `None` means "the whole series", and
+    /// `(uid, recurrence_id)` is the identity a CANCEL/update applies to.
+    pub recurrence_id: Option<String>,
     pub method: Option<String>,
     pub sequence: u32,
     /// `DTSTAMP` as an RFC3339 UTC string, when present. Used by REPLY
@@ -94,6 +100,11 @@ pub fn parse_ics(bytes: &[u8]) -> Option<ParsedEvent> {
     })?;
 
     let uid = event.get_uid().map(|s| s.to_string());
+    let recurrence_id = event
+        .properties()
+        .get("RECURRENCE-ID")
+        .and_then(DatePerhapsTime::from_property)
+        .and_then(format_date_perhaps_time);
     let sequence = event.get_sequence().unwrap_or(0);
     let dtstamp = event
         .get_timestamp()
@@ -125,6 +136,7 @@ pub fn parse_ics(bytes: &[u8]) -> Option<ParsedEvent> {
 
     Some(ParsedEvent {
         uid,
+        recurrence_id,
         method,
         sequence,
         dtstamp,
@@ -143,6 +155,7 @@ pub fn parse_ics(bytes: &[u8]) -> Option<ParsedEvent> {
 pub fn event_frontmatter(parsed: &ParsedEvent) -> EventFrontmatter {
     EventFrontmatter {
         uid: parsed.uid.clone(),
+        recurrence_id: parsed.recurrence_id.clone(),
         method: parsed.method.clone(),
         sequence: parsed.sequence,
         summary: parsed.summary.clone(),
@@ -152,6 +165,12 @@ pub fn event_frontmatter(parsed: &ParsedEvent) -> EventFrontmatter {
         organizer: parsed.organizer.clone(),
         rsvp: "needs-action".to_string(),
         recurrence: parsed.recurrence.clone().unwrap_or_default(),
+        // Derived state, folded in by `crate::reconcile::fold_status` where
+        // the whole account's payloads are visible; a single ics cannot know
+        // whether it was cancelled or superseded later.
+        cancelled: false,
+        superseded: false,
+        cancelled_instances: Vec::new(),
         attendees: parsed
             .attendees
             .iter()
@@ -462,6 +481,10 @@ END:VCALENDAR\r
     fn parse_cancel_preserved() {
         let ev = parse_ics(CANCEL.as_bytes()).unwrap();
         assert_eq!(ev.method.as_deref(), Some("CANCEL"));
+        assert_eq!(
+            ev.recurrence_id, None,
+            "a whole-series CANCEL carries no RECURRENCE-ID"
+        );
         assert_eq!(ev.uid.as_deref(), Some("abc123@google.com"));
         assert_eq!(ev.sequence, 1);
     }
@@ -522,4 +545,27 @@ END:VCALENDAR\r
         assert!(!is_imip_invite(b"this is not a vcalendar at all"));
         assert!(!is_imip_invite(&[0xff, 0xfe]), "invalid UTF-8 -> not an invite");
     }
+
+    /// #0031: a single-occurrence payload carries a `RECURRENCE-ID`, and it is
+    /// normalised exactly like `DTSTART`, so the same instance named in UTC
+    /// and with a `TZID` is one identity.
+    #[test]
+    fn parses_recurrence_id_and_normalises_it_like_dtstart() {
+        let utc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\n\
+                   UID:series@x\r\nSEQUENCE:1\r\nRECURRENCE-ID:20260720T120000Z\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let zoned = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+                     UID:series@x\r\nSEQUENCE:1\r\n\
+                     RECURRENCE-ID;TZID=Europe/Berlin:20260720T140000\r\n\
+                     END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let utc = parse_ics(utc.as_bytes()).unwrap();
+        let zoned = parse_ics(zoned.as_bytes()).unwrap();
+        assert_eq!(utc.recurrence_id.as_deref(), Some("2026-07-20T12:00:00Z"));
+        assert_eq!(
+            zoned.recurrence_id.as_deref(),
+            Some("2026-07-20T14:00:00+02:00"),
+            "the zoned form keeps its own offset, as DTSTART does"
+        );
+    }
+
 }

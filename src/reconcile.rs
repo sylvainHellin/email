@@ -94,6 +94,16 @@ impl InviteMessage {
     pub fn dtstamp(&self) -> &str {
         self.parsed.dtstamp.as_deref().unwrap_or_default()
     }
+
+    /// The normalised `RECURRENCE-ID`, `None` when the payload addresses the
+    /// whole series (#0031).
+    pub fn recurrence_id(&self) -> Option<&str> {
+        self.parsed
+            .recurrence_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    }
 }
 
 /// A single REPLY observation: one attendee's `PARTSTAT` for one UID.
@@ -123,6 +133,9 @@ pub struct ReconcileReport {
     /// Attendee statuses the fold resolved onto an invite, counted once per
     /// (invite, attendee) pair.
     pub resolved: usize,
+    /// Invites a `METHOD:CANCEL` tombstoned (#0031). They stay listed and
+    /// readable; nothing is deleted.
+    pub cancelled: usize,
 }
 
 /// Every invite of one account, parsed, in `(mailbox, uid)` order.
@@ -230,6 +243,118 @@ pub fn apply_replies(
     resolved
 }
 
+/// The cancellations recorded for one iCal UID (#0031).
+#[derive(Debug, Default, Clone)]
+struct UidCancels {
+    /// Highest `SEQUENCE` of a whole-series `METHOD:CANCEL` (no
+    /// `RECURRENCE-ID`) seen for this UID.
+    series: Option<u32>,
+    /// `RECURRENCE-ID` -> highest `SEQUENCE` of a single-occurrence CANCEL.
+    instances: std::collections::BTreeMap<String, u32>,
+}
+
+/// The account-wide `(UID, RECURRENCE-ID)` version chain: which identities were
+/// cancelled, and which copy of each is the current one (#0031).
+///
+/// Derived like everything else here: computed from the ics blobs on every
+/// pass, never stored. Arrival order does not matter -- a CANCEL that reaches
+/// the mailbox before its REQUEST is folded exactly like one that follows it,
+/// because both are just rows when the fold runs.
+#[derive(Debug, Default, Clone)]
+pub struct StatusIndex {
+    /// UID -> its cancellations.
+    cancels: HashMap<String, UidCancels>,
+    /// `(UID, RECURRENCE-ID or "")` -> the highest `(sequence, dtstamp)` seen
+    /// among the REQUESTs for that identity.
+    latest: HashMap<(String, String), (u32, String)>,
+}
+
+/// Fold every CANCEL and REQUEST of `invites` into a [`StatusIndex`].
+///
+/// Payloads with no usable UID are skipped: without one there is no identity
+/// to cancel or supersede against, and an unrelated event must never be
+/// tombstoned by a UID-less CANCEL.
+pub fn fold_status(invites: &[InviteMessage]) -> StatusIndex {
+    let mut index = StatusIndex::default();
+    for invite in invites {
+        let Some(uid) = invite.uid() else { continue };
+        let seq = invite.parsed.sequence;
+        match invite.method().as_str() {
+            "CANCEL" => {
+                let entry = index.cancels.entry(uid.to_string()).or_default();
+                match invite.recurrence_id() {
+                    // A `RECURRENCE-ID` scopes the cancellation to that one
+                    // occurrence; the rest of the series lives on.
+                    Some(rid) => {
+                        let slot = entry.instances.entry(rid.to_string()).or_insert(seq);
+                        *slot = (*slot).max(seq);
+                    }
+                    None => entry.series = Some(entry.series.unwrap_or(seq).max(seq)),
+                }
+            }
+            "REQUEST" => {
+                let key = (
+                    uid.to_string(),
+                    invite.recurrence_id().unwrap_or_default().to_string(),
+                );
+                let rank = (seq, invite.dtstamp().to_string());
+                let slot = index.latest.entry(key).or_insert_with(|| rank.clone());
+                if rank > *slot {
+                    *slot = rank;
+                }
+            }
+            _ => {}
+        }
+    }
+    index
+}
+
+impl StatusIndex {
+    /// Mark one event with what the account-wide fold knows about it:
+    /// `cancelled`, `superseded`, and the individually cancelled occurrences
+    /// of a series.
+    ///
+    /// `dtstamp` is the copy's own, the tiebreak within one `SEQUENCE`.
+    ///
+    /// Sequence rules (iTIP, RFC 5546 §3.2):
+    /// - a CANCEL cancels a copy whose `SEQUENCE` is at or below its own; a
+    ///   *stale* CANCEL (lower sequence than the surviving REQUEST) is a
+    ///   cancellation of a version that was already replaced, and is ignored;
+    /// - a REQUEST is superseded only by a strictly greater
+    ///   `(SEQUENCE, DTSTAMP)`, so a re-delivered or replayed copy at an equal
+    ///   or lower version never displaces the newer state.
+    pub fn apply(&self, event: &mut EventFrontmatter, dtstamp: &str) {
+        let Some(uid) = event.uid.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+            return;
+        };
+        let rid = event.recurrence_id.clone();
+        let seq = event.sequence;
+        if let Some(cancels) = self.cancels.get(uid) {
+            let series_cancelled = cancels.series.is_some_and(|c| c >= seq);
+            let instance_cancelled = rid
+                .as_deref()
+                .and_then(|r| cancels.instances.get(r))
+                .is_some_and(|&c| c >= seq);
+            event.cancelled = series_cancelled || instance_cancelled;
+            // Only the series row reports per-occurrence cancellations; an
+            // occurrence payload reports its own state in `cancelled`.
+            if rid.is_none() {
+                event.cancelled_instances = cancels
+                    .instances
+                    .iter()
+                    .filter(|(_, &c)| c >= seq)
+                    .map(|(r, _)| r.clone())
+                    .collect();
+            }
+        }
+        let key = (uid.to_string(), rid.unwrap_or_default());
+        event.superseded = self
+            .latest
+            .get(&key)
+            .is_some_and(|latest| *latest > (seq, dtstamp.to_string()));
+    }
+}
+
 /// Our own answer to an invite: the winning REPLY we sent for it, falling back
 /// to whatever `PARTSTAT` the organizer's own copy already carries for us.
 ///
@@ -268,6 +393,7 @@ pub fn own_rsvp(
 pub fn reconcile_account(store: &Store, blobs: &BlobStore, account: &str) -> ReconcileReport {
     let invites = load_invites(store, blobs, account);
     let replies = fold_replies(&invites);
+    let status = fold_status(&invites);
     let mut report = ReconcileReport {
         replies_seen: invites.iter().filter(|i| i.method() == "REPLY").count(),
         ..Default::default()
@@ -277,6 +403,10 @@ pub fn reconcile_account(store: &Store, blobs: &BlobStore, account: &str) -> Rec
         let mut event = crate::calendar::event_frontmatter(&invite.parsed);
         let by_addr = invite.uid().and_then(|uid| replies.get(uid));
         report.resolved += apply_replies(&mut event, invite.parsed.sequence, by_addr);
+        status.apply(&mut event, invite.dtstamp());
+        if event.cancelled {
+            report.cancelled += 1;
+        }
     }
     report
 }
@@ -564,6 +694,7 @@ pub(crate) mod tests {
                 invites_seen: 1,
                 replies_seen: 2,
                 resolved: 2,
+                cancelled: 0,
             }
         );
         assert_eq!(
@@ -651,6 +782,220 @@ status: accepted\n---\n\nsee attached\n";
             reconcile_account(&fx.store, &fx.blobs, "alice").replies_seen,
             0,
             "the forged attachment is not a reply"
+        );
+    }
+
+    /// A `METHOD:CANCEL` payload for a whole series, or (with `recurrence_id`)
+    /// for one occurrence of it.
+    fn cancel_ics(uid: &str, seq: u32, recurrence_id: Option<&str>) -> String {
+        let rid = recurrence_id
+            .map(|r| format!("RECURRENCE-ID:{r}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             SEQUENCE:{seq}\r\nDTSTAMP:20260715T090000Z\r\nSTATUS:CANCELLED\r\n{rid}\
+             ORGANIZER:mailto:me@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// A `METHOD:REQUEST` payload with an explicit `DTSTAMP` and an optional
+    /// `RECURRENCE-ID` (an occurrence override).
+    fn request_ics(uid: &str, seq: u32, dtstamp: &str, recurrence_id: Option<&str>) -> String {
+        let rid = recurrence_id
+            .map(|r| format!("RECURRENCE-ID:{r}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             SEQUENCE:{seq}\r\nDTSTAMP:{dtstamp}\r\nSUMMARY:Plan\r\nDTSTART:20260720T120000Z\r\n\
+             RRULE:FREQ=WEEKLY\r\n{rid}ORGANIZER:mailto:me@example.com\r\n\
+             ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:a@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// The folded state of the stored REQUEST matching `uid`/`recurrence_id`.
+    fn folded(fx: &Fixture, uid: &str, recurrence_id: Option<&str>) -> EventFrontmatter {
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let status = fold_status(&invites);
+        let request = invites
+            .iter()
+            .find(|i| {
+                i.method() == "REQUEST"
+                    && i.uid() == Some(uid)
+                    && i.recurrence_id() == recurrence_id
+            })
+            .expect("the REQUEST is in the store");
+        let mut event = crate::calendar::event_frontmatter(&request.parsed);
+        status.apply(&mut event, request.dtstamp());
+        event
+    }
+
+    /// A whole-series CANCEL tombstones the event: it is marked cancelled and
+    /// still readable, never removed.
+    #[test]
+    fn a_cancel_tombstones_the_whole_event() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u1@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite("inbox", 2, "Cancelled: Plan", &cancel_ics("u1@x", 1, None));
+        let event = folded(&fx, "u1@x", None);
+        assert!(event.cancelled);
+        assert!(event.cancelled_instances.is_empty());
+        assert_eq!(event.summary.as_deref(), Some("Plan"), "the event is kept");
+        assert_eq!(
+            reconcile_account(&fx.store, &fx.blobs, "alice").cancelled,
+            1
+        );
+    }
+
+    /// Arrival order is irrelevant: a CANCEL ingested *before* its REQUEST
+    /// tombstones it just as one ingested after would.
+    #[test]
+    fn a_cancel_that_arrives_before_its_request_still_applies() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Cancelled: Plan", &cancel_ics("u2@x", 1, None));
+        fx.ingest_invite("inbox", 2, "Plan", &request_ics("u2@x", 0, "20260701T090000Z", None));
+        assert!(folded(&fx, "u2@x", None).cancelled);
+    }
+
+    /// A CANCEL naming one `RECURRENCE-ID` kills that occurrence only: the
+    /// series stays live and lists the cancelled occurrence.
+    #[test]
+    fn an_occurrence_cancel_does_not_kill_the_series() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u3@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Cancelled: Plan",
+            &cancel_ics("u3@x", 1, Some("20260727T120000Z")),
+        );
+        let series = folded(&fx, "u3@x", None);
+        assert!(!series.cancelled, "the series survives an occurrence cancel");
+        assert_eq!(
+            series.cancelled_instances,
+            vec!["2026-07-27T12:00:00Z".to_string()]
+        );
+    }
+
+    /// The occurrence override itself is what the occurrence CANCEL cancels,
+    /// and the series row beside it is untouched.
+    #[test]
+    fn an_occurrence_cancel_marks_only_that_occurrence() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u4@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Plan (moved)",
+            &request_ics("u4@x", 0, "20260702T090000Z", Some("20260727T120000Z")),
+        );
+        fx.ingest_invite(
+            "inbox",
+            3,
+            "Cancelled: Plan",
+            &cancel_ics("u4@x", 0, Some("20260727T120000Z")),
+        );
+        assert!(folded(&fx, "u4@x", Some("2026-07-27T12:00:00Z")).cancelled);
+        assert!(!folded(&fx, "u4@x", None).cancelled);
+    }
+
+    /// A stale CANCEL (a lower sequence than the surviving REQUEST) cancelled
+    /// a version that has already been replaced, and must not tombstone the
+    /// rescheduled event.
+    #[test]
+    fn a_stale_cancel_does_not_tombstone_a_newer_request() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Cancelled: Plan", &cancel_ics("u5@x", 0, None));
+        fx.ingest_invite("inbox", 2, "Plan", &request_ics("u5@x", 2, "20260701T090000Z", None));
+        assert!(!folded(&fx, "u5@x", None).cancelled);
+    }
+
+    /// A UID-less CANCEL has no identity to apply to and must never tombstone
+    /// an unrelated event.
+    #[test]
+    fn a_uidless_cancel_tombstones_nothing() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u6@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Cancelled",
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\n\
+             SEQUENCE:9\r\nDTSTAMP:20260715T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        assert!(!folded(&fx, "u6@x", None).cancelled);
+    }
+
+    /// A malformed CANCEL is skipped like any other unparseable payload: the
+    /// event stays live, the other invites are unaffected, and the pass does
+    /// not fail.
+    #[test]
+    fn a_malformed_cancel_degrades_to_no_cancellation() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u7@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Cancelled: Plan",
+            "BEGIN:VCALENDAR\r\nMETHOD:CANCEL\r\nthis is not an ics\r\n",
+        );
+        assert!(!folded(&fx, "u7@x", None).cancelled);
+        assert_eq!(
+            reconcile_account(&fx.store, &fx.blobs, "alice"),
+            ReconcileReport {
+                invites_seen: 1,
+                replies_seen: 0,
+                resolved: 0,
+                cancelled: 0,
+            }
+        );
+    }
+
+    /// A re-issue with a higher `SEQUENCE` supersedes the copy already stored;
+    /// the new copy is not itself superseded.
+    #[test]
+    fn a_higher_sequence_request_supersedes_the_stored_one() {
+        let fx = fixture();
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u8@x", 0, "20260701T090000Z", None));
+        fx.ingest_invite("inbox", 2, "Plan (moved)", &request_ics("u8@x", 1, "20260702T090000Z", None));
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let status = fold_status(&invites);
+        for invite in invites.iter().filter(|i| i.method() == "REQUEST") {
+            let mut event = crate::calendar::event_frontmatter(&invite.parsed);
+            status.apply(&mut event, invite.dtstamp());
+            assert_eq!(
+                event.superseded,
+                event.sequence == 0,
+                "sequence {} superseded={}",
+                event.sequence,
+                event.superseded
+            );
+        }
+    }
+
+    /// The clobber guard: a re-delivered copy at a lower *or equal*
+    /// `(SEQUENCE, DTSTAMP)` never marks the newer state as superseded, so a
+    /// replayed old invite cannot displace what is stored.
+    #[test]
+    fn a_stale_or_equal_sequence_request_never_supersedes() {
+        let fx = fixture();
+        // sequence 2 is the current version.
+        fx.ingest_invite("inbox", 1, "Plan", &request_ics("u9@x", 2, "20260703T090000Z", None));
+        // A replay of sequence 1, and a duplicate of sequence 2 with the same
+        // DTSTAMP (the same version delivered twice).
+        fx.ingest_invite("archive", 2, "Plan", &request_ics("u9@x", 1, "20260705T090000Z", None));
+        fx.ingest_invite("archive", 3, "Plan", &request_ics("u9@x", 2, "20260703T090000Z", None));
+
+        let invites = load_invites(&fx.store, &fx.blobs, "alice");
+        let status = fold_status(&invites);
+        let current = invites
+            .iter()
+            .find(|i| i.parsed.sequence == 2 && i.mailbox == "inbox")
+            .unwrap();
+        let mut event = crate::calendar::event_frontmatter(&current.parsed);
+        status.apply(&mut event, current.dtstamp());
+        assert!(
+            !event.superseded,
+            "a lower/equal-version copy must not supersede the stored one"
         );
     }
 

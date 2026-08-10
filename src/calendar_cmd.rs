@@ -49,6 +49,13 @@ pub fn handle_rebuild(config: &GlobalConfig, account_name: Option<String>) -> Re
             report.invites_seen,
             report.replies_seen,
         );
+        if report.cancelled > 0 {
+            println!(
+                "{} {} invite(s) cancelled by the organizer (kept, marked cancelled)",
+                "•".blue(),
+                report.cancelled.to_string().bold(),
+            );
+        }
     }
     Ok(())
 }

@@ -1137,9 +1137,11 @@ pub struct CalendarEvent {
     /// True when the winning copy came from the Sent mailbox, i.e. we are the
     /// organizer (no own-RSVP, and RSVP is refused).
     pub is_organizer: bool,
-    /// True when a `METHOD:CANCEL` message for this UID exists on disk with a
-    /// sequence at least as high as this event's (#0034 display-only; the
-    /// cancellation *semantics* are #0031).
+    /// True when a `METHOD:CANCEL` for this event's `(UID, RECURRENCE-ID)`
+    /// exists in the store with a sequence at least as high as this event's
+    /// (#0031). The row stays listed and readable: a cancellation tombstones
+    /// the event, it never deletes it. Mirrors `event.cancelled`, which the
+    /// shared card renders.
     pub cancelled: bool,
 }
 

@@ -79,9 +79,13 @@ impl Candidate {
 ///   the Sent/Inbox/Archive copies of one event collapse into one row;
 /// - events with no usable UID fall back to row identity (they are still real
 ///   events, they just cannot be deduped);
-/// - a `METHOD:CANCEL` message tags its UID as cancelled when its sequence is
-///   at least the surviving REQUEST's; the row stays visible (display only --
-///   the cancellation *semantics* are #0031).
+/// - a `METHOD:CANCEL` message tags its identity as cancelled when its sequence
+///   is at least the surviving REQUEST's; the row **stays visible**, marked
+///   cancelled, rather than being deleted (#0031: a tombstone the user can
+///   still read, never silent data loss);
+/// - identity is `(UID, RECURRENCE-ID)`: a CANCEL naming one occurrence of a
+///   series cancels that occurrence only, and is listed on the series row as a
+///   cancelled occurrence instead of tombstoning the whole series (#0031).
 ///
 /// Never panics: an unreadable blob, an unparseable payload and an account
 /// with no invites all degrade to fewer rows, and every field degrades to a
@@ -94,28 +98,27 @@ pub fn load_events_for_account(
 ) -> Vec<CalendarEvent> {
     let invites = reconcile::load_invites(store, blobs, account);
     let replies = reconcile::fold_replies(&invites);
+    // Cancellations and the version chain, folded over the whole account so
+    // arrival order does not matter: a CANCEL ingested before its REQUEST
+    // tombstones it just the same (#0031).
+    let status = reconcile::fold_status(&invites);
 
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
-    // uid -> highest CANCEL sequence seen.
-    let mut cancels: HashMap<String, u32> = HashMap::new();
 
     for invite in &invites {
-        let uid = invite.uid().map(str::to_string);
-        match invite.method().as_str() {
-            "CANCEL" => {
-                if let Some(uid) = uid {
-                    let slot = cancels.entry(uid).or_insert(invite.parsed.sequence);
-                    *slot = (*slot).max(invite.parsed.sequence);
-                }
-                continue;
-            }
-            "REQUEST" => {}
-            // REPLY (an attendee's response) and anything unrecognised are not
-            // agenda rows.
-            _ => continue,
+        // Identity is (UID, RECURRENCE-ID): an occurrence override is its own
+        // agenda row, not a duplicate of the series.
+        let uid = invite.uid().map(|uid| match invite.recurrence_id() {
+            Some(rid) => format!("{uid}\u{0}{rid}"),
+            None => uid.to_string(),
+        });
+        // REPLY (an attendee's response), CANCEL (folded into `status`) and
+        // anything unrecognised are not agenda rows.
+        if invite.method() != "REQUEST" {
+            continue;
         }
 
-        let candidate = candidate_from(invite, self_address, &replies);
+        let candidate = candidate_from(invite, self_address, &replies, &status);
         let key = uid.unwrap_or_else(|| format!("row:{}", invite.row_id));
         match candidates.get(&key) {
             Some(existing) if existing.rank() >= candidate.rank() => {}
@@ -125,15 +128,8 @@ pub fn load_events_for_account(
         }
     }
 
-    let mut events: Vec<CalendarEvent> = candidates
-        .into_iter()
-        .map(|(key, mut candidate)| {
-            candidate.row.cancelled = cancels
-                .get(&key)
-                .is_some_and(|&cancel_seq| cancel_seq >= candidate.sequence);
-            candidate.row
-        })
-        .collect();
+    let mut events: Vec<CalendarEvent> =
+        candidates.into_values().map(|candidate| candidate.row).collect();
 
     // Chronological, undated last; the row reference as the final tiebreak so
     // the order is stable across runs.
@@ -150,11 +146,14 @@ fn candidate_from(
     invite: &InviteMessage,
     self_address: &str,
     replies: &reconcile::ReplyIndex,
+    status: &reconcile::StatusIndex,
 ) -> Candidate {
     let mut event = crate::calendar::event_frontmatter(&invite.parsed);
     let by_addr = invite.uid().and_then(|uid| replies.get(uid));
     reconcile::apply_replies(&mut event, invite.parsed.sequence, by_addr);
     event.rsvp = reconcile::own_rsvp(&event, self_address, by_addr);
+    status.apply(&mut event, invite.dtstamp());
+    let cancelled = event.cancelled;
 
     let start = normalize_stamp(event.start.as_deref());
     let end = normalize_stamp(event.end.as_deref());
@@ -176,7 +175,7 @@ fn candidate_from(
             end_sort,
             start_display: start.display,
             is_organizer: invite.mailbox == SENT_MAILBOX,
-            cancelled: false,
+            cancelled,
             event,
         },
         sequence: invite.parsed.sequence,
@@ -314,6 +313,17 @@ mod tests {
         format!(
             "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\n{uid_line}\
              SEQUENCE:{sequence}\r\nDTSTAMP:20260701T090000Z\r\nSUMMARY:{summary}\r\n{start_line}\
+             ORGANIZER:mailto:org@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// A single-occurrence payload: `RECURRENCE-ID` naming one instance of the
+    /// `uid` series, with a start on that instance.
+    fn occurrence_ics(method: &str, uid: &str, sequence: u32, recurrence_id: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             SEQUENCE:{sequence}\r\nDTSTAMP:20260701T090000Z\r\nRECURRENCE-ID:{recurrence_id}\r\n\
+             SUMMARY:Weekly (moved)\r\nDTSTART:{recurrence_id}\r\n\
              ORGANIZER:mailto:org@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         )
     }
@@ -515,6 +525,144 @@ mod tests {
             events[0].cancelled,
             "cancel_seq == request_seq must still tag the row"
         );
+    }
+
+    /// An occurrence-level CANCEL (`RECURRENCE-ID`) must not tombstone the
+    /// series row: the weekly meeting lives on, minus one occurrence, which
+    /// the row reports so the user can see what was dropped (#0031).
+    #[test]
+    fn an_occurrence_cancel_leaves_the_series_row_live() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-r"), 0, "Weekly", Some(":20260801T090000Z")),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Cancelled: Weekly",
+            &occurrence_ics("CANCEL", "uid-r", 1, "20260808T090000Z"),
+        );
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 1, "the CANCEL is not its own agenda row");
+        assert!(!events[0].cancelled, "the series survives");
+        assert_eq!(
+            events[0].event.cancelled_instances,
+            vec!["2026-08-08T09:00:00Z".to_string()]
+        );
+    }
+
+    /// An occurrence override (`RECURRENCE-ID` on a REQUEST) is its own agenda
+    /// row, cancellable on its own, and does not collapse into the series.
+    #[test]
+    fn an_occurrence_override_is_its_own_row() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-o"), 0, "Weekly", Some(":20260801T090000Z")),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Weekly (moved)",
+            &occurrence_ics("REQUEST", "uid-o", 0, "20260808T090000Z"),
+        );
+        fx.ingest_invite(
+            "inbox",
+            3,
+            "Cancelled: Weekly",
+            &occurrence_ics("CANCEL", "uid-o", 1, "20260808T090000Z"),
+        );
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 2, "series and override are separate rows");
+        let series = events.iter().find(|e| e.subject == "Weekly").unwrap();
+        let override_row = events
+            .iter()
+            .find(|e| e.subject == "Weekly (moved)")
+            .unwrap();
+        assert!(!series.cancelled);
+        assert!(override_row.cancelled, "the occurrence itself is cancelled");
+    }
+
+    /// A malformed CANCEL costs itself and nothing else: the event it names
+    /// stays live and listed rather than the whole agenda failing (#0031).
+    #[test]
+    fn a_malformed_cancel_leaves_the_agenda_intact() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-m"), 0, "Weekly", Some(":20260801T090000Z")),
+        );
+        fx.ingest_invite("inbox", 2, "Cancelled: Weekly", "METHOD:CANCEL but broken");
+        let events = agenda(&fx);
+        assert_eq!(subjects(&events), vec!["Weekly"]);
+        assert!(!events[0].cancelled);
+    }
+
+    /// A CANCEL ingested before the REQUEST it cancels still tombstones it:
+    /// the fold sees rows, not an arrival order (#0031).
+    #[test]
+    fn a_cancel_before_the_request_still_tombstones_the_row() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Cancelled: Doomed",
+            &event_ics("CANCEL", Some("uid-ooo"), 0, "Doomed", Some(":20260801T090000Z")),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Doomed",
+            &event_ics("REQUEST", Some("uid-ooo"), 0, "Doomed", Some(":20260801T090000Z")),
+        );
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 1, "the event is kept, not deleted");
+        assert!(events[0].cancelled);
+        assert!(events[0].event.cancelled, "the shared card says so too");
+    }
+
+    /// A re-issued invite at a higher SEQUENCE replaces the stored copy, and a
+    /// replay of the older one (ingested afterwards) does not clobber it back.
+    #[test]
+    fn a_higher_sequence_replaces_and_a_replay_does_not_clobber() {
+        let fx = fixture();
+        fx.ingest_invite(
+            "inbox",
+            1,
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-up"), 0, "Weekly", Some(":20260801T090000Z")),
+        );
+        fx.ingest_invite(
+            "inbox",
+            2,
+            "Weekly (moved)",
+            &event_ics(
+                "REQUEST",
+                Some("uid-up"),
+                3,
+                "Weekly (moved)",
+                Some(":20260802T090000Z"),
+            ),
+        );
+        // The same old version delivered again, into another mailbox.
+        fx.ingest_invite(
+            "archive",
+            3,
+            "Weekly",
+            &event_ics("REQUEST", Some("uid-up"), 0, "Weekly", Some(":20260801T090000Z")),
+        );
+        let events = agenda(&fx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.sequence, 3);
+        assert_eq!(events[0].event.summary.as_deref(), Some("Weekly (moved)"));
+        assert!(!events[0].event.superseded, "the winner is the current one");
     }
 
     /// A stale CANCEL (older sequence than the surviving REQUEST) does not tag

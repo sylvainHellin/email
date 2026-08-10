@@ -1245,14 +1245,8 @@ impl App {
         // the selected message only (#0038 item 6). The cursor is on it, so
         // this is the memo the render pass already filled in the common case.
         let event = self.load_message_invite(msg);
-        let is_request = event
-            .as_ref()
-            .and_then(|e| e.method.as_deref())
-            .is_some_and(|m| m.eq_ignore_ascii_case("REQUEST"));
-        if !is_request {
-            self.set_status(
-                "Only received invitations (REQUEST) can be RSVP'd".to_string(),
-            );
+        if let Some(refusal) = rsvp_refusal(event.as_ref()) {
+            self.set_status(refusal);
             return;
         }
         let summary = event
@@ -2146,6 +2140,32 @@ impl App {
 /// entry used to answer from its own `body` field before it became lazy
 /// (#0038 scope item 5). An entry the index has no body for (no store row, or
 /// a blob the retention sweep evicted) simply does not match on body.
+/// Why the invite under the mail cursor cannot be RSVP'd, or `None` when it
+/// can (#0029 for the REQUEST guard, #0031 for the version guards).
+///
+/// Pure so the version rules are pinned without a store: the payload the card
+/// shows is one *version* of the event, and a reply to a cancelled or
+/// superseded version would carry a `SEQUENCE` the organizer has already moved
+/// past. Refuse and say why rather than mailing an answer about a dead
+/// version; the invite itself stays readable either way.
+fn rsvp_refusal(event: Option<&crate::types::EventFrontmatter>) -> Option<String> {
+    let is_request = event
+        .and_then(|e| e.method.as_deref())
+        .is_some_and(|m| m.eq_ignore_ascii_case("REQUEST"));
+    if !is_request {
+        return Some("Only received invitations (REQUEST) can be RSVP'd".to_string());
+    }
+    if event.is_some_and(|e| e.cancelled) {
+        return Some("This event was cancelled by the organizer \u{2014} nothing to RSVP".to_string());
+    }
+    if event.is_some_and(|e| e.superseded) {
+        return Some(
+            "A newer version of this invitation has arrived \u{2014} RSVP from that one".to_string(),
+        );
+    }
+    None
+}
+
 fn email_matches(
     email: &EmailEntry,
     needle_lower: &str,
@@ -3709,6 +3729,7 @@ mod tests {
                 rsvp: "needs-action".into(),
                 recurrence: String::new(),
                 attendees: Vec::new(),
+                ..Default::default()
             },
             subject: format!("Invitation: {summary}"),
             start_sort: start.to_string(),
@@ -3789,6 +3810,37 @@ mod tests {
             .status_message
             .as_deref()
             .is_some_and(|m| m.contains("organizer")));
+    }
+
+    /// #0031: the mail-view RSVP refuses a cancelled or superseded version of
+    /// an event, so no reply goes out carrying a `SEQUENCE` the organizer has
+    /// already moved past. A current REQUEST is still accepted.
+    #[test]
+    fn rsvp_refusal_covers_cancelled_and_superseded_versions() {
+        let request = |f: fn(&mut crate::types::EventFrontmatter)| {
+            let mut ev = crate::types::EventFrontmatter {
+                method: Some("REQUEST".into()),
+                ..Default::default()
+            };
+            f(&mut ev);
+            ev
+        };
+        assert!(super::rsvp_refusal(Some(&request(|_| {}))).is_none());
+        assert!(super::rsvp_refusal(None)
+            .is_some_and(|m| m.contains("Only received invitations")));
+        assert!(super::rsvp_refusal(Some(&crate::types::EventFrontmatter {
+            method: Some("CANCEL".into()),
+            ..Default::default()
+        }))
+        .is_some_and(|m| m.contains("Only received invitations")));
+        assert!(
+            super::rsvp_refusal(Some(&request(|e| e.cancelled = true)))
+                .is_some_and(|m| m.contains("cancelled")),
+        );
+        assert!(
+            super::rsvp_refusal(Some(&request(|e| e.superseded = true)))
+                .is_some_and(|m| m.contains("newer version")),
+        );
     }
 
     /// `V` on a cancelled row refuses: the organizer already called the

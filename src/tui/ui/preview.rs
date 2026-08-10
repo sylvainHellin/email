@@ -71,6 +71,29 @@ fn render_event_card(lines: Vec<Line<'static>>, frame: &mut Frame, area: Rect) {
     frame.render_widget(card, area);
 }
 
+/// The "some occurrences were cancelled" line of a recurring event's card
+/// (#0031): a count plus the first few `RECURRENCE-ID`s, so a long series does
+/// not push the rest of the card off the pane.
+fn cancelled_instances_line(instances: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let head = instances
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = instances.len().saturating_sub(SHOWN);
+    let suffix = if rest > 0 {
+        format!(", +{rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} occurrence(s) cancelled: {head}{suffix}",
+        instances.len()
+    )
+}
+
 /// Build the event summary card content (unit-testable): title, time range,
 /// location, organizer, own RSVP state, per-attendee statuses, recurrence, and
 /// the honest "not synced to Exchange" caveat. `is_sent` flips the framing for
@@ -97,6 +120,31 @@ pub(super) fn event_card_lines(event: &EventFrontmatter, is_sent: bool) -> Vec<L
             Style::default()
                 .fg(theme::active().accent)
                 .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // Cancellation and supersession first: they change what every line below
+    // them means (#0031). A cancelled invite is kept and shown, tombstoned --
+    // never deleted out from under the user.
+    if event.cancelled {
+        lines.push(Line::from(Span::styled(
+            "Cancelled by the organizer.".to_string(),
+            Style::default()
+                .fg(theme::active().error)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else if event.superseded {
+        lines.push(Line::from(Span::styled(
+            "Superseded: a newer version of this invitation has arrived.".to_string(),
+            Style::default()
+                .fg(theme::active().warning)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if !event.cancelled && !event.cancelled_instances.is_empty() {
+        lines.push(Line::from(Span::styled(
+            cancelled_instances_line(&event.cancelled_instances),
+            Style::default().fg(theme::active().warning),
         )));
     }
 
@@ -141,7 +189,10 @@ pub(super) fn event_card_lines(event: &EventFrontmatter, is_sent: bool) -> Vec<L
     }
 
     // Honest caveat (D4): iMIP-only, no Exchange server-calendar sync in v1.
-    let caveat = if is_sent {
+    let caveat = if event.cancelled {
+        // No RSVP prompt on a dead version: `V` refuses it (#0031).
+        "Cancelled invitations take no response; nothing was sent to Exchange (no Graph in v1)."
+    } else if is_sent {
         "Not synced to your Exchange calendar (no Graph in v1)."
     } else {
         "RSVP is emailed to the organizer; not synced to Exchange (no Graph in v1). Press V to respond."
@@ -596,6 +647,7 @@ mod event_card_tests {
                 EventAttendee { address: "a@example.com".to_string(), status: "accepted".to_string() },
                 EventAttendee { address: "b@example.com".to_string(), status: "needs-action".to_string() },
             ],
+            ..Default::default()
         }
     }
 
@@ -631,6 +683,72 @@ mod event_card_tests {
         assert!(!text.contains("Press V to respond"));
     }
 
+    /// #0031: the cancellation banner is part of the shared card, so the mail
+    /// preview and the Calendar detail say the same thing, and the rest of the
+    /// invite is still rendered below it (tombstone, not deletion).
+    #[test]
+    fn cancelled_card_leads_with_the_banner_and_keeps_the_event() {
+        let mut ev = sample_event();
+        ev.cancelled = true;
+        let text: String = event_card_lines(&ev, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Cancelled by the organizer."), "text=\n{text}");
+        assert!(text.contains("LOC Day planning"), "the event is still shown");
+        assert!(text.contains("Room 4.12"));
+        assert!(
+            !text.contains("Press V to respond"),
+            "a cancelled invite takes no RSVP:\n{text}"
+        );
+    }
+
+    /// A superseded copy says so instead of pretending to be current, and the
+    /// cancellation banner wins when both apply.
+    #[test]
+    fn superseded_card_says_a_newer_version_arrived() {
+        let mut ev = sample_event();
+        ev.superseded = true;
+        let text: String = event_card_lines(&ev, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Superseded"), "text=\n{text}");
+
+        ev.cancelled = true;
+        let text: String = event_card_lines(&ev, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Cancelled by the organizer."));
+        assert!(!text.contains("Superseded"), "one banner, not two:\n{text}");
+    }
+
+    /// A recurring series with individually cancelled occurrences lists them
+    /// (truncated) instead of tombstoning the whole series.
+    #[test]
+    fn cancelled_occurrences_are_listed_on_the_series_card() {
+        let mut ev = sample_event();
+        ev.cancelled_instances = vec![
+            "2026-07-27T12:00:00Z".into(),
+            "2026-08-03T12:00:00Z".into(),
+            "2026-08-10T12:00:00Z".into(),
+            "2026-08-17T12:00:00Z".into(),
+        ];
+        let text: String = event_card_lines(&ev, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("4 occurrence(s) cancelled"), "text=\n{text}");
+        assert!(text.contains("2026-07-27T12:00:00Z"));
+        assert!(text.contains("+1 more"), "the list is truncated:\n{text}");
+        assert!(!text.contains("Cancelled by the organizer."));
+    }
+
     #[test]
     fn card_handles_minimal_event() {
         let ev = EventFrontmatter {
@@ -638,6 +756,7 @@ mod event_card_tests {
             summary: None, start: None, end: None, location: None,
             organizer: None, rsvp: "needs-action".to_string(),
             recurrence: String::new(), attendees: vec![],
+            ..Default::default()
         };
         let lines = event_card_lines(&ev, false);
         // Own RSVP + caveat still render even with no other fields.

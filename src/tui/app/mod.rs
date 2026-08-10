@@ -1145,6 +1145,12 @@ impl App {
         let by_addr = uid.as_deref().and_then(|uid| replies.get(uid));
         crate::reconcile::apply_replies(&mut event, parsed.sequence, by_addr);
         event.rsvp = crate::reconcile::own_rsvp(&event, &self.self_address(), by_addr);
+        // Cancellation and supersession are account-wide facts, not facts of
+        // this one payload: a CANCEL or a bumped REQUEST is a *different*
+        // message (#0031). The card shows the state of the event this message
+        // is a copy of, not the state the copy was born with.
+        crate::reconcile::fold_status(&invites)
+            .apply(&mut event, parsed.dtstamp.as_deref().unwrap_or_default());
         Some(event)
     }
 

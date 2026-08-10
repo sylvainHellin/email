@@ -197,19 +197,9 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         return;
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    if event.cancelled {
-        lines.push(Line::from(Span::styled(
-            "Cancelled by the organizer.",
-            Style::default()
-                .fg(theme::active().error)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-    lines.extend(super::preview::event_card_lines(
-        &event.event,
-        event.is_organizer,
-    ));
+    // The cancellation banner lives in the shared card (#0031), so the mail
+    // preview and the agenda detail say the same thing in the same place.
+    let lines: Vec<Line> = super::preview::event_card_lines(&event.event, event.is_organizer);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -350,6 +340,7 @@ mod tests {
                 rsvp: rsvp.to_string(),
                 recurrence: String::new(),
                 attendees: Vec::new(),
+                ..Default::default()
             },
             subject: "Invitation: Planning".into(),
             start_sort: "2026-08-01T09:00:00".into(),

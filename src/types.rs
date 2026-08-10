@@ -229,10 +229,14 @@ pub struct EventAttendee {
 ///
 /// Every field is optional or defaulted so that emails without an `event:`
 /// block (the vast majority) round-trip unchanged.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 pub struct EventFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+    /// `RECURRENCE-ID` of a single-occurrence payload (#0031), `None` for the
+    /// whole series. Part of the event identity together with `uid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<String>,
     /// REQUEST | REPLY | CANCEL
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -257,6 +261,21 @@ pub struct EventFrontmatter {
     pub recurrence: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attendees: Vec<EventAttendee>,
+    /// Derived (#0031): a `METHOD:CANCEL` for this identity exists locally with
+    /// a sequence at least this event's. The event is kept and shown, marked
+    /// cancelled -- never deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// Derived (#0031): a newer `METHOD:REQUEST` for the same identity exists
+    /// locally (higher `SEQUENCE`, or the same one with a later `DTSTAMP`), so
+    /// this copy is a superseded version of the event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// Derived (#0031): the `RECURRENCE-ID`s of occurrences of this series that
+    /// were cancelled individually. Empty for a non-recurring event and for a
+    /// single-occurrence payload (which reports its own state in `cancelled`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_instances: Vec<String>,
 }
 
 /// Read a string field that may be written as a bare key (YAML null) as the

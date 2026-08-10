@@ -250,6 +250,7 @@ fn invite_frontmatter() -> EventFrontmatter {
         rsvp: "needs-action".into(),
         recurrence: String::new(),
         attendees: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -358,6 +359,10 @@ fn calendar_fixture() -> App {
             rsvp: rsvp.into(),
             recurrence: String::new(),
             attendees: Vec::new(),
+            // The loader sets both (#0031): the row flag drives the agenda
+            // badge, the frontmatter flag drives the shared card's banner.
+            cancelled,
+            ..Default::default()
         },
         subject: format!("Invitation: {summary}"),
         start_sort: start.to_string(),
@@ -597,6 +602,17 @@ fn golden_mail_view_jump_date_prompt() {
 #[test]
 fn golden_calendar_view() {
     let mut app = calendar_fixture();
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The Calendar view with the cursor on the cancelled event (#0031): the row
+/// keeps its strike-through badge *and* the detail pane leads with the
+/// cancellation banner above an otherwise complete card -- a tombstone the
+/// user can still read, never a deleted event.
+#[test]
+fn golden_calendar_view_cancelled_event_detail() {
+    let mut app = calendar_fixture();
+    app.calendar_view.list_index = 1;
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
