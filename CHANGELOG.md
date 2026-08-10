@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **iMIP cancellations and updates, receive side (#0031).** A `METHOD:CANCEL`
+  now does something: the event it names is marked cancelled everywhere it is
+  shown -- the red "Cancelled by the organizer." banner leads the shared event
+  card in the mail preview and the Calendar detail, and the agenda row keeps
+  its `cancelled` badge. It is a tombstone, never a deletion: the invite, its
+  `invite.ics` and every field on the card stay readable, because an event the
+  organizer called off is still something the user may want to look at. A
+  re-issued invite with a bumped `SEQUENCE` supersedes the copy already
+  stored, and the older copy says so on its card instead of pretending to be
+  current. Identity is `(UID, RECURRENCE-ID)` and the version chain is
+  `(SEQUENCE, DTSTAMP)`, so a CANCEL naming one occurrence of a series kills
+  that occurrence only (the series row lists it and lives on), and a replayed
+  or re-delivered copy at an equal or lower version can never clobber newer
+  local state. `V` refuses to RSVP a cancelled or superseded version rather
+  than mailing an answer the organizer has already moved past. All of it is
+  derived on every pass from the stored `invite.ics` blobs and never
+  persisted, so arrival order is irrelevant: a CANCEL that reaches the mailbox
+  before its invitation applies exactly the same. A malformed or UID-less
+  CANCEL costs itself and nothing else. Send-side updates and cancellations
+  (re-sending with a bumped `SEQUENCE`) remain open as #0084.
+
+### Added
 - **Jump to a date in the mailbox list (#0017).** `g t` arms an inline
   `date:` prompt over the list and Enter moves the cursor to the newest
   message on or before what was typed: `2024-03-07`, `2024-03`, `2024`,
