@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Inline images in the preview pane (#0010).** A message whose HTML body
+  points at its own image parts with `cid:` URLs now shows them as pixels, not
+  as nothing: the terminal is asked once at startup what it can draw
+  (`ratatui-image`'s capability query -- kitty, iTerm2 or sixel), and each
+  referenced image is decoded once per cursor move and painted into rows the
+  text flow reserves for it. Only inline-referenced images are drawn; an
+  attached photo the body never mentions stays an attachment. Every terminal
+  that cannot draw pixels keeps exactly the pane it had, plus a
+  `[image: filename]` line per image -- halfblocks were rejected on purpose,
+  and no escape byte is emitted anywhere that has not said it understands one.
+  A Graph row (no RFC822 to walk), an undecodable part, and anything over 8 MB
+  or 40 megapixels degrade to the same placeholder, per image.
+
+### Added
 - **iMIP cancellations and updates, receive side (#0031).** A `METHOD:CANCEL`
   now does something: the event it names is marked cancelled everywhere it is
   shown -- the red "Cancelled by the organizer." banner leads the shared event

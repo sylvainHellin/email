@@ -76,6 +76,11 @@ pub struct App {
     /// The parsed invite behind the preview pane's event card, memoised the
     /// same way (#0038 scope item 6). See [`PreviewInvite`].
     pub preview_invite: PreviewInvite,
+    /// The inline images of the previewed message, memoised the same way
+    /// (#0010). Empty on every terminal without a graphics protocol -- the
+    /// placeholder lines are built from the same list, so it is filled with
+    /// names there too and only the decoded protocol is missing.
+    pub(crate) preview_images: crate::tui::images::PreviewImages,
     /// Lowercased bodies of the active mailbox, built only while body search
     /// is on. See [`SearchBodies`] for why this is a blob batch read rather
     /// than an FTS query.
@@ -216,6 +221,7 @@ impl App {
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
             preview_invite: PreviewInvite::default(),
+            preview_images: Default::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
@@ -309,6 +315,7 @@ impl App {
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
             preview_invite: PreviewInvite::default(),
+            preview_images: Default::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
@@ -1098,6 +1105,62 @@ impl App {
         self.preview_body.fill(key, text);
     }
 
+    /// Refresh the inline-image memo of the preview pane (#0010).
+    ///
+    /// Runs beside [`Self::refresh_preview_body`] at the top of the render
+    /// pass and costs nothing for the overwhelmingly common case: a row with
+    /// no attachments answers from its own list entry, without opening the
+    /// store. A row that has attachments costs one raw-blob read, one MIME
+    /// walk and one decode per `cid:`-referenced image, once per cursor move.
+    ///
+    /// Both halves of the ticket's degradation live here. A Graph row has no
+    /// RFC822 to walk, so it yields no inline images at all; a terminal with
+    /// no graphics protocol still gets the names, and the renderer turns each
+    /// one into a `[image: name]` line.
+    pub(crate) fn refresh_preview_images(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_images.holds(&key) {
+            return;
+        }
+        let has_attachments = self
+            .selected_email()
+            .is_some_and(|e| e.has_attachments);
+        let images = match (&key, has_attachments) {
+            (Some((_, EntryKey::Msg(msg), _)), true) => self.load_inline_images(*msg),
+            _ => Vec::new(),
+        };
+        self.preview_images.fill(key, images);
+    }
+
+    /// Read one message's `cid:`-referenced images out of the store.
+    fn load_inline_images(&self, msg: MessageRef) -> Vec<crate::tui::images::PreviewImage> {
+        let account = &self.account_config.name;
+        let Some(store) = open_store(account) else {
+            return Vec::new();
+        };
+        let blobs = crate::store::BlobStore::for_account(account);
+        // No HTML part means nothing can carry a `cid:` reference, and that is
+        // checked before the raw blob is read: a plain-text message with a PDF
+        // attached must not pay for its own bytes.
+        let Some(html) = crate::store::read::load_html(&store, &blobs, msg.row_id()) else {
+            return Vec::new();
+        };
+        if !html.to_ascii_lowercase().contains("cid:") {
+            return Vec::new();
+        }
+        let Some(raw) = crate::store::read::load_raw(&store, &blobs, msg.row_id()) else {
+            return Vec::new();
+        };
+        crate::parse::inline_images(&raw, &html)
+            .into_iter()
+            .map(|img| crate::tui::images::PreviewImage {
+                dimensions: crate::tui::images::dimensions(&img.content),
+                protocol: crate::tui::images::protocol(&img.content),
+                name: img.filename,
+            })
+            .collect()
+    }
+
     /// Refresh the preview invite memo, reading and parsing one ics blob when
     /// the cursor, the account or the list generation moved under it.
     ///
@@ -1239,6 +1302,26 @@ impl App {
     pub(crate) fn prime_preview_invite(&mut self, event: crate::types::EventFrontmatter) {
         let key = self.preview_body_key();
         self.preview_invite.fill(key, Some(event));
+    }
+
+    /// Park inline-image names as the preview's images, for fixtures that have
+    /// no store.
+    ///
+    /// The fixtures get names and no protocol, which is exactly the shape a
+    /// terminal without graphics produces: the golden frames therefore capture
+    /// the placeholder path and can never capture an image cell.
+    #[cfg(test)]
+    pub(crate) fn prime_preview_images(&mut self, names: &[&str]) {
+        let key = self.preview_body_key();
+        let images = names
+            .iter()
+            .map(|name| crate::tui::images::PreviewImage {
+                name: (*name).to_string(),
+                dimensions: None,
+                protocol: None,
+            })
+            .collect();
+        self.preview_images.fill(key, images);
     }
 
     /// Make the body-search index match the mode: built and current for the

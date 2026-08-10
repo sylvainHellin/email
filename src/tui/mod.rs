@@ -3,6 +3,7 @@ mod actions;
 mod bg;
 mod event;
 mod helpers;
+pub(crate) mod images;
 mod mutations;
 pub mod theme;
 mod ui;
@@ -59,6 +60,10 @@ pub fn run() -> Result<()> {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
+    // Ask the terminal what graphics protocol it speaks (#0010), once, after
+    // the alternate screen is up and before any key is read: the query talks
+    // to stdio and a concurrent reader would eat the reply.
+    images::init();
 
     let size = terminal.size()?;
     app.terminal_width = size.width;

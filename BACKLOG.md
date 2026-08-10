@@ -24,7 +24,6 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0060 Enforce the retention policy](docs/tickets/0060-retention-enforcement.md) -- feature
 - [#TKT-0044 Pane zoom/focus (herdr-style), after the data-layer rework](docs/tickets/TKT-0044-after-the-data-layer-rework-it-would-be-good-to-ha.md) -- feature
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
-- [#0010 Inline image rendering](docs/tickets/0010-inline-image-rendering.md) -- feature
 
 ### Distribution / cross-platform (adoption track)
 

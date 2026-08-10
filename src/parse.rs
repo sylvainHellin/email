@@ -711,6 +711,128 @@ pub fn display_fetched_emails(emails: &[FetchedEmail], full_body: bool) {
     println!("{}", "─".repeat(60));
 }
 
+// ---------------------------------------------------------------------------
+// Inline images (#0010)
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling on the decoded bytes of one inline image part.
+///
+/// The preview decodes these on the render pass's thread, so an image nobody
+/// would want to look at in a terminal cell grid is skipped rather than paid
+/// for. Eight megabytes is far above any real logo or screenshot and far below
+/// anything that would stall a frame.
+pub const MAX_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One image part of a message that the HTML body actually points at.
+///
+/// This is deliberately narrower than an attachment: the ticket's rule (#0010)
+/// is that only images referenced inline by `Content-ID` are rendered, so a
+/// mail with twelve attached photos still shows twelve attachment rows and no
+/// inline graphics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    /// The filename the part was sent under, or a synthesized `inline-N.ext`.
+    pub filename: String,
+    /// The `Content-ID`, angle brackets stripped.
+    pub content_id: String,
+    /// The part's MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// The decoded bytes.
+    pub content: Vec<u8>,
+}
+
+/// Normalise a `Content-ID` for comparison: angle brackets off, lowercased.
+fn normalize_cid(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_ascii_lowercase()
+}
+
+/// Whether `html` references `cid` through a `cid:` URL.
+///
+/// A substring match rather than an HTML parse: the reference can appear in a
+/// `src`, a `background`, a `style` `url()` or a CSS block, and every one of
+/// those spells it `cid:<id>`. What follows the id must not be an id character,
+/// so `cid:logo` does not match `cid:logo2`.
+fn html_references_cid(html_lower: &str, cid: &str) -> bool {
+    if cid.is_empty() {
+        return false;
+    }
+    let needle = format!("cid:{cid}");
+    let mut from = 0;
+    while let Some(at) = html_lower[from..].find(&needle) {
+        let end = from + at + needle.len();
+        let next = html_lower[end..].chars().next();
+        match next {
+            // An id character right after the match means we matched a prefix
+            // of a longer Content-ID.
+            Some(c) if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' => {}
+            _ => return true,
+        }
+        from = end;
+    }
+    false
+}
+
+/// The image parts of `raw` that `html` references by `cid:` URL, decoded.
+///
+/// Only matching parts are decoded: a message whose HTML points at one 20 kB
+/// logo does not pay for the 4 MB PDF beside it. Parts above
+/// [`MAX_INLINE_IMAGE_BYTES`] are dropped, and so is a message that does not
+/// parse at all -- the preview then shows what it always showed.
+pub fn inline_images(raw: &[u8], html: &str) -> Vec<InlineImage> {
+    let Ok(parsed) = mailparse::parse_mail(raw) else {
+        return Vec::new();
+    };
+    let html_lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut counter = 0usize;
+    collect_inline_images(&parsed, &html_lower, &mut counter, &mut out);
+    out
+}
+
+fn collect_inline_images(
+    part: &mailparse::ParsedMail,
+    html_lower: &str,
+    counter: &mut usize,
+    out: &mut Vec<InlineImage>,
+) {
+    if part.ctype.mimetype.to_ascii_lowercase().starts_with("image/") {
+        let cid = part
+            .headers
+            .iter()
+            .find(|h| h.get_key().eq_ignore_ascii_case("Content-ID"))
+            .map(|h| normalize_cid(&h.get_value()))
+            .unwrap_or_default();
+        if html_references_cid(html_lower, &cid) {
+            let disposition = part.get_content_disposition();
+            let filename = disposition
+                .params
+                .get("filename")
+                .or_else(|| part.ctype.params.get("name"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    *counter += 1;
+                    format!("inline-{}.{}", counter, mime_ext_for(&part.ctype.mimetype))
+                });
+            if let Ok(content) = part.get_body_raw() {
+                if !content.is_empty() && content.len() <= MAX_INLINE_IMAGE_BYTES {
+                    out.push(InlineImage {
+                        filename: sanitize_attachment_filename(&filename),
+                        content_id: cid,
+                        media_type: part.ctype.mimetype.to_ascii_lowercase(),
+                        content,
+                    });
+                }
+            }
+        }
+    }
+    for sub in &part.subparts {
+        collect_inline_images(sub, html_lower, counter, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,5 +1392,72 @@ mod tests {
         let result = save_attachment(&source, dest_dir.path()).unwrap();
         assert_eq!(result, dest_dir.path().join("Makefile_1"));
         assert_eq!(std::fs::read(&result).unwrap(), b"data");
+    }
+
+    // -----------------------------------------------------------------
+    // Inline images (#0010)
+    // -----------------------------------------------------------------
+
+    /// A 1x1 transparent PNG, base64, as an inline part would carry it.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn related_message(html: &str, cid: &str, extra_part: &str) -> String {
+        format!(
+            "From: a@example.com\r\nSubject: hi\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n\
+--B\r\nContent-Type: image/png; name=\"logo.png\"\r\nContent-ID: <{cid}>\r\n\
+Content-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"logo.png\"\r\n\r\n{TINY_PNG_B64}\r\n{extra_part}--B--\r\n"
+        )
+    }
+
+    #[test]
+    fn inline_images_returns_the_cid_referenced_image() {
+        let raw = related_message("<p><img src=\"cid:logo@x\"></p>", "logo@x", "");
+        let html = "<p><img src=\"cid:logo@x\"></p>";
+        let found = inline_images(raw.as_bytes(), html);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].filename, "logo.png");
+        assert_eq!(found[0].content_id, "logo@x");
+        assert_eq!(found[0].media_type, "image/png");
+        // The bytes are the decoded PNG, not the base64 text.
+        assert_eq!(&found[0].content[1..4], b"PNG");
+    }
+
+    #[test]
+    fn an_unreferenced_image_part_is_not_inline() {
+        // The same message, but the HTML points at nothing: an attached photo
+        // stays an attachment and is not drawn into the preview.
+        let raw = related_message("<p>hello</p>", "logo@x", "");
+        let found = inline_images(raw.as_bytes(), "<p>hello</p>");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_cid_match_stops_at_an_id_boundary() {
+        // `cid:logo` must not match the part whose Content-ID is `logo2`.
+        let raw = related_message("<img src=\"cid:logo\">", "logo2", "");
+        assert!(inline_images(raw.as_bytes(), "<img src=\"cid:logo\">").is_empty());
+        let raw = related_message("<img src=\"cid:logo2\">", "logo2", "");
+        assert_eq!(inline_images(raw.as_bytes(), "<img src=\"cid:logo2\">").len(), 1);
+    }
+
+    #[test]
+    fn cid_matching_ignores_case_and_angle_brackets() {
+        let raw = related_message("<img src=\"CID:Logo@X\">", "Logo@X", "");
+        assert_eq!(inline_images(raw.as_bytes(), "<img src=\"CID:Logo@X\">").len(), 1);
+    }
+
+    #[test]
+    fn a_non_image_cid_part_is_not_an_inline_image() {
+        let raw = "MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/html\r\n\r\n<a href=\"cid:doc@x\">d</a>\r\n\
+--B\r\nContent-Type: application/pdf; name=\"d.pdf\"\r\nContent-ID: <doc@x>\r\n\r\nnot-an-image\r\n--B--\r\n";
+        assert!(inline_images(raw.as_bytes(), "<a href=\"cid:doc@x\">d</a>").is_empty());
+    }
+
+    #[test]
+    fn unparseable_bytes_yield_no_inline_images() {
+        assert!(inline_images(b"", "<img src=\"cid:x\">").is_empty());
     }
 }

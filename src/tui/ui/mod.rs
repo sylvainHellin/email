@@ -78,6 +78,10 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     // (#0038 scope item 6) and costs nothing for a message that is not one.
     app.refresh_preview_body();
     app.refresh_preview_invite();
+    // The inline images of the previewed message, on the same memo discipline
+    // (#0010). Free for a row with no attachments, and free on every terminal
+    // that cannot draw pixels beyond the names the placeholder lines carry.
+    app.refresh_preview_images();
 
     // Bottom rows: a herdr-style mode/hint bar (#0032) above the status bar.
     let outer = Layout::default()

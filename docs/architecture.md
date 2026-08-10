@@ -189,7 +189,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/read_cmd.rs` | `mp show`, `mp list-messages` (#0062) and the `mp search --local` listing (#0043): the human read surface over `store::read` and `store::search`, offline, rendering to a `String` so the layout is testable. Not the dump: that is an oracle with a pinned record shape. |
 | `src/cutover.rs` | `mp cutover` (#0040): the end of the file-era transition. Mints an `id:` into any draft that has none (the one-time draft "import"; the drafts directory never moved) and reports the dead file-era mailbox directories. Deletes nothing, by design. |
 | `src/reconcile.rs` | iMIP invite reconciliation, folded over the rows at display time and never persisted: attendee `PARTSTAT`s (#0030) and, since #0031, the `(UID, RECURRENCE-ID)` cancellation/version fold (`fold_status`) that marks an event cancelled, superseded, or missing individual occurrences |
-| `src/parse.rs` | RFC822 parsing, attachment extraction and sanitisation, `open_file_with_system()`, `materialisation_dir()`, `stable_attachments_dir()`, `ensure_utf8_charset()` |
+| `src/parse.rs` | RFC822 parsing, attachment extraction and sanitisation, `inline_images` (the `cid:`-referenced image parts behind #0010), `open_file_with_system()`, `materialisation_dir()`, `stable_attachments_dir()`, `ensure_utf8_charset()` |
 | `src/draft.rs` | Draft parsing and validation, reply and forward creation (`create_draft_from_source`), `source_from_row`, status transitions, `settle_sent_draft` |
 | `src/send.rs` | `markdown_to_html`, message building, `send_draft` + `SendContext`, per-recipient submission, `DurableSend`, `resume_outbox` |
 | `src/outbox.rs` | The durable send state machine and its blob refcounting |
@@ -233,6 +233,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `helpers.rs` | Terminal suspend and resume, editor, clipboard, the two watcher loops, `lib_do_sync`, `lib_do_sync_graph`, `resolve_send_account` |
 | `event.rs` | Crossterm event polling |
 | `theme.rs` | Named themes, semantic colour slots |
+| `images.rs` | The whole terminal-graphics surface (#0010): the one-shot `ratatui-image` capability query, the row arithmetic for an image in a cell grid, and the `PreviewImages` memo. Never initialised outside `tui::run`, so every test and every golden frame sees no picker and renders `[image: name]` placeholders. |
 | **`src/tui/app/`** | |
 | `mod.rs` | `App` struct, `new()`, `update()`, account sync, core state helpers |
 | `types.rs` | `EmailEntry`, `AccountState`, `BgResult`, `Action`, `Focus`, `MailboxKind`, `open_store`, mailbox builders |
@@ -352,7 +353,7 @@ It was `email-cli` before #0022, and `get` falls back to that name so a user who
 
 ## Testing
 
-- **1080 tests**, run by `cargo test`.
+- **1118 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).

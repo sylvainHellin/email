@@ -561,6 +561,28 @@ pub fn load_html(store: &Store, blobs: &BlobStore, message_row: i64) -> Option<S
     crate::parse::parse_rfc822_to_fetched_email(&raw).and_then(|email| email.html_body)
 }
 
+/// The raw RFC822 bytes of one message, or `None` when it has none.
+///
+/// Only the IMAP path stores them: a Graph row has no RFC822 at all (#0042),
+/// so a caller that needs the MIME tree, like the preview's inline-image scan
+/// (#0010), gets `None` there and must degrade rather than guess.
+pub fn load_raw(store: &Store, blobs: &BlobStore, message_row: i64) -> Option<Vec<u8>> {
+    let hash: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT hash FROM message_blobs
+             WHERE message_row = ?1 AND kind = 'raw' ORDER BY ordinal LIMIT 1",
+            [message_row],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!("[store] reading the raw hash of message {message_row}: {e:#}");
+            None
+        })?;
+    read_blob(blobs, message_row, hash.as_deref()?)
+}
+
 /// Resolve the body blobs of a batch of messages, keyed by `messages.id`.
 ///
 /// One prepared statement, one blob read per id: the batch shape exists for

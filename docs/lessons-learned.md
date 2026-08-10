@@ -863,3 +863,50 @@ This is why Rust 2024 made `set_var` `unsafe`; it is not a tidiness point.
 It also cost the suite its parallelism, because every data-dir test queued behind one mutex.
 The fix is to remove the shared state rather than guard it: `config::test_env` keeps the overrides in thread-locals, and since libtest runs each test on its own thread a fixture's paths are invisible to every other test -- no lock, no serialisation, no environment mutation anywhere in the binary ([src/config.rs](../src/config.rs), #0077).
 The seam has to cover *every* reader inside the binary to help, which is why `parse::materialisation_root` moved too.
+
+## Terminal graphics are painted over the cell grid, not into it
+
+An inline image (#0010) is not cells: kitty, iTerm2 and sixel all paint pixels
+the terminal owns, positioned by the cursor at the moment the escape sequence
+is written, and ratatui's buffer knows nothing about them. Three consequences
+shaped the implementation and will shape anything that touches it.
+
+(1) **Clipping does not happen.** A `Paragraph` that overflows its pane is cut
+at the border; an image that overflows is drawn over whatever is next to the
+pane, border included. The preview therefore draws an image only when the whole
+block it reserved is inside the pane (`images::fits_within`), and a
+half-scrolled image simply does not appear. "Draw it and let the layout clip"
+is not an option that exists.
+
+(2) **A `TestBackend` golden cannot capture one honestly.** `ratatui-image`
+smuggles the escape sequence through the buffer, so a headless golden of an
+image pane would snapshot raw protocol bytes -- unreadable, and different per
+protocol and per cell size. The fix is not to exclude image cells from the
+snapshot but to make the headless path structurally imageless: the capability
+query runs in `tui::run` alone, so no test process ever has a picker, every
+`PreviewImage` carries `protocol: None`, and the golden captures the
+placeholder contract instead. A golden that *could* contain an image cell is a
+golden that will churn.
+
+(3) **Halfblocks are a different feature, not a fallback.** `ratatui-image`
+defaults to drawing images as coloured half-block characters when the terminal
+answers nothing. That is real output in real cells -- it would change what
+every non-graphics terminal shows and would land in the goldens. It was mapped
+to "no graphics" deliberately; the ticket's fallback was a text placeholder.
+
+The capability query has its own trap: it writes to stdout and reads the reply
+off stdin, so it must run after the alternate screen is up and before the event
+loop starts polling keys. A concurrent reader eats the reply and the terminal
+looks capability-less.
+
+## Pick the image formats the binary carries, or `image` picks all of them
+
+`ratatui-image` exposes an `image-defaults` feature that turns on the `image`
+crate's whole default format set: exr, avif (via `ravif`), y4m, tiff, plus
+`rayon`. Adding it pulled ~60 crates for formats no email has ever carried.
+Depending on `image` directly with `default-features = false` and
+`features = ["png", "jpeg", "gif", "webp", "bmp"]` costs 16 crates instead --
+cargo's feature unification then gives `ratatui-image` exactly those decoders.
+Note that `cargo add` *merges* features into an existing dependency line rather
+than replacing them, so removing `image-defaults` meant editing `Cargo.toml` by
+hand.

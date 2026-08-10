@@ -72,6 +72,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Only used to enable the `vendored` feature for static musl release builds
 # (see .github/workflows/release.yml). Not compiled in default builds.
 openssl = { version = "0.10", optional = true }
+ratatui-image = { version = "9", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
 # Statically link OpenSSL (built from source). Required for the
