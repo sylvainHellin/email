@@ -97,6 +97,19 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     let hint_area = outer[1];
     let status_area = outer[2];
 
+    // Pane zoom (#TKT-0044): one pane owns the whole content area, the view
+    // switcher and the other panes step aside, and the hint and status bars
+    // stay put -- a zoom must not cost the user the row that says how to
+    // leave it. Every width tier collapses to the same single pane, so the
+    // narrow tier gets zoom for free.
+    if let Some(pane) = app.zoomed_pane() {
+        render_zoomed_pane(app, frame, main_area, pane);
+        status::render_hint_bar(app, frame, hint_area);
+        status::render_status_bar(app, frame, status_area);
+        render_overlays(app, frame, area);
+        return;
+    }
+
     let show_right = app.terminal_width >= 80;
     let show_sidebar = app.terminal_width >= 40;
 
@@ -185,6 +198,36 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     status::render_hint_bar(app, frame, hint_area);
     status::render_status_bar(app, frame, status_area);
 
+    render_overlays(app, frame, area);
+}
+
+/// Draw one pane over the whole content area (#TKT-0044).
+///
+/// The panes keep their own renderers and their own borders, so a zoomed pane
+/// is the pane the user already knows, wider: nothing about the content is
+/// special-cased for the zoom, which is what keeps the two layouts from
+/// drifting apart.
+fn render_zoomed_pane(
+    app: &mut App,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    pane: super::app::Focus,
+) {
+    use super::app::Focus;
+    match pane {
+        Focus::Sidebar => sidebar::render_sidebar(app, frame, area),
+        Focus::Headers => headers::render_headers(app, frame, area),
+        Focus::Preview => preview::render_body(app, frame, area),
+        // `Focus::Search` is folded into `List` by `App::zoom_target`, and
+        // `ComposeWizard` never zooms; both are unreachable here.
+        Focus::List | Focus::Search | Focus::ComposeWizard => {
+            list::render_email_list(app, frame, area)
+        }
+    }
+}
+
+/// The single-overlay dispatch, shared by the split and zoomed layouts.
+fn render_overlays(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
     // Exactly one overlay at a time by construction (#0032): a single match
     // on `app.overlay` replaces the former if-cascade of independent overlay
     // flags. Dim the whole frame first so the modal visually floats above the

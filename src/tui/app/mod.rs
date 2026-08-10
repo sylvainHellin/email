@@ -87,6 +87,14 @@ pub struct App {
     pub search_bodies: SearchBodies,
     pub search_query: String,
     pub search_includes_body: bool,
+    /// Zoom the focused pane to the whole content area (#TKT-0044).
+    ///
+    /// A bool rather than a `Focus`: what is zoomed is always *the focused
+    /// pane*, herdr-style, so `Tab` under a zoom moves the zoom with the focus
+    /// instead of leaving a zoomed pane the keyboard no longer drives. Session
+    /// state like `flagged_only`, not per-account state: a zoom the user armed
+    /// deliberately survives an account or mailbox switch.
+    pub zoomed: bool,
     /// Narrow the list to flagged messages only (#0079).
     ///
     /// A read-side view over `EmailEntry::flagged`, which already mirrors
@@ -226,6 +234,7 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             flagged_only: false,
+            zoomed: false,
             jump_date_input: None,
             watcher_active: false,
             imap_config: None,
@@ -320,6 +329,7 @@ impl App {
             search_query: String::new(),
             search_includes_body: false,
             flagged_only: false,
+            zoomed: false,
             jump_date_input: None,
             watcher_active: false,
             imap_config: None,
@@ -889,6 +899,53 @@ impl App {
             message,
             level,
         });
+    }
+
+    // ---------------------------------------------------------------
+    // Pane zoom (#TKT-0044)
+    // ---------------------------------------------------------------
+
+    /// The pane a zoom would fill the content area with, or `None` when the
+    /// current focus is not a pane that can be zoomed.
+    ///
+    /// `Focus::Search` maps to the list: the `/` prompt is drawn inside the
+    /// list pane, so zooming "the search" means zooming the list it filters.
+    /// `Focus::ComposeWizard` maps to nothing, because the wizard is an
+    /// overlay over the whole frame and already owns it.
+    pub fn zoom_target(&self) -> Option<Focus> {
+        match self.focus {
+            Focus::Sidebar => Some(Focus::Sidebar),
+            Focus::List | Focus::Search => Some(Focus::List),
+            Focus::Headers => Some(Focus::Headers),
+            Focus::Preview => Some(Focus::Preview),
+            Focus::ComposeWizard => None,
+        }
+    }
+
+    /// The pane the renderer must draw alone, or `None` for the normal split.
+    ///
+    /// Zoom is Mail-view state: the other two views are a list and a detail
+    /// card that already resize themselves, and the dispatcher never fires
+    /// `z` there (`KeyAction::is_view_agnostic`). Leaving the flag alone on a
+    /// view switch is deliberate -- a user who zooms the preview, glances at
+    /// the calendar and comes back finds the preview still zoomed.
+    pub fn zoomed_pane(&self) -> Option<Focus> {
+        if !self.zoomed || self.view != View::Mail {
+            return None;
+        }
+        self.zoom_target()
+    }
+
+    /// Toggle the zoom on the focused pane (#TKT-0044).
+    ///
+    /// A focus that names no pane (the compose wizard) says so instead of
+    /// silently arming a zoom that would take effect later, somewhere else.
+    pub fn toggle_zoom(&mut self) {
+        if self.zoom_target().is_none() {
+            self.set_status("Nothing to zoom here.".to_string());
+            return;
+        }
+        self.zoomed = !self.zoomed;
     }
 
     pub fn set_status(&mut self, msg: String) {

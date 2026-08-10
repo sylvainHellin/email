@@ -233,6 +233,10 @@ pub enum KeyAction {
     JumpMailbox,
     FocusForward,
     FocusBackward,
+    /// Zoom the focused pane to the whole content area, or restore the split
+    /// (#TKT-0044). Mail view only, which is why it is deliberately absent
+    /// from [`KeyAction::is_view_agnostic`].
+    ToggleZoom,
     /// Leader `Space m` / `Space c` / `Space a`: switch the top-level view. The
     /// executor reads the continuation key to pick the target view (#0033).
     SwitchView,
@@ -450,6 +454,10 @@ pub static KEYMAP: &[KeyBinding] = &[
     b("/", Chord::Char('/'), KeyCtx::Global, KeyAction::FilterMetadata, "Filter by metadata", true),
     b("\\", Chord::Char('\\'), KeyCtx::Global, KeyAction::SearchContent, "Search email content", false),
     b("?", Chord::Char('?'), KeyCtx::Global, KeyAction::ToggleHelp, "Toggle this help", true),
+    // Zoom is Global by context but Mail-only by action: `is_view_agnostic`
+    // leaves it out, so the dispatcher swallows `z` in Contacts and Calendar,
+    // where a two-pane split the user can zoom does not exist (#TKT-0044).
+    short(b("z", Chord::Char('z'), KeyCtx::Global, KeyAction::ToggleZoom, "Zoom / unzoom the focused pane", true), "Zoom pane"),
     b("!", Chord::Char('!'), KeyCtx::Global, KeyAction::ToggleActivityLog, "Toggle activity log", false),
     b("L", Chord::Char('L'), KeyCtx::Global, KeyAction::OpenActivityOverlay, "Open activity log overlay", false),
     b("Ctrl+l", Chord::CtrlChar('l'), KeyCtx::Global, KeyAction::OpenLogFile, "Open log file in $EDITOR", false),

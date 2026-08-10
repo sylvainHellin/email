@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Pane zoom (#TKT-0044).** `z` gives the focused pane the whole content
+  area, herdr-style, and `z` again restores the split -- a zoomed email list
+  gains its contact column back, a zoomed preview reads at full width. The
+  zoom follows the focus, so `Tab` under a zoom moves it to the next pane
+  instead of stranding one, and the hint bar's badge says `BODY ZOOM` so the
+  hidden panes are never mistaken for empty ones. The hint and status rows are
+  never hidden by it. Mail view only: Contacts and Calendar are a list and a
+  detail card that already resize themselves, and `z` is swallowed there.
 - **Inline images in the preview pane (#0010).** A message whose HTML body
   points at its own image parts with `cid:` URLs now shows them as pixels, not
   as nothing: the terminal is asked once at startup what it can draw

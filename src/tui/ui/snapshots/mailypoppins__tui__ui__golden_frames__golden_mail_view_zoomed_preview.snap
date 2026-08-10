@@ -1,0 +1,53 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |╭ 󰃭 Invitation ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+01 |│Bauprojekt Ubergabe                                                                                                   │
+02 |│When: 2026-08-03T09:00:00+02:00  →  2026-08-03T10:30:00+02:00                                                         │
+03 |│Where: Raum 2.14, Arcisstrasse                                                                                        │
+04 |│Organizer: planung@example.org                                                                                        │
+05 |│Your RSVP: No response yet                                                                                            │
+06 |│RSVP is emailed to the organizer; not synced to Exchange (no Graph in v1). Press V to respond.                        │
+07 |╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+08 |╭ Body ────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+09 |│Hallo Sylvain,                                                                                                        │
+10 |│                                                                                                                      │
+11 |│anbei der Plan für die Übergabe.                                                                                      │
+12 |│                                                                                                                      │
+13 |││ Bitte bis Freitag bestätigen.                                                                                       │
+14 |│                                                                                                                      │
+15 |│Grüße                                                                                                                 │
+16 |│                                                                                                                      │
+17 |│                                                                                                                      │
+18 |│                                                                                                                      │
+19 |│                                                                                                                      │
+20 |│                                                                                                                      │
+21 |│                                                                                                                      │
+22 |│                                                                                                                      │
+23 |│                                                                                                                      │
+24 |│                                                                                                                      │
+25 |│                                                                                                                      │
+26 |│                                                                                                                      │
+27 |│                                                                                                                      │
+28 |│                                                                                                                      │
+29 |│                                                                                                                      │
+30 |│                                                                                                                      │
+31 |│                                                                                                                      │
+32 |│                                                                                                                      │
+33 |│                                                                                                                      │
+34 |│                                                                                                                      │
+35 |│                                                                                                                      │
+36 |│                                                                                                                      │
+37 |╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+38 | BODY ZOOM   j/k Scroll line by line  Esc Return to list
+39 | ? help                                                                                            2 unread | Inbox 1/5
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+01 |bold@1..20
+02 |bold@1..7
+03 |bold@1..8
+04 |bold@1..12
+05 |bold@1..12
+38 |bold@0..11 bg:surface@11..13 bg:surface+bold@13..16 bg:surface@16..38 bg:surface+bold@38..41 bg:surface@41..120
+39 |bg:surface@0..120

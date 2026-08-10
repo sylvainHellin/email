@@ -114,21 +114,26 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
 /// The badge label for a non-prefixed context. A live selection takes over the
 /// badge (herdr's `N SELECTED`) since that is the most useful mode cue.
 fn mode_label(app: &App, ctx: KeyCtx) -> String {
+    // A zoom hides the other panes, so the bar has to say so: the badge is the
+    // only chrome left that can (#TKT-0044). It suffixes whatever the badge
+    // would otherwise be, selection included, because both facts matter.
+    let zoom = if app.zoomed_pane().is_some() { " ZOOM" } else { "" };
     if !app.selection.is_empty() {
-        return format!("{} SELECTED", app.selection.len());
+        return format!("{} SELECTED{zoom}", app.selection.len());
     }
-    match ctx {
-        KeyCtx::Global => "MAIL".to_string(),
-        KeyCtx::Sidebar => "MAILBOXES".to_string(),
-        KeyCtx::List => "MAIL".to_string(),
-        KeyCtx::Headers => "HEADERS".to_string(),
-        KeyCtx::Preview => "BODY".to_string(),
-        KeyCtx::ServerSearch => "SEARCH".to_string(),
-        KeyCtx::Contacts => "CONTACTS".to_string(),
-        KeyCtx::Calendar => "CALENDAR".to_string(),
-        KeyCtx::Activity => "ACTIVITY".to_string(),
-        KeyCtx::Help => "HELP".to_string(),
-    }
+    let base = match ctx {
+        KeyCtx::Global => "MAIL",
+        KeyCtx::Sidebar => "MAILBOXES",
+        KeyCtx::List => "MAIL",
+        KeyCtx::Headers => "HEADERS",
+        KeyCtx::Preview => "BODY",
+        KeyCtx::ServerSearch => "SEARCH",
+        KeyCtx::Contacts => "CONTACTS",
+        KeyCtx::Calendar => "CALENDAR",
+        KeyCtx::Activity => "ACTIVITY",
+        KeyCtx::Help => "HELP",
+    };
+    format!("{base}{zoom}")
 }
 
 pub(super) fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {

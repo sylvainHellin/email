@@ -148,6 +148,10 @@ impl App {
                 self.help_filter_active = false;
                 self.overlay = Overlay::Help;
             }
+            A::ToggleZoom => {
+                self.pending_prefix = None;
+                self.toggle_zoom();
+            }
             A::ToggleActivityLog => {
                 self.pending_prefix = None;
                 self.show_activity_log = !self.show_activity_log;
@@ -4104,5 +4108,81 @@ mod tests {
         assert_eq!(app.list_index, 0, "nothing moved");
         let status = app.status_message.clone().unwrap();
         assert!(status.contains("YYYY-MM-DD"), "{status}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pane zoom (#TKT-0044)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn z_zooms_the_focused_pane_and_z_again_restores_the_split() {
+        let mut app = app_with_emails(sample());
+        app.focus = Focus::Preview;
+        assert_eq!(app.zoomed_pane(), None);
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert_eq!(app.zoomed_pane(), Some(Focus::Preview));
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert_eq!(app.zoomed_pane(), None);
+    }
+
+    #[test]
+    fn the_zoom_follows_the_focus() {
+        // herdr zooms *the active pane*, so cycling focus under a zoom moves
+        // the zoom rather than leaving a zoomed pane the keyboard no longer
+        // drives.
+        let mut app = app_with_emails(sample());
+        app.focus = Focus::List;
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert_eq!(app.zoomed_pane(), Some(Focus::List));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.zoomed_pane(), Some(Focus::Preview));
+    }
+
+    #[test]
+    fn the_search_prompt_zooms_the_list_it_filters() {
+        let mut app = app_with_emails(sample());
+        app.focus = Focus::Search;
+        app.zoomed = true;
+        assert_eq!(app.zoomed_pane(), Some(Focus::List));
+    }
+
+    #[test]
+    fn the_compose_wizard_has_nothing_to_zoom_and_says_so() {
+        let mut app = app_with_emails(sample());
+        app.focus = Focus::ComposeWizard;
+        app.toggle_zoom();
+        assert!(!app.zoomed, "the flag must not arm for a later pane");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Nothing to zoom here.")
+        );
+    }
+
+    #[test]
+    fn zoom_is_a_mail_view_layout_and_is_ignored_elsewhere() {
+        // `z` never fires off Mail (`is_view_agnostic` leaves `ToggleZoom`
+        // out), and even a flag set before the switch changes nothing there.
+        let mut app = app_with_emails(sample());
+        app.zoomed = true;
+        app.view = View::Contacts;
+        assert_eq!(app.zoomed_pane(), None);
+        app.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        assert!(app.zoomed, "the flag is untouched off Mail");
+        // Back on Mail the zoom the user armed is still there.
+        app.view = View::Mail;
+        assert_eq!(app.zoomed_pane(), Some(Focus::List));
+    }
+
+    #[test]
+    fn a_zoom_survives_an_account_switch() {
+        // Session state, not per-account state: switching accounts must not
+        // silently un-zoom the pane the user is reading.
+        let mut app = app_with_emails(sample());
+        app.focus = Focus::Preview;
+        app.zoomed = true;
+        app.save_to_account();
+        app.load_from_account(0);
+        assert_eq!(app.zoomed_pane(), Some(Focus::Preview));
     }
 }

@@ -11,6 +11,7 @@
       { "key": "/", "action": "Filter by metadata" },
       { "key": "\\", "action": "Search email content" },
       { "key": "?", "action": "Toggle this help" },
+      { "key": "z", "action": "Zoom / unzoom the focused pane" },
       { "key": "!", "action": "Toggle activity log" },
       { "key": "L", "action": "Open activity log overlay" },
       { "key": "Ctrl+l", "action": "Open log file in $EDITOR" },

@@ -617,6 +617,35 @@ fn golden_mail_view_inline_image_placeholders() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The preview pane zoomed to the whole content area (#TKT-0044).
+///
+/// What the frame pins is that a zoom is a *layout* change and nothing else:
+/// the pane keeps its own renderer, its own border and its own title, the
+/// sidebar, list, headers and view switcher are gone, and the hint and status
+/// bars stay -- the row that says how to leave a zoom must survive it. The
+/// badge reads `BODY ZOOM`, which is the only chrome left that can say the
+/// other panes are hidden rather than empty.
+#[test]
+fn golden_mail_view_zoomed_preview() {
+    let mut app = mail_fixture();
+    app.focus = crate::tui::app::Focus::Preview;
+    app.zoomed = true;
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The email list zoomed, from the same fixture (#TKT-0044).
+///
+/// The list is the pane a zoom changes most: the same table gets the whole
+/// width, so the subject column stops being truncated at 40 columns. Captured
+/// beside the preview zoom because the two exercise different renderers under
+/// the same layout branch.
+#[test]
+fn golden_mail_view_zoomed_list() {
+    let mut app = mail_fixture();
+    app.zoomed = true;
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The calendar agenda plus the shared event card.
 #[test]
 fn golden_calendar_view() {

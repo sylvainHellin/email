@@ -242,7 +242,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `jump_date.rs` | The closed date grammar behind jump-to-date (`g t`, #0017): pure, clock-free, `parse_jump_date(input, today)` |
 | `calendar_view.rs` | Agenda rows built from the iMIP messages the store holds |
 | **`src/tui/ui/`** | |
-| `mod.rs` | `view()`, the top-level layout dispatch |
+| `mod.rs` | `view()`, the top-level layout dispatch, including the #TKT-0044 pane zoom (one pane over the whole content area, hint and status bars kept) and the shared overlay dispatch |
 | `views.rs` | View switcher chrome |
 | `sidebar.rs`, `list.rs`, `headers.rs`, `preview.rs`, `compose.rs`, `status.rs`, `activity.rs` | Mail view panes |
 | `calendar.rs`, `contacts.rs` | The other two views |
@@ -353,7 +353,7 @@ It was `email-cli` before #0022, and `get` falls back to that name so a user who
 
 ## Testing
 
-- **1118 tests**, run by `cargo test`.
+- **1126 tests**, run by `cargo test`.
 All of them run offline in under a second.
 - Unit tests are inline `#[cfg(test)] mod tests` in each module; integration tests live in `tests/` and use `tempfile::tempdir()` plus `MAILYPOPPINS_CONFIG_DIR` and `MAILYPOPPINS_DATA_DIR` for isolation.
 - `insta` snapshots cover `markdown_to_html`, the whole `mp --help` surface (`tests/cli_help_snapshot.rs`) and the TUI golden frames (`src/tui/ui/golden_frames.rs`).
