@@ -1,0 +1,47 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |
+01 |
+02 |
+03 |      ╭ Server Search (All) ─────────────────────────────────────────────────────────────────────────────────────╮
+04 |      │ Search In: Current Account                                                                               │
+05 |      │      From: █                                                                                             │
+06 |      │        To:                                                                                               │
+07 |      │   Subject:                                                                                               │
+08 |      │  Keywords:                                                                                               │
+09 |      │     After:                                                                                               │
+10 |      │    Before:                                                                                               │
+11 |      │Attachment: [ ] has attachment                                                                            │
+12 |      │  Advanced: from:x (a OR b) has:attachment …                                                              │
+13 |      │  Fill the form and press Enter to search                                                                 │
+14 |      │                                                                                                          │
+15 |      │                                                                                                          │
+16 |      │                                                                                                          │
+17 |      │                                                                                                          │
+18 |      │                                                                                                          │
+19 |      │                                                                                                          │
+20 |      │                                                                                                          │
+21 |      │                                                                                                          │
+22 |      │                                                                                                          │
+23 |      │                                                                                                          │
+24 |      │                                                                                                          │
+25 |      │                                                                                                          │
+26 |      │                                                                                                          │
+27 |      │                                                                                                          │
+28 |      │                                                                                                          │
+29 |      │                                                                                                          │
+30 |      │                                                                                                          │
+31 |      │                                                                                                          │
+32 |      │                                                                                                          │
+33 |      │                                                                                                          │
+34 |      │                                                                                                          │
+35 |      │                                                                                                          │
+36 |      ╰─────────────────── Tab/Shift+Tab: fields | Space: toggle | Enter: search | Esc: close ───────────────────╯
+37 |
+38 |
+39 |
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+05 |bold@7..19

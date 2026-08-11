@@ -34,7 +34,8 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
 use crate::tui::app::{
-    App, CalendarEvent, EmailEntry, EntryKey, MailboxInfo, MailboxKind, MessageRef, Overlay, View,
+    App, CalendarEvent, EmailEntry, EntryKey, MailboxInfo, MailboxKind, MessageRef, Overlay,
+    SearchField, SearchOverlayFocus, View,
 };
 use crate::tui::theme::{self, Theme};
 use crate::types::EventFrontmatter;
@@ -688,6 +689,40 @@ fn golden_drafts_view_with_a_parse_skip() {
 fn golden_help_overlay() {
     let mut app = mail_fixture();
     app.overlay = Overlay::Help;
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The Outlook-shape server-search form (#0086b), empty: the scope toggle, the
+/// four text fields, the two date fields, the attachment toggle and the empty
+/// Advanced line with its placeholder. `From` is focused (the default landing).
+#[test]
+fn golden_search_form_empty() {
+    let mut app = mail_fixture();
+    app.overlay = Overlay::Search;
+    app.server_search_focus = SearchOverlayFocus::Field(SearchField::From);
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The same form filled from the structured fields with the attachment toggle
+/// on and `Current Mailbox` scope, so the frame carries a value in every field
+/// row and the `[x]` toggle state. The Advanced line is empty, so the
+/// structured fields render live (not greyed).
+#[test]
+fn golden_search_form_filled() {
+    let mut app = mail_fixture();
+    app.overlay = Overlay::Search;
+    app.server_search_focus = SearchOverlayFocus::Field(SearchField::Keywords);
+    app.search_form = crate::tui::app::SearchForm {
+        scope: crate::tui::app::SearchScopeState(crate::tui::app::SearchScope::CurrentMailbox),
+        from: "boss@corp.com".to_string(),
+        to: String::new(),
+        subject: "budget".to_string(),
+        keywords: "invoice OR receipt".to_string(),
+        after: "2026-01-01".to_string(),
+        before: "2026-07-01".to_string(),
+        attachment: true,
+        advanced: String::new(),
+    };
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 

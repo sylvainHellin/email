@@ -26,8 +26,19 @@ All notable changes to this project are documented in this file.
   matched as one contiguous IMAP `TEXT` phrase (quote it to keep the phrase),
   and `--local` refuses `to:`/`cc:`/`filename:` (not indexed) with a clear
   message instead of searching them as literal text. The TUI's server-search
-  overlay inherits the richer grammar for free; its Outlook-shape form is
-  #0086b.
+  overlay inherits the richer grammar for free.
+- **Outlook-shape TUI search form (#0086b).** The server-search overlay (`f`) is
+  now a field form instead of one line: a `Search In` scope toggle (Current
+  Mailbox / Current Account, per-account only, no All-Accounts), `From`, `To`,
+  `Subject`, `Keywords` (free text incl. `a OR b` groups and quoted phrases),
+  custom `After` / `Before` date fields, an `Attachment` toggle, and an
+  `Advanced` raw-grammar line that accepts the full #0086a grammar and surfaces
+  its parse error verbatim. Tab / Shift+Tab cycle the fields, Space flips the
+  toggles, Enter searches, Esc closes, reusing the compose wizard's
+  conventions. A non-blank `Advanced` line takes over and greys the structured
+  fields; otherwise the structured fields build a `search::Query` AST directly
+  (no string concatenation) through the same lowering path the CLI uses. An
+  empty form is a no-op. No new key binding: `f` still opens the overlay.
 - **Retention enforcement (#0060).** The `[retention]` disk cap is now acted on:
   a sweep runs after every `mp sync` and on demand via `mp store gc`. It is the
   first code path in mailypoppins that deletes user data, so every deletion

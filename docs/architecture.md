@@ -258,7 +258,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `views.rs` | View switcher chrome |
 | `sidebar.rs`, `list.rs`, `headers.rs`, `preview.rs`, `compose.rs`, `status.rs`, `activity.rs` | Mail view panes |
 | `calendar.rs`, `contacts.rs` | The other two views |
-| `overlays.rs`, `search.rs` | Confirm dialog, attachment picker, persistent error, help overlay, server search |
+| `overlays.rs`, `search.rs` | Confirm dialog, attachment picker, persistent error, help overlay, server search. The server-search overlay (`f`) is the Outlook-shape form (#0086b): a scope toggle, `From`/`To`/`Subject`/`Keywords` text fields, custom `After`/`Before` dates, an attachment toggle, and an `Advanced` raw-grammar line. The form builds a `search::Query` AST directly (via `SearchForm::build_query` -> `search::from_cli`, no string concatenation) and `Action::ServerSearch` carries the parsed `Query`; a non-blank `Advanced` line takes over and greys the structured fields. |
 | `widgets.rs`, `util.rs` | Shared widgets, `pane_border_style`, `hint_span`, `truncate` |
 
 ## TUI layering

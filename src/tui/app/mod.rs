@@ -169,7 +169,7 @@ pub struct App {
     pub activity_scroll: u16,
 
     // Server search overlay scratch state (overlay presence is Overlay::Search)
-    pub server_search_query: String,
+    pub search_form: SearchForm,
     pub server_search_focus: SearchOverlayFocus,
     pub server_search_results: Vec<SearchResultEntry>,
     pub server_search_index: usize,
@@ -263,8 +263,8 @@ impl App {
             activity_filter: String::new(),
             activity_filter_active: false,
             activity_scroll: 0,
-            server_search_query: String::new(),
-            server_search_focus: SearchOverlayFocus::Input,
+            search_form: SearchForm::default(),
+            server_search_focus: SearchOverlayFocus::Field(SearchField::From),
             server_search_results: Vec::new(),
             server_search_index: 0,
             server_search_headers_scroll: 0,
@@ -358,8 +358,8 @@ impl App {
             activity_filter: String::new(),
             activity_filter_active: false,
             activity_scroll: 0,
-            server_search_query: String::new(),
-            server_search_focus: SearchOverlayFocus::Input,
+            search_form: SearchForm::default(),
+            server_search_focus: SearchOverlayFocus::Field(SearchField::From),
             server_search_results: Vec::new(),
             server_search_index: 0,
             server_search_headers_scroll: 0,
@@ -789,6 +789,17 @@ impl App {
                 label: m.label.clone(),
             })
             .collect()
+    }
+
+    /// The focused mailbox as a single [`SearchTarget`] for the form's
+    /// "Current Mailbox" scope (#0086b). `None` when the focused mailbox is a
+    /// local-only view with no server name.
+    pub fn current_mailbox_target(&self) -> Option<SearchTarget> {
+        let m = self.mailboxes.get(self.active_mailbox)?;
+        Some(SearchTarget {
+            server_name: m.server_name.clone()?,
+            label: m.label.clone(),
+        })
     }
 
     pub fn search_target_by_name(&self, name: &str) -> Option<SearchTarget> {

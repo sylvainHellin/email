@@ -7,7 +7,8 @@ use super::{
     Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
     ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
     EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
-    RsvpOverlay, SearchBodies, SearchOverlayFocus, ThreadEntry, ThreadOverlay,
+    RsvpOverlay, SearchBodies, SearchField, SearchOverlayFocus, SearchScope, ThreadEntry,
+    ThreadOverlay,
 };
 
 impl App {
@@ -629,12 +630,12 @@ impl App {
             }
             A::ServerSearch => {
                 self.pending_prefix = None;
-                self.server_search_query.clear();
+                self.search_form = crate::tui::app::SearchForm::default();
                 self.server_search_results.clear();
                 self.server_search_index = 0;
                 self.server_search_scroll = 0;
                 self.server_search_headers_scroll = 0;
-                self.server_search_focus = SearchOverlayFocus::Input;
+                self.server_search_focus = SearchOverlayFocus::Field(SearchField::From);
                 self.server_search_loading = false;
                 self.server_search_status = None;
                 self.overlay = Overlay::Search;
@@ -825,57 +826,129 @@ impl App {
 
     fn handle_search_overlay_key(&mut self, key: KeyEvent) -> Option<Message> {
         match self.server_search_focus {
-            SearchOverlayFocus::Input => self.handle_search_overlay_input_key(key),
+            SearchOverlayFocus::Field(field) => self.handle_search_form_key(key, field),
             SearchOverlayFocus::List => self.handle_search_overlay_list_key(key),
         }
     }
 
-    fn handle_search_overlay_input_key(&mut self, key: KeyEvent) -> Option<Message> {
+    /// The Outlook-shape search form (#0086b). Tab/Shift-Tab cycle the fields
+    /// (reusing the compose-wizard convention), Space flips the scope /
+    /// attachment toggles, typing edits the focused text field, Enter searches
+    /// and Esc closes. The form builds a `search::Query` AST and routes it
+    /// through the same lowering path the CLI uses.
+    fn handle_search_form_key(&mut self, key: KeyEvent, field: SearchField) -> Option<Message> {
+        // A non-blank Advanced line disables the structured fields: skip over
+        // them when cycling so Tab lands only on Scope / Attachment / Advanced,
+        // and refuse edits to a greyed field.
+        let advanced_active = self.search_form.advanced_active();
+        let field_enabled = |f: SearchField| {
+            !advanced_active || matches!(f, SearchField::Advanced)
+        };
+
         match key.code {
-            KeyCode::Char(c) => {
-                self.server_search_query.push(c);
+            KeyCode::Esc => {
+                self.close_overlay();
             }
-            KeyCode::Backspace => {
-                self.server_search_query.pop();
-            }
-            KeyCode::Enter => {
-                if !self.server_search_query.is_empty() {
-                    let parsed = match crate::search::parse(&self.server_search_query) {
-                        Ok(q) => q,
-                        Err(e) => {
-                            self.server_search_status = Some(format!("Invalid query: {e}"));
-                            return None;
-                        }
-                    };
-                    let (targets, scope_label) = if let Some(ref name) = parsed.in_mailbox {
-                        if let Some(target) = self.search_target_by_name(name) {
-                            let label = target.label.clone();
-                            (vec![target], label)
-                        } else {
-                            self.server_search_status = Some(format!("Unknown mailbox: {}", name));
-                            return None;
-                        }
-                    } else {
-                        (self.all_search_targets(), "All".to_string())
-                    };
-                    self.server_search_scope_label = scope_label;
-                    self.push_action(Action::ServerSearch {
-                        query: self.server_search_query.clone(),
-                        targets,
-                    });
+            KeyCode::Tab => {
+                let mut next = field.next();
+                while !field_enabled(next) {
+                    next = next.next();
                 }
+                self.server_search_focus = SearchOverlayFocus::Field(next);
             }
-            KeyCode::Tab | KeyCode::Down => {
-                if !self.server_search_results.is_empty() {
+            KeyCode::BackTab => {
+                let mut prev = field.prev();
+                while !field_enabled(prev) {
+                    prev = prev.prev();
+                }
+                self.server_search_focus = SearchOverlayFocus::Field(prev);
+            }
+            KeyCode::Down => {
+                // From the Advanced line (last field) Down drops into the
+                // results list if there are hits, matching the old overlay.
+                if field == SearchField::Advanced && !self.server_search_results.is_empty() {
                     self.server_search_focus = SearchOverlayFocus::List;
                 }
             }
-            KeyCode::Esc => {
-                self.close_overlay();
+            KeyCode::Char(' ') if field == SearchField::Scope => {
+                self.search_form.scope.0 = self.search_form.scope.0.toggled();
+            }
+            KeyCode::Char(' ') if field == SearchField::Attachment && !advanced_active => {
+                self.search_form.attachment = !self.search_form.attachment;
+            }
+            KeyCode::Enter => {
+                self.submit_search_form();
+            }
+            KeyCode::Backspace => {
+                if field_enabled(field) {
+                    if let Some(text) = self.search_form.text_field_mut(field) {
+                        text.pop();
+                        self.server_search_status = None;
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                // Ctrl-prefixed chars are not text.
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return None;
+                }
+                if field_enabled(field) {
+                    if let Some(text) = self.search_form.text_field_mut(field) {
+                        text.push(c);
+                        self.server_search_status = None;
+                    }
+                }
             }
             _ => {}
         }
         None
+    }
+
+    /// Build the AST from the form and dispatch, or surface the parse error
+    /// verbatim. A blank form is a no-op.
+    fn submit_search_form(&mut self) {
+        let query = match self.search_form.build_query() {
+            Ok(Some(q)) => q,
+            Ok(None) => return, // blank form: nothing to search for
+            Err(e) => {
+                self.server_search_status = Some(e);
+                return;
+            }
+        };
+
+        // `in:` inside the Advanced line still resolves a mailbox; otherwise the
+        // scope toggle decides the targets (Q3: mailbox or account, never all
+        // accounts).
+        let (targets, scope_label) = if let Some(ref name) = query.in_mailbox {
+            match self.search_target_by_name(name) {
+                Some(target) => {
+                    let label = target.label.clone();
+                    (vec![target], label)
+                }
+                None => {
+                    self.server_search_status = Some(format!("Unknown mailbox: {name}"));
+                    return;
+                }
+            }
+        } else {
+            match self.search_form.scope.0 {
+                SearchScope::CurrentMailbox => match self.current_mailbox_target() {
+                    Some(target) => {
+                        let label = target.label.clone();
+                        (vec![target], label)
+                    }
+                    None => {
+                        self.server_search_status =
+                            Some("Current mailbox has no server search target".to_string());
+                        return;
+                    }
+                },
+                SearchScope::CurrentAccount => (self.all_search_targets(), "All".to_string()),
+            }
+        };
+
+        self.server_search_scope_label = scope_label;
+        self.push_action(Action::ServerSearch { query, targets });
     }
 
     fn handle_search_overlay_list_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -883,7 +956,7 @@ impl App {
         if len == 0 {
             match key.code {
                 KeyCode::Tab | KeyCode::BackTab => {
-                    self.server_search_focus = SearchOverlayFocus::Input;
+                    self.server_search_focus = SearchOverlayFocus::Field(SearchField::Advanced);
                 }
                 KeyCode::Esc => {
                     self.close_overlay();
@@ -956,7 +1029,7 @@ impl App {
                 self.open_search_result_attachment_picker(AttachmentPickerMode::Save);
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.server_search_focus = SearchOverlayFocus::Input;
+                self.server_search_focus = SearchOverlayFocus::Field(SearchField::Advanced);
             }
             KeyCode::Esc => {
                 self.close_overlay();

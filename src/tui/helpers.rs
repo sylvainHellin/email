@@ -401,21 +401,21 @@ pub(super) struct SyncResultMeta {
 pub(super) async fn lib_do_multi_search(
     account: &str,
     imap_config: &ImapConfig,
-    query: &str,
+    parsed: &crate::search::Query,
     targets: &[SearchTarget],
 ) -> anyhow::Result<Vec<SearchHit>> {
-    // One grammar (#0086a): parse to the shared AST, then render for this
-    // server. Gmail runs has:attachment via X-GM-RAW; a plain server has no
-    // attachment key, so the residue is post-filtered from the store below.
-    let parsed = crate::search::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // One grammar (#0086a): the caller already parsed to the shared AST (the
+    // CLI positional path and the #0086b form both build a `Query`); render it
+    // for this server. Gmail runs has:attachment via X-GM-RAW; a plain server
+    // has no attachment key, so the residue is post-filtered from the store.
     let host_lc = imap_config.host.to_ascii_lowercase();
     let gmail = host_lc == "imap.gmail.com"
         || host_lc.ends_with(".gmail.com")
         || host_lc.ends_with("googlemail.com");
     let (imap_search, attachment_postfilter) = if gmail {
-        (crate::search::to_gmail_search_command(&parsed), false)
+        (crate::search::to_gmail_search_command(parsed), false)
     } else {
-        let r = crate::search::to_imap(&parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let r = crate::search::to_imap(parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
         (r.search, r.attachment_postfilter)
     };
     let msg_id = parsed.message_id.clone();
@@ -537,11 +537,9 @@ pub(super) async fn lib_do_sync_graph(
 pub(super) async fn lib_do_multi_search_graph(
     account: &str,
     graph_config: &crate::config::GraphConfig,
-    query: &str,
+    parsed: &crate::search::Query,
     targets: &[SearchTarget],
 ) -> anyhow::Result<Vec<SearchHit>> {
-    let parsed = crate::search::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
-
     let client = crate::graph::GraphClient::new_async(graph_config).await?;
     let total_limit = 50usize;
     let per_mb = (total_limit / targets.len().max(1)).max(5);
@@ -554,7 +552,7 @@ pub(super) async fn lib_do_multi_search_graph(
         }
         let budget = per_mb.min(total_limit - total);
         match client
-            .search_messages(&parsed, Some(&target.server_name), budget)
+            .search_messages(parsed, Some(&target.server_name), budget)
             .await
         {
             Ok(emails) => {

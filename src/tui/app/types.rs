@@ -913,10 +913,219 @@ pub struct SearchResultEntry {
     pub source_label: String,
 }
 
+/// Which control of the Outlook-shape server-search form (#0086b) is focused,
+/// or the results list once a search has returned hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchOverlayFocus {
-    Input,
+    /// One of the form's structured / advanced controls.
+    Field(SearchField),
+    /// The results list (only reachable once there are hits).
     List,
+}
+
+/// The fields of the server-search form (#0086b), in Tab order. The Outlook
+/// shape trimmed to the #0086 decisions: a scope toggle (no All-Accounts), the
+/// four text fields, two custom date fields, an attachment toggle, and the
+/// raw-grammar Advanced power lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchField {
+    /// Search In: Current Mailbox / Current Account (toggle).
+    Scope,
+    From,
+    To,
+    Subject,
+    /// Free text (incl. OR groups / phrases); lowers to `Text` clauses.
+    Keywords,
+    /// `after:` custom date (YYYY-MM-DD).
+    After,
+    /// `before:` custom date (YYYY-MM-DD).
+    Before,
+    /// Attachment toggle -> `Term::HasAttachment`.
+    Attachment,
+    /// Raw #0086a grammar; when non-empty it takes over and the structured
+    /// fields are greyed / ignored.
+    Advanced,
+}
+
+impl SearchField {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchField::Scope => "Search In",
+            SearchField::From => "From",
+            SearchField::To => "To",
+            SearchField::Subject => "Subject",
+            SearchField::Keywords => "Keywords",
+            SearchField::After => "After",
+            SearchField::Before => "Before",
+            SearchField::Attachment => "Attachment",
+            SearchField::Advanced => "Advanced",
+        }
+    }
+
+    /// True for the free-text fields that accept typed characters. The scope
+    /// and attachment toggles are flipped, not typed into.
+    pub fn is_text(&self) -> bool {
+        !matches!(self, SearchField::Scope | SearchField::Attachment)
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            SearchField::Scope => SearchField::From,
+            SearchField::From => SearchField::To,
+            SearchField::To => SearchField::Subject,
+            SearchField::Subject => SearchField::Keywords,
+            SearchField::Keywords => SearchField::After,
+            SearchField::After => SearchField::Before,
+            SearchField::Before => SearchField::Attachment,
+            SearchField::Attachment => SearchField::Advanced,
+            SearchField::Advanced => SearchField::Scope,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            SearchField::Scope => SearchField::Advanced,
+            SearchField::From => SearchField::Scope,
+            SearchField::To => SearchField::From,
+            SearchField::Subject => SearchField::To,
+            SearchField::Keywords => SearchField::Subject,
+            SearchField::After => SearchField::Keywords,
+            SearchField::Before => SearchField::After,
+            SearchField::Attachment => SearchField::Before,
+            SearchField::Advanced => SearchField::Attachment,
+        }
+    }
+}
+
+/// Scope of a server search (#0086b, Q3: per-account only; no All-Accounts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    /// Just the focused mailbox.
+    CurrentMailbox,
+    /// Every mailbox of the current account.
+    CurrentAccount,
+}
+
+impl SearchScope {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchScope::CurrentMailbox => "Current Mailbox",
+            SearchScope::CurrentAccount => "Current Account",
+        }
+    }
+
+    pub fn toggled(&self) -> Self {
+        match self {
+            SearchScope::CurrentMailbox => SearchScope::CurrentAccount,
+            SearchScope::CurrentAccount => SearchScope::CurrentMailbox,
+        }
+    }
+}
+
+/// Scratch state for the Outlook-shape server-search form (#0086b).
+///
+/// The form builds a [`crate::search::Query`] AST directly (no string
+/// concatenation) and routes it through the same lowering path the CLI uses:
+/// the free-text `keywords` field is parsed by [`crate::search::parse`] and the
+/// structured fields become [`crate::search::Flags`], so both feed
+/// [`crate::search::from_cli`]. The `advanced` line, when non-empty, takes over
+/// entirely and is parsed on its own.
+#[derive(Debug, Clone, Default)]
+pub struct SearchForm {
+    pub scope: SearchScopeState,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub keywords: String,
+    pub after: String,
+    pub before: String,
+    pub attachment: bool,
+    pub advanced: String,
+}
+
+/// Wrapper so [`SearchForm`] can `derive(Default)` with a sensible scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchScopeState(pub SearchScope);
+
+impl Default for SearchScopeState {
+    fn default() -> Self {
+        SearchScopeState(SearchScope::CurrentAccount)
+    }
+}
+
+impl SearchForm {
+    /// True when the Advanced line is the active input (it takes precedence
+    /// over every structured field once it holds anything non-blank).
+    pub fn advanced_active(&self) -> bool {
+        !self.advanced.trim().is_empty()
+    }
+
+    /// True when nothing has been entered anywhere: neither the Advanced line
+    /// nor any structured field nor the attachment toggle. An empty form is a
+    /// no-op (Enter does not dispatch a search).
+    pub fn is_blank(&self) -> bool {
+        !self.advanced_active()
+            && self.from.trim().is_empty()
+            && self.to.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.keywords.trim().is_empty()
+            && self.after.trim().is_empty()
+            && self.before.trim().is_empty()
+            && !self.attachment
+    }
+
+    /// A mutable handle to the text of the focused field, or `None` for the
+    /// toggles (scope / attachment) which are flipped rather than typed into.
+    pub fn text_field_mut(&mut self, field: SearchField) -> Option<&mut String> {
+        match field {
+            SearchField::From => Some(&mut self.from),
+            SearchField::To => Some(&mut self.to),
+            SearchField::Subject => Some(&mut self.subject),
+            SearchField::Keywords => Some(&mut self.keywords),
+            SearchField::After => Some(&mut self.after),
+            SearchField::Before => Some(&mut self.before),
+            SearchField::Advanced => Some(&mut self.advanced),
+            SearchField::Scope | SearchField::Attachment => None,
+        }
+    }
+
+    /// Build the [`crate::search::Query`] this form describes.
+    ///
+    /// When the Advanced line is active it is parsed directly. Otherwise the
+    /// structured fields lower through [`crate::search::from_cli`]: `keywords`
+    /// is the positional grammar (so `a OR b` and quoted phrases work) and the
+    /// rest are flags. Returns the `ParseError` / validation message verbatim
+    /// for the overlay to surface. Returns `Ok(None)` for a blank form.
+    pub fn build_query(&self) -> Result<Option<crate::search::Query>, String> {
+        if self.advanced_active() {
+            return crate::search::parse(self.advanced.trim())
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
+        if self.is_blank() {
+            return Ok(None);
+        }
+        let opt = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        let flags = crate::search::Flags {
+            from: opt(&self.from),
+            to: opt(&self.to),
+            cc: None,
+            subject: opt(&self.subject),
+            body: None,
+            filename: None,
+            has_attachment: self.attachment,
+            after: opt(&self.after),
+            before: opt(&self.before),
+        };
+        crate::search::from_cli(self.keywords.trim(), &flags).map(Some)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,7 +1495,9 @@ pub enum Action {
     FetchAccount(usize),
     Sync,
     ServerSearch {
-        query: String,
+        /// The already-parsed AST the form (or the overlay's raw line) built,
+        /// so the lowering path renders it without re-parsing (#0086b).
+        query: crate::search::Query,
         targets: Vec<SearchTarget>,
     },
     SearchResultOpen,
@@ -1624,6 +1835,148 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // Search form -> AST (#0086b)
+    // -----------------------------------------------------------------------
+
+    use crate::search::{Clause, Term};
+
+    #[test]
+    fn search_form_empty_is_noop() {
+        // A blank form builds nothing: Enter must not dispatch a search.
+        let form = SearchForm::default();
+        assert!(form.is_blank());
+        assert_eq!(form.build_query().unwrap(), None);
+    }
+
+    #[test]
+    fn search_form_default_scope_is_current_account() {
+        assert_eq!(
+            SearchForm::default().scope.0,
+            SearchScope::CurrentAccount
+        );
+    }
+
+    #[test]
+    fn search_form_builds_every_structured_field() {
+        let form = SearchForm {
+            from: "boss@corp.com".to_string(),
+            to: "me@corp.com".to_string(),
+            subject: "budget".to_string(),
+            keywords: "invoice OR receipt".to_string(),
+            after: "2026-01-01".to_string(),
+            before: "2026-07-01".to_string(),
+            attachment: true,
+            ..Default::default()
+        };
+        let q = form.build_query().unwrap().expect("non-blank form");
+        // No string concatenation: each field is its own AST clause. `keywords`
+        // parses as the positional grammar, so `a OR b` is an Or clause.
+        assert!(q
+            .clauses
+            .contains(&Clause::Single(Term::From("boss@corp.com".into()))));
+        assert!(q
+            .clauses
+            .contains(&Clause::Single(Term::To("me@corp.com".into()))));
+        assert!(q
+            .clauses
+            .contains(&Clause::Single(Term::Subject("budget".into()))));
+        assert!(q.clauses.contains(&Clause::Or(vec![
+            Term::Text("invoice".into()),
+            Term::Text("receipt".into()),
+        ])));
+        assert!(q
+            .clauses
+            .contains(&Clause::Single(Term::After("2026-01-01".into()))));
+        assert!(q
+            .clauses
+            .contains(&Clause::Single(Term::Before("2026-07-01".into()))));
+        assert!(q.clauses.contains(&Clause::Single(Term::HasAttachment)));
+    }
+
+    #[test]
+    fn search_form_attachment_toggle_only() {
+        // The attachment toggle alone is a real (non-blank) query.
+        let form = SearchForm {
+            attachment: true,
+            ..Default::default()
+        };
+        assert!(!form.is_blank());
+        let q = form.build_query().unwrap().unwrap();
+        assert_eq!(q.clauses, vec![Clause::Single(Term::HasAttachment)]);
+    }
+
+    #[test]
+    fn search_form_rejects_bad_date() {
+        let form = SearchForm {
+            after: "not-a-date".to_string(),
+            ..Default::default()
+        };
+        let err = form.build_query().unwrap_err();
+        assert!(err.contains("after"), "date error surfaced: {err}");
+    }
+
+    #[test]
+    fn search_form_advanced_overrides_structured_fields() {
+        // Rule: a non-blank Advanced line takes over; the structured fields are
+        // ignored (greyed in the UI). Here `from`/`subject` are set but the
+        // built query is exactly what Advanced parses to.
+        let form = SearchForm {
+            from: "ignored@corp.com".to_string(),
+            subject: "ignored".to_string(),
+            advanced: "has:attachment".to_string(),
+            ..Default::default()
+        };
+        assert!(form.advanced_active());
+        let q = form.build_query().unwrap().unwrap();
+        assert_eq!(q.clauses, vec![Clause::Single(Term::HasAttachment)]);
+    }
+
+    #[test]
+    fn search_form_advanced_parse_error_surfaces() {
+        // A malformed Advanced grammar returns the ParseError Display verbatim
+        // (its three-line caret message), for the overlay to show.
+        let form = SearchForm {
+            advanced: "from:x (invoice OR".to_string(),
+            ..Default::default()
+        };
+        let err = form.build_query().unwrap_err();
+        assert!(
+            err.contains("invalid search query"),
+            "ParseError Display surfaced: {err}"
+        );
+        assert!(err.contains('^'), "caret present: {err}");
+    }
+
+    #[test]
+    fn search_field_focus_cycles_through_all_nine() {
+        // Tab forward from the first field visits every field once and wraps.
+        let mut f = SearchField::Scope;
+        let mut seen = vec![f];
+        for _ in 0..8 {
+            f = f.next();
+            seen.push(f);
+        }
+        assert_eq!(seen.len(), 9);
+        assert_eq!(f.next(), SearchField::Scope, "wraps to the start");
+        // Shift-Tab is the exact inverse.
+        assert_eq!(SearchField::Scope.prev(), SearchField::Advanced);
+        assert_eq!(SearchField::From.prev(), SearchField::Scope);
+        // Every field is distinct in the cycle.
+        let mut uniq = seen.clone();
+        uniq.sort_by_key(|f| f.label());
+        uniq.dedup_by_key(|f| f.label());
+        assert_eq!(uniq.len(), 9);
+    }
+
+    #[test]
+    fn search_field_toggles_are_not_text() {
+        assert!(!SearchField::Scope.is_text());
+        assert!(!SearchField::Attachment.is_text());
+        assert!(SearchField::From.is_text());
+        assert!(SearchField::Advanced.is_text());
+    }
 
     // -----------------------------------------------------------------------
     // extract_display_name

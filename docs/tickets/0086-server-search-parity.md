@@ -3,7 +3,7 @@ id: 0086
 title: Server search parity - one grammar, honest per-backend translation, an Outlook-shape TUI form
 type: feature
 priority: later
-status: open
+status: done
 created: 2026-08-11
 ---
 
@@ -53,6 +53,46 @@ Consequences for the scopes below: **scope 3 (the TUI form, #0086b)** drops the
 Save-Search button, replaces the Date dropdown with two date fields
 (`After` / `Before`), and the "Search In" control loses the All-Accounts option
 (Current Mailbox / Current Account only).
+
+---
+
+## Delivered (#0086b, 2026-08-11)
+
+The TUI form shipped.
+Choices pinned during implementation.
+
+Entry binding: no new key.
+`f` (`KeyAction::ServerSearch`, "Search (IMAP)") already opened the single-line
+`Overlay::Search`; it now opens the form.
+The form replaces the overlay and its `Advanced` line is the power lane, so the
+old quick single-line grammar stays reachable there with the same muscle memory.
+No KEYMAP row changed, so `mp dump-keys`, the website key table, and the help
+overlay are untouched and no regen was needed.
+(`/` and `\` were never the server-search openers; they are the in-list metadata
+filter and content search, so there was no collision to resolve.)
+
+Advanced-vs-fields rule, one direction: a non-blank `Advanced` line takes over.
+While it holds anything, the structured fields are greyed and ignored (Tab skips
+them; typing into them is refused), and the built query is exactly what
+`search::parse(advanced)` yields.
+Clear the Advanced line and the structured fields drive again.
+
+Form to AST: the form builds a `search::Query` directly, no string
+concatenation.
+The `Keywords` field is parsed as the positional grammar (so `a OR b` and quoted
+phrases work) and `From`, `To`, `Subject`, `After`, `Before`, attachment become
+`search::Flags`; both feed `search::from_cli`, the same lowering the CLI uses.
+A blank form is a no-op.
+`Action::ServerSearch` now carries the parsed `Query`, not a string, so the
+helpers render it without re-parsing.
+
+Scope wiring: the `Search In` toggle picks targets, Current Mailbox to the
+focused mailbox and Current Account to `all_search_targets()`.
+An `in:` in the Advanced line still overrides to a named mailbox.
+
+Focus and keys: Tab and Shift+Tab cycle fields, Space flips the scope and
+attachment toggles, Enter searches, Esc closes, the compose-wizard conventions.
+A `ParseError` from the Advanced line is surfaced verbatim in the overlay status.
 
 ---
 
