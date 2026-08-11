@@ -40,7 +40,7 @@ const imapCommands = [
   { command: 'mp list-mailboxes', description: 'List available server mailboxes' },
   { command: 'mp archive <selector>', description: 'Archive a received email (server + local)' },
   { command: 'mp delete <selector>', description: 'Delete a received email (server + local), or a local draft with a drafts selector' },
-  { command: 'mp search <query>', description: 'Search emails on server' },
+  { command: 'mp search <query>', description: 'Search emails on the server with one grammar (fields, has:attachment, dates, OR groups); --local searches the store offline' },
   { command: 'mp open <selector>', description: 'Open attachment in default app' },
   { command: 'mp save <selector> [--output]', description: 'Save attachment(s) to directory' },
 ];
@@ -119,16 +119,30 @@ const localSearchSyntax = [
 ];
 
 const searchSyntax = [
-  { command: 'from:', description: 'Filter by sender (IMAP FROM)' },
-  { command: 'to:', description: 'Filter by recipient (IMAP TO)' },
-  { command: 'cc:', description: 'Filter by CC (IMAP CC)' },
-  { command: 'subject:', description: 'Filter by subject (IMAP SUBJECT)' },
-  { command: 'body:', description: 'Filter by body content (IMAP BODY)' },
-  { command: 'since:', description: 'Emails since date (YYYY-MM-DD)' },
-  { command: 'before:', description: 'Emails before date (YYYY-MM-DD)' },
+  { command: 'from:', description: 'Filter by sender' },
+  { command: 'to:', description: 'Filter by recipient' },
+  { command: 'cc:', description: 'Filter by CC' },
+  { command: 'subject:', description: 'Filter by subject' },
+  { command: 'body:', description: 'Filter by body content' },
+  { command: 'filename:', description: 'Match an attachment filename (Gmail/Exchange/--local only)' },
+  { command: 'has:attachment', description: 'Only mail carrying an attachment' },
+  { command: 'after:', description: 'On or after this date, YYYY-MM-DD (since: is an alias)' },
+  { command: 'before:', description: 'Strictly before this date, YYYY-MM-DD' },
   { command: 'message-id:', description: 'Exact RFC 5322 Message-ID lookup; angle brackets optional' },
   { command: 'in:', description: 'Restrict search to a mailbox' },
-  { command: 'bare text', description: 'Matches any field (IMAP TEXT)' },
+  { command: '"a phrase"', description: 'A quoted phrase is one term' },
+  { command: '(a OR b)', description: 'An OR group; AND-ed with the rest of the query' },
+  { command: 'bare text', description: 'Matches any field' },
+];
+
+const searchFlags = [
+  { command: '--from / --to / --cc / --subject / --body / --filename <s>', description: 'The field prefixes as flags; they build the same query' },
+  { command: '--has-attachment', description: 'Only mail carrying an attachment (has:attachment)' },
+  { command: '--after / --before <YYYY-MM-DD>', description: 'The date range as flags' },
+  { command: '--mailbox <name>', description: 'Scope to one mailbox (per-account only)' },
+  { command: '-n, --limit <N>', description: 'Max results (default: 20)' },
+  { command: '--full', description: 'Show full body instead of preview' },
+  { command: '--local', description: 'Search the local FTS index offline instead of the server' },
 ];
 
 // Slugify a section title for the heading anchor id.
@@ -341,12 +355,33 @@ const slug = (title) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
     <section>
       <h2 id="search-syntax">Search Query Syntax</h2>
       <p>
-        The <code>mp search</code> command and the TUI server search overlay (<code>f</code>)
-        accept structured queries with prefix operators. Quoted values are supported
-        (e.g., <code>from:"John Doe"</code>). Without an <code>in:</code> prefix, all configured
-        mailboxes are searched in sequence.
+        The <code>mp search</code> command, its <code>--local</code> mode and the TUI
+        server search overlay (<code>f</code>) all speak <strong>one grammar</strong>.
+        Fields AND together, <code>(a OR b)</code> groups an alternation, and quoted
+        values are supported (e.g., <code>from:"John Doe"</code>). Sylvain's example
+        <code>from:boss@corp.com (invoice OR receipt) has:attachment</code> runs on
+        every backend. Without an <code>in:</code> prefix or <code>--mailbox</code>, all
+        the account's mailboxes are searched. A malformed query is an error with a
+        caret pointing at the problem, never a silent search for less.
       </p>
       <CommandTable commands={searchSyntax} />
+
+      <h3 id="search-flags">Flags (same query, for scripting)</h3>
+      <p>
+        Every field has a matching flag; a flag invocation builds the identical
+        query as its positional twin, so
+        <code>mp search --from boss@corp.com --has-attachment 'invoice OR receipt'</code>
+        equals <code>mp search 'from:boss@corp.com (invoice OR receipt) has:attachment'</code>.
+      </p>
+      <CommandTable commands={searchFlags} />
+
+      <h3 id="search-attachment-honesty">has:attachment across backends</h3>
+      <p>
+        On Gmail and Microsoft Exchange <code>has:attachment</code> runs server-side.
+        Plain IMAP (RFC 3501) has <em>no</em> attachment search key, so <code>mp</code>
+        answers that part from the local store's synced mail and prints a warning that
+        un-synced mail is not covered -- run <code>mp sync</code> for full coverage.
+      </p>
 
       <h3 id="local-search-syntax">Local full-text search (<code>--local</code>)</h3>
       <p>

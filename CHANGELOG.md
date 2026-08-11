@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **One search grammar across every backend (#0086a).** `mp search` now speaks a
+  single grammar that a single parser lowers to one AST and four renderers, so
+  the server path and `mp search --local` finally read the same input (the
+  #0043 two-grammar debt is closed). New in the grammar: `has:attachment`,
+  `(a OR b)` groups and bare `a OR b`, `filename:`, quoted phrases everywhere,
+  and custom `after:` / `before:` dates (`since:` aliases `after:`); the old
+  `in:` and `message-id:` directives still work. Every field also has a flag
+  (`--from --to --cc --subject --body --filename --has-attachment --after
+  --before`) that builds the identical query, so
+  `mp search --from boss@corp.com --has-attachment 'invoice OR receipt'` equals
+  `mp search 'from:boss@corp.com (invoice OR receipt) has:attachment'`. On Gmail
+  (`X-GM-RAW`) and Microsoft Exchange (`$search`/`$filter`) every term including
+  the attachment test runs server-side; plain IMAP (RFC 3501) has no attachment
+  search key, so that residue is answered from the local store's synced mail and
+  the run prints a warning that un-synced mail is not covered. A malformed query
+  is now an error with a caret pointing at the problem, never a silent search
+  for fewer conditions. Two behaviour changes fall out of parentheses and `OR`
+  becoming grammar: a bare multi-word query is now AND-ed per word rather than
+  matched as one contiguous IMAP `TEXT` phrase (quote it to keep the phrase),
+  and `--local` refuses `to:`/`cc:`/`filename:` (not indexed) with a clear
+  message instead of searching them as literal text. The TUI's server-search
+  overlay inherits the richer grammar for free; its Outlook-shape form is
+  #0086b.
 - **Retention enforcement (#0060).** The `[retention]` disk cap is now acted on:
   a sweep runs after every `mp sync` and on demand via `mp store gc`. It is the
   first code path in mailypoppins that deletes user data, so every deletion

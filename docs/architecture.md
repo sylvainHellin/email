@@ -59,6 +59,7 @@ Refcounts live in the database so a reference can be taken in the same transacti
 Only `rowid`-returning `MATCH` queries work; there is nothing to rebuild from, and nothing needs to be, because a store that loses its index is dropped.
 It is written inside the same transaction as the `messages` row it describes and removed by every delete path, so it needs no reconcile pass; `store::search::index_drift` is the check that says so rather than the comment claiming it.
 `store::search` is the query side (#0043), behind `mp search --local`.
+Since #0086a it no longer parses: it lowers the shared query AST (`crate::search`) with `to_fts`, so `--local` and server search read one grammar and the #0043 two-grammar debt is closed.
 - `sync_cursors` is keyed by `(account, mailbox)` and keeps `last_uid` (where the IMAP pull resumes) apart from `highest_modseq` (a CONDSTORE sequence, NULL until #0041) and `deltalink` (the Graph `/messages/delta` resume point, #0042; on a Graph account `uidvalidity` holds the hashed folder id that token is bound to, which is the analogous column on purpose).
 The two were one column until #0054, which stored a UID where a modseq was read back.
 `arrival_mark` (v5, #0072) is the one column here a later pass reads back: the UID above which the mailbox still owes the store a message the server lists, which keeps the prune gate shut until a pass reaches through it.
@@ -193,6 +194,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `src/secrets.rs` | Machine-bound encrypted secrets store (ChaCha20-Poly1305 + HKDF-SHA256). `SecretsBackend` trait with `EncryptedFileBackend` (default) and `KeyringBackend` (opt-in). See [secrets.md](secrets.md). |
 | `src/oauth2.rs` | OAuth2 device-code flow, encrypted token cache at `tokens_dir()/<account>.enc`, refresh, XOAUTH2 SASL builder. Scope-parameterised (`IMAP_SMTP_SCOPES` vs `GRAPH_SCOPES`). |
 | `src/ingest.rs` | The receive-path writer: fetched message to one `messages` row plus blobs, FTS maintenance, cursors, `prune_vanished`, `apply_seen_flags`, `graph_uid` |
+| `src/search.rs` | The unified search grammar (#0086a): one parser (`parse`) to one AST (`Query`/`Clause`/`Term`, plus the `in:`/`message-id:` directives), the CLI-flag builder (`from_cli`), and four renderers (`to_imap` with a `has:attachment` post-filter split, `to_gmail`/`to_gmail_search_command` for `X-GM-RAW`, `to_graph` for `$search`/`$filter`, `to_fts` for the local index). Malformed queries return a caret-pointed `ParseError`. `fts_expression` survives as a thin renderer wrapper. |
 | `src/selector.rs` | The `mp://account/mailbox/key` grammar: parse, resolve, format. Namespace fixed by the command, never sniffed. |
 | `src/dump.rs` | `mp dump-mailbox`: path-free NDJSON envelope dump of the store, the parity harness for the data-layer rewrite |
 | `src/read_cmd.rs` | `mp show`, `mp list-messages` (#0062) and the `mp search --local` listing (#0043): the human read surface over `store::read` and `store::search`, offline, rendering to a `String` so the layout is testable. Not the dump: that is an oracle with a pinned record shape. |
@@ -220,7 +222,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `mod.rs` | `Store`: the file, the pragmas, the drop-and-rebuild contract |
 | `schema.rs` | Schema v6 SQL, version stamping, required-table validation, and the identity notes |
 | `read.rs` | Listings, counts, Message-ID lookup, body and HTML loading, `materialise_attachments` |
-| `search.rs` | Full-text search over `messages_fts` (#0043): the user-query-to-MATCH translation, the bm25 ranking and `index_drift` |
+| `search.rs` | Full-text search over `messages_fts` (#0043): `search`/`search_ast` join the index, `crate::search::to_fts` renders the `MATCH` string plus the attachment/date SQL predicates, then bm25 ranks; `fts_expression` and `index_drift` |
 | `write.rs` | The optimistic local half of a flag, move or delete |
 | `drafts.rs` | The derived index over `<account_dir>/drafts/` |
 | `blobs.rs` | The content-addressed blob store and its refcount discipline |
@@ -228,9 +230,9 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | **`src/imap_client/`** | |
 | `mod.rs` | `ImapStream` wrapper, `open_imap_session()`, re-exports |
 | `pool.rs` | The persistent session pool (`checkout`, `PooledSession`) and `ServerCaps`, the strict post-LOGIN capability gate (#0041) |
-| `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, the arrival-coverage arithmetic |
+| `fetch.rs` | `fetch_new_raw_on_session` (the two-pass store fetch), `vanished_uids`, `fetch_emails*`, `search_on_session` (runs a pre-rendered `SEARCH`, the seam the unified grammar lowers to), the arrival-coverage arithmetic |
 | `store_sync.rs` | `ImapBackend` (the `SyncBackend` impl: the parallel per-mailbox fetch), `sync_mailboxes()`, `list_mailboxes()` |
-| `search.rs` | `parse_search_query()`, `build_imap_search_query()`, `FetchCriteria` |
+| `search.rs` | `build_imap_search_query()`, `FetchCriteria`, `parse_date_to_imap` (the structured direct-lookup path; the user grammar moved to `crate::search`) |
 | `watch.rs` | `watch_mailbox()` (IMAP IDLE) |
 | `ops.rs` | Single-message server ops: move, delete, read flags |
 | `batch.rs` | `batch_move_on_server`, `batch_delete_on_server` |
