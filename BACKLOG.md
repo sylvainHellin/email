@@ -23,6 +23,7 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 - [#0081 QRESYNC, UIDPLUS, and advancing the modseq on a capped pass](docs/tickets/0081-qresync-uidplus.md) -- perf _(the split-out half of #0041, which shipped the session pool and the CONDSTORE delta)_
 - [#0085 On-open re-fetch of an evicted body](docs/tickets/0085-on-open-body-refetch.md) -- feature _(the missing half of #0060, whose eviction sweep shipped; required before lowering a cap below the working set)_
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
+- [#0086 Server search parity: one grammar, per-backend translation, Outlook-shape TUI form](docs/tickets/0086-server-search-parity.md) -- feature _(closes the #0043 two-grammar debt; suggested split #0086a engine + #0086b TUI form, saved-search a stretch)_
 
 ### Distribution / cross-platform (adoption track)
 
