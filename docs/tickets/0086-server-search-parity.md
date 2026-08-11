@@ -27,6 +27,35 @@ grammar"). This ticket resolves that by making both paths render **one** grammar
 
 ---
 
+## Decisions (2026-08-11)
+
+Sylvain's product calls, closing the three open questions and re-scoping the
+ticket.
+These are binding.
+The design text below is kept for context, but where it conflicts, these win.
+
+- **Q1 - plain-IMAP `has:attachment`: option (b) ONLY.** No `BODYSTRUCTURE`
+  round-trip. `has:attachment` is stripped from the server query and the residue
+  is answered from the store's `messages.has_attachments` column, with a printed
+  warning that un-synced mail is not covered (run `mp sync` for full coverage).
+  Option (a) is dropped.
+- **Q2 - dates: custom `before:` / `after:` only.** No Outlook-style presets
+  (Today / This Week / This Month / This Year).
+  The TUI date control (in #0086b) becomes two plain date fields.
+- **Q3 - scope: per-account only.** No "All Accounts" scope, in the CLI or the
+  form.
+  Scope is the focused mailbox or the current account's mailboxes.
+- **#0086c saved searches: DROPPED, not deferred.** No persistence, no picker,
+  no "Save Search" button anywhere.
+  Removed from the plan entirely.
+
+Consequences for the scopes below: **scope 3 (the TUI form, #0086b)** drops the
+Save-Search button, replaces the Date dropdown with two date fields
+(`After` / `Before`), and the "Search In" control loses the All-Accounts option
+(Current Mailbox / Current Account only).
+
+---
+
 ## Where search lives today (integration map, cite before you touch)
 
 **CLI grammar + IMAP translation** - `src/imap_client/search.rs`
@@ -133,7 +162,7 @@ so.** The only residue on a modern account is nothing; on plain IMAP it is
 `has:attachment` (Q1). Every degraded run prints/`set_status` one line naming what
 ran locally and whether the candidate set was capped.
 
-### 3. TUI search form overlay (Outlook shape)
+### 3. TUI search form overlay (Outlook shape) - #0086b, per Decisions above
 
 Replace the single-line `Overlay::Search` input with a form built from the #0032
 widget kit (`modal_stack_areas` header/content/footer; `render_action_button` for
@@ -141,21 +170,24 @@ widget kit (`modal_stack_areas` header/content/footer; `render_action_button` fo
 
 | Outlook field | mp field | AST term |
 |---|---|---|
-| Search In [▾] | scope dropdown: **Current Mailbox** / **Current Account (all mailboxes)** / **All Accounts** | targets (see below) |
+| Search In [▾] | scope dropdown: **Current Mailbox** / **Current Account (all mailboxes)** | targets (see below) |
 | From | text | `From` |
 | To | text | `To` |
 | Subject | text | `Subject` |
 | Keywords | text | `Text` (subject+body) |
-| Date [Any ▾] | dropdown: Any / Today / This Week / This Month / This Year / Custom | `Before`/`After` (Q2) |
+| After / Before | two date fields (`YYYY-MM-DD`), custom only | `After` / `Before` |
 | Attachment [toggle] | bool | `HasAttachment` |
 | Add more options | reveals Cc, Body-only, Filename, Size | `Cc`/`Body`/`Filename`/`Larger` |
-| Save Search | **stretch, separate** (see below) | - |
 | Search (button) | dispatch | build `Query`, `Action::ServerSearch` |
 
-- **Scope wiring:** *Current Mailbox* → single `SearchTarget` for the focused mailbox; *Current Account* → `all_search_targets()` (`src/tui/app/mod.rs:783`, today's default); *All Accounts* → new: iterate `App::accounts`, run each account's search against its own store/session, merge and re-sort (Q3 - may defer).
-- **Focus:** `Tab`/`BackTab` cycle fields; the toggle flips on `Space`; dropdowns open on `Enter`. Reuse `SearchOverlayFocus`, widen it to a field enum.
-- **Escape hatch:** keep a raw-grammar line ("Advanced") so power users type `from:x (a OR b) has:attachment` directly - it parses to the same AST. This preserves the current muscle memory while the form drives the same engine.
-- Results list/preview panes (`src/tui/ui/search.rs`) are unchanged; they already flag attachments.
+Per the Decisions above: **no Save-Search button** (#0086c dropped), the date
+control is **two custom date fields** not a preset dropdown (Q2), and the scope
+control has **no All-Accounts option** (Q3).
+
+- Scope wiring maps *Current Mailbox* to a single `SearchTarget` for the focused mailbox and *Current Account* to `all_search_targets()` (`src/tui/app/mod.rs:783`, today's default), with no cross-account merge.
+- Focus cycles fields with `Tab`/`BackTab`, the toggle flips on `Space`, and dropdowns open on `Enter`, reusing `SearchOverlayFocus` widened to a field enum.
+- The escape hatch keeps a raw-grammar line ("Advanced") so power users type `from:x (a OR b) has:attachment` directly, parsed to the same AST via `mailypoppins::search::parse` (the #0086a engine), which preserves the current muscle memory while the form drives the same engine.
+- Results list and preview panes (`src/tui/ui/search.rs`) are unchanged and already flag attachments.
 
 ### 4. CLI flags mirroring the same fields (for scripting)
 
@@ -167,7 +199,7 @@ mp search [QUERY]
   --from <s> --to <s> --cc <s> --subject <s> --body <s>
   --has-attachment
   --after <YYYY-MM-DD> --before <YYYY-MM-DD>
-  --mailbox <MB> | --account <name> | --all-accounts
+  --mailbox <MB>   (per-account only; no --all-accounts, per Q3)
   -n <N> --full --local
 ```
 
@@ -175,11 +207,10 @@ mp search [QUERY]
 `mp search 'from:boss@corp.com (invoice OR receipt) has:attachment'` produce the
 identical `Query`.
 
-### Stretch (list separately, do not scope into v1): Saved searches
-Outlook's "Save Search" = a **named, UNSCOPED** query persisted and re-runnable.
-mp has no store for this. It is its own ticket: persistence format, an unscoped
-re-run (scope chosen at run time, not save time), and a picker. **Not part of
-#0086.**
+### Saved searches - DROPPED (was stretch #0086c)
+Outlook's "Save Search" was a candidate stretch. Per the Decisions above it is
+**dropped, not deferred**: no persistence, no picker, no "Save Search" button.
+Not part of #0086 in any phase.
 
 ---
 
@@ -199,8 +230,8 @@ re-run (scope chosen at run time, not save time), and a picker. **Not part of
 4. **`(a OR b)` grouping** parses and lowers correctly on all four renderers
    (IMAP nesting, Gmail raw, Graph, FTS).
 5. **TUI form** in the Outlook shape: Search In / From / To / Subject / Keywords /
-   Date / Attachment, a Search button, and the raw-query escape hatch. Scope
-   dropdown maps to mailbox / account / all-accounts.
+   After / Before / Attachment, a Search button, and the raw-query escape hatch.
+   Scope dropdown maps to mailbox / account only (no all-accounts, per Q3).
 6. **CLI flags** mirror every field and are equivalent to the positional grammar.
 7. Existing behaviour (`in:`, `message-id:`, `--local`, `--mailbox`, the 50-hit
    TUI cap) is preserved; all current `search.rs` tests pass or are migrated.
@@ -213,14 +244,14 @@ Bigger than one ticket. Suggested split:
   renderers, the plain-IMAP attachment post-filter, `--has-attachment`/`--after`
   etc. flags, and migration of the existing tests. This alone fixes gaps (1) and
   (2) for scripting and discharges the #0043 debt. **~M (3-5 days).**
-- **#0086b - TUI Outlook-shape form.** Field form overlay, scope dropdown,
-  Date presets, toggle, raw escape hatch, wired to #0086a's engine. **~M (3-4
-  days).** Depends on #0086a.
-- **#0086c (stretch) - Saved searches.** Separate, later.
+- **#0086b - TUI Outlook-shape form.** Field form overlay, scope dropdown
+  (mailbox / account only), two custom date fields, toggle, raw escape hatch,
+  wired to #0086a's engine. **~M (3-4 days).** Depends on #0086a.
+- **#0086c - Saved searches: DROPPED** (see Decisions above).
 
 Do #0086a first; it is usable on its own via CLI and the current single-line
 overlay (which just gets a richer grammar for free).
 
-## Open questions for Sylvain (see report)
-Q1 plain-IMAP attachment strategy; Q2 Date presets vs custom-only; Q3 whether
-"All Accounts" scope ships in v1.
+## Open questions for Sylvain - RESOLVED
+See the Decisions (2026-08-11) section at the top. Q1 = option (b) only, Q2 =
+custom dates only, Q3 = per-account only; #0086c saved searches dropped.
