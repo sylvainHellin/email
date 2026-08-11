@@ -53,6 +53,7 @@ pub mod read;
 pub mod rebuild;
 pub mod search;
 pub mod schema;
+pub mod sweep;
 pub mod write;
 
 use std::collections::HashMap;

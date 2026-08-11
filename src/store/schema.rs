@@ -387,6 +387,15 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete a `meta` row. A no-op when the key is absent. Used by the retention
+/// sweep to clear its over-cap marker once the store drops back under budget
+/// (#0060).
+pub fn clear_meta(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", [key])
+        .with_context(|| format!("clearing meta key {key}"))?;
+    Ok(())
+}
+
 /// Read a `meta` row. `Ok(None)` when the key is absent; an error when the
 /// table itself is missing or unreadable.
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {

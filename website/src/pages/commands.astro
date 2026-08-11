@@ -59,6 +59,7 @@ const storeOptions = [
 ];
 
 const maintenanceCommands = [
+  { command: 'mp store gc [--dry-run] [--force] [--all-accounts]', description: 'Run the retention sweep now: evict cached blobs over the disk cap. The first over-cap run only warns and records a marker; run it again to evict. --dry-run prints what would go without touching anything; a plan reclaiming more than half the store is refused without --force. The sweep also runs automatically after every sync.' },
   { command: 'mp cutover [--account NAME] [--dry-run]', description: 'End the pre-1.0 file-era layout: give any draft that has none an id: field, and report the old .md mailbox directories nothing reads any more' },
 ];
 

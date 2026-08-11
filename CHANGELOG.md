@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Retention enforcement (#0060).** The `[retention]` disk cap is now acted on:
+  a sweep runs after every `mp sync` and on demand via `mp store gc`. It is the
+  first code path in mailypoppins that deletes user data, so every deletion
+  decision is pinned by a test. The store is a cache, so eviction removes only
+  cached blob *files* (and their refcount rows), never a `messages` row: the
+  message list stays complete and a re-ingest re-materialises an evicted body.
+  A two-strike marker makes the first over-cap sweep *warn only* (`store at X /
+  cap Y, will prune on next run`) and persist a store-level marker; the next
+  over-cap sweep evicts, and dropping back under the cap clears the marker.
+  Eviction order is age horizon first (attachments then bodies past their
+  horizon), then attachment blobs oldest-first, then body blobs oldest-first,
+  stopping the moment the store is back under the cap; a blob a message still
+  references inside its horizon survives. `mp store gc --dry-run` prints what
+  would go; a sweep that would reclaim more than half the store's blob bytes is
+  refused without `--force` (a fat-finger guard while on-demand re-fetch of an
+  evicted body, #0085, does not yet exist). The default cap is 10 GB
+  (per-account `max_disk_bytes` overrides still win), and `mp config show` now
+  reports retention as enforced. Raw RFC822 blobs are not evicted (the order
+  names only attachments and bodies).
 - **Pane zoom (#TKT-0044).** `z` gives the focused pane the whole content
   area, herdr-style, and `z` again restores the split -- a zoomed email list
   gains its contact column back, a zoomed preview reads at full width. The

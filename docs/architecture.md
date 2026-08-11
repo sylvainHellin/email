@@ -75,6 +75,15 @@ The blob store (`src/store/blobs.rs`) is `<account_dir>/blobs/ab/cd/<sha256>`: e
 The name is the content, which buys dedup, verification (a read re-hashes and refuses bytes that no longer match their name) and immutability.
 Blob files are written before the transaction that references them, never inside it: an unreferenced blob is a harmless orphan a sweep reclaims, while a row pointing at a missing blob is a hole in the read path.
 
+### Retention sweep
+
+`src/store/sweep.rs` is the one code path that deletes user data (#0060), and it deletes only from the cache: blob *files* and their `blobs` refcount rows, never a `messages` row, so the listing stays complete and an evicted body is re-materialised by a re-ingest of the same message.
+It runs after every `mp sync` and on demand via `mp store gc`, honouring the resolved `RetentionPolicy` (`max_disk_bytes`, default 10 GB, and the body/attachment age horizons).
+A two-strike rule protects a store that briefly spikes: the first over-cap sweep only warns and persists a store-level marker in `meta`, the next over-cap sweep evicts, and dropping back under the cap clears the marker.
+When it does evict, victims are taken age-horizon-first (attachments then bodies past their horizon), then attachment blobs oldest-first, then body blobs oldest-first, stopping the moment the store is back under the cap; a blob's age is its freshest referencing message, so a shared blob survives while any message still inside its horizon references it.
+The sweep and a concurrent ingest cannot interleave mid-statement: both go through the store's single-writer WAL connection discipline, so a `mp store gc` run during a sync only ever sees committed blobs.
+One half is deferred to #0085: on-open re-fetch of an evicted body does not exist yet (a plain `mp sync` skips a UID it already has a row for), so until it ships recovery is a targeted re-ingest, and `mp store gc` refuses to reclaim more than half a store at once without `--force`.
+
 ## Data flow
 
 ### Receive
@@ -215,6 +224,7 @@ Changes on a non-active account set `has_unseen`, which is the badge in the stat
 | `write.rs` | The optimistic local half of a flag, move or delete |
 | `drafts.rs` | The derived index over `<account_dir>/drafts/` |
 | `blobs.rs` | The content-addressed blob store and its refcount discipline |
+| `sweep.rs` | The retention sweep (#0060): the over-cap two-strike marker, the eviction order, `mp store gc` |
 | **`src/imap_client/`** | |
 | `mod.rs` | `ImapStream` wrapper, `open_imap_session()`, re-exports |
 | `pool.rs` | The persistent session pool (`checkout`, `PooledSession`) and `ServerCaps`, the strict post-LOGIN capability gate (#0041) |

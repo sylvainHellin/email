@@ -347,6 +347,11 @@ enum Commands {
         #[command(subcommand)]
         action: OutboxAction,
     },
+    /// Local store maintenance (retention garbage collection)
+    Store {
+        #[command(subcommand)]
+        action: StoreAction,
+    },
     /// Report what is left of the file-era `.md` tree, and import its drafts.
     ///
     /// Assigns an `id:` frontmatter field to any draft that has none, so a
@@ -418,6 +423,30 @@ enum OutboxAction {
     Discard {
         /// Outbox row id, as shown by `mp outbox list`
         id: i64,
+    },
+}
+
+/// Local store maintenance (#0060). Today just the retention garbage
+/// collector; the sweep that also runs automatically after every sync.
+#[derive(Subcommand)]
+enum StoreAction {
+    /// Run the retention sweep now: evict cached blobs over the disk cap.
+    ///
+    /// The first over-cap run only warns and records a marker; run it again to
+    /// evict. `--dry-run` prints what would go without touching anything. A run
+    /// that would reclaim more than half the store's blob bytes is refused
+    /// without `--force` (a fat-finger guard while on-demand re-fetch, #0085,
+    /// does not yet exist).
+    Gc {
+        /// Print what would be evicted and stop; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Evict even when the plan would reclaim more than half the store.
+        #[arg(long)]
+        force: bool,
+        /// Sweep every configured account rather than just the default / `-A`.
+        #[arg(long)]
+        all_accounts: bool,
     },
 }
 
@@ -1346,6 +1375,150 @@ async fn sync_one_account(
     Ok(())
 }
 
+/// Run the retention sweep for one account and report it, the body of
+/// `mp store gc`.
+///
+/// A store file that does not exist yet has nothing to sweep, which is the
+/// common case for a freshly configured or drafts-only account.
+fn run_store_gc(
+    global_config: &GlobalConfig,
+    account: &AccountConfig,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    let path = mailypoppins::config::store_path(&account.name);
+    if !path.exists() {
+        println!(
+            "  {} {} has no store yet; nothing to sweep",
+            "\u{b7}".dimmed(),
+            account.name
+        );
+        return Ok(());
+    }
+    let policy = mailypoppins::config::retention_for(global_config, account)?;
+    let store = mailypoppins::store::Store::open(&path)?;
+    let blobs = mailypoppins::store::BlobStore::for_account(&account.name);
+    let outcome = mailypoppins::store::sweep::sweep(
+        &store,
+        &blobs,
+        &policy,
+        mailypoppins::store::sweep::SweepOptions { dry_run, force },
+    )?;
+    report_sweep_outcome(&account.name, &outcome, true);
+    Ok(())
+}
+
+/// Run the automatic post-sync retention sweep for one account, best-effort.
+///
+/// A sweep failure never fails the sync it rides on: the store is a cache and
+/// an unswept cache is merely too big, not broken, so the error is logged and
+/// the sync still reports success.
+fn retention_sweep_after_sync(global_config: &GlobalConfig, account: &AccountConfig) {
+    let policy = match mailypoppins::config::retention_for(global_config, account) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("[retention] skipping sweep for '{}': {e:#}", account.name);
+            return;
+        }
+    };
+    let path = mailypoppins::config::store_path(&account.name);
+    if !path.exists() {
+        return;
+    }
+    let store = match mailypoppins::store::Store::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("[retention] sweep could not open the store of '{}': {e:#}", account.name);
+            return;
+        }
+    };
+    let blobs = mailypoppins::store::BlobStore::for_account(&account.name);
+    match mailypoppins::store::sweep::sweep(
+        &store,
+        &blobs,
+        &policy,
+        mailypoppins::store::sweep::SweepOptions::default(),
+    ) {
+        Ok(outcome) => report_sweep_outcome(&account.name, &outcome, false),
+        Err(e) => warn!("[retention] sweep of '{}' failed: {e:#}", account.name),
+    }
+}
+
+/// Print a retention sweep outcome. `manual` distinguishes `mp store gc` (which
+/// speaks even when there is nothing to do) from the post-sync sweep (which
+/// stays quiet unless it warned, evicted, or cleared a stale marker).
+fn report_sweep_outcome(
+    account: &str,
+    outcome: &mailypoppins::store::sweep::SweepOutcome,
+    manual: bool,
+) {
+    use mailypoppins::store::sweep::{human_bytes, SweepDecision};
+    let at = human_bytes(outcome.before_bytes);
+    let cap = human_bytes(outcome.cap_bytes);
+    match &outcome.decision {
+        SweepDecision::UnderCap { cleared_marker } => {
+            if *cleared_marker {
+                println!(
+                    "{} {}: store back under budget ({at} / {cap}); over-cap marker cleared",
+                    "\u{2713}".green(),
+                    account
+                );
+            } else if manual {
+                println!(
+                    "{} {}: store at {at} / cap {cap}, under budget (nothing to evict)",
+                    "\u{2713}".green(),
+                    account
+                );
+            }
+        }
+        SweepDecision::WarnedFirstBreach => {
+            println!(
+                "{} {}: store at {at} / cap {cap}, will prune on next run",
+                "\u{26a0}".yellow(),
+                account
+            );
+        }
+        SweepDecision::RefusedTooMuch { would_evict_bytes } => {
+            println!(
+                "{} {}: pruning would reclaim {} ({} > half of {at}); refusing. \
+                 Re-run `mp store gc --force` to proceed \
+                 (on-demand re-fetch of an evicted body is not built yet, #0085).",
+                "\u{26a0}".yellow(),
+                account,
+                human_bytes(*would_evict_bytes),
+                human_bytes(*would_evict_bytes),
+            );
+        }
+        SweepDecision::Evicted => {
+            let prefix = if outcome.dry_run { "[dry-run] " } else { "" };
+            let now = human_bytes(outcome.after_bytes);
+            println!(
+                "{} {}{}: {} {} blob(s) ({}), store {} at {now} / cap {cap}",
+                "\u{2713}".green(),
+                prefix,
+                account,
+                if outcome.dry_run { "would evict" } else { "evicted" },
+                outcome.evicted.len(),
+                human_bytes(outcome.reclaimed_bytes()),
+                if outcome.dry_run { "would be" } else { "now" },
+            );
+            if outcome.dry_run {
+                for e in &outcome.evicted {
+                    let horizon = if e.past_horizon { " [past horizon]" } else { "" };
+                    println!(
+                        "    {} {} {} ({}){}",
+                        "\u{2192}".dimmed(),
+                        &e.hash[..12],
+                        e.kind.as_str(),
+                        human_bytes(e.size),
+                        horizon,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
@@ -2167,12 +2340,20 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 attempted += 1;
-                if let Err(e) =
-                    sync_one_account(account_config, limit, mailbox.as_deref(), dry_run).await
-                {
-                    error!("[sync] account '{}' failed: {e:#}", account_config.name);
-                    eprintln!("{} {}: {:#}", "✗".red(), account_config.name, e);
-                    failed.push(account_config.name.clone());
+                match sync_one_account(account_config, limit, mailbox.as_deref(), dry_run).await {
+                    Ok(()) => {
+                        // The retention sweep rides on every real sync (#0060):
+                        // a dry-run touches nothing, and a failed sync is not a
+                        // moment to start deleting cached blobs.
+                        if !dry_run {
+                            retention_sweep_after_sync(&global_config, account_config);
+                        }
+                    }
+                    Err(e) => {
+                        error!("[sync] account '{}' failed: {e:#}", account_config.name);
+                        eprintln!("{} {}: {:#}", "✗".red(), account_config.name, e);
+                        failed.push(account_config.name.clone());
+                    }
                 }
             }
 
@@ -2575,6 +2756,28 @@ async fn main() -> Result<()> {
 
         Some(Commands::Outbox { action }) => {
             cmd_outbox(&account_config, action).await?;
+        }
+
+        Some(Commands::Store { action }) => {
+            let StoreAction::Gc {
+                dry_run,
+                force,
+                all_accounts,
+            } = action;
+            let accounts: Vec<AccountConfig> = if all_accounts {
+                global_config.accounts.clone()
+            } else {
+                vec![account_config.clone()]
+            };
+            if accounts.is_empty() || accounts.iter().all(|a| a.name.is_empty()) {
+                return Err(anyhow!("No account to sweep (check `mp config show`)"));
+            }
+            for account in &accounts {
+                if accounts.len() > 1 {
+                    println!("\n{}", format!("\u{2500}\u{2500} {} \u{2500}\u{2500}", account.name).bold());
+                }
+                run_store_gc(&global_config, account, dry_run, force)?;
+            }
         }
 
         Some(Commands::Cutover { account, dry_run }) => {

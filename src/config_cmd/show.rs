@@ -3,8 +3,18 @@ use colored::*;
 
 use crate::config::{
     all_configured_mailboxes, blobs_dir, config_path, drafts_dir, get_secret, load_global_config,
-    mailypoppins_data_dir, store_path, AuthMethod,
+    mailypoppins_data_dir, retention_for, store_path, AuthMethod,
 };
+use crate::store::sweep::human_bytes;
+
+/// A horizon in days, with `0` spelled as the keep-all it means.
+fn horizon_label(days: u32) -> String {
+    if days == 0 {
+        "0 (keep all)".to_string()
+    } else {
+        format!("{days}")
+    }
+}
 
 /// Print the config file path.
 pub fn cmd_config_path() {
@@ -151,6 +161,29 @@ pub fn cmd_config_show() -> Result<()> {
         } else {
             for (role, mapping) in &all {
                 println!("    {} -> {}", format!("[{}]", role).bold(), mapping.server);
+            }
+        }
+
+        // Retention is enforced as of #0060: the sweep runs after every sync
+        // and via `mp store gc`. This block used to (and must no longer) label
+        // it unenforced.
+        match retention_for(&config, account) {
+            Ok(policy) => {
+                println!("\n  {}", "[retention]".bold());
+                println!("    enforced             = {}", "yes (sweep after sync + `mp store gc`)".green());
+                println!("    max_disk_bytes       = {}", human_bytes(policy.max_disk_bytes));
+                println!(
+                    "    body_horizon_days    = {}",
+                    horizon_label(policy.body_horizon_days)
+                );
+                println!(
+                    "    attachment_horizon_days = {}",
+                    horizon_label(policy.attachment_horizon_days)
+                );
+            }
+            Err(e) => {
+                println!("\n  {}", "[retention]".bold());
+                println!("    {}", format!("invalid: {e:#}").red());
             }
         }
 

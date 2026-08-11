@@ -253,11 +253,16 @@ pub struct SignatureEntry {
 // ---------------------------------------------------------------------------
 //
 // The local store is a cache in front of the server, so evicting a body or an
-// attachment is not deletion: the envelope row stays and the bytes are
-// re-fetched on open. That is what makes retention a safe, user-facing knob.
+// attachment is not deletion: the envelope row stays and the bytes can be
+// re-materialised by re-ingesting the same message. That is what makes
+// retention a safe, user-facing knob.
 //
-// This is the parsing and defaults surface only. Nothing here evicts anything;
-// the pruning pass lands with the eviction work.
+// This is the parsing and defaults surface. The eviction sweep that acts on
+// these values lives in `crate::store::sweep` (#0060): it runs after every sync
+// and via `mp store gc`. The one half still owed is on-demand re-fetch of an
+// evicted body when a message is opened (#0085); until it ships, recovery of an
+// evicted body is a targeted re-ingest, and the sweep guards against reclaiming
+// more than half a store at once without `--force`.
 
 /// Default metadata horizon: keep every envelope row, forever, so the message
 /// list and search always render the full history. Envelopes are cheap.
@@ -270,9 +275,11 @@ pub const DEFAULT_BODY_HORIZON_DAYS: u32 = 365;
 /// attachments dominate disk use.
 pub const DEFAULT_ATTACHMENT_HORIZON_DAYS: u32 = 90;
 
-/// Default disk budget per account: 5 GB, a conservative cap that overrides
-/// the horizons when the two disagree.
-pub const DEFAULT_MAX_DISK_BYTES: u64 = 5_000_000_000;
+/// Default disk budget per account: 10 GB, a conservative cap that overrides
+/// the horizons when the two disagree. Signed off with the #0060 retention
+/// enforcement work (the pre-enforcement default was 5 GB, a number nothing
+/// acted on); a per-account `max_disk_bytes` override still wins over it.
+pub const DEFAULT_MAX_DISK_BYTES: u64 = 10_000_000_000;
 
 /// Upper bound on any horizon: 36500 days (100 years). Larger values are a
 /// typo, and `0` already means keep-all.
@@ -2050,7 +2057,7 @@ host = "smtp.example.com"
         assert_eq!(policy.metadata_horizon_days, 0, "metadata defaults to keep-all");
         assert_eq!(policy.body_horizon_days, 365);
         assert_eq!(policy.attachment_horizon_days, 90);
-        assert_eq!(policy.max_disk_bytes, 5_000_000_000);
+        assert_eq!(policy.max_disk_bytes, 10_000_000_000, "#0060 signed-off 10 GB default");
     }
 
     #[test]

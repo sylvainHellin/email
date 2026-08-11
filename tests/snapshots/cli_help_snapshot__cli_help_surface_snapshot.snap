@@ -35,6 +35,7 @@ Commands:
   contacts        Contact index operations
   calendar        Calendar / iMIP invite operations
   outbox          Inspect and unblock the durable send queue
+  store           Local store maintenance (retention garbage collection)
   cutover         Report what is left of the file-era `.md` tree, and import its drafts
   dump-keys       Dump the TUI key bindings from the single KEYMAP source of truth
   dump-mailbox    Dump message envelopes from the local message store as NDJSON
@@ -683,6 +684,50 @@ Options:
       --no-signature           Skip signature entirely
   -A, --account <ACCOUNT>      Account to use (default: first in config)
   -h, --help                   Print help
+
+$ mp store --help
+Local store maintenance (retention garbage collection)
+
+Usage: mp store [OPTIONS] <COMMAND>
+
+Commands:
+  gc    Run the retention sweep now: evict cached blobs over the disk cap
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
+      --no-signature           Skip signature entirely
+  -A, --account <ACCOUNT>      Account to use (default: first in config)
+  -h, --help                   Print help
+
+$ mp store gc --help
+Run the retention sweep now: evict cached blobs over the disk cap.
+
+The first over-cap run only warns and records a marker; run it again to evict. `--dry-run` prints what would go without touching anything. A run that would reclaim more than half the store's blob bytes is refused without `--force` (a fat-finger guard while on-demand re-fetch, #0085, does not yet exist).
+
+Usage: mp store gc [OPTIONS]
+
+Options:
+      --dry-run
+          Print what would be evicted and stop; change nothing
+
+      --force
+          Evict even when the plan would reclaim more than half the store
+
+      --all-accounts
+          Sweep every configured account rather than just the default / `-A`
+
+  -s, --signature <SIGNATURE>
+          Signature to use (overrides config default)
+
+      --no-signature
+          Skip signature entirely
+
+  -A, --account <ACCOUNT>
+          Account to use (default: first in config)
+
+  -h, --help
+          Print help (see a summary with '-h')
 
 $ mp cutover --help
 Report what is left of the file-era `.md` tree, and import its drafts.

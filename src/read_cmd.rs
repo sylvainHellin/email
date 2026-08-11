@@ -180,7 +180,12 @@ pub fn render_show(message: &ShownMessage) -> String {
         // produce is a sentence, not an error, because the row is still real
         // and everything above this line is still true.
         None => line(
-            "(no stored body: it was evicted or never ingested; `mp sync` fetches it again)"
+            // Be honest about recovery: a plain `mp sync` skips a UID it already
+            // holds a row for, so it does NOT re-download an evicted body.
+            // On-demand re-fetch on open is #0085; until it ships, a targeted
+            // re-ingest of this message is the recovery.
+            "(no stored body: retention evicted it, or it was never ingested; \
+             re-ingesting this message restores it -- on-demand re-fetch is #0085)"
                 .dimmed()
                 .to_string(),
         ),
