@@ -45,6 +45,33 @@ struct Cli {
     account: Option<String>,
 }
 
+/// The long help for `mp search`: one grammar, every backend, with examples.
+const SEARCH_LONG_ABOUT: &str = "\
+Search emails with one grammar that every backend speaks.
+
+Fields (combine freely, implicit AND between them):
+  from:  to:  cc:  subject:  body:  filename:   match a field
+  has:attachment                                 only mail with an attachment
+  before:YYYY-MM-DD  after:YYYY-MM-DD             a date range (since: aliases after:)
+  in:MAILBOX                                      scope to one mailbox
+  message-id:<id>                                 exact Message-ID lookup
+
+Operators:
+  \"a phrase\"        a quoted phrase is one term
+  a OR b            either term
+  (a OR b)          a parenthesised OR group, AND-ed with the rest
+
+Examples:
+  mp search 'from:boss@corp.com (invoice OR receipt) has:attachment'
+  mp search --from boss@corp.com --has-attachment 'invoice OR receipt'
+  mp search 'subject:\"quarterly report\" after:2026-01-01 before:2026-07-01'
+  mp search --local 'from:ada ledger'
+
+Backend honesty: on Gmail and Exchange every term runs server-side. On plain
+IMAP has:attachment has no server key, so it is answered from the local store
+(synced mail only) and the run prints a warning. filename: is Gmail/Exchange/
+--local only.";
+
 #[derive(Subcommand)]
 enum Commands {
     /// Send a single approved email, or (with --invite) a calendar invitation
@@ -306,16 +333,45 @@ enum Commands {
         limit: usize,
     },
     /// Search emails on the IMAP server, or locally with --local
+    #[command(long_about = SEARCH_LONG_ABOUT)]
     Search {
-        /// Search query (supports from:, to:, subject:, body:, since:, before:,
-        /// message-id:, in: prefixes). message-id: matches the RFC 5322
-        /// Message-ID exactly, with or without angle brackets.
-        /// With --local: full-text words, "a phrase", a trailing * for a
-        /// prefix, and the from:, subject:, body: field filters.
+        /// Search query. One grammar for every backend: fields from: to: cc:
+        /// subject: body: filename:, the flag has:attachment, dates
+        /// before:YYYY-MM-DD / after:YYYY-MM-DD (since: aliases after:),
+        /// quoted "phrases", OR and (a OR b) groups, plus in: and message-id:.
+        /// Combine with the flags below; they build the same query.
+        #[arg(default_value = "")]
         query: String,
-        /// Mailbox to search (default: all configured mailboxes)
+        /// Mailbox to search (default: all the account's mailboxes)
         #[arg(long)]
         mailbox: Option<String>,
+        /// Match the sender (from:)
+        #[arg(long)]
+        from: Option<String>,
+        /// Match a recipient (to:)
+        #[arg(long)]
+        to: Option<String>,
+        /// Match a Cc recipient (cc:)
+        #[arg(long)]
+        cc: Option<String>,
+        /// Match the subject (subject:)
+        #[arg(long)]
+        subject: Option<String>,
+        /// Match the body (body:)
+        #[arg(long)]
+        body: Option<String>,
+        /// Match an attachment filename (Gmail/Exchange/--local only)
+        #[arg(long)]
+        filename: Option<String>,
+        /// Only mail carrying an attachment (has:attachment)
+        #[arg(long)]
+        has_attachment: bool,
+        /// On or after this date, YYYY-MM-DD (after:)
+        #[arg(long)]
+        after: Option<String>,
+        /// Strictly before this date, YYYY-MM-DD (before:)
+        #[arg(long)]
+        before: Option<String>,
         /// Max results (default: 20)
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
@@ -2604,13 +2660,42 @@ async fn main() -> Result<()> {
         Some(Commands::Search {
             query,
             mailbox,
+            from,
+            to,
+            cc,
+            subject,
+            body,
+            filename,
+            has_attachment,
+            after,
+            before,
             limit,
             full,
             local,
         }) => {
+            // One parser, one AST (#0086a): the positional grammar and the
+            // flags build the identical query. A malformed query is an error
+            // with a caret, never a silent search for less.
+            let flags = mailypoppins::search::Flags {
+                from,
+                to,
+                cc,
+                subject,
+                body,
+                filename,
+                has_attachment,
+                after,
+                before,
+            };
+            let query_ast = mailypoppins::search::from_cli(&query, &flags)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            // Resolve mailbox scope: --mailbox flag > in: directive > all.
+            let mailbox_name = mailbox.or_else(|| query_ast.in_mailbox.clone());
+
             if local {
                 let store = received_store(&account_config.name)?;
-                let mailbox_key = match mailbox.as_deref() {
+                let mailbox_key = match mailbox_name.as_deref() {
                     Some(want) => Some(resolve_mailbox_key(&account_config, want)?),
                     None => None,
                 };
@@ -2618,10 +2703,10 @@ async fn main() -> Result<()> {
                     "search-local",
                     account_config.name.clone(),
                 );
-                let hits = mailypoppins::store::search::search(
+                let hits = mailypoppins::store::search::search_ast(
                     &store,
                     &account_config.name,
-                    &query,
+                    &query_ast,
                     mailbox_key.as_deref(),
                     limit,
                 )?;
@@ -2645,17 +2730,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut criteria = parse_search_query(&query);
-
-            // Resolve mailbox scope: --mailbox flag > in: prefix > all
-            let mailbox_name = mailbox.or_else(|| criteria.in_mailbox.take());
-            criteria.in_mailbox = None;
-
             if account_config.auth_method == AuthMethod::Graph {
                 let graph_config = GraphConfig::load(&account_config)?;
                 let client = graph::GraphClient::new_async(&graph_config).await?;
                 let mut emails = client
-                    .search_messages(&criteria, mailbox_name.as_deref(), limit)
+                    .search_messages(&query_ast, mailbox_name.as_deref(), limit)
                     .await?;
                 sort_fetched_by_date(&mut emails);
                 if emails.is_empty() {
@@ -2665,61 +2744,90 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let imap_config = ImapConfig::load(&account_config)?;
-
-                if let Some(ref mb) = mailbox_name {
-                    let mut emails =
-                        fetch_emails(&imap_config, &criteria, mb, Some(limit)).await?;
-                    sort_fetched_by_date(&mut emails);
-                    if emails.is_empty() {
-                        println!("{}", "No results found".yellow());
-                    } else {
-                        println!("{} result(s) in {}:\n", emails.len(), mb);
-                        display_fetched_emails(&emails, full);
-                    }
+                // Gmail is the only IMAP server with an attachment key
+                // (`X-GM-RAW has:attachment`); a plain server has none, so its
+                // has:attachment residue is post-filtered from the store below.
+                let host_lc = imap_config.host.to_ascii_lowercase();
+                let gmail = host_lc == "imap.gmail.com"
+                    || host_lc.ends_with(".gmail.com")
+                    || host_lc.ends_with("googlemail.com");
+                let (imap_search, attachment_postfilter) = if gmail {
+                    (mailypoppins::search::to_gmail_search_command(&query_ast), false)
                 } else {
-                    // Search all configured mailboxes
-                    let configured = all_configured_mailboxes(&account_config);
-                    let mut session = imap_client::open_imap_session(&imap_config).await?;
-                    let per_mb = (limit / configured.len().max(1)).max(5);
-                    let mut total = 0usize;
-                    let mut all_emails: Vec<FetchedEmail> = Vec::new();
+                    let r = mailypoppins::search::to_imap(&query_ast)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    (r.search, r.attachment_postfilter)
+                };
+                let msg_id = query_ast.message_id.clone();
 
-                    for (role, mapping) in &configured {
-                        if total >= limit {
-                            break;
-                        }
-                        let budget = per_mb.min(limit - total);
-                        match imap_client::fetch_emails_on_session(
-                            &mut session,
-                            &criteria,
-                            &mapping.server,
-                            Some(budget),
-                        )
-                        .await
-                        {
-                            Ok(emails) if !emails.is_empty() => {
-                                total += emails.len();
-                                all_emails.extend(emails);
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "{} Search in {} failed: {}",
-                                    "\u{26a0}".yellow(),
-                                    role,
-                                    e
-                                );
-                            }
-                        }
+                // The target mailboxes: the scoped one, or all the account's.
+                let targets: Vec<(String, String)> = match mailbox_name {
+                    Some(ref mb) => vec![(mb.clone(), mb.clone())],
+                    None => all_configured_mailboxes(&account_config)
+                        .iter()
+                        .map(|(role, mapping)| (role.to_string(), mapping.server.clone()))
+                        .collect(),
+                };
+
+                let mut session = imap_client::open_imap_session(&imap_config).await?;
+                let per_mb = (limit / targets.len().max(1)).max(5);
+                let mut total = 0usize;
+                let mut all_emails: Vec<FetchedEmail> = Vec::new();
+                for (label, server) in &targets {
+                    if total >= limit {
+                        break;
                     }
-                    session.logout().await.ok();
-
-                    sort_fetched_by_date(&mut all_emails);
-                    if all_emails.is_empty() {
-                        println!("{}", "No results found".yellow());
+                    let budget = if targets.len() == 1 {
+                        limit
                     } else {
-                        display_fetched_emails(&all_emails, full);
+                        per_mb.min(limit - total)
+                    };
+                    match imap_client::search_on_session(
+                        &mut session,
+                        &imap_search,
+                        msg_id.as_deref(),
+                        server,
+                        Some(budget),
+                    )
+                    .await
+                    {
+                        Ok(emails) => {
+                            total += emails.len();
+                            all_emails.extend(emails);
+                        }
+                        Err(e) => {
+                            eprintln!("{} Search in {} failed: {}", "\u{26a0}".yellow(), label, e);
+                        }
                     }
+                }
+                session.logout().await.ok();
+
+                // Plain-IMAP has:attachment (#0086a, option b): keep only hits
+                // the local store marks as carrying an attachment, and say that
+                // un-synced mail is not covered.
+                if attachment_postfilter {
+                    let store = received_store(&account_config.name)?;
+                    let with_att = mailypoppins::store::read::message_ids_with_attachments(
+                        &store,
+                        &account_config.name,
+                    )?;
+                    all_emails.retain(|e| {
+                        e.message_id.as_deref().is_some_and(|m| {
+                            with_att.contains(&mailypoppins::store::read::normalize_message_id_key(m))
+                        })
+                    });
+                    eprintln!(
+                        "{} has:attachment on plain IMAP is answered from the local store, so \
+                         un-synced mail is not covered. Run `mp sync` for full coverage.",
+                        "\u{26a0}".yellow()
+                    );
+                }
+
+                sort_fetched_by_date(&mut all_emails);
+                if all_emails.is_empty() {
+                    println!("{}", "No results found".yellow());
+                } else {
+                    display_fetched_emails(&all_emails, full);
                 }
             }
         }

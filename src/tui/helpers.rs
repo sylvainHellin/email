@@ -16,9 +16,7 @@ use super::app::{App, EmailEntry, MessageRef, SearchHit, SearchTarget};
 
 use crate::config::{all_configured_mailboxes, AccountConfig, ImapConfig};
 use crate::draft::parse_email_draft;
-use crate::imap_client::{
-    fetch_emails_on_session, open_imap_session, parse_search_query, sync_mailboxes, SyncTarget,
-};
+use crate::imap_client::{open_imap_session, search_on_session, sync_mailboxes, SyncTarget};
 use crate::parse::FetchedEmail;
 use crate::store::open_store;
 
@@ -406,8 +404,21 @@ pub(super) async fn lib_do_multi_search(
     query: &str,
     targets: &[SearchTarget],
 ) -> anyhow::Result<Vec<SearchHit>> {
-    let mut criteria = parse_search_query(query);
-    criteria.in_mailbox = None;
+    // One grammar (#0086a): parse to the shared AST, then render for this
+    // server. Gmail runs has:attachment via X-GM-RAW; a plain server has no
+    // attachment key, so the residue is post-filtered from the store below.
+    let parsed = crate::search::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let host_lc = imap_config.host.to_ascii_lowercase();
+    let gmail = host_lc == "imap.gmail.com"
+        || host_lc.ends_with(".gmail.com")
+        || host_lc.ends_with("googlemail.com");
+    let (imap_search, attachment_postfilter) = if gmail {
+        (crate::search::to_gmail_search_command(&parsed), false)
+    } else {
+        let r = crate::search::to_imap(&parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
+        (r.search, r.attachment_postfilter)
+    };
+    let msg_id = parsed.message_id.clone();
 
     let mut session = open_imap_session(imap_config).await?;
     let total_limit = 50usize;
@@ -426,8 +437,14 @@ pub(super) async fn lib_do_multi_search(
             target.server_name,
             target.label,
         );
-        match fetch_emails_on_session(&mut session, &criteria, &target.server_name, Some(budget))
-            .await
+        match search_on_session(
+            &mut session,
+            &imap_search,
+            msg_id.as_deref(),
+            &target.server_name,
+            Some(budget),
+        )
+        .await
         {
             Ok(emails) => {
                 log::info!(
@@ -452,6 +469,22 @@ pub(super) async fn lib_do_multi_search(
     }
 
     session.logout().await.ok();
+
+    // Plain-IMAP has:attachment (#0086a, option b): keep only hits the local
+    // store marks as carrying an attachment (synced mail only).
+    if attachment_postfilter {
+        if let Some(store) = open_store(account) {
+            if let Ok(with_att) =
+                crate::store::read::message_ids_with_attachments(&store, account)
+            {
+                hits.retain(|h| {
+                    h.fetched.message_id.as_deref().is_some_and(|m| {
+                        with_att.contains(&crate::store::read::normalize_message_id_key(m))
+                    })
+                });
+            }
+        }
+    }
 
     hits.sort_by(|a, b| b.entry.date_sort.cmp(&a.entry.date_sort));
 
@@ -507,8 +540,7 @@ pub(super) async fn lib_do_multi_search_graph(
     query: &str,
     targets: &[SearchTarget],
 ) -> anyhow::Result<Vec<SearchHit>> {
-    let mut criteria = parse_search_query(query);
-    criteria.in_mailbox = None;
+    let parsed = crate::search::parse(query).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let client = crate::graph::GraphClient::new_async(graph_config).await?;
     let total_limit = 50usize;
@@ -522,7 +554,7 @@ pub(super) async fn lib_do_multi_search_graph(
         }
         let budget = per_mb.min(total_limit - total);
         match client
-            .search_messages(&criteria, Some(&target.server_name), budget)
+            .search_messages(&parsed, Some(&target.server_name), budget)
             .await
         {
             Ok(emails) => {

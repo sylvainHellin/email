@@ -840,9 +840,14 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.server_search_query.is_empty() {
-                    let criteria =
-                        crate::imap_client::parse_search_query(&self.server_search_query);
-                    let (targets, scope_label) = if let Some(ref name) = criteria.in_mailbox {
+                    let parsed = match crate::search::parse(&self.server_search_query) {
+                        Ok(q) => q,
+                        Err(e) => {
+                            self.server_search_status = Some(format!("Invalid query: {e}"));
+                            return None;
+                        }
+                    };
+                    let (targets, scope_label) = if let Some(ref name) = parsed.in_mailbox {
                         if let Some(target) = self.search_target_by_name(name) {
                             let label = target.label.clone();
                             (vec![target], label)

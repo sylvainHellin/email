@@ -2302,11 +2302,12 @@ impl GraphClient {
     /// Search messages using Graph $search and $filter.
     pub async fn search_messages(
         &self,
-        criteria: &crate::imap_client::FetchCriteria,
+        query: &crate::search::Query,
         folder: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FetchedEmail>> {
-        let (search_param, filter_param) = parse_search_to_graph_params(criteria);
+        let (search_param, filter_param) =
+            crate::search::to_graph(query).map_err(|e| anyhow!("{e}"))?;
 
         let base = if let Some(f) = folder {
             let fp = resolve_folder_path(f);
@@ -2348,7 +2349,7 @@ impl GraphClient {
                     status
                 );
                 return self
-                    .search_messages_filter_only(criteria, folder, limit)
+                    .search_messages_filter_only(query, folder, limit)
                     .await;
             }
             return Err(anyhow!(
@@ -2373,7 +2374,7 @@ impl GraphClient {
             emails.push(email);
         }
 
-        crate::imap_client::retain_exact_message_id(&mut emails, criteria);
+        retain_exact_message_id_graph(&mut emails, query.message_id.as_deref());
 
         Ok(emails)
     }
@@ -2381,11 +2382,11 @@ impl GraphClient {
     /// Fallback search using only $filter (when $search is not available).
     async fn search_messages_filter_only(
         &self,
-        criteria: &crate::imap_client::FetchCriteria,
+        query: &crate::search::Query,
         folder: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FetchedEmail>> {
-        let (_, filter_param) = parse_search_to_graph_params(criteria);
+        let (_, filter_param) = crate::search::to_graph(query).map_err(|e| anyhow!("{e}"))?;
 
         let base = if let Some(f) = folder {
             let fp = resolve_folder_path(f);
@@ -2436,78 +2437,25 @@ impl GraphClient {
             emails.push(email);
         }
 
-        crate::imap_client::retain_exact_message_id(&mut emails, criteria);
+        retain_exact_message_id_graph(&mut emails, query.message_id.as_deref());
 
         Ok(emails)
     }
 }
 
-/// Convert FetchCriteria to Graph ($search, $filter) parameters.
-fn parse_search_to_graph_params(
-    criteria: &crate::imap_client::FetchCriteria,
-) -> (Option<String>, Option<String>) {
-    let mut search_parts: Vec<String> = Vec::new();
-    let mut filter_parts: Vec<String> = Vec::new();
-
-    // Free-text search (maps to $search)
-    if let Some(ref text) = criteria.text {
-        search_parts.push(text.clone());
-    }
-
-    // Structured fields
-    if let Some(ref from) = criteria.from {
-        filter_parts.push(format!(
-            "from/emailAddress/address eq '{}'",
-            from.replace('\'', "''")
-        ));
-    }
-    if let Some(ref to) = criteria.to {
-        // $filter on toRecipients requires /any() lambda
-        filter_parts.push(format!(
-            "toRecipients/any(r: r/emailAddress/address eq '{}')",
-            to.replace('\'', "''")
-        ));
-    }
-    if let Some(ref cc) = criteria.cc {
-        filter_parts.push(format!(
-            "ccRecipients/any(r: r/emailAddress/address eq '{}')",
-            cc.replace('\'', "''")
-        ));
-    }
-    if let Some(ref subject) = criteria.subject {
-        // subject contains is better done via $search
-        search_parts.push(format!("subject:{}", subject));
-    }
-    if let Some(ref body) = criteria.body {
-        search_parts.push(format!("body:{}", body));
-    }
-    if let Some(ref since) = criteria.since {
-        filter_parts.push(format!("receivedDateTime ge {}", since));
-    }
-    if let Some(ref before) = criteria.before {
-        filter_parts.push(format!("receivedDateTime lt {}", before));
-    }
-    if let Some(ref message_id) = criteria.message_id {
-        // Graph stores the header verbatim, angle brackets included.
-        filter_parts.push(format!(
-            "internetMessageId eq '{}'",
-            crate::imap_client::bracketed_message_id(message_id).replace('\'', "''")
-        ));
-    }
-
-    let search = if search_parts.is_empty() {
-        None
-    } else {
-        Some(search_parts.join(" "))
+/// Tighten the fuzzy `$search` / `$filter` match to an exact Message-ID one,
+/// case- and bracket-insensitively, when the query named a Message-ID.
+fn retain_exact_message_id_graph(emails: &mut Vec<FetchedEmail>, message_id: Option<&str>) {
+    let Some(mid) = message_id else {
+        return;
     };
-
-    let filter = if filter_parts.is_empty() {
-        None
-    } else {
-        Some(filter_parts.join(" and "))
-    };
-
-    (search, filter)
+    let wanted = crate::imap_client::normalize_message_id(mid).to_string();
+    emails.retain(|email| {
+        email
+            .message_id
+            .as_deref()
+            .is_some_and(|m| crate::imap_client::normalize_message_id(m).eq_ignore_ascii_case(&wanted))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2971,36 +2919,29 @@ mod tests {
         assert_eq!(resolve_folder_path("MyFolder"), "MyFolder");
     }
 
+    // The Graph rendering now goes through the shared grammar (#0086a):
+    // `crate::search::parse` -> `to_graph`. These pin the same wiring the
+    // search command uses, over the unified AST.
     #[test]
-    fn test_parse_search_to_graph_params_text_only() {
-        let criteria = crate::imap_client::FetchCriteria {
-            text: Some("hello world".to_string()),
-            ..Default::default()
-        };
-        let (search, filter) = parse_search_to_graph_params(&criteria);
+    fn graph_params_text_only() {
+        let query = crate::search::parse("hello world").unwrap();
+        let (search, filter) = crate::search::to_graph(&query).unwrap();
         assert_eq!(search.unwrap(), "hello world");
         assert!(filter.is_none());
     }
 
     #[test]
-    fn test_parse_search_to_graph_params_from_filter() {
-        let criteria = crate::imap_client::FetchCriteria {
-            from: Some("alice@example.com".to_string()),
-            ..Default::default()
-        };
-        let (search, filter) = parse_search_to_graph_params(&criteria);
+    fn graph_params_from_filter() {
+        let query = crate::search::parse("from:alice@example.com").unwrap();
+        let (search, filter) = crate::search::to_graph(&query).unwrap();
         assert!(search.is_none());
         assert!(filter.unwrap().contains("from/emailAddress/address"));
     }
 
     #[test]
-    fn test_parse_search_to_graph_params_date_range() {
-        let criteria = crate::imap_client::FetchCriteria {
-            since: Some("2024-01-01".to_string()),
-            before: Some("2024-02-01".to_string()),
-            ..Default::default()
-        };
-        let (_, filter) = parse_search_to_graph_params(&criteria);
+    fn graph_params_date_range() {
+        let query = crate::search::parse("after:2024-01-01 before:2024-02-01").unwrap();
+        let (_, filter) = crate::search::to_graph(&query).unwrap();
         let f = filter.unwrap();
         assert!(f.contains("receivedDateTime ge"));
         assert!(f.contains("receivedDateTime lt"));

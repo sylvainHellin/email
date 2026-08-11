@@ -430,22 +430,92 @@ Options:
   -h, --help                   Print help
 
 $ mp search --help
-Search emails on the IMAP server, or locally with --local
+Search emails with one grammar that every backend speaks.
 
-Usage: mp search [OPTIONS] <QUERY>
+Fields (combine freely, implicit AND between them):
+  from:  to:  cc:  subject:  body:  filename:   match a field
+  has:attachment                                 only mail with an attachment
+  before:YYYY-MM-DD  after:YYYY-MM-DD             a date range (since: aliases after:)
+  in:MAILBOX                                      scope to one mailbox
+  message-id:<id>                                 exact Message-ID lookup
+
+Operators:
+  "a phrase"        a quoted phrase is one term
+  a OR b            either term
+  (a OR b)          a parenthesised OR group, AND-ed with the rest
+
+Examples:
+  mp search 'from:boss@corp.com (invoice OR receipt) has:attachment'
+  mp search --from boss@corp.com --has-attachment 'invoice OR receipt'
+  mp search 'subject:"quarterly report" after:2026-01-01 before:2026-07-01'
+  mp search --local 'from:ada ledger'
+
+Backend honesty: on Gmail and Exchange every term runs server-side. On plain
+IMAP has:attachment has no server key, so it is answered from the local store
+(synced mail only) and the run prints a warning. filename: is Gmail/Exchange/
+--local only.
+
+Usage: mp search [OPTIONS] [QUERY]
 
 Arguments:
-  <QUERY>  Search query (supports from:, to:, subject:, body:, since:, before:, message-id:, in: prefixes). message-id: matches the RFC 5322 Message-ID exactly, with or without angle brackets. With --local: full-text words, "a phrase", a trailing * for a prefix, and the from:, subject:, body: field filters
+  [QUERY]
+          Search query. One grammar for every backend: fields from: to: cc: subject: body: filename:, the flag has:attachment, dates before:YYYY-MM-DD / after:YYYY-MM-DD (since: aliases after:), quoted "phrases", OR and (a OR b) groups, plus in: and message-id:. Combine with the flags below; they build the same query
+          
+          [default: ]
 
 Options:
-      --mailbox <MAILBOX>      Mailbox to search (default: all configured mailboxes)
-  -n, --limit <LIMIT>          Max results (default: 20) [default: 20]
-      --full                   Show full body instead of preview
-      --local                  Search the local store's full-text index instead of the server (offline, ranked, covers every synced mailbox at once)
-  -s, --signature <SIGNATURE>  Signature to use (overrides config default)
-      --no-signature           Skip signature entirely
-  -A, --account <ACCOUNT>      Account to use (default: first in config)
-  -h, --help                   Print help
+      --mailbox <MAILBOX>
+          Mailbox to search (default: all the account's mailboxes)
+
+      --from <FROM>
+          Match the sender (from:)
+
+      --to <TO>
+          Match a recipient (to:)
+
+      --cc <CC>
+          Match a Cc recipient (cc:)
+
+      --subject <SUBJECT>
+          Match the subject (subject:)
+
+      --body <BODY>
+          Match the body (body:)
+
+      --filename <FILENAME>
+          Match an attachment filename (Gmail/Exchange/--local only)
+
+      --has-attachment
+          Only mail carrying an attachment (has:attachment)
+
+      --after <AFTER>
+          On or after this date, YYYY-MM-DD (after:)
+
+      --before <BEFORE>
+          Strictly before this date, YYYY-MM-DD (before:)
+
+  -n, --limit <LIMIT>
+          Max results (default: 20)
+          
+          [default: 20]
+
+      --full
+          Show full body instead of preview
+
+      --local
+          Search the local store's full-text index instead of the server (offline, ranked, covers every synced mailbox at once)
+
+  -s, --signature <SIGNATURE>
+          Signature to use (overrides config default)
+
+      --no-signature
+          Skip signature entirely
+
+  -A, --account <ACCOUNT>
+          Account to use (default: first in config)
+
+  -h, --help
+          Print help (see a summary with '-h')
 
 $ mp config --help
 Manage configuration

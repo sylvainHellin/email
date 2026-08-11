@@ -40,14 +40,33 @@ pub async fn fetch_emails_on_session(
     mailbox: &str,
     limit: Option<usize>,
 ) -> Result<Vec<FetchedEmail>> {
+    let query = build_imap_search_query(criteria);
+    search_on_session(session, &query, criteria.message_id.as_deref(), mailbox, limit).await
+}
+
+/// Run a pre-rendered IMAP `SEARCH` on an existing session and fetch the hits.
+///
+/// This is the seam the unified search grammar (#0086a) lowers to: the caller
+/// renders `imap_search` from the shared AST (`crate::search::to_imap` for a
+/// plain server, `to_gmail_search_command` for a Gmail `X-GM-RAW` string), so
+/// nested `OR` and every other grammar feature reaches the wire without this
+/// function knowing the grammar. `message_id`, when set, tightens the server's
+/// substring `HEADER` match to an exact one after the fetch, the same guarantee
+/// [`fetch_emails_on_session`] gives.
+pub async fn search_on_session(
+    session: &mut ImapSession,
+    imap_search: &str,
+    message_id: Option<&str>,
+    mailbox: &str,
+    limit: Option<usize>,
+) -> Result<Vec<FetchedEmail>> {
     session
         .select(mailbox)
         .await
         .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
 
-    let query = build_imap_search_query(criteria);
     let uids = session
-        .uid_search(&query)
+        .uid_search(imap_search)
         .await
         .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
 
@@ -83,7 +102,15 @@ pub async fn fetch_emails_on_session(
 
     // `HEADER "Message-ID"` is a substring match on the server side; make the
     // lookup exact here so every caller of this seam gets the same guarantee.
-    super::search::retain_exact_message_id(&mut emails, criteria);
+    if let Some(mid) = message_id {
+        let wanted = super::search::normalize_message_id(mid).to_string();
+        emails.retain(|email| {
+            email
+                .message_id
+                .as_deref()
+                .is_some_and(|m| super::search::normalize_message_id(m).eq_ignore_ascii_case(&wanted))
+        });
+    }
 
     Ok(emails)
 }

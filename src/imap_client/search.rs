@@ -120,124 +120,11 @@ pub(crate) fn build_imap_search_query(criteria: &FetchCriteria) -> String {
     }
 }
 
-/// Parse a user search string into structured FetchCriteria.
+/// Parse a `YYYY-MM-DD` date into the IMAP `D-Mon-YYYY` form.
 ///
-/// Recognized prefixes: from:, to:, cc:, subject:, body:, since:, before:,
-/// message-id:, in:
-/// Quoted values supported: from:"John Doe"
-/// Bare text (no prefix) becomes a TEXT search.
-pub fn parse_search_query(input: &str) -> FetchCriteria {
-    let mut criteria = FetchCriteria {
-        from: None,
-        to: None,
-        cc: None,
-        subject: None,
-        body: None,
-        since: None,
-        before: None,
-        text: None,
-        message_id: None,
-        in_mailbox: None,
-    };
-
-    let mut remaining = Vec::new();
-    let mut chars = input.chars().peekable();
-
-    while chars.peek().is_some() {
-        while chars.peek() == Some(&' ') {
-            chars.next();
-        }
-        if chars.peek().is_none() {
-            break;
-        }
-
-        let rest: String = chars.clone().collect();
-        let lower_rest = rest.to_lowercase();
-
-        let mut matched = false;
-        for (prefix, setter) in [
-            ("from:", 0u8),
-            ("to:", 1),
-            ("cc:", 2),
-            ("subject:", 3),
-            ("body:", 4),
-            ("since:", 5),
-            ("before:", 6),
-            ("in:", 7),
-            ("message-id:", 8),
-        ] {
-            if lower_rest.starts_with(prefix) {
-                for _ in 0..prefix.len() {
-                    chars.next();
-                }
-                let value = extract_search_value(&mut chars);
-                match setter {
-                    0 => criteria.from = Some(value),
-                    1 => criteria.to = Some(value),
-                    2 => criteria.cc = Some(value),
-                    3 => criteria.subject = Some(value),
-                    4 => criteria.body = Some(value),
-                    5 => criteria.since = Some(value),
-                    6 => criteria.before = Some(value),
-                    7 => criteria.in_mailbox = Some(value),
-                    8 => criteria.message_id = Some(value),
-                    _ => unreachable!(),
-                }
-                matched = true;
-                break;
-            }
-        }
-
-        if !matched {
-            let mut word = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == ' ' {
-                    break;
-                }
-                word.push(c);
-                chars.next();
-            }
-            if !word.is_empty() {
-                remaining.push(word);
-            }
-        }
-    }
-
-    if !remaining.is_empty() {
-        criteria.text = Some(remaining.join(" "));
-    }
-
-    criteria
-}
-
-fn extract_search_value(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
-    while chars.peek() == Some(&' ') {
-        chars.next();
-    }
-
-    if chars.peek() == Some(&'"') {
-        chars.next();
-        let mut value = String::new();
-        for c in chars.by_ref() {
-            if c == '"' {
-                break;
-            }
-            value.push(c);
-        }
-        value
-    } else {
-        let mut value = String::new();
-        while let Some(&c) = chars.peek() {
-            if c == ' ' {
-                break;
-            }
-            value.push(c);
-            chars.next();
-        }
-        value
-    }
-}
-
+/// The user-facing search grammar lives in [`crate::search`] now (#0086a); this
+/// stays here because it is the shared date lowering the IMAP renderer and the
+/// structured [`FetchCriteria`] path both use.
 pub(crate) fn parse_date_to_imap(date_str: &str) -> Option<String> {
     let parts: Vec<&str> = date_str.split('-').collect();
     if parts.len() != 3 {
@@ -380,83 +267,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_search_query_from() {
-        let criteria = parse_search_query("from:alice@example.com");
-        assert_eq!(criteria.from, Some("alice@example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_to() {
-        let criteria = parse_search_query("to:bob@example.org");
-        assert_eq!(criteria.to, Some("bob@example.org".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_cc() {
-        let criteria = parse_search_query("cc:secret@example.net");
-        assert_eq!(criteria.cc, Some("secret@example.net".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_subject() {
-        let criteria = parse_search_query("subject:invoice");
-        assert_eq!(criteria.subject, Some("invoice".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_body() {
-        let criteria = parse_search_query("body:contract");
-        assert_eq!(criteria.body, Some("contract".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_since_before() {
-        let criteria = parse_search_query("since:2024-12-01 before:2024-12-31");
-        assert_eq!(criteria.since, Some("2024-12-01".to_string()));
-        assert_eq!(criteria.before, Some("2024-12-31".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_in_mailbox() {
-        let criteria = parse_search_query("in:INBOX from:alice");
-        assert_eq!(criteria.in_mailbox, Some("INBOX".to_string()));
-        assert_eq!(criteria.from, Some("alice".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_bare_text() {
-        let criteria = parse_search_query("urgent meeting");
-        assert_eq!(criteria.text, Some("urgent meeting".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_quoted_value() {
-        let criteria = parse_search_query("from:\"Alice Smith\" subject:report");
-        assert_eq!(criteria.from, Some("Alice Smith".to_string()));
-        assert_eq!(criteria.subject, Some("report".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_case_insensitive_prefix() {
-        let criteria = parse_search_query("FROM:alice SUBJECT:report");
-        assert_eq!(criteria.from, Some("alice".to_string()));
-        assert_eq!(criteria.subject, Some("report".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_multiple_bare_words() {
-        let criteria = parse_search_query("urgent meeting notes");
-        assert_eq!(criteria.text, Some("urgent meeting notes".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_mixed_prefix_and_bare() {
-        let criteria = parse_search_query("from:alice urgent");
-        assert_eq!(criteria.from, Some("alice".to_string()));
-        assert_eq!(criteria.text, Some("urgent".to_string()));
-    }
-
-    #[test]
     fn test_normalize_message_id_strips_one_bracket_layer() {
         assert_eq!(normalize_message_id("<abc@example.com>"), "abc@example.com");
         assert_eq!(normalize_message_id("abc@example.com"), "abc@example.com");
@@ -494,27 +304,6 @@ mod tests {
             bracketed_message_id("<abc@example.com>"),
             "<abc@example.com>"
         );
-    }
-
-    #[test]
-    fn test_parse_search_query_message_id() {
-        let bare = parse_search_query("message-id:abc123@example.com");
-        assert_eq!(bare.message_id, Some("abc123@example.com".to_string()));
-        // Angle brackets survive the parser; normalization happens downstream.
-        let bracketed = parse_search_query("message-id:<abc123@example.com>");
-        assert_eq!(bracketed.message_id, Some("<abc123@example.com>".to_string()));
-        // Prefix matching is case-insensitive like every other prefix.
-        let upper = parse_search_query("MESSAGE-ID:<abc123@example.com>");
-        assert_eq!(upper.message_id, Some("<abc123@example.com>".to_string()));
-    }
-
-    #[test]
-    fn test_parse_search_query_message_id_not_confused_with_other_prefixes() {
-        let criteria = parse_search_query("in:Archive message-id:<a@b> from:alice");
-        assert_eq!(criteria.in_mailbox, Some("Archive".to_string()));
-        assert_eq!(criteria.message_id, Some("<a@b>".to_string()));
-        assert_eq!(criteria.from, Some("alice".to_string()));
-        assert_eq!(criteria.text, None);
     }
 
     #[test]

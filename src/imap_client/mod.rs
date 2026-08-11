@@ -8,7 +8,10 @@ mod store_sync;
 mod watch;
 
 pub use batch::{add_flag_in_mailboxes, batch_delete_on_server, batch_move_on_server};
-pub use fetch::{fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, vanished_uids};
+pub use fetch::{
+    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, search_on_session,
+    vanished_uids,
+};
 pub use ops::{
     add_flag_on_server, delete_email_on_server, mark_read_on_server, mark_unread_on_server,
     move_email_on_server, remove_flag_on_server,
@@ -16,8 +19,7 @@ pub use ops::{
 pub use pool::{checkout, PooledSession, ServerCaps};
 pub use sent::ImapSentMailbox;
 pub use search::{
-    bracketed_message_id, normalize_message_id, parse_search_query, retain_exact_message_id,
-    FetchCriteria,
+    bracketed_message_id, normalize_message_id, retain_exact_message_id, FetchCriteria,
 };
 pub use store_sync::{list_mailboxes, sync_mailboxes, ImapBackend};
 // The sync types moved to `crate::sync` with the engine (#0059); re-exported

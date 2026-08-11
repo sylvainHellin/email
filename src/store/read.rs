@@ -223,6 +223,40 @@ pub fn mailbox_counts(store: &Store, account: &str) -> Result<HashMap<String, us
     Ok(out)
 }
 
+/// The normalized `Message-ID`s an account has synced that carry an attachment.
+///
+/// This is the store side of the plain-IMAP `has:attachment` post-filter
+/// (#0086a): RFC 3501 has no attachment search key, so the caller runs the rest
+/// of the query server-side and keeps only the hits whose `Message-ID` this set
+/// contains, warning that un-synced mail is not covered. Keys are stripped of
+/// their angle brackets and lower-cased so the caller can compare against a
+/// server header without caring which spelling either side used.
+pub fn message_ids_with_attachments(
+    store: &Store,
+    account: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT message_id FROM messages WHERE account = ?1 AND has_attachments = 1",
+    )?;
+    let rows = stmt.query_map([account], |row| row.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        let mid = row.context("reading an attachment Message-ID")?;
+        out.insert(normalize_message_id_key(&mid));
+    }
+    Ok(out)
+}
+
+/// Strip one layer of angle brackets and lower-case, the comparison key the
+/// attachment post-filter uses on both sides.
+pub fn normalize_message_id_key(raw: &str) -> String {
+    let t = raw.trim();
+    t.strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(t)
+        .to_ascii_lowercase()
+}
+
 /// The rows an account holds for one `Message-ID`, in `(mailbox, uid)` order.
 ///
 /// This is the store-side replacement for the `message_id_index` the TUI used
