@@ -9,7 +9,7 @@ use log::{debug, error, info, warn};
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{AuthMethod, EmailSettings, SmtpConfig};
 use crate::types::{EmailDraft, EmailStatus};
@@ -236,6 +236,43 @@ mod tests {
     fn test_markdown_to_html_basic_paragraph() {
         let html = markdown_to_html("Hello **world**!\n\nSecond paragraph.", &default_settings(), None, None);
         assert_snapshot!(html);
+    }
+
+    #[test]
+    fn test_resolve_attachment_paths_expands_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        // Files land out of order and include a dotfile that must be skipped.
+        fs::write(dir.path().join("b.pdf"), b"b").unwrap();
+        fs::write(dir.path().join("a.pdf"), b"a").unwrap();
+        fs::write(dir.path().join(".hidden"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+
+        let entries = vec![dir.path().to_string_lossy().to_string()];
+        let resolved = resolve_attachment_paths(&entries).unwrap();
+
+        let names: Vec<String> = resolved
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // Sorted, dotfile and subdirectory dropped.
+        assert_eq!(names, vec!["a.pdf".to_string(), "b.pdf".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_attachment_paths_passes_files_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.pdf");
+        fs::write(&file, b"one").unwrap();
+        // A file entry and a non-existent entry are both returned unchanged;
+        // the missing one fails later at read time, not here.
+        let entries = vec![
+            file.to_string_lossy().to_string(),
+            "/no/such/file.pdf".to_string(),
+        ];
+        let resolved = resolve_attachment_paths(&entries).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0], file);
+        assert_eq!(resolved[1], PathBuf::from("/no/such/file.pdf"));
     }
 
     #[test]
@@ -1633,29 +1670,77 @@ fn parse_graph_recipients(field: Option<&str>) -> Vec<(String, String)> {
     }
 }
 
+/// Expand a draft's `attachments:` frontmatter entries into concrete files.
+///
+/// Each entry is tilde-expanded. A directory entry contributes every regular
+/// file directly inside it (non-recursive, sorted by file name, dotfiles
+/// skipped); any other entry contributes itself unchanged. This lets a draft
+/// name one folder instead of listing every file in it. A path that is neither
+/// a readable directory nor an existing file is passed through untouched, so
+/// the later `fs::read` reports the missing path the same way it always has.
+pub fn resolve_attachment_paths(entries: &[String]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let expanded = shellexpand::tilde(entry);
+        let path = PathBuf::from(expanded.as_ref());
+        if path.is_dir() {
+            let mut dir_files = Vec::new();
+            for dent in fs::read_dir(&path)
+                .with_context(|| format!("Failed to read attachment folder: {}", entry))?
+            {
+                let dent = dent
+                    .with_context(|| format!("Failed to read attachment folder: {}", entry))?;
+                let file = dent.path();
+                if !file.is_file() {
+                    continue;
+                }
+                let is_dotfile = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'));
+                if is_dotfile {
+                    continue;
+                }
+                dir_files.push(file);
+            }
+            // Deterministic order so the same folder always attaches the same
+            // sequence; `read_dir` yields entries in arbitrary order.
+            dir_files.sort();
+            paths.extend(dir_files);
+        } else {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// Read one attachment file into its `(filename, bytes, content-type)` triple.
+fn read_attachment(path: &Path) -> Result<(String, Vec<u8>, String)> {
+    let content =
+        fs::read(path).with_context(|| format!("Failed to read attachment: {}", path.display()))?;
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+    let content_type = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    Ok((filename, content, content_type))
+}
+
 /// The attachments a draft names, read off the paths in its frontmatter.
 ///
 /// Only the Graph path needs them separately: the SMTP path's bytes are built
 /// by [`build_draft_message`], which reads the same list itself and fails the
-/// same way on a path that is not there.
+/// same way on a path that is not there. Directory entries are expanded by
+/// [`resolve_attachment_paths`].
 fn draft_attachments(draft: &EmailDraft) -> Result<Vec<(String, Vec<u8>, String)>> {
-    let mut data = Vec::new();
     let Some(attachments) = draft.frontmatter.attachments.as_ref() else {
-        return Ok(data);
+        return Ok(Vec::new());
     };
-    for att_path in attachments {
-        let expanded = shellexpand::tilde(att_path);
-        let path = Path::new(expanded.as_ref());
-        let content = fs::read(path)
-            .with_context(|| format!("Failed to read attachment: {}", att_path))?;
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_string());
-        let content_type = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-        data.push((filename, content, content_type));
+    let mut data = Vec::new();
+    for path in resolve_attachment_paths(attachments)? {
+        data.push(read_attachment(&path)?);
     }
     Ok(data)
 }
@@ -2303,18 +2388,8 @@ pub fn build_draft_message(
         // application/ics ]; regular file attachments (if any) follow.
         let mut mixed = build_invite_mime_body(&draft.body_markdown, body_html, ics);
         if let Some(attachments) = &draft.frontmatter.attachments {
-            for attachment_path in attachments {
-                let expanded = shellexpand::tilde(attachment_path);
-                let path = Path::new(expanded.as_ref());
-                let file_content = fs::read(path)
-                    .with_context(|| format!("Failed to read attachment: {}", attachment_path))?;
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "attachment".to_string());
-                let content_type = mime_guess::from_path(path)
-                    .first_or_octet_stream()
-                    .to_string();
+            for path in resolve_attachment_paths(attachments)? {
+                let (filename, file_content, content_type) = read_attachment(&path)?;
                 let content_type_parsed = content_type.parse().unwrap_or_else(|_| {
                     "application/octet-stream".parse().expect("static MIME type")
                 });
@@ -2323,25 +2398,12 @@ pub fn build_draft_message(
         }
         builder.multipart(mixed).context("Failed to build invite message")?
     } else if let Some(attachments) = &draft.frontmatter.attachments {
-        if !attachments.is_empty() {
+        let files = resolve_attachment_paths(attachments)?;
+        if !files.is_empty() {
             let mut mixed = MultiPart::mixed().multipart(body_multipart);
 
-            for attachment_path in attachments {
-                let expanded = shellexpand::tilde(attachment_path);
-                let path = Path::new(expanded.as_ref());
-
-                let file_content = fs::read(path)
-                    .with_context(|| format!("Failed to read attachment: {}", attachment_path))?;
-
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "attachment".to_string());
-
-                let content_type = mime_guess::from_path(path)
-                    .first_or_octet_stream()
-                    .to_string();
-
+            for path in files {
+                let (filename, file_content, content_type) = read_attachment(&path)?;
                 let content_type_parsed = content_type.parse()
                     .unwrap_or_else(|_| "application/octet-stream".parse().expect("static MIME type"));
                 let attachment = Attachment::new(filename).body(file_content, content_type_parsed);

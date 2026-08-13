@@ -1046,11 +1046,29 @@ pub fn validate_draft(draft: &EmailDraft) -> Result<Vec<String>> {
     validate_field(draft.frontmatter.cc.as_ref(), "cc")?;
     validate_field(draft.frontmatter.bcc.as_ref(), "bcc")?;
 
-    // Check attachments exist
+    // Check attachments exist. A folder entry is valid as long as it holds at
+    // least one file, which `send` expands into individual attachments.
     if let Some(attachments) = &draft.frontmatter.attachments {
         for attachment in attachments {
             let expanded = shellexpand::tilde(attachment);
-            if !Path::new(expanded.as_ref()).exists() {
+            let path = Path::new(expanded.as_ref());
+            if path.is_dir() {
+                let has_file = fs::read_dir(path)
+                    .ok()
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            e.path().is_file()
+                                && !e
+                                    .file_name()
+                                    .to_str()
+                                    .is_some_and(|n| n.starts_with('.'))
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_file {
+                    warnings.push(format!("Attachment folder is empty: {}", attachment));
+                }
+            } else if !path.exists() {
                 warnings.push(format!("Attachment not found: {}", attachment));
             }
         }

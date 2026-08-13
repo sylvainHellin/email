@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Folder entries in `attachments:`.**
+  A draft's `attachments:` frontmatter now accepts a directory path, not only individual files.
+  A folder entry attaches every regular file directly inside it (sorted by name, subfolders and dotfiles skipped), so a batch of files can be named by one folder rather than listed one by one.
+  File entries behave as before, and the two can be mixed in the same list.
+  Draft validation warns when a named folder holds no files.
+  The expansion is shared by the SMTP and Graph send paths.
 - **One search grammar across every backend (#0086a).** `mp search` now speaks a
   single grammar that a single parser lowers to one AST and four renderers, so
   the server path and `mp search --local` finally read the same input (the

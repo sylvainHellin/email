@@ -14,7 +14,7 @@ const frontmatterFields = [
   { command: 'status', description: 'Workflow state: draft, approved, or sent. Required.' },
   { command: 'from', description: 'Sender address. Optional -- overrides default_from from config.' },
   { command: 'reply_to', description: 'Reply-to address. Optional.' },
-  { command: 'attachments', description: 'List of absolute file paths to attach. Optional.' },
+  { command: 'attachments', description: 'List of file paths to attach; a folder path attaches every file inside it. Optional.' },
   { command: 'in_reply_to', description: 'Message-ID of the message this draft answers. Written by mp reply; on send, the source is marked answered.' },
   { command: 'forwarded_from', description: 'Message-ID of the message this draft forwards. Written by mp forward; on send, the source is marked forwarded.' },
 ];
@@ -222,6 +222,9 @@ Email body here.`;
       <h2 id="attachments">Attachments</h2>
       <p>
         A draft's <code>attachments:</code> field holds file paths, and any readable path works.
+        An entry that points at a folder attaches every file directly inside it (sorted by name,
+        subfolders and dotfiles skipped), so a batch of files can be named by one directory rather
+        than listed one by one.
         Received attachments are not files: they live as blobs beside the message row in the
         account's store. Forwarding a message therefore materialises its attachments once, into a
         stable per-message directory under the account, and writes those paths into the draft, so
