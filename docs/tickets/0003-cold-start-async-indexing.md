@@ -51,3 +51,12 @@ P1 -- secondary to [#0002 persist-mailbox-states](0002-persist-mailbox-states.md
 - Tests: 3 new unit tests for `build_message_id_index` (per-dir
   collection, missing-dir skip, empty-mailboxes). Total 339 tests
   pass.
+
+## Decision note (2026-08-14)
+
+The owner confirmed the startup approach this ticket set in motion.
+The TUI must paint instantly from stale or cached data, and a background refresh updates the UI when fresh data arrives.
+That is the two-phase startup the perf audit still asks for beyond the index scan already shipped here: the first `terminal.draw` must not wait behind per-account store work.
+The remaining piece is the per-account `PRAGMA integrity_check` and the redundant serial store opens that still gate the first paint (performance audit finding 1, §b.1 / S1, ~240 ms per 44 MB store, ~1.2 s for five accounts).
+Scope is unchanged; this note records the confirmed direction so the follow-up work lands under the same ticket.
+Priority stays now.

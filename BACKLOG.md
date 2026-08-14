@@ -8,13 +8,20 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056, #0057, #0058 and #0064 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0071; #0065, #0066, #0067, #0068 and #0071 have shipped.
 
-_Nothing queued; the next thing to start comes from the Next tier below._
+> Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). New tickets #0087 to #0096 spread across Now / Next / Later below.
+
+- [#0089 Send the current draft in place, approve and send in one confirmed step](docs/tickets/0089-send-current-draft-approve-and-send.md) -- feature
+- [#0092 Keybinding scheme redesign to an nvim-style mnemonic prefix model](docs/tickets/0092-keybinding-scheme-redesign.md) -- feature _(blocked on [docs/plans/keybinding-redesign.md](docs/plans/keybinding-redesign.md) review)_
+- [#0093 Memoise the wrapped preview body and dirty-flag the redraw loop](docs/tickets/0093-memoise-preview-body-wrap.md) -- perf
 
 ## Next
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
-_Nothing queued; the next thing to start comes from the Later tier below._
+- [#0087 Opening a message in the preview marks it read](docs/tickets/0087-auto-mark-read-on-open.md) -- feature _(cross-ref #0004)_
+- [#0088 Collapse the three search entry points into one, body search off the UI thread](docs/tickets/0088-unify-search-entry-points.md) -- feature _(cross-ref #0043, #0086)_
+- [#0094 Index the mailbox listing sort and drop the correlated per-row subquery](docs/tickets/0094-mailbox-list-index.md) -- perf
+- [#0096 Expand the header pane with Bcc/Reply-To, an attachment indicator, and bounded scroll](docs/tickets/0096-header-pane-expansion.md) -- feature
 
 ## Later
 
@@ -22,6 +29,9 @@ _Nothing queued; the next thing to start comes from the Later tier below._
 
 - [#0081 QRESYNC, UIDPLUS, and advancing the modseq on a capped pass](docs/tickets/0081-qresync-uidplus.md) -- perf _(the split-out half of #0041, which shipped the session pool and the CONDSTORE delta)_
 - [#0085 On-open re-fetch of an evicted body](docs/tickets/0085-on-open-body-refetch.md) -- feature _(the missing half of #0060, whose eviction sweep shipped; required before lowering a cap below the working set)_
+- [#0090 Undo-send hold window before SMTP hand-off](docs/tickets/0090-undo-send-hold-window.md) -- feature _(configurable, default 20 s; sequence after #0089)_
+- [#0091 HTML-to-text rendering through an external tool](docs/tickets/0091-html-to-text-rendering.md) -- feature _(evaluate w3m / lynx / pandoc)_
+- [#0095 One shared tokio runtime instead of a fresh runtime per network action](docs/tickets/0095-shared-tokio-runtime.md) -- chore
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
 
 ### Distribution / cross-platform (adoption track)
