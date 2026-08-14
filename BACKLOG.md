@@ -11,7 +11,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 > Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). New tickets #0087 to #0096 spread across Now / Next / Later below.
 
 - [#0089 Send the current draft in place, approve and send in one confirmed step](docs/tickets/0089-send-current-draft-approve-and-send.md) -- feature
-- [#0092 Keybinding scheme redesign to an nvim-style mnemonic prefix model](docs/tickets/0092-keybinding-scheme-redesign.md) -- feature _(blocked on [docs/plans/keybinding-redesign.md](docs/plans/keybinding-redesign.md) review)_
+- [#0092 Keybinding scheme redesign to an nvim-style mnemonic prefix model](docs/tickets/0092-keybinding-scheme-redesign.md) -- feature _(plan approved with amendments 2026-08-14; open for implementation)_
 - [#0093 Memoise the wrapped preview body and dirty-flag the redraw loop](docs/tickets/0093-memoise-preview-body-wrap.md) -- perf
 
 ## Next
@@ -22,6 +22,9 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0088 Collapse the three search entry points into one, body search off the UI thread](docs/tickets/0088-unify-search-entry-points.md) -- feature _(cross-ref #0043, #0086)_
 - [#0094 Index the mailbox listing sort and drop the correlated per-row subquery](docs/tickets/0094-mailbox-list-index.md) -- perf
 - [#0096 Expand the header pane with Bcc/Reply-To, an attachment indicator, and bounded scroll](docs/tickets/0096-header-pane-expansion.md) -- feature
+- [#0097 Type a short body in the compose wizard without opening $EDITOR](docs/tickets/0097-compose-wizard-body-field.md) -- feature
+- [#0098 Attach a file to an existing draft from the TUI](docs/tickets/0098-attach-file-to-existing-draft.md) -- feature _(cross-ref #0016)_
+- [#0100 Command palette (fuzzy finder over the KeyAction catalogue)](docs/tickets/0100-command-palette.md) -- feature _(depends on #0092)_
 
 ## Later
 
@@ -31,6 +34,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0085 On-open re-fetch of an evicted body](docs/tickets/0085-on-open-body-refetch.md) -- feature _(the missing half of #0060, whose eviction sweep shipped; required before lowering a cap below the working set)_
 - [#0090 Undo-send hold window before SMTP hand-off](docs/tickets/0090-undo-send-hold-window.md) -- feature _(configurable, default 20 s; sequence after #0089)_
 - [#0091 HTML-to-text rendering through an external tool](docs/tickets/0091-html-to-text-rendering.md) -- feature _(evaluate w3m / lynx / pandoc)_
+- [#0099 Per-account signatures appended on compose and reply](docs/tickets/0099-per-account-signatures.md) -- feature
+- [#0101 Conversation-view collapse and inline navigation on top of the thread view](docs/tickets/0101-conversation-view-collapse-inline-nav.md) -- feature _(cross-ref #0008)_
 - [#0095 One shared tokio runtime instead of a fresh runtime per network action](docs/tickets/0095-shared-tokio-runtime.md) -- chore
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
 

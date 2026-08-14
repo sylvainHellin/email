@@ -3,7 +3,7 @@ id: 0092
 title: Keybinding scheme redesign to an nvim-style mnemonic prefix model
 type: feature
 priority: now
-status: blocked
+status: open
 created: 2026-08-14
 ---
 
@@ -29,8 +29,8 @@ This ticket subsumes the following audit findings, which the redesign must resol
 
 ## Status
 
-Blocked, awaiting review of [docs/plans/keybinding-redesign.md](../plans/keybinding-redesign.md).
-Do not start implementation until that design is reviewed and accepted.
+2026-08-14: the design plan [docs/plans/keybinding-redesign.md](../plans/keybinding-redesign.md) was approved with amendments (family letters swap to `f` search and `s` system, `ca` reply-all, `ga` account switching, command palette confirmed, no legacy map), so this ticket is open for implementation.
+The plan is the design of record; follow its migration order.
 
 ## Cross-references
 
