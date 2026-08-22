@@ -9,7 +9,7 @@ use super::super::images;
 
 use crate::types::EventFrontmatter;
 
-use super::super::app::{App, Focus, MailboxKind};
+use super::super::app::{App, BodyKey, Focus, MailboxKind};
 use super::super::theme;
 use super::util::pane_border_style;
 
@@ -49,23 +49,44 @@ pub(super) fn render_body(app: &mut App, frame: &mut Frame, area: Rect) {
     // The body is not part of the entry: it is loaded from the blob store for
     // the selected message only and memoised in `App::preview_body`, refreshed
     // at the top of the render pass (#0038 scope item 5).
-    let body = app.preview_body.text().replace("{{SIGNATURE}}", "[signature]");
+    //
+    // The wrapped/styled `Vec<Line>` product is memoised too (#0093): before
+    // this, `wrap_and_style_body` re-parsed inline markdown and re-wrapped the
+    // whole body on every frame -- every scroll keystroke and every idle tick.
+    // The cache rebuilds only when the body content, the pane width, or the
+    // inline-image set moved; a scroll then costs one clone of the visible
+    // window instead of an O(body length) re-wrap.
     let inner = block.inner(body_area);
-    let inner_width = inner.width as usize;
-    let mut lines: Vec<Line> = wrap_and_style_body(&body, inner_width);
+    let inner_width = inner.width;
+    let epoch = app.preview_body.epoch();
+    let images_key = app.preview_images.key().clone();
+    if !app.preview_lines.holds(epoch, inner_width, &images_key) {
+        let body = app
+            .preview_body
+            .text()
+            .replace("{{SIGNATURE}}", "[signature]");
+        let mut lines = wrap_and_style_body(&body, inner_width as usize);
+        // Inline images (#0010) are appended to the text flow rather than
+        // spliced into it: html2text gives no stable anchor for the `<img>` it
+        // dropped, so the honest placement is a labelled block at the end of
+        // the body, in message order. Each image contributes a `[image: name]`
+        // line, and on a terminal that can draw pixels the rows it needs after
+        // it, blank, which the graphics pass below paints over. The block is
+        // part of the memoised product, keyed by the same image set.
+        let placements = append_image_block(&app.preview_images, &mut lines, inner_width);
+        app.preview_lines
+            .fill(epoch, inner_width, images_key, lines, placements);
+    }
 
-    // Inline images (#0010) are appended to the text flow rather than spliced
-    // into it: html2text gives no stable anchor for the `<img>` it dropped, so
-    // the honest placement is a labelled block at the end of the body, in
-    // message order. Each image contributes a `[image: name]` line, and on a
-    // terminal that can draw pixels the rows it needs after it, blank, which
-    // the graphics pass below paints over.
-    let placements = append_image_block(&app.preview_images, &mut lines, inner.width);
+    // Render just the scrolled window. The lines are pre-wrapped (one `Line`
+    // per screen row), so slicing here is exactly what `.scroll()` did over the
+    // full vector, at O(visible height) instead of O(body length).
+    let visible = app
+        .preview_lines
+        .visible_slice(app.preview_scroll as usize, inner.height as usize);
+    let placements = app.preview_lines.placements().to_vec();
 
-    let content = Paragraph::new(lines)
-        .block(block)
-        .scroll((app.preview_scroll, 0));
-
+    let content = Paragraph::new(visible).block(block);
     frame.render_widget(content, body_area);
 
     render_inline_images(app, frame, inner, &placements);
@@ -73,10 +94,96 @@ pub(super) fn render_body(app: &mut App, frame: &mut Frame, area: Rect) {
 
 /// Where one inline image landed in the wrapped body: its index into
 /// `app.preview_images` and the body line its first pixel row sits on.
+#[derive(Clone)]
 struct ImagePlacement {
     index: usize,
     line: usize,
     rows: u16,
+}
+
+/// Memoised wrapped/styled preview body (#0093).
+///
+/// [`wrap_and_style_body`] walks the whole body, parses inline markdown and
+/// word-wraps it into one [`Line`] per screen row. Before #0093 that ran on
+/// every frame, so every scroll keystroke and every idle tick re-did O(body
+/// length) work. This slot holds the product (body lines plus the appended
+/// inline-image block) and rebuilds it only when the body content, the pane
+/// width, or the inline-image set changed. Rendering then clones just the
+/// visible window, so a scroll costs O(visible height), not O(body length).
+///
+/// The key is `(body epoch, width, images key)`, all compared in O(1):
+/// - **body content** -- `PreviewBody::epoch` bumps whenever the previewed
+///   text or its identity changes, which covers a selection move, an async
+///   body arrival (`prime_preview_body`), and a re-ingest under the same
+///   cursor (the `mailbox_load_generation` inside the body key moves).
+/// - **width** -- a terminal resize changes `inner_width` and forces a
+///   re-wrap.
+/// - **images** -- two neighbouring messages could share body text but differ
+///   in inline images; the image memo's key discriminates them.
+///
+/// The theme is deliberately *not* part of the key: it is process-global and
+/// fixed once at startup (`theme::init` over a `OnceLock`), so no in-session
+/// change can stale the colors baked into these lines.
+#[derive(Default)]
+pub(crate) struct PreviewLinesCache {
+    epoch: u64,
+    width: u16,
+    images_key: Option<BodyKey>,
+    lines: Vec<Line<'static>>,
+    placements: Vec<ImagePlacement>,
+}
+
+impl PreviewLinesCache {
+    /// True when the cache already answers for this `(epoch, width, images)`
+    /// tuple, so the render pass can skip the re-wrap.
+    pub(crate) fn holds(&self, epoch: u64, width: u16, images_key: &Option<BodyKey>) -> bool {
+        self.epoch == epoch && self.width == width && &self.images_key == images_key
+    }
+
+    /// Replace the cached product wholesale.
+    fn fill(
+        &mut self,
+        epoch: u64,
+        width: u16,
+        images_key: Option<BodyKey>,
+        lines: Vec<Line<'static>>,
+        placements: Vec<ImagePlacement>,
+    ) {
+        self.epoch = epoch;
+        self.width = width;
+        self.images_key = images_key;
+        self.lines = lines;
+        self.placements = placements;
+    }
+
+    fn placements(&self) -> &[ImagePlacement] {
+        &self.placements
+    }
+
+    /// The `height` rows starting at `scroll`, cloned. The lines are
+    /// pre-wrapped, so one line is one row and this is exactly the window
+    /// `Paragraph::scroll` would have shown over the full vector.
+    fn visible_slice(&self, scroll: usize, height: usize) -> Vec<Line<'static>> {
+        let total = self.lines.len();
+        let start = scroll.min(total);
+        let end = start.saturating_add(height).min(total);
+        self.lines[start..end].to_vec()
+    }
+
+    #[cfg(test)]
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    #[cfg(test)]
+    fn cached_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[cfg(test)]
+    fn cached_width(&self) -> u16 {
+        self.width
+    }
 }
 
 /// Append the `[image: name]` lines, and the blank rows a drawable image
@@ -538,7 +645,7 @@ fn parse_list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
-fn wrap_and_style_body<'a>(body: &'a str, width: usize) -> Vec<Line<'a>> {
+fn wrap_and_style_body(body: &str, width: usize) -> Vec<Line<'static>> {
     let mut result: Vec<Line> = Vec::new();
     let mut in_code_block = false;
 
@@ -1032,5 +1139,63 @@ mod inline_image_tests {
         );
         // Scrolled past the top: half of it would be above the pane.
         assert_eq!(placement_rect(&placement, 8, inner), None);
+    }
+}
+/// The wrapped-body memo (#0093): the styled lines are built once per
+/// `(body epoch, width, image set)` and rendered as a scrolled window, so a
+/// scroll or an unrelated keypress no longer re-parses the whole body. What is
+/// testable offline is the wrap product, the cache-key discipline, and the
+/// windowing; all three are here.
+#[cfg(test)]
+mod preview_cache_tests {
+    use super::event_card_tests::line_text;
+    use super::*;
+
+    #[test]
+    fn wrapped_lines_are_owned_and_respect_the_width() {
+        let body = "the quick brown fox jumps over the lazy dog";
+        let lines = wrap_and_style_body(body, 10);
+        assert!(lines.len() > 1, "a long line wraps to several rows");
+        for line in &lines {
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(width <= 10, "row wider than the pane: {width}");
+        }
+    }
+
+    #[test]
+    fn cache_hits_only_on_matching_epoch_width_and_images() {
+        let mut cache = PreviewLinesCache::default();
+        let lines = wrap_and_style_body("hello world", 40);
+        let n = lines.len();
+        cache.fill(7, 40, None, lines, Vec::new());
+
+        assert!(cache.holds(7, 40, &None), "same key hits");
+        assert!(!cache.holds(8, 40, &None), "a new body epoch misses");
+        assert!(!cache.holds(7, 41, &None), "a resize misses");
+        assert_eq!(cache.line_count(), n);
+        assert_eq!(cache.cached_epoch(), 7);
+        assert_eq!(cache.cached_width(), 40);
+    }
+
+    #[test]
+    fn visible_slice_is_the_scrolled_window_and_clamps() {
+        let mut cache = PreviewLinesCache::default();
+        let body = (0..10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = wrap_and_style_body(&body, 40);
+        assert_eq!(lines.len(), 10, "ten short lines, one row each");
+        cache.fill(1, 40, None, lines, Vec::new());
+
+        let window = cache.visible_slice(2, 3);
+        assert_eq!(window.len(), 3);
+        assert_eq!(line_text(&window[0]), "line 2");
+        assert_eq!(line_text(&window[2]), "line 4");
+
+        // Scrolled past the end: an empty window, not a panic.
+        assert!(cache.visible_slice(50, 5).is_empty());
+        // A window taller than what remains is clamped to the remainder.
+        assert_eq!(cache.visible_slice(8, 10).len(), 2);
     }
 }

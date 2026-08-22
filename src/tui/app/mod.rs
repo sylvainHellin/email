@@ -81,6 +81,13 @@ pub struct App {
     /// placeholder lines are built from the same list, so it is filled with
     /// names there too and only the decoded protocol is missing.
     pub(crate) preview_images: crate::tui::images::PreviewImages,
+    /// The wrapped/styled lines behind the preview pane, memoised by
+    /// `(body epoch, pane width, image set)` (#0093). Rebuilt from
+    /// [`App::preview_body`] only when one of those moves, so a scroll or an
+    /// unrelated keypress reuses the parse instead of redoing it. Refreshed
+    /// inside [`crate::tui::ui::preview::render_body`], the one place that
+    /// knows the pane's width.
+    pub(crate) preview_lines: crate::tui::ui::preview::PreviewLinesCache,
     /// Lowercased bodies of the active mailbox, built only while body search
     /// is on. See [`SearchBodies`] for why this is a blob batch read rather
     /// than an FTS query.
@@ -230,6 +237,7 @@ impl App {
             preview_body: PreviewBody::default(),
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
+            preview_lines: Default::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,
@@ -325,6 +333,7 @@ impl App {
             preview_body: PreviewBody::default(),
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
+            preview_lines: Default::default(),
             search_bodies: SearchBodies::default(),
             search_query: String::new(),
             search_includes_body: false,

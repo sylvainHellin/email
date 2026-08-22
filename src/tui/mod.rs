@@ -127,18 +127,38 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
         app.push_action(app::Action::FetchAccount(i));
     }
 
+    // Redraw only when something changed (#0093 §b.7). The loop used to call
+    // `terminal.draw` unconditionally every iteration -- ~4x/s at the 250 ms
+    // idle poll -- rebuilding every widget's content each tick. `dirty` starts
+    // true so the first frame always paints; every branch below that mutates
+    // visible state sets it again. Background updates (watcher events, bg
+    // results, drafts changes) set it too, so an async body arrival or a sync
+    // completion is never swallowed. The spinner keeps a slow tick of its own
+    // while `bg_count > 0`.
+    let mut dirty = true;
     while app.running {
-        terminal.draw(|frame| ui::view(&mut app, frame))?;
+        if dirty {
+            terminal.draw(|frame| ui::view(&mut app, frame))?;
+            dirty = false;
+        }
 
         if let Some(msg) = event::poll_event()? {
             let mut current_msg = Some(msg);
             while let Some(m) = current_msg {
                 current_msg = app.update(m);
             }
+            // Any input -- keypress or resize -- can change what is shown.
+            dirty = true;
         } else {
+            let status_ticks_before = app.status_ticks;
             app.tick_status();
+            if app.status_ticks != status_ticks_before {
+                // A status message expired and cleared itself.
+                dirty = true;
+            }
             if app.bg_count > 0 {
                 app.bg_spin_tick = app.bg_spin_tick.wrapping_add(1);
+                dirty = true;
             }
         }
 
@@ -149,6 +169,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 while let Some(m) = current_msg {
                     current_msg = app.update(m);
                 }
+                dirty = true;
             }
             Ok(WatchEvent::Reconnected { account_index }) => {
                 let acct_name = app.accounts.get(account_index)
@@ -161,6 +182,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 if account_index == app.active_account {
                     app.watcher_active = true;
                 }
+                dirty = true;
             }
             Ok(WatchEvent::Error { account_index, message }) => {
                 let acct_name = app.accounts.get(account_index)
@@ -173,19 +195,35 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 if account_index == app.active_account {
                     app.watcher_active = false;
                 }
+                dirty = true;
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
+                // The watch_tx original is held by this function, so this arm
+                // is effectively unreachable during the run; guard the redraw
+                // on a real state change anyway so it cannot spin.
+                let was_active =
+                    app.watcher_active || app.accounts.iter().any(|a| a.watcher_active);
                 for acct in &mut app.accounts {
                     acct.watcher_active = false;
                 }
                 app.watcher_active = false;
+                if was_active {
+                    dirty = true;
+                }
             }
         }
 
-        // Check background task results (drain all available)
+        // Check background task results (drain all available). These carry the
+        // async work the UI parked -- sync completion, a body/invite/image
+        // arrival -- so every drained result forces a redraw (#0093).
+        let mut got_bg_result = false;
         while let Ok(result) = bg_rx.try_recv() {
             bg::handle_bg_result(&mut app, result);
+            got_bg_result = true;
+        }
+        if got_bg_result {
+            dirty = true;
         }
 
         // The drafts directory, scanned once a second (#0050). The fingerprint
@@ -214,6 +252,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                     }
                 }
                 app.recount_all_mailboxes();
+                // A drafts change reindexed and possibly reloaded the list.
+                dirty = true;
             }
         }
 
@@ -229,9 +269,15 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             }
         }
 
-        // Process pending actions (drain queue so user actions are never lost)
+        // Process pending actions (drain queue so user actions are never lost).
+        // Handling one mutates state or spawns background work, both of which
+        // need a repaint.
+        let had_actions = !app.pending_actions.is_empty();
         while let Some(action) = app.pending_actions.pop_front() {
             actions::handle_action(&mut app, terminal, action, &bg_tx)?;
+        }
+        if had_actions {
+            dirty = true;
         }
     }
 

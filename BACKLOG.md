@@ -12,7 +12,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 - [#0089 Send the current draft in place, approve and send in one confirmed step](docs/tickets/0089-send-current-draft-approve-and-send.md) -- feature
 - [#0092 Keybinding scheme redesign to an nvim-style mnemonic prefix model](docs/tickets/0092-keybinding-scheme-redesign.md) -- feature _(plan approved with amendments 2026-08-14; open for implementation)_
-- [#0093 Memoise the wrapped preview body and dirty-flag the redraw loop](docs/tickets/0093-memoise-preview-body-wrap.md) -- perf
 
 ## Next
 

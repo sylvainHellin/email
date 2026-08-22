@@ -8,7 +8,7 @@ mod golden_frames;
 mod headers;
 mod list;
 mod overlays;
-mod preview;
+pub(crate) mod preview;
 mod search;
 mod sidebar;
 mod status;

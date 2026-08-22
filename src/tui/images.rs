@@ -204,6 +204,13 @@ impl PreviewImages {
         &self.key == key
     }
 
+    /// The selection this memo currently answers for. The wrapped-line cache
+    /// folds it into its own key so a message whose body text is identical to
+    /// its neighbour's but whose inline images differ still rebuilds.
+    pub(crate) fn key(&self) -> &Option<BodyKey> {
+        &self.key
+    }
+
     /// Park `images` as the inline images for `key`.
     pub(crate) fn fill(&mut self, key: Option<BodyKey>, images: Vec<PreviewImage>) {
         self.key = key;

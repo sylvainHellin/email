@@ -523,6 +523,14 @@ pub(crate) type BodyKey = (usize, EntryKey, u64);
 pub struct PreviewBody {
     key: Option<BodyKey>,
     text: String,
+    /// Monotonic stamp of the *content*, bumped by [`Self::fill`] only when the
+    /// key or the text actually changes. The wrapped-line memo
+    /// ([`crate::tui::ui::preview::PreviewLinesCache`]) keys on this so it can
+    /// decide a cache hit in O(1) instead of re-comparing the whole body
+    /// string every frame. The skip-draft and primed paths refill the same
+    /// text every frame; a plain compare here keeps the stamp (and so the
+    /// wrapped lines) stable across those frames.
+    epoch: u64,
 }
 
 impl PreviewBody {
@@ -531,13 +539,24 @@ impl PreviewBody {
         &self.text
     }
 
+    /// The content stamp, bumped whenever the body or its key changes. The
+    /// wrapped-line memo pairs this with the pane width to detect a rebuild.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// True when the memo already answers for `key`.
     pub(crate) fn holds(&self, key: &Option<BodyKey>) -> bool {
         &self.key == key
     }
 
-    /// Park `text` as the body for `key`.
+    /// Park `text` as the body for `key`, bumping the content stamp when either
+    /// the key or the text moved. Called every frame on the skip-draft and
+    /// primed paths, so it must not bump on an unchanged refill.
     pub(crate) fn fill(&mut self, key: Option<BodyKey>, text: String) {
+        if self.key != key || self.text != text {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
         self.key = key;
         self.text = text;
     }
@@ -1835,6 +1854,33 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // PreviewBody content stamp (#0093)
+    // -----------------------------------------------------------------------
+
+    /// The wrapped-line memo keys on this stamp, so it must move exactly when
+    /// the shown content moves and hold still on an unchanged refill (the
+    /// skip-draft and primed paths refill the same text every frame).
+    #[test]
+    fn preview_body_epoch_bumps_on_change_and_holds_on_refill() {
+        let mut pb = PreviewBody::default();
+        let start = pb.epoch();
+
+        // A new body bumps the stamp.
+        pb.fill(None, "hello".to_string());
+        let after_first = pb.epoch();
+        assert_ne!(after_first, start, "first fill must bump");
+
+        // Refilling the identical (key, text) must not bump: this is the
+        // every-frame skip-draft/primed case.
+        pb.fill(None, "hello".to_string());
+        assert_eq!(pb.epoch(), after_first, "unchanged refill holds the stamp");
+
+        // Different text bumps.
+        pb.fill(None, "world".to_string());
+        assert_ne!(pb.epoch(), after_first, "changed text bumps");
+    }
 
     // -----------------------------------------------------------------------
     // Search form -> AST (#0086b)

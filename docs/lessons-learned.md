@@ -910,3 +910,31 @@ cargo's feature unification then gives `ratatui-image` exactly those decoders.
 Note that `cargo add` *merges* features into an existing dependency line rather
 than replacing them, so removing `image-defaults` meant editing `Cargo.toml` by
 hand.
+
+## Memoising the preview body: the `Vec<Line>` was already owned
+
+`wrap_and_style_body` was typed `fn(&'a str) -> Vec<Line<'a>>`, which read as if
+the styled lines borrowed the body. They do not: every span is built from an
+owned `String` (`to_string`, `format!`, `word_wrap`'s output, and
+`parse_inline_markdown`'s `Vec<Span<'static>>`). The `'a` was cosmetic, so
+memoising the product across frames (#0093) needed only the return type widened
+to `Vec<Line<'static>>`, no ownership rework.
+
+Two more traps for that cache. (1) Key it in O(1) or the compare is the cost you
+were removing: comparing the whole body `String` every frame is itself O(body
+length), so `PreviewBody` got a content `epoch` that bumps only on a real
+change, and the cache keys on `(epoch, width, image set)`. The skip-draft and
+primed paths refill the same text every frame, so the bump has to be gated on an
+actual `(key, text)` change or the epoch churns and the cache never hits. (2)
+Theme is not a cache key: it is set once at startup through a `OnceLock`
+(`theme::init`) with no in-session switch, so the colors baked into the cached
+lines can never go stale. If a runtime theme toggle is ever added, it must
+invalidate this cache (and the invite/image memos, which also bake theme
+colors).
+
+The dirty-flag redraw (same ticket) has one non-obvious safety point: the
+`watch_rx` `Disconnected` arm re-runs every iteration once it fires (the
+receiver keeps yielding `Disconnected`), so marking the frame dirty there
+unconditionally would spin the redraw at full speed. Guard it on an actual
+`watcher_active` transition. In practice the arm is unreachable because
+`run_loop` still holds the original `watch_tx`.

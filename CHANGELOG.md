@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+- **The preview body is wrapped once, not every frame (#0093).** Parsing the
+  inline markdown and word-wrapping the whole message into styled lines used to
+  run on every render, so every scroll keystroke and every idle tick redid work
+  proportional to the body length. The styled lines are now memoised, keyed by
+  the body content, the pane width and the inline-image set, and only the
+  scrolled window is rendered, so a scroll costs the visible height rather than
+  the whole body. The cache rebuilds on a selection move, an async body
+  arrival, a re-ingest under the cursor, and a terminal resize.
+- **The TUI redraws only when something changed (#0093).** The event loop
+  called `terminal.draw` on every iteration, roughly four times a second at
+  idle, rebuilding all widget content each tick. It now tracks a dirty flag and
+  skips the draw when nothing moved; input, resize, watcher events, background
+  results and drafts changes all mark the frame dirty, and the busy spinner
+  keeps its own slow tick, so idle CPU drops toward zero without stalling any
+  background update.
+
 ### Added
 - **Folder entries in `attachments:`.**
   A draft's `attachments:` frontmatter now accepts a directory path, not only individual files.
