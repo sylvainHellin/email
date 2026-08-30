@@ -38,6 +38,17 @@ jobs:
           if ! [ -s /tmp/notes.md ]; then
             echo "::warning::No '## [$version]' section in CHANGELOG.md; release notes will be empty."
           fi
+          # GitHub caps release bodies at 125000 characters; truncate at a
+          # line boundary and point at the changelog for the rest.
+          max=120000
+          if [ "$(wc -c < /tmp/notes.md)" -gt "$max" ]; then
+            awk -v max="$max" '{ total += length($0) + 1; if (total > max) exit; print }' \
+              /tmp/notes.md > /tmp/notes-truncated.md
+            printf '\n*Notes truncated; see [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md) for the full section.*\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> /tmp/notes-truncated.md
+            mv /tmp/notes-truncated.md /tmp/notes.md
+            echo "::warning::Release notes exceeded ${max} characters and were truncated."
+          fi
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
