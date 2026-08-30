@@ -452,6 +452,17 @@ All notable changes to this project are documented in this file.
   IMAP/Graph parity half of #0059 stays parked with the Graph backend itself.
 
 ### Fixed
+- **The literal `{{SIGNATURE}}` marker no longer rides along in a message's
+  `text/plain` part (#0102).** The plain-text alternative of a sent reply or
+  forward was `body_markdown` verbatim, and nothing replaced the
+  `{{SIGNATURE}}` placeholder there: only the HTML path consumed it and the TUI
+  preview substituted it for display, so a recipient whose client rendered the
+  plain part saw the literal `{{SIGNATURE}}` mid-message. Pre-existing before
+  #0099 and masked because most clients prefer the HTML part. The plain part is
+  now built by dropping the marker and collapsing the blank lines it padded down
+  to a single paragraph break, on both the ordinary send and the invite plain
+  part; the signature text itself, spliced into the body at draft time (#0099),
+  stays, and the HTML splice behaviour is unchanged.
 - **A hand-written numeric `id:` in a draft is rejected loudly instead of
   silently re-identifying the draft (#0083).** `id: 123e456` or
   `id: 1234567890123456` typed into frontmatter by `$EDITOR` or an agent is a

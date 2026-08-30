@@ -222,6 +222,36 @@ blockquote {{ margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; 
     )
 }
 
+/// Strip the `{{SIGNATURE}}` marker out of a plain-text body (#0102).
+///
+/// Since #0099 the signature Markdown is spliced into the draft body at
+/// creation time and a bare `{{SIGNATURE}}` marker is left where the HTML send
+/// path splices the rich-HTML quote (`draft.rs`). The HTML build consumes that
+/// marker (`markdown_to_html`) and the TUI preview substitutes it for display
+/// (`tui/ui/preview.rs`), but the `text/plain` alternative shipped
+/// `body_markdown` verbatim, so a recipient reading the plain part saw the
+/// literal `{{SIGNATURE}}` mid-message. Drop the marker and collapse the blank
+/// lines it padded down to a single paragraph break so the plain text reads
+/// naturally and no double blank line is left where it stood.
+fn strip_signature_marker(body: &str) -> String {
+    const MARKER: &str = "{{SIGNATURE}}";
+    let mut out = body.to_string();
+    while let Some(idx) = out.find(MARKER) {
+        let before = out[..idx].trim_end_matches(char::is_whitespace).to_string();
+        let after = out[idx + MARKER.len()..]
+            .trim_start_matches(char::is_whitespace)
+            .to_string();
+        out = if before.is_empty() {
+            after
+        } else if after.is_empty() {
+            format!("{before}\n")
+        } else {
+            format!("{before}\n\n{after}")
+        };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +709,76 @@ mod tests {
             .parse()
             .expect("the stored from address parses on the submission path");
         assert_eq!(mailbox.email.to_string(), "jane@example.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_signature_marker (#0102)
+    // -----------------------------------------------------------------------
+
+    /// The marker is consumed by the HTML path and substituted in the TUI
+    /// preview, but the `text/plain` alternative used to ship it verbatim. It
+    /// must leave no trace, and the blank lines it padded collapse to a single
+    /// paragraph break rather than a double one.
+    #[test]
+    fn strip_signature_marker_collapses_the_blank_lines_it_padded() {
+        let body = "My reply\n\n-- \nBest, Alice\n\n{{SIGNATURE}}\n\nOn Mon wrote:\n> Quoted";
+        let plain = strip_signature_marker(body);
+        assert!(!plain.contains("{{SIGNATURE}}"), "marker survived: {plain:?}");
+        // The signature Markdown (spliced in at draft time, #0099) stays; only
+        // the marker and its padding go.
+        assert_eq!(
+            plain,
+            "My reply\n\n-- \nBest, Alice\n\nOn Mon wrote:\n> Quoted"
+        );
+        assert!(!plain.contains("\n\n\n"), "double blank line left behind: {plain:?}");
+    }
+
+    /// A body with no marker is returned untouched, so the non-reply send
+    /// paths keep byte-for-byte identical plain text.
+    #[test]
+    fn strip_signature_marker_is_a_no_op_without_the_marker() {
+        let body = "Just a plain note.\n\nSecond paragraph.\n";
+        assert_eq!(strip_signature_marker(body), body);
+    }
+
+    /// The reply/forward plain part built by `build_draft_message` carries no
+    /// `{{SIGNATURE}}` literal, on either the SMTP body or the invite path,
+    /// while the reply text and the quoted original still ride along.
+    #[test]
+    fn a_sent_reply_plain_part_carries_no_signature_marker() {
+        let mut draft = draft_with(Some("reply-marker"), "/drafts/reply.md");
+        draft.body_markdown =
+            "My reply\n\n\n-- \nBest, Alice\n\n{{SIGNATURE}}\n\nOn Mon, Alice wrote:\n> Original text"
+                .to_string();
+
+        // Non-invite path.
+        let built = build_draft_message(
+            &draft,
+            "fallback@example.com",
+            &EmailSettings::default(),
+            None,
+            None,
+        )
+        .expect("the reply draft builds");
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(!raw.contains("{{SIGNATURE}}"), "marker leaked into the message bytes");
+        assert!(raw.contains("My reply"), "reply text missing from the message");
+        assert!(raw.contains("Original text"), "quoted text missing from the message");
+
+        // Invite path: the same body feeds the invite alternative's plain part.
+        let invited = build_draft_message(
+            &draft,
+            "fallback@example.com",
+            &EmailSettings::default(),
+            None,
+            Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"),
+        )
+        .expect("the invite reply draft builds");
+        let invited_raw = String::from_utf8_lossy(&invited.raw);
+        assert!(
+            !invited_raw.contains("{{SIGNATURE}}"),
+            "marker leaked into the invite message bytes"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2375,7 +2475,7 @@ pub fn build_draft_message(
         .singlepart(
             SinglePart::builder()
                 .header(ContentType::TEXT_PLAIN)
-                .body(draft.body_markdown.clone()),
+                .body(strip_signature_marker(&draft.body_markdown)),
         )
         .singlepart(
             SinglePart::builder()
@@ -2387,7 +2487,8 @@ pub fn build_draft_message(
     let message = if let Some(ics) = invite_ics {
         // Invite path: multipart/mixed [ alternative(plain, html, calendar),
         // application/ics ]; regular file attachments (if any) follow.
-        let mut mixed = build_invite_mime_body(&draft.body_markdown, body_html, ics);
+        let mut mixed =
+            build_invite_mime_body(&strip_signature_marker(&draft.body_markdown), body_html, ics);
         if let Some(attachments) = &draft.frontmatter.attachments {
             for path in resolve_attachment_paths(attachments)? {
                 let (filename, file_content, content_type) = read_attachment(&path)?;
