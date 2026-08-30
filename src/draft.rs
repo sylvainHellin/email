@@ -731,6 +731,111 @@ pub fn rewrite_draft_recipients(path: &Path, edit: &DraftRecipientEdit) -> Resul
     Ok(())
 }
 
+/// Append `entry` to the `attachments:` list of a draft's frontmatter in
+/// place, preserving the body and every other frontmatter field
+/// byte-for-byte (#0098).
+///
+/// A bare or already-populated top-level `attachments:` key gains one more
+/// `  - "<entry>"` item after its last existing item; a draft with no
+/// `attachments:` key at all gains the key and the item just before the
+/// closing fence. `entry` is stored double-quoted and escaped exactly as the
+/// forward builder writes attachment paths, so a `~`-relative path survives
+/// verbatim to be expanded by [`crate::send`]'s `resolve_attachment_paths` at
+/// send time -- the same entry a hand-edit would have produced.
+///
+/// The file must begin with a `---` fence and contain a closing `---`; a
+/// malformed frontmatter is rejected without a write, the same guard
+/// [`rewrite_draft_recipients`] applies (the file is only written on success).
+pub fn append_draft_attachment(path: &Path, entry: &str) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let after_open = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow!("No frontmatter found (file does not start with '---')"))?;
+
+    // Split the frontmatter lines from the untouched body, the same way
+    // `rewrite_draft_recipients` does.
+    let mut fm_lines: Vec<String> = Vec::new();
+    let mut body = String::new();
+    let mut closed = false;
+    let mut cursor = 0usize;
+    while cursor < after_open.len() {
+        let rest = &after_open[cursor..];
+        let (line, advance) = match rest.find('\n') {
+            Some(nl) => (&rest[..nl], nl + 1),
+            None => (rest, rest.len()),
+        };
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed == "---" {
+            closed = true;
+            body = after_open[cursor + advance..].to_string();
+            break;
+        }
+        fm_lines.push(trimmed.to_string());
+        cursor += advance;
+    }
+    if !closed {
+        return Err(anyhow!("Malformed frontmatter: no closing '---' fence"));
+    }
+
+    let item = format!("  - {}", yaml_dq_escape(entry));
+
+    // The top-level `attachments:` key, if any. An indented line is a
+    // continuation (one of the list items) and is never matched as the key.
+    let key_idx = fm_lines.iter().position(|line| {
+        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        is_top_level && line.starts_with("attachments:")
+    });
+
+    match key_idx {
+        Some(key_idx) => {
+            // A flow-style value (`attachments: []`, `attachments: ["/a"]`)
+            // cannot take a block item: inserting `  - "x"` after it would
+            // produce YAML `parse_email_draft` rejects. Drafts are hand- and
+            // agent-edited files, so the shape is reachable; refuse without a
+            // write rather than corrupt the draft.
+            let value = fm_lines[key_idx]["attachments:".len()..].trim();
+            if !value.is_empty() && !value.starts_with('#') {
+                return Err(anyhow!(
+                    "attachments uses an inline value ({value}); edit the draft file to the block list form first"
+                ));
+            }
+            // Insert after the key's existing item block: the run of indented
+            // continuation lines immediately following the key line.
+            let mut insert_at = key_idx + 1;
+            while insert_at < fm_lines.len()
+                && (fm_lines[insert_at].starts_with(' ')
+                    || fm_lines[insert_at].starts_with('\t'))
+            {
+                insert_at += 1;
+            }
+            fm_lines.insert(insert_at, item);
+        }
+        None => {
+            fm_lines.push("attachments:".to_string());
+            fm_lines.push(item);
+        }
+    }
+
+    let mut rebuilt = String::new();
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    for line in fm_lines {
+        rebuilt.push_str(&line);
+        rebuilt.push_str(newline);
+    }
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    rebuilt.push_str(&body);
+
+    write_atomic(path, rebuilt.as_bytes())
+        .with_context(|| format!("Failed to write file: {}", path.display()))?;
+    Ok(())
+}
+
 /// Atomically overwrite `path` by writing to a `.tmp` sibling then renaming
 /// over the destination. Mirrors `secrets::write_secret_file_atomic` minus the
 /// fixed 0600 mode — drafts are plain files, so this preserves the permission
@@ -1905,6 +2010,130 @@ mod tests {
             subject: "S".to_string(),
         };
         let result = rewrite_draft_recipients(&path, &edit);
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    // -- append_draft_attachment (#0098) ---------------------------------
+
+    /// A hand-written flow-style value (`attachments: []`) is refused without
+    /// a write: a block item inserted after it would produce YAML the parser
+    /// rejects, and drafts are hand- and agent-edited files, so the shape is
+    /// reachable.
+    #[test]
+    fn test_append_attachment_refuses_a_flow_style_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("draft.md");
+        let original =
+            "---\nto: a@x.com\nsubject: S\nstatus: draft\nattachments: []\n---\n\nBody.\n";
+        fs::write(&path, original).unwrap();
+
+        let err = append_draft_attachment(&path, "/tmp/a.pdf").unwrap_err();
+        assert!(format!("{err:#}").contains("inline value"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "no write on refusal");
+    }
+
+    /// A bare `attachments:` key (the new-draft skeleton) gains the first item
+    /// under it, and the draft then parses with the attachment listed. The
+    /// body and every other field survive.
+    #[test]
+    fn test_append_attachment_to_a_bare_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("draft.md");
+        let original =
+            "---\nto: a@x.com\nsubject: S\nstatus: draft\nattachments:\n---\n\nBody.\n";
+        fs::write(&path, original).unwrap();
+
+        append_draft_attachment(&path, "~/Documents/report.pdf").unwrap();
+
+        let draft = parse_email_draft(&path).unwrap();
+        assert_eq!(
+            draft.frontmatter.attachments.as_deref(),
+            Some(["~/Documents/report.pdf".to_string()].as_slice())
+        );
+        assert_eq!(draft.body_markdown, "Body.");
+        assert_eq!(draft.frontmatter.subject, "S");
+    }
+
+    /// A second attach appends after the existing item rather than replacing
+    /// it, so both paths reach the send path; the `~` in each is stored
+    /// verbatim for `send` to expand later.
+    #[test]
+    fn test_append_attachment_after_existing_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("draft.md");
+        let original = concat!(
+            "---\n",
+            "to: a@x.com\n",
+            "subject: S\n",
+            "attachments:\n",
+            "  - \"/tmp/one.pdf\"\n",
+            "status: draft\n",
+            "---\n\nBody.\n",
+        );
+        fs::write(&path, original).unwrap();
+
+        append_draft_attachment(&path, "/tmp/two.pdf").unwrap();
+
+        let draft = parse_email_draft(&path).unwrap();
+        assert_eq!(
+            draft.frontmatter.attachments.as_deref(),
+            Some(["/tmp/one.pdf".to_string(), "/tmp/two.pdf".to_string()].as_slice())
+        );
+        // The `status:` key that followed the list is untouched.
+        assert_eq!(draft.frontmatter.status, EmailStatus::Draft);
+        assert_eq!(draft.body_markdown, "Body.");
+    }
+
+    /// A draft with no `attachments:` key at all gains the key and the item
+    /// just before the closing fence.
+    #[test]
+    fn test_append_attachment_adds_the_key_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("draft.md");
+        let original = "---\nto: a@x.com\nsubject: S\nstatus: draft\n---\n\nBody.\n";
+        fs::write(&path, original).unwrap();
+
+        append_draft_attachment(&path, "/tmp/one.pdf").unwrap();
+
+        let draft = parse_email_draft(&path).unwrap();
+        assert_eq!(
+            draft.frontmatter.attachments.as_deref(),
+            Some(["/tmp/one.pdf".to_string()].as_slice())
+        );
+        assert_eq!(draft.frontmatter.to.as_deref(), Some("a@x.com"));
+        assert_eq!(draft.body_markdown, "Body.");
+    }
+
+    /// A path with a double-quote is escaped, so the YAML stays parseable and
+    /// the entry round-trips byte-for-byte.
+    #[test]
+    fn test_append_attachment_escapes_quotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("draft.md");
+        let original =
+            "---\nto: a@x.com\nsubject: S\nstatus: draft\nattachments:\n---\n\nBody.\n";
+        fs::write(&path, original).unwrap();
+
+        append_draft_attachment(&path, "/tmp/wei\"rd.pdf").unwrap();
+
+        let draft = parse_email_draft(&path).unwrap();
+        assert_eq!(
+            draft.frontmatter.attachments.as_deref(),
+            Some(["/tmp/wei\"rd.pdf".to_string()].as_slice())
+        );
+    }
+
+    /// Malformed frontmatter is rejected without a write (the file is only
+    /// written on the success path), the same guard the recipient rewrite has.
+    #[test]
+    fn test_append_attachment_errors_on_missing_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nofm.md");
+        let original = "no frontmatter here\n";
+        fs::write(&path, original).unwrap();
+
+        let result = append_draft_attachment(&path, "/tmp/one.pdf");
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

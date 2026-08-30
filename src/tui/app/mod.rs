@@ -126,6 +126,15 @@ pub struct App {
     /// `Some` means armed, and the key handler and the list renderer both
     /// read exactly that.
     pub jump_date_input: Option<String>,
+    /// The attach-file prompt's buffer while it is armed, `None` when it is not
+    /// (#0098).
+    ///
+    /// The same one-`Option` state machine as [`Self::jump_date_input`]: it
+    /// borrows the search slot's one-line input while the user types a path,
+    /// takes the keyboard until Enter or Esc, and changes nothing about which
+    /// pane is focused. `Some` means armed; the key handler and the list
+    /// renderer both read exactly that.
+    pub attach_file_input: Option<String>,
     pub watcher_active: bool,
     pub imap_config: Option<crate::config::ImapConfig>,
     pub smtp_config: Option<crate::config::SmtpConfig>,
@@ -247,6 +256,7 @@ impl App {
             flagged_only: false,
             zoomed: false,
             jump_date_input: None,
+            attach_file_input: None,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,
@@ -340,6 +350,7 @@ impl App {
             flagged_only: false,
             zoomed: false,
             jump_date_input: None,
+            attach_file_input: None,
             watcher_active: false,
             imap_config: None,
             smtp_config: None,

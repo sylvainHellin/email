@@ -1585,6 +1585,14 @@ pub enum Action {
     OpenEventSource {
         msg: MessageRef,
     },
+    /// Append a file path to the cursor draft's `attachments:` frontmatter
+    /// (#0098). Carries the raw path the user typed at the attach prompt; the
+    /// handler resolves the cursor draft, appends the entry, and refreshes the
+    /// drafts index. The path's existence was already checked at the prompt,
+    /// so what reaches here is a path that was on disk when Enter was pressed.
+    AttachFileToDraft {
+        path: String,
+    },
 }
 
 /// Which destructive action a confirmation dialog is guarding.

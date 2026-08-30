@@ -183,6 +183,35 @@ fn draft_attachment_files(app: &mut App) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
+/// Append a file path to the cursor draft's `attachments:` frontmatter (#0098).
+///
+/// The write counterpart of [`draft_attachment_files`] (#0016): where that
+/// resolves and opens the paths a draft already lists, this adds one. It
+/// reuses the same [`cursor_draft`] resolution, so the file it writes is the
+/// draft under the cursor, and it stores the path verbatim -- `~` and all --
+/// so the entry is the very one [`crate::send`]'s `draft_attachments` expands
+/// and sends. The path was checked for existence at the prompt (see
+/// `App::handle_attach_file_key`), which is where a stale path is surfaced;
+/// a write failure here is named on the status line.
+fn attach_file_to_draft(app: &mut App, path: &str) {
+    let Some((id, draft_path)) = cursor_draft(
+        app,
+        "Attach needs a draft; received mail has no attachments to grow",
+    ) else {
+        return;
+    };
+    match crate::draft::append_draft_attachment(&draft_path, path) {
+        Ok(()) => {
+            let selector = Selector::for_draft(&app.account_config.name, &id);
+            app.set_status(format!("Attached {path} to {selector}"));
+            refresh_drafts_after_flip(app);
+        }
+        Err(e) => {
+            app.set_status_level(format!("Attach failed: {e:#}"), StatusLevel::Error);
+        }
+    }
+}
+
 /// [`cursor_attachment_files`] for a row named directly, which is the
 /// server-search hit that resolved to one.
 pub(super) fn row_attachment_files(app: &mut App, row_id: i64) -> Option<Vec<PathBuf>> {
@@ -1984,6 +2013,9 @@ pub(super) fn handle_action(
                     app.set_status_level(format!("Open failed: {e}"), StatusLevel::Error)
                 }
             }
+        }
+        Action::AttachFileToDraft { path } => {
+            attach_file_to_draft(app, &path);
         }
         Action::ComposeWizardCancel => {
             app.close_overlay();

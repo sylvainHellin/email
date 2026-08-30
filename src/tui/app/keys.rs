@@ -46,6 +46,13 @@ impl App {
             return self.handle_jump_date_key(key);
         }
 
+        // Attach-file input (#0098): armed by `t a` on a Drafts row, it owns
+        // the keyboard until Enter or Esc, the same hand-dispatched shape as
+        // the jump-to-date prompt above.
+        if self.attach_file_input.is_some() {
+            return self.handle_attach_file_key(key);
+        }
+
         // Contacts view fuzzy-search input (#0033): free-text, hand-dispatched
         // like the metadata-search input, once armed by `/`.
         if self.view == super::View::Contacts && self.contacts_view.searching {
@@ -511,6 +518,26 @@ impl App {
                 // Reached only with `g` pending (the leader continuation).
                 self.pending_prefix = None;
                 self.jump_date_input = Some(String::new());
+            }
+            A::AttachFile => {
+                // Catalogued Drafts-only, but resolved everywhere so the miss
+                // shows a hint (the same advisory-guard shape as `ce` edit
+                // recipients). Only a Drafts row has an `attachments:` list to
+                // grow, so arming the prompt outside Drafts would be a lie.
+                self.pending_prefix = None;
+                if self.active_kind() == MailboxKind::Drafts {
+                    if self.selected_email().and_then(|e| e.draft_id.as_ref()).is_some() {
+                        self.attach_file_input = Some(String::new());
+                    } else {
+                        self.set_status(
+                            "Attach needs a draft; this row has none".to_string(),
+                        );
+                    }
+                } else {
+                    self.set_status(
+                        "Attach file (t a) is only available in Drafts".to_string(),
+                    );
+                }
             }
             A::OpenEditor => {
                 self.pending_prefix = None;
@@ -2262,6 +2289,60 @@ impl App {
             }
             KeyCode::Backspace => {
                 if let Some(buf) = self.jump_date_input.as_mut() {
+                    buf.pop();
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Attach-file input (#0098).
+    ///
+    /// `Enter` resolves the typed path and, when it is on disk, hands it to
+    /// [`Action::AttachFileToDraft`] which appends it to the cursor draft's
+    /// `attachments:` frontmatter. A path that does not resolve is named on the
+    /// status line and the prompt stays armed, so a typo costs a correction
+    /// rather than a re-arm -- the same shape the jump-to-date prompt uses.
+    /// `Esc` abandons it, and an empty commit is a silent cancel.
+    ///
+    /// The path is expanded for the existence check the way
+    /// [`crate::send::resolve_attachment_paths`] expands it (`~` to `$HOME`),
+    /// but the raw text the user typed is what is stored, so a portable
+    /// `~`-relative entry survives to be re-expanded at send time.
+    fn handle_attach_file_key(&mut self, key: KeyEvent) -> Option<Message> {
+        match key.code {
+            KeyCode::Enter => {
+                let input = self.attach_file_input.clone().unwrap_or_default();
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    // An empty commit cancels rather than storing a blank entry.
+                    self.attach_file_input = None;
+                    return None;
+                }
+                let expanded = shellexpand::tilde(trimmed).into_owned();
+                if !std::path::Path::new(&expanded).exists() {
+                    self.set_status_level(
+                        format!("No such file: {trimmed}"),
+                        crate::tui::app::StatusLevel::Warning,
+                    );
+                    return None;
+                }
+                self.attach_file_input = None;
+                self.push_action(Action::AttachFileToDraft {
+                    path: trimmed.to_string(),
+                });
+            }
+            KeyCode::Esc => {
+                self.attach_file_input = None;
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = self.attach_file_input.as_mut() {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = self.attach_file_input.as_mut() {
                     buf.pop();
                 }
             }
@@ -4506,6 +4587,96 @@ mod tests {
         assert_eq!(app.list_index, 0, "nothing moved");
         let status = app.status_message.clone().unwrap();
         assert!(status.contains("YYYY-MM-DD"), "{status}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Attach file to a draft (#0098)
+    // -----------------------------------------------------------------------
+
+    /// The Drafts mailbox active with one draft under the cursor and the list
+    /// focused: the surface `t a` (attach) is reachable from.
+    fn app_in_drafts() -> App {
+        let mut app = app_with_mailboxes();
+        app.active_mailbox = 1; // Drafts
+        app.emails = std::sync::Arc::new(vec![draft_entry("draft-1", "Re: report")]);
+        app.email_cache = vec![None, Some(std::sync::Arc::clone(&app.emails)), None, None];
+        app.rebuild_visible();
+        app.list_index = 0;
+        app.focus = Focus::List;
+        app
+    }
+
+    /// `t a` on a Drafts row arms the prompt, typing edits it, an on-disk path
+    /// commits (disarms and queues the append), and a path that is not on disk
+    /// keeps the prompt up with the reason on the status line -- the same
+    /// correction-not-re-arm shape the jump-to-date prompt uses (#0098).
+    #[test]
+    fn the_attach_prompt_is_armed_typed_and_committed_by_the_keyboard() {
+        let mut app = app_in_drafts();
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(app.attach_file_input.as_deref(), Some(""), "the prompt is armed");
+
+        // A path that is not on disk is surfaced, not stored: the prompt stays.
+        for c in "/no/such/file".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.attach_file_input.as_deref(),
+            Some("/no/such/file"),
+            "a missing path keeps the prompt armed"
+        );
+        assert!(app.pending_actions.is_empty(), "nothing was queued");
+        assert!(app.status_message.as_deref().unwrap().contains("No such file"));
+
+        // A path that exists: Enter disarms and queues the append verbatim.
+        let tmp = std::env::temp_dir().join(format!("mp-attach-test-{}.txt", std::process::id()));
+        std::fs::write(&tmp, b"x").unwrap();
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        app.attach_file_input = Some(tmp_str.clone());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.attach_file_input.is_none(), "an on-disk path disarms the prompt");
+        assert!(
+            matches!(
+                app.pending_actions.front(),
+                Some(Action::AttachFileToDraft { path }) if *path == tmp_str
+            ),
+            "the append is queued with the typed path: {:?}",
+            app.pending_actions
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// While the attach prompt is armed it owns the keyboard: `d` types a
+    /// character, it does not delete the draft under the cursor; Esc abandons.
+    #[test]
+    fn the_armed_attach_prompt_swallows_the_keys_that_would_otherwise_act() {
+        let mut app = app_in_drafts();
+        app.attach_file_input = Some(String::new());
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.attach_file_input.as_deref(), Some("d"));
+        assert!(app.pending_actions.is_empty(), "{:?}", app.pending_actions);
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.attach_file_input.is_none(), "Esc abandons the prompt");
+    }
+
+    /// Attach is Drafts-only: pressed in a received-mail mailbox it arms
+    /// nothing and says why (the advisory-guard shape `ce` edit recipients
+    /// uses), so `t a` never grows a non-existent `attachments:` list (#0098).
+    #[test]
+    fn attach_is_refused_outside_drafts() {
+        let mut app = app_with_mailboxes(); // Inbox active, received mail
+        app.focus = Focus::List;
+        app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.attach_file_input.is_none(), "no prompt outside Drafts");
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("only available in Drafts"));
     }
 
     // -----------------------------------------------------------------------

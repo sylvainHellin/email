@@ -1,6 +1,5 @@
 ---
 source: src/tui/ui/golden_frames.rs
-assertion_line: 698
 expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 ---
 == text 120x40 (trailing spaces trimmed) ==
@@ -42,7 +41,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 35 |╭ View ────────────────────────────│  y           Copy selector (mp://)             │                                  │
 36 |│     mail  |  contacts  |  calenda│  Esc         Clear selection / return to list  │                                  │
 37 |╰──────────────────────────────────│  gj / gk     Next / previous message           │──────────────────────────────────╯
-38 | HELP                              ╰─────────────────── 1-36/103 ───────────────────╯
+38 | HELP                              ╰─────────────────── 1-36/104 ───────────────────╯
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 02 |bold@36..44

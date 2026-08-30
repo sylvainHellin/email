@@ -272,6 +272,9 @@ pub enum KeyAction {
     ToggleSelect,
     SelectAllVisible,
     ClearSelection,
+    /// Leader `t a`: prompt for a file path and append it to the cursor
+    /// draft's `attachments:` frontmatter (#0098). Drafts-only.
+    AttachFile,
     OpenEditor,
     Reply,
     ReplyAll,
@@ -642,6 +645,9 @@ pub static KEYMAP: &[KeyBinding] = &[
     bg("Ctrl+a", Chord::CtrlChar('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SelectAllVisible, "Select all visible", false),
     // `ce` edit recipients, Drafts only (the compose family's list-scoped tail).
     pg("ce", Chord::Char('e'), 'c', KeyCtx::List, Guard::DraftsOnly, KeyAction::EditRecipients, "Edit recipients (Drafts only)", false),
+    // `ta` attach-file, Drafts only (the thread/attachment family's list tail,
+    // #0098): prompts for a path and appends it to the draft's `attachments:`.
+    pg("ta", Chord::Char('a'), 't', KeyCtx::List, Guard::DraftsOnly, KeyAction::AttachFile, "Attach file to draft (Drafts only)", false),
     // `fF` flagged-only filter (the find family's list-scoped tail). No
     // NonEmptyList guard: the filter can empty the list and must be able to
     // undo that.

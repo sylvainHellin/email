@@ -688,6 +688,19 @@ fn golden_drafts_view_with_a_parse_skip() {
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
+/// The attach-file prompt armed on a Drafts row (#0098): the `attach:` input
+/// row the list pane borrows from the search slot, with the typed path and the
+/// block cursor, over the unfiltered Drafts list. The same one-line borrow the
+/// jump-to-date prompt uses, only the prefix and the mailbox differ.
+#[test]
+fn golden_drafts_view_attach_prompt() {
+    let mut app = drafts_fixture();
+    // Cursor on the readable draft below the parse-skip row.
+    app.list_index = 1;
+    app.attach_file_input = Some("~/Documents/report.pdf".to_string());
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
 /// The help overlay floating over the dimmed mail view. Rendered straight
 /// through `ui::view` with `Overlay::Help` set, exactly as the event loop
 /// leaves the state after `?`; no event loop is needed.

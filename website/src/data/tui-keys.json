@@ -67,6 +67,7 @@
       { "key": "v", "action": "Toggle selection" },
       { "key": "Ctrl+a", "action": "Select all visible" },
       { "key": "ce", "action": "Edit recipients (Drafts only)" },
+      { "key": "ta", "action": "Attach file to draft (Drafts only)" },
       { "key": "fF", "action": "Show flagged only (toggle)" }
     ]
   },
