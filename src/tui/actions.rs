@@ -1122,8 +1122,8 @@ pub(super) fn handle_action(
             app.set_status_level("Sending...".to_string(), StatusLevel::Progress);
             let tx = bg_tx.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                let result = send_one_draft(&rt, &draft, &ctx).and_then(|r| send_status_line(&r));
+                let rt = super::runtime::shared();
+                let result = send_one_draft(rt, &draft, &ctx).and_then(|r| send_status_line(&r));
                 let _ = tx.send(BgResult::Send {
                     account_index: acct_idx,
                     result: result.map_err(|e| format!("{e:#}")),
@@ -1177,8 +1177,7 @@ pub(super) fn handle_action(
             );
             let tx = bg_tx.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("failed to create tokio runtime");
+                let rt = super::runtime::shared();
                 let result = (|| -> anyhow::Result<String> {
                     let outcome = rt.block_on(crate::send::send_rsvp(
                         &ics,
@@ -1251,7 +1250,7 @@ pub(super) fn handle_action(
             let acct_idx = app.active_account;
             let tx = bg_tx.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                let rt = super::runtime::shared();
                 let result = (|| -> anyhow::Result<String> {
                     let drafts = find_drafts(&dir, Some(EmailStatus::Approved))?;
                     if drafts.is_empty() {
@@ -1640,7 +1639,7 @@ pub(super) fn handle_action(
                 app.set_status_level("Quick sync (Graph)...".to_string(), StatusLevel::Progress);
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let sync_result =
                         rt.block_on(lib_do_sync_graph(&account_config, &graph_config, 100));
                     let (result, new_inbox_mail) = match sync_result {
@@ -1668,7 +1667,7 @@ pub(super) fn handle_action(
                 app.set_status_level("Quick sync...".to_string(), StatusLevel::Progress);
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let sync_result = rt.block_on(super::helpers::lib_do_sync(
                         &account_config,
                         &imap_config,
@@ -1739,8 +1738,7 @@ pub(super) fn handle_action(
                     StatusLevel::Progress,
                 );
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("failed to create tokio runtime");
+                    let rt = super::runtime::shared();
                     let sync_result =
                         rt.block_on(lib_do_sync_graph(&account_config, &graph_config, 100));
                     let (result, new_inbox_mail) = match sync_result {
@@ -1764,8 +1762,7 @@ pub(super) fn handle_action(
                     StatusLevel::Progress,
                 );
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("failed to create tokio runtime");
+                    let rt = super::runtime::shared();
                     let sync_result = rt.block_on(super::helpers::lib_do_sync(
                         &account_config,
                         &imap_config,
@@ -1797,7 +1794,7 @@ pub(super) fn handle_action(
                 let graph_config = app.graph_config.clone().unwrap();
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let result = rt.block_on(lib_do_multi_search_graph(
                         &account,
                         &graph_config,
@@ -1824,7 +1821,7 @@ pub(super) fn handle_action(
                 };
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let result = rt.block_on(super::helpers::lib_do_multi_search(
                         &account,
                         &imap_config,
@@ -1864,7 +1861,7 @@ pub(super) fn handle_action(
                 );
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let result = rt
                         .block_on(lib_do_sync_graph(&account_config, &graph_config, usize::MAX))
                         .map(|(msg, _meta)| msg)
@@ -1889,7 +1886,7 @@ pub(super) fn handle_action(
                 app.set_status_level("Full sync...".to_string(), StatusLevel::Progress);
                 std::thread::spawn(move || {
                     let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        super::runtime::shared();
                     let result = rt
                         .block_on(super::helpers::lib_do_sync(
                             &account_config,

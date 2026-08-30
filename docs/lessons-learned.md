@@ -938,3 +938,19 @@ receiver keeps yielding `Disconnected`), so marking the frame dirty there
 unconditionally would spin the redraw at full speed. Guard it on an actual
 `watcher_active` transition. In practice the arm is unreachable because
 `run_loop` still holds the original `watch_tx`.
+
+A single shared tokio runtime (#0095) is safe to `block_on` from many threads at
+once, but only because it is multi-thread. `Runtime::block_on` takes `&self`, so
+the background action threads and the two watcher threads can each drive their
+own future on their own OS thread concurrently, using the one shared worker pool
+and reactor. A `new_current_thread` runtime would not serve this: only one
+thread can drive a current-thread scheduler at a time, so concurrent `block_on`
+calls contend and spawned tasks can stall until their originating thread drives
+again. The nesting panic ("Cannot start a runtime from within the context of
+another runtime") never triggers here because every site runs on a plain
+`std::thread::spawn` (or watcher) thread, never a tokio worker thread and never
+already inside a `block_on`; `oauth2.rs` and `config_cmd/helpers.rs` guard the
+genuinely nested cases themselves with `Handle::try_current()`. The runtime is a
+`static LazyLock` and is never dropped: nothing relied on per-op runtime teardown
+for cleanup (IMAP sockets live on async-std's global reactor and the pooled
+session cache; SMTP/Graph close when their futures complete).

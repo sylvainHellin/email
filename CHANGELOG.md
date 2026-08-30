@@ -30,6 +30,15 @@ All notable changes to this project are documented in this file.
   switch or a reload is one index scan with no temp sort. The listing content
   is unchanged; the schema version bumps to 7, which rebuilds existing stores
   from their cache on the next open.
+- **Network actions share one tokio runtime instead of building a fresh one
+  each (#0095).** Every background sync, send and search, plus the IMAP and
+  Graph watcher threads, used to call `tokio::runtime::Runtime::new()` on their
+  own thread and tear the whole runtime down when the op finished, spinning up
+  a worker thread per core and a blocking pool every time. They now `block_on`
+  a single lazily-built multi-thread runtime that lives for the process, so an
+  action pays the work and not the thread-pool churn. Blocking semantics are
+  unchanged: each call still blocks its own OS thread, and no path nests one
+  runtime inside another.
 
 ### Added
 - **Folder entries in `attachments:`.**

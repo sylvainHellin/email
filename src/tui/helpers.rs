@@ -47,16 +47,7 @@ pub(super) fn watcher_loop(
     const BASE_BACKOFF_SECS: u64 = 30;
     const MAX_BACKOFF_SECS: u64 = 300;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => {
-            let _ = tx.send(WatchEvent::Error {
-                account_index,
-                message: "Failed to create async runtime".into(),
-            });
-            return;
-        }
-    };
+    let rt = super::runtime::shared();
 
     let mut consecutive_failures: u32 = 0;
 
@@ -131,16 +122,7 @@ pub(super) fn graph_watcher_loop(
 ) {
     use std::collections::HashSet;
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => {
-            let _ = tx.send(WatchEvent::Error {
-                account_index,
-                message: "Failed to create async runtime".into(),
-            });
-            return;
-        }
-    };
+    let rt = super::runtime::shared();
 
     let mut client: Option<crate::graph::GraphClient> = None;
     let mut known: Option<HashSet<String>> = None;

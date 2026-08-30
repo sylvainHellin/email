@@ -34,7 +34,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0091 HTML-to-text rendering through an external tool](docs/tickets/0091-html-to-text-rendering.md) -- feature _(evaluate w3m / lynx / pandoc)_
 - [#0099 Per-account signatures appended on compose and reply](docs/tickets/0099-per-account-signatures.md) -- feature
 - [#0101 Conversation-view collapse and inline navigation on top of the thread view](docs/tickets/0101-conversation-view-collapse-inline-nav.md) -- feature _(cross-ref #0008)_
-- [#0095 One shared tokio runtime instead of a fresh runtime per network action](docs/tickets/0095-shared-tokio-runtime.md) -- chore
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
 
 ### Distribution / cross-platform (adoption track)
