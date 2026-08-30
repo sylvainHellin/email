@@ -20,7 +20,9 @@ base_url="https://github.com/sylvainHellin/mailypoppins/releases/download/v${ver
 checksum() {
   local target="$1"
   # Checksum files contain "<sha256>  <filename>".
-  curl -fsSL "${base_url}/mailypoppins-${target}.tar.gz.sha256" | awk '{print $1}'
+  # Asset name: the workflow uploads "mailypoppins-<target>.sha256"
+  # (not ".tar.gz.sha256").
+  curl -fsSL "${base_url}/mailypoppins-${target}.sha256" | awk '{print $1}'
 }
 
 sha_macos_arm64="$(checksum aarch64-apple-darwin)"
