@@ -31,15 +31,17 @@
 //!
 //! ## Leader / prefix model
 //!
-//! A binding may declare a single-key `prefix`. Two leaders exist: `Space`
-//! (the Global view switcher `Space m/c/a`, #0033) and `g` (the List-scoped
-//! `gg`/`G` jumps). The chord matcher only fires a prefixed binding when the
+//! A binding may declare a single-key `prefix`. The leaders are the `Space`
+//! view switcher (`Space m/c/a`, #0033), the Vim `g` motion prefix, and the
+//! five mnemonic family leaders `f`/`c`/`g`/`t`/`s` (#0092: find, compose, go,
+//! thread, system). The chord matcher only fires a prefixed binding when the
 //! matching prefix is pending; `handle_key` sets `App::pending_prefix` to the
-//! armed leader when a bare prefix key is seen (and the hint bar shows the
-//! pending continuations). The two leaders never cross-arm: a pending `Space`
-//! only fires `Space`-prefixed rows and a pending `g` only fires `g`-prefixed
-//! rows. This generalizes the former special-cased `gg` handling into
-//! first-class data.
+//! armed leader when a bare prefix key is seen (the hint bar and the which-key
+//! popup then show the pending continuations). Strict prefix mode (see
+//! [`resolve`]): while a prefix is pending only that family's continuations are
+//! eligible, so a key that is not a continuation cancels the chord instead of
+//! firing a flat binding (which-key semantics), and the leaders never
+//! cross-arm.
 //!
 //! ## (B)-lite runtime dispatch
 //!
@@ -60,6 +62,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum KeyCtx {
     /// Always-live top-level bindings (quit, help, account/mailbox jump, ...).
     Global,
+    /// Actions on the current message, live in every reading pane (List,
+    /// Headers, Body). Promoted from the old List-only set (#0092) so a
+    /// message action resolves identically whichever reading pane has focus.
+    Message,
     /// Email list pane has focus and is non-empty.
     List,
     /// Mailbox sidebar pane has focus.
@@ -85,6 +91,7 @@ impl KeyCtx {
     pub fn group_title(self) -> &'static str {
         match self {
             KeyCtx::Global => "GLOBAL",
+            KeyCtx::Message => "MESSAGE (list, headers, body)",
             KeyCtx::Sidebar => "SIDEBAR",
             KeyCtx::List => "EMAIL LIST",
             KeyCtx::ServerSearch => "SERVER SEARCH",
@@ -100,6 +107,7 @@ impl KeyCtx {
     /// Help-overlay section order (also the hint-bar precedence).
     pub const HELP_ORDER: &'static [KeyCtx] = &[
         KeyCtx::Global,
+        KeyCtx::Message,
         KeyCtx::Sidebar,
         KeyCtx::List,
         KeyCtx::ServerSearch,
@@ -231,8 +239,15 @@ pub enum KeyAction {
     SwitchAccount,
     JumpAccount,
     JumpMailbox,
+    /// `gm`: focus the mailbox sidebar (go to mailboxes).
+    GoMailbox,
     FocusForward,
     FocusBackward,
+    /// Arm one of the mnemonic family leaders (`f`/`c`/`g`/`t`/`s`, #0092).
+    /// Unlike [`KeyAction::Manual`] (the view-agnostic Space leader), this is
+    /// Mail-only, so it is swallowed in the Contacts/Calendar views unless the
+    /// active pane rebinds the letter.
+    ArmPrefix,
     /// Zoom the focused pane to the whole content area, or restore the split
     /// (#TKT-0044). Mail view only, which is why it is deliberately absent
     /// from [`KeyAction::is_view_agnostic`].
@@ -265,6 +280,13 @@ pub enum KeyAction {
     ToggleFlag,
     /// Narrow the list to flagged messages, or widen it back (#0079).
     ToggleFlaggedFilter,
+    /// Advance the list cursor to the next / previous message from any reading
+    /// pane (`J`/`K`, `gj`/`gk`), so triage does not need a focus hop (#0092).
+    NextMessage,
+    PrevMessage,
+    /// Esc in any reading pane: clear a live selection, else return to the
+    /// list (#0092, symmetric across List / Headers / Body).
+    EscMessage,
     MovePicker,
     Rsvp,
     /// Open the conversation (threading) overlay for the cursor message (#0008).
@@ -427,6 +449,48 @@ const fn bg(
     row(keys, chord, None, ctx, guard, action, desc, hint)
 }
 
+/// Prefixed (leader-continuation) live binding, e.g. `ff`, `cr`, `ss`.
+const fn p(
+    keys: &'static str,
+    chord: Chord,
+    prefix: char,
+    ctx: KeyCtx,
+    action: KeyAction,
+    desc: &'static str,
+    hint: bool,
+) -> KeyBinding {
+    row(keys, chord, Some(prefix), ctx, Guard::None, action, desc, hint)
+}
+
+/// Prefixed guarded live binding.
+const fn pg(
+    keys: &'static str,
+    chord: Chord,
+    prefix: char,
+    ctx: KeyCtx,
+    guard: Guard,
+    action: KeyAction,
+    desc: &'static str,
+    hint: bool,
+) -> KeyBinding {
+    row(keys, chord, Some(prefix), ctx, guard, action, desc, hint)
+}
+
+/// A bare leader key that arms a family/prefix (`f`/`c`/`g`/`t`/`s`, Space).
+const fn leader(prefix: char, ctx: KeyCtx, action: KeyAction) -> KeyBinding {
+    row("", Chord::PrefixLeader(prefix), None, ctx, Guard::None, action, "", false)
+}
+
+/// Whether a family leader stays live outside the Mail view: true iff the
+/// family carries at least one view-agnostic continuation (today only `s`,
+/// whose `sc`/`sf`/`sl` open the config, the log and the activity overlay
+/// from any view). Derived from [`KEYMAP`] so it cannot drift from the data.
+pub fn leader_is_view_agnostic(leader: char) -> bool {
+    KEYMAP
+        .iter()
+        .any(|b| b.prefix == Some(leader) && b.action.is_view_agnostic())
+}
+
 /// Hand-dispatched (documented-only) binding.
 const fn manual(
     keys: &'static str,
@@ -445,78 +509,110 @@ const fn manual(
 /// dispatch, and — after `mp dump-keys` + regeneration — the website.
 pub static KEYMAP: &[KeyBinding] = &[
     // -- GLOBAL -----------------------------------------------------------
+    // The flat escape hatches plus the five mnemonic family leaders (#0092):
+    // `f` find, `c` compose, `g` go, `t` thread/attach, `s` system/sync. A
+    // leader arms a pending prefix; the which-key popup and hint bar then show
+    // that family's continuations. Leaders are Mail-only (ArmPrefix is not
+    // view-agnostic), so a family letter that a non-Mail view binds flat (the
+    // Contacts `c`, the Calendar `t`) still reaches that view's pane action.
+    // Exception: a family whose continuations include view-agnostic actions
+    // (`s`, see `leader_is_view_agnostic`) arms in every view, so the config/
+    // log/activity utilities stay reachable outside Mail.
     b("q", Chord::Char('q'), KeyCtx::Global, KeyAction::Quit, "Quit", true),
-    bg("`", Chord::Char('`'), KeyCtx::Global, Guard::MultiAccount, KeyAction::SwitchAccount, "Switch account", false),
-    bg("Ctrl+1-9", Chord::CtrlDigit, KeyCtx::Global, Guard::MultiAccount, KeyAction::JumpAccount, "Jump to account", false),
     b("1-9", Chord::Digit, KeyCtx::Global, KeyAction::JumpMailbox, "Jump to mailbox", true),
     b("Tab", Chord::Code(SpecialCode::Tab), KeyCtx::Global, KeyAction::FocusForward, "Cycle focus forward", false),
     b("Shift+Tab", Chord::Code(SpecialCode::BackTab), KeyCtx::Global, KeyAction::FocusBackward, "Cycle focus backward", false),
-    b("/", Chord::Char('/'), KeyCtx::Global, KeyAction::FilterMetadata, "Filter by metadata", true),
-    b("\\", Chord::Char('\\'), KeyCtx::Global, KeyAction::SearchContent, "Search email content", false),
     b("?", Chord::Char('?'), KeyCtx::Global, KeyAction::ToggleHelp, "Toggle this help", true),
     // Zoom is Global by context but Mail-only by action: `is_view_agnostic`
     // leaves it out, so the dispatcher swallows `z` in Contacts and Calendar,
     // where a two-pane split the user can zoom does not exist (#TKT-0044).
     short(b("z", Chord::Char('z'), KeyCtx::Global, KeyAction::ToggleZoom, "Zoom / unzoom the focused pane", true), "Zoom pane"),
     b("!", Chord::Char('!'), KeyCtx::Global, KeyAction::ToggleActivityLog, "Toggle activity log", false),
-    b("L", Chord::Char('L'), KeyCtx::Global, KeyAction::OpenActivityOverlay, "Open activity log overlay", false),
-    b("Ctrl+l", Chord::CtrlChar('l'), KeyCtx::Global, KeyAction::OpenLogFile, "Open log file in $EDITOR", false),
-    b("Ctrl+e", Chord::CtrlChar('e'), KeyCtx::Global, KeyAction::OpenConfigFile, "Open config.toml in $EDITOR", false),
-    // View switcher leader (#0033, Space follow-up): Space opens the leader,
-    // then m/c/a picks a view. Global so it works from every pane and every
-    // view. Space was freed for this by moving list toggle-select to `v`.
-    row("", Chord::PrefixLeader(' '), None, KeyCtx::Global, Guard::None, KeyAction::Manual, "", false),
+    // Send the current draft from any focus: one confirm, and an unapproved
+    // draft is approved as part of the send (#0092, merges the old `A` + `x`).
+    short(b("x", Chord::Char('x'), KeyCtx::Global, KeyAction::Send, "Send current draft (approve + send)", true), "Send"),
+    // Family leaders.
+    leader('f', KeyCtx::Global, KeyAction::ArmPrefix),
+    leader('c', KeyCtx::Global, KeyAction::ArmPrefix),
+    leader('g', KeyCtx::Global, KeyAction::ArmPrefix),
+    leader('t', KeyCtx::Global, KeyAction::ArmPrefix),
+    leader('s', KeyCtx::Global, KeyAction::ArmPrefix),
+    // `f` find family (global entry): one FTS-backed search over all mail.
+    p("ff", Chord::Char('f'), 'f', KeyCtx::Global, KeyAction::ServerSearch, "Search all mail (sender, subject, body)", true),
+    // `c` compose family (global entry).
+    p("cn", Chord::Char('n'), 'c', KeyCtx::Global, KeyAction::NewDraft, "New draft", true),
+    // `g` go family (global jumps).
+    p("gm", Chord::Char('m'), 'g', KeyCtx::Global, KeyAction::GoMailbox, "Go to mailboxes (sidebar)", false),
+    pg("ga", Chord::Char('a'), 'g', KeyCtx::Global, Guard::MultiAccount, KeyAction::SwitchAccount, "Switch account", false),
+    // `s` system / sync / accounts family.
+    p("ss", Chord::Char('s'), 's', KeyCtx::Global, KeyAction::QuickSync, "Quick sync", true),
+    p("sS", Chord::Char('S'), 's', KeyCtx::Global, KeyAction::FullSync, "Full sync", false),
+    p("sl", Chord::Char('l'), 's', KeyCtx::Global, KeyAction::OpenActivityOverlay, "Activity log overlay", false),
+    p("sc", Chord::Char('c'), 's', KeyCtx::Global, KeyAction::OpenConfigFile, "Open config.toml in $EDITOR", false),
+    p("sf", Chord::Char('f'), 's', KeyCtx::Global, KeyAction::OpenLogFile, "Open log file in $EDITOR", false),
+    // View switcher leader (#0033): Space opens the leader, then m/c/a picks a
+    // view. Manual (view-agnostic) so it works from every pane and view.
+    leader(' ', KeyCtx::Global, KeyAction::Manual),
     row("Space m", Chord::Char('m'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Mail view", true),
     row("Space c", Chord::Char('c'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Contacts view", true),
     row("Space a", Chord::Char('a'), Some(' '), KeyCtx::Global, Guard::None, KeyAction::SwitchView, "Switch to Calendar view", true),
+    // -- MESSAGE (list, headers, body) ------------------------------------
+    // Actions on the current message, live in all three reading panes so
+    // acting on what you are reading never needs a focus hop (#0092). The
+    // dispatcher tries this context after the focused pane's own context, so a
+    // pane keeps its scroll keys (`j`/`k`) while sharing every message action.
+    short(bg("J / K", Chord::Char('J'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::NextMessage, "Next / previous message", true), "Next/prev"),
+    bg("", Chord::Char('K'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::PrevMessage, "", false),
+    short(bg("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::Message, Guard::NonEmptyList, KeyAction::OpenEditor, "Open in editor (mail read-only)", true), "Open (read-only)"),
+    bg("r", Chord::Char('r'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::Reply, "Reply", true),
+    bg("a", Chord::Char('a'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::Archive, "Archive", true),
+    bg("d", Chord::Char('d'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::Delete, "Delete", true),
+    bg("u", Chord::Char('u'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::ToggleRead, "Toggle read/unread", false),
+    bg("*", Chord::Char('*'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::ToggleFlag, "Toggle flag/star", false),
+    bg("M", Chord::Char('M'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::MovePicker, "Move to mailbox (fuzzy picker)", false),
+    bg("y", Chord::Char('y'), KeyCtx::Message, Guard::NonEmptyList, KeyAction::CopyMessageRef, "Copy selector (mp://)", false),
+    short(b("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::Message, KeyAction::EscMessage, "Clear selection / return to list", true), "Back"),
+    // `g` go-family continuations that apply to every reading pane.
+    p("gj / gk", Chord::Char('j'), 'g', KeyCtx::Message, KeyAction::NextMessage, "Next / previous message", false),
+    p("", Chord::Char('k'), 'g', KeyCtx::Message, KeyAction::PrevMessage, "", false),
+    // `f` find family: narrow the current list (metadata, incremental).
+    p("fm", Chord::Char('m'), 'f', KeyCtx::Message, KeyAction::FilterMetadata, "Filter the current list", false),
+    // `c` compose family (message-scoped continuations).
+    pg("cr", Chord::Char('r'), 'c', KeyCtx::Message, Guard::NonEmptyList, KeyAction::Reply, "Reply", false),
+    pg("ca", Chord::Char('a'), 'c', KeyCtx::Message, Guard::NonEmptyList, KeyAction::ReplyAll, "Reply all", false),
+    pg("cf", Chord::Char('f'), 'c', KeyCtx::Message, Guard::NonEmptyList, KeyAction::Forward, "Forward", false),
+    // `t` thread / attachment family.
+    pg("tt", Chord::Char('t'), 't', KeyCtx::Message, Guard::NonEmptyList, KeyAction::OpenThread, "Show conversation (thread)", false),
+    pg("to", Chord::Char('o'), 't', KeyCtx::Message, Guard::NonEmptyList, KeyAction::OpenAttachment, "Open attachment", false),
+    pg("ts", Chord::Char('s'), 't', KeyCtx::Message, Guard::NonEmptyList, KeyAction::SaveAttachment, "Save attachment to disk", false),
+    pg("tb", Chord::Char('b'), 't', KeyCtx::Message, Guard::NonEmptyList, KeyAction::OpenInBrowser, "Open HTML in browser", false),
+    pg("tv", Chord::Char('v'), 't', KeyCtx::Message, Guard::NonEmptyList, KeyAction::Rsvp, "RSVP to invitation (Accept/Tentative/Decline)", false),
     // -- SIDEBAR ----------------------------------------------------------
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Sidebar, KeyAction::SidebarDown, "Navigate mailboxes", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Sidebar, KeyAction::SidebarUp, "", false),
     b("Enter", Chord::Code(SpecialCode::Enter), KeyCtx::Sidebar, KeyAction::SidebarSelect, "Select mailbox", true),
     // -- EMAIL LIST -------------------------------------------------------
-    // Most list actions require a non-empty list (matching the old empty-list
-    // early-return that only allowed s/S/f/n). Only s/S/f/n are exempt.
+    // List-only affordances: cursor motion, selection, the go-family jumps and
+    // the two find-family list filters. Every message action lives in the
+    // shared MESSAGE context above, so this section is just what only the list
+    // can do. Most rows guard on a non-empty list (the old empty-list early
+    // return); the flagged filter does not, since it can empty the list itself.
     short(bg("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListDown, "Navigate emails", true), "Navigate"),
     bg("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListUp, "", false),
-    row("", Chord::PrefixLeader('g'), None, KeyCtx::List, Guard::NonEmptyList, KeyAction::Manual, "", false),
     row("", Chord::Char('g'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListTop, "", false),
     bg("gg / G", Chord::Char('G'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ListBottom, "Jump to top / bottom", false),
-    // `g t` ("go to") rather than the ticket's suggested `D`: `D` is taken
-    // (mark approved as draft), and `g d` would resolve ambiguously against
-    // the unprefixed `d` (delete), which `no_duplicate_live_dispatch_per_context`
-    // refuses for exactly the right reason -- a reordered table would turn a
-    // mistyped jump into a delete.
-    row("g t", Chord::Char('t'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::JumpToDate, "Jump to date (e.g. last week)", false),
+    // `gt` ("go to date") rather than `gd`: `d` is delete in the message
+    // context, and `gd` resolving against a mistyped delete is exactly what
+    // `no_duplicate_live_dispatch_per_context` refuses.
+    row("gt", Chord::Char('t'), Some('g'), KeyCtx::List, Guard::NonEmptyList, KeyAction::JumpToDate, "Jump to date (e.g. last week)", false),
     short(bg("v", Chord::Char('v'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleSelect, "Toggle selection", true), "Select"),
     bg("Ctrl+a", Chord::CtrlChar('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SelectAllVisible, "Select all visible", false),
-    bg("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::List, Guard::NonEmptyList, KeyAction::ClearSelection, "Clear selection", false),
-    short(bg("Enter / e", Chord::CharOrCode('e', SpecialCode::Enter), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenEditor, "Open in editor (mail read-only)", true), "Open (read-only)"),
-    bg("r / R", Chord::Char('r'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Reply, "Reply / Reply-all", true),
-    bg("", Chord::Char('R'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ReplyAll, "", false),
-    bg("w", Chord::Char('w'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Forward, "Forward", false),
-    bg("c", Chord::Char('c'), KeyCtx::List, Guard::DraftsOnly, KeyAction::EditRecipients, "Edit recipients (Drafts only)", false),
-    bg("a", Chord::Char('a'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Archive, "Archive", true),
-    bg("d", Chord::Char('d'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Delete, "Delete", true),
-    bg("m", Chord::Char('m'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleRead, "Toggle read/unread", false),
-    bg("*", Chord::Char('*'), KeyCtx::List, Guard::NonEmptyList, KeyAction::ToggleFlag, "Toggle flag/star", false),
-    // No `NonEmptyList` guard, unlike its `*` sibling: the filter itself can
-    // empty the list, and the key that emptied it has to be able to undo that.
-    b("F", Chord::Char('F'), KeyCtx::List, KeyAction::ToggleFlaggedFilter, "Show flagged only (toggle)", false),
-    bg("M", Chord::Char('M'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MovePicker, "Move to mailbox (fuzzy picker)", false),
-    bg("V", Chord::Char('V'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Rsvp, "RSVP to invitation (Accept/Tentative/Decline)", false),
-    bg("T", Chord::Char('T'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenThread, "Show conversation (thread)", false),
-    bg("A", Chord::Char('A'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Approve, "Approve draft", false),
-    bg("D", Chord::Char('D'), KeyCtx::List, Guard::NonEmptyList, KeyAction::MarkDraft, "Mark approved as draft (reverse A)", false),
-    bg("x / X", Chord::Char('x'), KeyCtx::List, Guard::NonEmptyList, KeyAction::Send, "Send / Send all approved", false),
-    bg("", Chord::Char('X'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SendAll, "", false),
-    bg("y", Chord::Char('y'), KeyCtx::List, Guard::NonEmptyList, KeyAction::CopyMessageRef, "Copy selector (mp://)", false),
-    bg("o", Chord::Char('o'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenAttachment, "Open attachment", false),
-    bg("O", Chord::Char('O'), KeyCtx::List, Guard::NonEmptyList, KeyAction::SaveAttachment, "Save attachment to disk", false),
-    bg("b", Chord::Char('b'), KeyCtx::List, Guard::NonEmptyList, KeyAction::OpenInBrowser, "Open HTML in browser", false),
-    b("n", Chord::Char('n'), KeyCtx::List, KeyAction::NewDraft, "New draft", true),
-    short(b("s / S", Chord::Char('s'), KeyCtx::List, KeyAction::QuickSync, "Quick sync / Full sync", true), "Sync"),
-    b("", Chord::Char('S'), KeyCtx::List, KeyAction::FullSync, "", false),
-    b("f", Chord::Char('f'), KeyCtx::List, KeyAction::ServerSearch, "Search (IMAP)", true),
+    // `ce` edit recipients, Drafts only (the compose family's list-scoped tail).
+    pg("ce", Chord::Char('e'), 'c', KeyCtx::List, Guard::DraftsOnly, KeyAction::EditRecipients, "Edit recipients (Drafts only)", false),
+    // `fF` flagged-only filter (the find family's list-scoped tail). No
+    // NonEmptyList guard: the filter can empty the list and must be able to
+    // undo that.
+    p("fF", Chord::Char('F'), 'f', KeyCtx::List, KeyAction::ToggleFlaggedFilter, "Show flagged only (toggle)", false),
     // -- SERVER SEARCH (overlay-internal; hand-dispatched) ----------------
     manual("j/k", KeyCtx::ServerSearch, "Navigate results", true),
     manual("gg / G", KeyCtx::ServerSearch, "Jump to top / bottom", false),
@@ -561,27 +657,18 @@ pub static KEYMAP: &[KeyBinding] = &[
     short(b("t", Chord::Char('t'), KeyCtx::Calendar, KeyAction::CalendarToggleScope, "Show past events / upcoming only", true), "Past / upcoming"),
     short(b("r", Chord::Char('r'), KeyCtx::Calendar, KeyAction::CalendarRefresh, "Refresh events from disk", true), "Refresh"),
     // -- HEADERS ----------------------------------------------------------
+    // The headers pane scrolls; every message action (open attachment, browser,
+    // reply, triage, next/prev, Esc) comes from the shared MESSAGE context, so
+    // there are no longer hidden pane-local rows here (#0092).
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Headers, KeyAction::HeadersDown, "Scroll headers", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Headers, KeyAction::HeadersUp, "", false),
-    // Hidden rows (empty display): the headers pane shares the list's
-    // attachment/browser bindings; kept out of help so this pane's help stays
-    // as it was (only j/k) while still dispatching through the table.
-    b("", Chord::Char('o'), KeyCtx::Headers, KeyAction::OpenAttachment, "Open attachment", false),
-    b("", Chord::Char('O'), KeyCtx::Headers, KeyAction::SaveAttachment, "Save attachment to disk", false),
-    b("", Chord::Char('b'), KeyCtx::Headers, KeyAction::OpenInBrowser, "Open HTML in browser", false),
     // -- BODY -------------------------------------------------------------
+    // Bare `j`/`k` scroll the body; bare `d`/`u` are delete / toggle-read from
+    // the MESSAGE context, so half-page scroll moved to Ctrl+d / Ctrl+u (#0092).
     b("j/k", Chord::CharOrCode('j', SpecialCode::Down), KeyCtx::Preview, KeyAction::PreviewDown, "Scroll line by line", true),
     b("", Chord::CharOrCode('k', SpecialCode::Up), KeyCtx::Preview, KeyAction::PreviewUp, "", false),
-    b("d/u", Chord::Char('d'), KeyCtx::Preview, KeyAction::PreviewHalfDown, "Half-page down / up", false),
-    b("", Chord::Char('u'), KeyCtx::Preview, KeyAction::PreviewHalfUp, "", false),
-    // Hidden rows (empty display): the body pane shares the attachment/browser
-    // bindings; kept out of help so the body-pane help stays as before
-    // (j/k, d/u, V, Esc) while still dispatching through the table.
-    b("", Chord::Char('o'), KeyCtx::Preview, KeyAction::OpenAttachment, "Open attachment", false),
-    b("", Chord::Char('O'), KeyCtx::Preview, KeyAction::SaveAttachment, "Save attachment to disk", false),
-    b("", Chord::Char('b'), KeyCtx::Preview, KeyAction::OpenInBrowser, "Open HTML in browser", false),
-    b("V", Chord::Char('V'), KeyCtx::Preview, KeyAction::Rsvp, "RSVP to invitation (Accept/Tentative/Decline)", false),
-    b("Esc", Chord::Code(SpecialCode::Esc), KeyCtx::Preview, KeyAction::PreviewToList, "Return to list", true),
+    b("Ctrl+d / Ctrl+u", Chord::CtrlChar('d'), KeyCtx::Preview, KeyAction::PreviewHalfDown, "Half-page down / up", false),
+    b("", Chord::CtrlChar('u'), KeyCtx::Preview, KeyAction::PreviewHalfUp, "", false),
     // -- ACTIVITY LOG (overlay-internal; hand-dispatched) -----------------
     manual("j/k", KeyCtx::Activity, "Scroll line by line", true),
     manual("d/u", KeyCtx::Activity, "Half-page down / up", false),
@@ -609,12 +696,17 @@ pub fn resolve(
         if kb.ctx != ctx || matches!(kb.chord, Chord::Manual) {
             continue;
         }
-        // Leader continuations require the matching prefix pending; non-prefixed
-        // rows require no prefix pending (the leader key already consumed it).
+        // Strict prefix mode (#0092): while a prefix is pending, ONLY that
+        // family's continuations are eligible; a flat (non-prefixed) row is
+        // inert until the prefix is cleared. This is which-key semantics: a
+        // key that is not a continuation of the pending family cancels the
+        // chord instead of firing a flat binding, so an accidental `s` then
+        // `x` cannot send. When nothing is pending only flat rows match; the
+        // `PrefixLeader` rows (also non-prefixed) then arm the family.
         match (kb.prefix, prefix_pending) {
             (Some(p), Some(pending)) if p == pending => {}
-            (Some(_), _) => continue,
-            (None, _) => {}
+            (None, None) => {}
+            _ => continue,
         }
         if !guard_ok(kb.guard) {
             continue;
@@ -798,6 +890,7 @@ mod tests {
     fn every_contexts_hint_row_fits_the_golden_width_after_the_short_labels() {
         for ctx in [
             KeyCtx::Global,
+            KeyCtx::Message,
             KeyCtx::Sidebar,
             KeyCtx::List,
             KeyCtx::Headers,
@@ -858,15 +951,23 @@ mod tests {
             ])
             .collect();
         for &ctx in KeyCtx::HELP_ORDER {
-            for &pending in &[None, Some('g'), Some(' ')] {
+            for &pending in &[
+                None,
+                Some('g'),
+                Some(' '),
+                Some('f'),
+                Some('c'),
+                Some('t'),
+                Some('s'),
+            ] {
                 for &ev in &probes {
                     let mut hits = KEYMAP.iter().filter(|kb| {
                         kb.ctx == ctx
                             && !matches!(kb.chord, Chord::Manual)
                             && match (kb.prefix, pending) {
                                 (Some(p), Some(q)) => p == q,
-                                (Some(_), None) => false,
-                                (None, _) => true,
+                                (None, None) => true,
+                                _ => false,
                             }
                             && kb.chord.matches(ev, pending)
                     });
@@ -917,24 +1018,26 @@ mod tests {
     /// Guards live in the data model, not ad-hoc code.
     #[test]
     fn context_guards_are_modeled() {
-        let c = KEYMAP
+        // `ce` edit-recipients is Drafts-only (the compose family's list tail).
+        let ce = KEYMAP
             .iter()
-            .find(|kb| kb.keys == "c" && kb.ctx == KeyCtx::List)
+            .find(|kb| kb.keys == "ce" && kb.ctx == KeyCtx::List)
             .expect("edit-recipients binding present");
-        assert_eq!(c.guard, Guard::DraftsOnly);
+        assert_eq!(ce.guard, Guard::DraftsOnly);
 
-        let backtick = KEYMAP
+        // `ga` switch-account is multi-account only (#0092, replaced `` ` ``).
+        let ga = KEYMAP
             .iter()
-            .find(|kb| kb.keys == "`")
+            .find(|kb| kb.keys == "ga")
             .expect("account switch binding present");
-        assert_eq!(backtick.guard, Guard::MultiAccount);
+        assert_eq!(ga.guard, Guard::MultiAccount);
     }
 
     #[test]
     fn leader_prefix_is_first_class_data() {
         // Both leaders (g for list jumps, Space for the view switcher) are
         // catalogued as prefixed continuation data plus a PrefixLeader row.
-        for leader in [' ', 'g'] {
+        for leader in [' ', 'f', 'c', 'g', 't', 's'] {
             let combos: Vec<_> =
                 KEYMAP.iter().filter(|kb| kb.prefix == Some(leader)).collect();
             assert!(
@@ -954,31 +1057,51 @@ mod tests {
     /// continuations do not fire, and vice versa. (The dispatch-time analogue
     /// of the view-switcher-on-Space decision.)
     #[test]
+    fn only_the_system_family_leader_is_view_agnostic() {
+        assert!(leader_is_view_agnostic('s'), "`s` carries config/log/activity");
+        for l in ['f', 'c', 'g', 't'] {
+            assert!(!leader_is_view_agnostic(l), "family `{l}` must stay Mail-only");
+        }
+    }
+
+    #[test]
     fn leaders_do_not_cross_arm() {
         // Space pending -> the view-switch continuation `m` fires (Global),
-        // but the list `g` continuation does NOT.
+        // but the list `g` continuation does NOT (strict prefix mode).
         assert_eq!(
             resolve(KeyCtx::Global, key('m'), Some(' '), &allow),
             Some(KeyAction::SwitchView)
         );
         assert_eq!(resolve(KeyCtx::List, key('g'), Some(' '), &allow), None);
-        // g pending -> the list `g` continuation fires, but the Space view
-        // switch does NOT (its continuations require Space pending).
+        // g pending -> the list `g` continuation fires; the go-family global
+        // jump `gm` fires; the Space view switch does NOT.
         assert_eq!(
             resolve(KeyCtx::List, key('g'), Some('g'), &allow),
             Some(KeyAction::ListTop)
         );
-        assert_eq!(resolve(KeyCtx::Global, key('m'), Some('g'), &allow), None);
+        assert_eq!(
+            resolve(KeyCtx::Global, key('m'), Some('g'), &allow),
+            Some(KeyAction::GoMailbox)
+        );
+        // Strict prefix: a flat key does not fire while a prefix is pending, so
+        // `s` then `x` cannot send (the accidental-destructive case #0092
+        // guards against).
+        assert_eq!(resolve(KeyCtx::Global, key('x'), Some('s'), &allow), None);
         // Same in the Calendar pane context (#0034), which owns `gg`/`G` too.
         assert_eq!(resolve(KeyCtx::Calendar, key('g'), Some(' '), &allow), None);
         assert_eq!(
             resolve(KeyCtx::Calendar, key('g'), Some('g'), &allow),
             Some(KeyAction::CalendarTop)
         );
-        // A bare Space with nothing pending arms the leader (Manual toggle).
+        // A bare Space with nothing pending arms the view leader (Manual).
         assert_eq!(
             resolve(KeyCtx::Global, key(' '), None, &allow),
             Some(KeyAction::Manual)
+        );
+        // A bare family leader with nothing pending arms its prefix.
+        assert_eq!(
+            resolve(KeyCtx::Global, key('s'), None, &allow),
+            Some(KeyAction::ArmPrefix)
         );
     }
 
@@ -991,42 +1114,50 @@ mod tests {
             resolve(KeyCtx::Global, key('q'), None, &allow),
             Some(KeyAction::Quit)
         );
-        // List reply vs reply-all are distinct.
+        // Message-context reply (flat `r`) is shared by every reading pane;
+        // reply-all is the `ca` compose-family chord.
         assert_eq!(
-            resolve(KeyCtx::List, key('r'), None, &allow),
+            resolve(KeyCtx::Message, key('r'), None, &allow),
             Some(KeyAction::Reply)
         );
         assert_eq!(
-            resolve(KeyCtx::List, key('R'), None, &allow),
+            resolve(KeyCtx::Message, key('a'), Some('c'), &allow),
             Some(KeyAction::ReplyAll)
         );
-        // Ctrl+e (config) does not collide with bare e (editor) in List.
+        // The system family carries config/log opens (`sc`, `sf`), replacing
+        // the old Ctrl+e / Ctrl+l flat keys.
         assert_eq!(
-            resolve(KeyCtx::Global, ctrl('e'), None, &allow),
+            resolve(KeyCtx::Global, key('c'), Some('s'), &allow),
             Some(KeyAction::OpenConfigFile)
         );
+        // Enter / e open the message from any reading pane.
         assert_eq!(
-            resolve(KeyCtx::List, key('e'), None, &allow),
+            resolve(KeyCtx::Message, key('e'), None, &allow),
             Some(KeyAction::OpenEditor)
         );
-        // Leader: bare g pending, then g -> top.
+        // Leader: g pending, then g -> list top.
         assert_eq!(
             resolve(KeyCtx::List, key('g'), Some('g'), &allow),
             Some(KeyAction::ListTop)
         );
-        // Without pending prefix, g is a leader (Manual action reserved -> None
-        // via the PrefixLeader row, which resolve returns as its action).
+        // The family leaders arm from the Global context (bare g, nothing
+        // pending, is the go-family leader).
         assert_eq!(
-            resolve(KeyCtx::List, key('g'), None, &allow),
-            Some(KeyAction::Manual)
+            resolve(KeyCtx::Global, key('g'), None, &allow),
+            Some(KeyAction::ArmPrefix)
+        );
+        // The find-family search entry.
+        assert_eq!(
+            resolve(KeyCtx::Global, key('f'), Some('f'), &allow),
+            Some(KeyAction::ServerSearch)
         );
     }
 
-    /// `T` opens the conversation overlay from the list (#0008).
+    /// `tt` opens the conversation overlay from any reading pane (#0008/#0092).
     #[test]
-    fn thread_key_resolves_in_the_list() {
+    fn thread_chord_resolves_in_the_message_context() {
         assert_eq!(
-            resolve(KeyCtx::List, key('T'), None, &allow),
+            resolve(KeyCtx::Message, key('t'), Some('t'), &allow),
             Some(KeyAction::OpenThread)
         );
     }
@@ -1035,11 +1166,14 @@ mod tests {
     #[test]
     fn resolve_respects_guards() {
         let deny_drafts = |g: Guard| g != Guard::DraftsOnly;
-        // `c` is guarded to Drafts; when the guard denies, it does not resolve.
-        assert_eq!(resolve(KeyCtx::List, key('c'), None, &deny_drafts), None);
+        // `ce` is guarded to Drafts; when the guard denies, it does not resolve.
+        assert_eq!(
+            resolve(KeyCtx::List, key('e'), Some('c'), &deny_drafts),
+            None
+        );
         // When allowed, it resolves.
         assert_eq!(
-            resolve(KeyCtx::List, key('c'), None, &allow),
+            resolve(KeyCtx::List, key('e'), Some('c'), &allow),
             Some(KeyAction::EditRecipients)
         );
     }

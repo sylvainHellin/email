@@ -53,6 +53,29 @@ All notable changes to this project are documented in this file.
   unchanged: each call still blocks its own OS thread, and no path nests one
   runtime inside another.
 
+### Changed
+- **BREAKING: the TUI keymap moved to an nvim-style mnemonic prefix scheme (#0092).**
+  The old flat single-key map, whose meaning changed with pane focus, is gone; there is no
+  compatibility layer. High-frequency triage stays flat in every reading pane (List, Headers,
+  Body): `j`/`k` move or scroll, `J`/`K` next/previous message, `Enter`/`e` open, `r` reply,
+  `a` archive, `d` delete, `u` toggle read, `*` flag, `M` move, `x` send the current draft, and
+  `Esc` clears a selection or returns to the list. Everything rarer moved under one of five
+  family leaders, each with a which-key popup of its continuations: `f` find (`ff` search all
+  mail, `fm` filter the list, `fF` flagged-only), `c` compose (`cn` new, `cr` reply, `ca`
+  reply-all, `cf` forward, `ce` edit recipients), `g` go (`gg`/`G` top/bottom, `gj`/`gk` and
+  `J`/`K` next/prev, `gt` date, `gm` mailboxes, `ga` switch account), `t` thread/attachment
+  (`tt` conversation, `to`/`ts` open/save attachment, `tb` open in browser, `tv` RSVP), and `s`
+  system (`ss`/`sS` quick/full sync, `sl` activity log, `sc` config, `sf` log file). Every
+  message action now resolves identically whichever reading pane holds focus, so acting on the
+  message you are reading no longer needs a focus hop; `Tab` cycles in reading order (Sidebar,
+  List, Headers, Body); and no live binding is hidden from the `?` help overlay any more. Body
+  half-page scroll moved to `Ctrl+d`/`Ctrl+u`. Sending an unapproved draft with `x` now approves
+  it as part of the send. The separate approve (`A`), mark-draft (`D`) and send-all (`X`) keys,
+  the account-cycle backtick and `Ctrl+1-9`, and the `\`/`L`/`Ctrl+e`/`Ctrl+l` bindings were
+  removed; batch approve and send-all remain on the CLI (`mp mark-approved`, `mp send-approved`).
+  The help overlay and the website key table are both generated from the one `KEYMAP` table, so
+  they moved with it.
+
 ### Added
 - **Folder entries in `attachments:`.**
   A draft's `attachments:` frontmatter now accepts a directory path, not only individual files.

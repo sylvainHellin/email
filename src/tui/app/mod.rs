@@ -6,8 +6,8 @@ mod types;
 
 pub use calendar_view::load_events_for_account;
 pub use keymap::{
-    dump_json, dump_markdown, help_sections, hint_bindings, prefix_continuations, resolve, Guard,
-    KeyAction, KeyBinding, KeyCtx, KEYMAP,
+    dump_json, dump_markdown, help_sections, hint_bindings, leader_is_view_agnostic,
+    prefix_continuations, resolve, Guard, KeyAction, KeyBinding, KeyCtx, KEYMAP,
 };
 pub use types::*;
 
@@ -741,6 +741,51 @@ impl App {
     /// view.
     pub fn pending_prefix(&self) -> Option<char> {
         self.pending_prefix
+    }
+
+    /// A human name for a pending family leader, for the which-key popup title
+    /// (#0092). Falls back to the bare key for anything unnamed.
+    pub fn prefix_family_name(prefix: char) -> &'static str {
+        match prefix {
+            'f' => "find",
+            'c' => "compose",
+            'g' => "go",
+            't' => "thread",
+            's' => "system",
+            ' ' => "view",
+            _ => "keys",
+        }
+    }
+
+    /// The continuations to show in the which-key popup for the pending prefix,
+    /// gathered from the Global, focused-pane and shared Message contexts and
+    /// deduped by their display key, in table order (#0092). Empty when no
+    /// prefix is pending.
+    pub fn prefix_popup_rows(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(p) = self.pending_prefix else {
+            return Vec::new();
+        };
+        let mut ctxs = vec![KeyCtx::Global];
+        if let Some(ctx) = self.key_context() {
+            if ctx != KeyCtx::Global {
+                ctxs.push(ctx);
+            }
+        }
+        if self.view == View::Mail
+            && matches!(self.focus, Focus::List | Focus::Headers | Focus::Preview)
+        {
+            ctxs.push(KeyCtx::Message);
+        }
+        let mut rows: Vec<(&'static str, &'static str)> = Vec::new();
+        for ctx in ctxs {
+            for kb in prefix_continuations(ctx, p) {
+                if kb.keys.is_empty() || rows.iter().any(|(k, _)| *k == kb.keys) {
+                    continue;
+                }
+                rows.push((kb.keys, kb.desc));
+            }
+        }
+        rows
     }
 
     /// The local directory of the active mailbox, which only Drafts has.

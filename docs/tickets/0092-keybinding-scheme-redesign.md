@@ -3,7 +3,7 @@ id: 0092
 title: Keybinding scheme redesign to an nvim-style mnemonic prefix model
 type: feature
 priority: now
-status: open
+status: done
 created: 2026-08-14
 ---
 
@@ -31,6 +31,8 @@ This ticket subsumes the following audit findings, which the redesign must resol
 
 2026-08-14: the design plan [docs/plans/keybinding-redesign.md](../plans/keybinding-redesign.md) was approved with amendments (family letters swap to `f` search and `s` system, `ca` reply-all, `ga` account switching, command palette confirmed, no legacy map), so this ticket is open for implementation.
 The plan is the design of record; follow its migration order.
+
+2026-08-30: done. The flat keymap in `src/tui/app/keymap.rs` was rewritten to the five mnemonic prefix families (`f`/`c`/`g`/`t`/`s`) with a which-key popup (`src/tui/ui/mod.rs::render_prefix_popup`) and a merged hint bar. Message actions were promoted to a shared `KeyCtx::Message` live in the List, Headers and Body panes (dispatch in `src/tui/app/keys.rs`), so every List action is reachable while reading; `J`/`K` (and `gj`/`gk`) give next/prev without a focus hop; `Esc` is symmetric across panes; `Tab` was re-ordered to cycle in reading order (Sidebar, List, Headers, Body). Review fixes: the `s` leader arms in every view (`leader_is_view_agnostic`), keeping the config/log/activity utilities reachable from Contacts and Calendar. The `o`/`O`/`b` bindings are no longer hidden (they are `to`/`ts`/`tb` in help). `x` merges approve+send. Deviations from the plan (recorded for the follow-ups below): `gg`/`G` stay list-only rather than scrolling the body/headers panes (the body/headers scroll offset is not clamped to content, so scroll-to-bottom would blank the pane); `gm` focuses the sidebar rather than opening a name picker, and `ga` cycles accounts rather than opening a picker (no new overlay was built); the separate approve (`A`), mark-draft (`D`) and send-all (`X`) keys were dropped from the TUI and now live only on the CLI. Help overlay, hint bar and website key table all regenerate from the one `KEYMAP`; the command palette and the #0019 config override layer remain their own tickets.
 
 ## Cross-references
 

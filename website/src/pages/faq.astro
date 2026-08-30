@@ -35,10 +35,11 @@ import AccordionItem from '../components/AccordionItem.astro';
         <AccordionItem question="Email not approved for sending">
           <p>
             The draft workflow requires explicit approval before sending. Run
-            <code>mp mark-approved &lt;selector&gt;</code> or press <code>A</code> in the TUI to
-            change a draft's status from <code>draft</code> to <code>approved</code>. Only approved
-            emails can be sent. To reverse an accidental approval, press <code>D</code> in the TUI
-            (or run <code>mp mark-draft &lt;selector&gt;</code>) and the draft is editable again.
+            <code>mp mark-approved &lt;selector&gt;</code> to change a draft's status from
+            <code>draft</code> to <code>approved</code>; only approved emails can be sent. In the
+            TUI, <code>x</code> approves and sends the current draft in one step. To reverse an
+            accidental approval, run <code>mp mark-draft &lt;selector&gt;</code> and the draft is
+            editable again.
           </p>
         </AccordionItem>
 
@@ -131,7 +132,7 @@ import AccordionItem from '../components/AccordionItem.astro';
             that is the same pass. On Gmail, archiving only removes the Inbox label and the copy
             in All Mail keeps its original, old identifier, so a capped sync will not see it
             again: the inbox row goes and the archived copy is re-filed by the next full sync
-            (<code>S</code> in the TUI).
+            (<code>sS</code> in the TUI).
           </p>
         </AccordionItem>
 
@@ -139,15 +140,15 @@ import AccordionItem from '../components/AccordionItem.astro';
           <p>
             Yes. Use the <code>[[accounts]]</code> array in <code>config.toml</code>. Each account
             has its own SMTP/IMAP settings, local store, and mailboxes. Switch between accounts in
-            the TUI with the backtick key (<code>`</code>) or <code>Ctrl+1-9</code>.
+            the TUI with <code>ga</code>.
           </p>
         </AccordionItem>
 
         <AccordionItem question="How are attachments handled?">
           <p>
             Incoming attachments are stored as blobs beside the message row, not as files you
-            browse. Use <code>o</code> in the TUI to open one (it is written to a private temp
-            directory first), <code>O</code> to save it to a directory you choose, or
+            browse. Use <code>to</code> in the TUI to open one (it is written to a private temp
+            directory first), <code>ts</code> to save it to a directory you choose, or
             <code>mp save</code> from the CLI. For outgoing drafts, list file paths in the
             <code>attachments:</code> frontmatter field, or point one entry at a folder to attach
             every file inside it; forwarding a message
@@ -160,7 +161,7 @@ import AccordionItem from '../components/AccordionItem.astro';
           <p>
             Outgoing emails are written in Markdown and converted to HTML for sending, with a
             plaintext fallback. For incoming mail both parts are kept: the text the TUI shows and
-            the original HTML, each as a blob beside the message row. Press <code>b</code> in the
+            the original HTML, each as a blob beside the message row. Press <code>tb</code> in the
             TUI to open the HTML version in your browser.
           </p>
         </AccordionItem>

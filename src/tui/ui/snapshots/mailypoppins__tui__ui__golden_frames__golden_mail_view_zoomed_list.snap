@@ -41,10 +41,10 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 35 |│                                                                                                                      │
 36 |│                                                                                                                      │
 37 |╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-38 | MAIL ZOOM   j/k Navigate  v Select  Enter / e Open (read-only)  r / R Reply / Reply-all  a Archive  d Delete …
+38 | MAIL ZOOM   j/k Navigate  v Select  J / K Next/prev  Enter / e Open (read-only)  r Reply  a Archive  d Delete  Esc Back
 39 | ? help                                                                                            2 unread | Inbox 1/5
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 02 |bg:surface+fg:selection+bold@1..68 bg:surface+fg:selection+bold@69..70 bg:surface+fg:selection+bold@71..119
 04 |bold@1..119
-38 |bold@0..11 bg:surface@11..13 bg:surface+bold@13..16 bg:surface@16..27 bg:surface+bold@27..28 bg:surface@28..37 bg:surface+bold@37..46 bg:surface@46..65 bg:surface+bold@65..70 bg:surface@70..90 bg:surface+bold@90..91 bg:surface@91..101 bg:surface+bold@101..102 bg:surface@102..120
+38 |bold@0..11 bg:surface@11..13 bg:surface+bold@13..16 bg:surface@16..27 bg:surface+bold@27..28 bg:surface@28..37 bg:surface+bold@37..42 bg:surface@42..54 bg:surface+bold@54..63 bg:surface@63..82 bg:surface+bold@82..83 bg:surface@83..91 bg:surface+bold@91..92 bg:surface@92..102 bg:surface+bold@102..103 bg:surface@103..112 bg:surface+bold@112..115 bg:surface@115..120
 39 |bg:surface@0..120

@@ -11,7 +11,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 > Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). New tickets #0087 to #0096 spread across Now / Next / Later below.
 
 - [#0089 Send the current draft in place, approve and send in one confirmed step](docs/tickets/0089-send-current-draft-approve-and-send.md) -- feature
-- [#0092 Keybinding scheme redesign to an nvim-style mnemonic prefix model](docs/tickets/0092-keybinding-scheme-redesign.md) -- feature _(plan approved with amendments 2026-08-14; open for implementation)_
 
 ## Next
 

@@ -25,6 +25,10 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         return;
     };
 
+    // A reading pane (List / Headers / Body) shares the promoted MESSAGE
+    // actions (#0092), so the hint bar merges the pane's own keys with the
+    // message set; otherwise the bar would advertise only `j/k` and `v`.
+    let msg_pane = matches!(ctx, KeyCtx::List | KeyCtx::Headers | KeyCtx::Preview);
     let pending = app.pending_prefix();
     let (badge, hints): (String, Vec<(&'static str, &'static str)>) = if let Some(p) = pending {
         // Leader pending: show its continuations (Space -> `m/c/a`; `g` ->
@@ -40,6 +44,13 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
                 conts.push((kb.keys, kb.hint_label()));
             }
         }
+        if msg_pane {
+            for kb in prefix_continuations(KeyCtx::Message, p) {
+                if !conts.iter().any(|(k, _)| *k == kb.keys) {
+                    conts.push((kb.keys, kb.hint_label()));
+                }
+            }
+        }
         // The leader badge: a printable name for Space, otherwise the
         // uppercased key (e.g. `g` -> `G`).
         let badge = if p == ' ' { "SPACE".to_string() } else { p.to_uppercase().to_string() };
@@ -51,10 +62,17 @@ pub(super) fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         // keys (`1-9 Jump to mailbox`, `/ Filter by metadata`) in Contacts /
         // Calendar. Pane contexts (Contacts list) are unaffected.
         let off_mail = app.view != View::Mail;
-        let hs: Vec<(&str, &str)> = hint_bindings(ctx)
+        let mut hs: Vec<(&str, &str)> = hint_bindings(ctx)
             .filter(|kb| !(off_mail && ctx == KeyCtx::Global && !kb.action.is_view_agnostic()))
             .map(|kb| (kb.keys, kb.hint_label()))
             .collect();
+        if msg_pane {
+            for kb in hint_bindings(KeyCtx::Message) {
+                if !hs.iter().any(|(k, _)| *k == kb.keys) {
+                    hs.push((kb.keys, kb.hint_label()));
+                }
+            }
+        }
         (mode_label(app, ctx).to_string(), hs)
     };
 
@@ -123,6 +141,9 @@ fn mode_label(app: &App, ctx: KeyCtx) -> String {
     }
     let base = match ctx {
         KeyCtx::Global => "MAIL",
+        // `key_context()` never returns Message (it reports the focused pane),
+        // but the match must be exhaustive; a reading pane is still "MAIL".
+        KeyCtx::Message => "MAIL",
         KeyCtx::Sidebar => "MAILBOXES",
         KeyCtx::List => "MAIL",
         KeyCtx::Headers => "HEADERS",

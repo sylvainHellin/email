@@ -1078,6 +1078,16 @@ pub(super) fn handle_action(
                 return Ok(());
             };
 
+            // `x` merges approve + send (#0092): the redesign dropped the
+            // separate approve key, so an unapproved draft is approved as part
+            // of the send. `mark_as_approved` is idempotent (an already-
+            // approved draft is left as is), so this is a no-op on a draft that
+            // was approved out of band.
+            if let Err(e) = crate::draft::mark_as_approved(&path) {
+                app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
+                return Ok(());
+            }
+
             let draft = match crate::draft::parse_email_draft(&path) {
                 Ok(draft) => draft,
                 Err(e) => {

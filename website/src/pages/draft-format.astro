@@ -168,8 +168,8 @@ Email body here.`;
     <section>
       <h2 id="reply-drafts">Reply Drafts</h2>
       <p>
-        Reply drafts are created with <code>mp reply</code> (or <code>r</code>/<code>R</code>
-        in the TUI). They record the source message in <code>in_reply_to</code> and carry a
+        Reply drafts are created with <code>mp reply</code> (or <code>r</code> to reply,
+        <code>ca</code> to reply-all, in the TUI). They record the source message in <code>in_reply_to</code> and carry a
         <code>{"{{SIGNATURE}}"}</code> placeholder between the reply area and the quoted original
         message.
       </p>
@@ -188,7 +188,7 @@ Email body here.`;
     <section>
       <h2 id="forward-drafts">Forward Drafts</h2>
       <p>
-        Forward drafts are created with <code>mp forward</code> (or <code>w</code> in the TUI).
+        Forward drafts are created with <code>mp forward</code> (or <code>cf</code> in the TUI).
         The <code>to:</code> field is left empty for you to fill in. The subject gets a
         "Fwd:" prefix, and any attachments from the original email are listed in the
         <code>attachments:</code> array with their absolute file paths. The source message
@@ -234,8 +234,8 @@ Email body here.`;
       <Code code={attachmentFrontmatter} lang="yaml" theme="catppuccin-mocha" />
       <p>
         To read an attachment of a received message rather than forward it: in the TUI press
-        <code>o</code> to open one in the default app (it is written to a private temp directory
-        first) or <code>O</code> to save it to a directory you choose, and from the CLI use
+        <code>to</code> to open one in the default app (it is written to a private temp directory
+        first) or <code>ts</code> to save it to a directory you choose, and from the CLI use
         <code>mp save &lt;selector&gt; --output &lt;dir&gt;</code>.
       </p>
     </section>

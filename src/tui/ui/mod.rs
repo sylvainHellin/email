@@ -261,4 +261,78 @@ fn render_overlays(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect
     } else if matches!(app.overlay, Overlay::Compose(_)) {
         compose::render_compose_wizard(app, frame, area);
     }
+
+    // which-key popup (#0092): when a mnemonic family leader is pending and no
+    // modal overlay owns the screen, float the pending family's continuations
+    // (key + label) so the chord is discoverable while it is being typed. The
+    // hint bar shows the same set inline; this is the larger, centred surface.
+    if !app.overlay.is_active() && app.pending_prefix().is_some() {
+        render_prefix_popup(app, frame, area);
+    }
+}
+
+/// Draw the which-key popup for the pending family leader (#0092).
+fn render_prefix_popup(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    use ratatui::layout::{Constraint, Direction, Flex, Layout};
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+
+    let Some(p) = app.pending_prefix() else {
+        return;
+    };
+    let rows = app.prefix_popup_rows();
+    if rows.is_empty() {
+        return;
+    }
+
+    let theme = super::theme::active();
+    let key_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(3).max(3);
+    let inner_w = rows
+        .iter()
+        .map(|(k, d)| key_w.max(k.chars().count()) + 2 + d.chars().count())
+        .max()
+        .unwrap_or(12);
+    let title = format!(" {} ", App::prefix_family_name(p));
+
+    let width = ((inner_w as u16) + 4)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(2));
+    let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .split(area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .split(horizontal[0]);
+    let popup = vertical[0];
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(keys, desc)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {keys:<key_w$}"),
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {desc}"), Style::default().fg(theme.text)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }

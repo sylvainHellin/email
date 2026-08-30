@@ -3,22 +3,50 @@
     "title": "GLOBAL",
     "bindings": [
       { "key": "q", "action": "Quit" },
-      { "key": "`", "action": "Switch account" },
-      { "key": "Ctrl+1-9", "action": "Jump to account" },
       { "key": "1-9", "action": "Jump to mailbox" },
       { "key": "Tab", "action": "Cycle focus forward" },
       { "key": "Shift+Tab", "action": "Cycle focus backward" },
-      { "key": "/", "action": "Filter by metadata" },
-      { "key": "\\", "action": "Search email content" },
       { "key": "?", "action": "Toggle this help" },
       { "key": "z", "action": "Zoom / unzoom the focused pane" },
       { "key": "!", "action": "Toggle activity log" },
-      { "key": "L", "action": "Open activity log overlay" },
-      { "key": "Ctrl+l", "action": "Open log file in $EDITOR" },
-      { "key": "Ctrl+e", "action": "Open config.toml in $EDITOR" },
+      { "key": "x", "action": "Send current draft (approve + send)" },
+      { "key": "ff", "action": "Search all mail (sender, subject, body)" },
+      { "key": "cn", "action": "New draft" },
+      { "key": "gm", "action": "Go to mailboxes (sidebar)" },
+      { "key": "ga", "action": "Switch account" },
+      { "key": "ss", "action": "Quick sync" },
+      { "key": "sS", "action": "Full sync" },
+      { "key": "sl", "action": "Activity log overlay" },
+      { "key": "sc", "action": "Open config.toml in $EDITOR" },
+      { "key": "sf", "action": "Open log file in $EDITOR" },
       { "key": "Space m", "action": "Switch to Mail view" },
       { "key": "Space c", "action": "Switch to Contacts view" },
       { "key": "Space a", "action": "Switch to Calendar view" }
+    ]
+  },
+  {
+    "title": "MESSAGE (list, headers, body)",
+    "bindings": [
+      { "key": "J / K", "action": "Next / previous message" },
+      { "key": "Enter / e", "action": "Open in editor (mail read-only)" },
+      { "key": "r", "action": "Reply" },
+      { "key": "a", "action": "Archive" },
+      { "key": "d", "action": "Delete" },
+      { "key": "u", "action": "Toggle read/unread" },
+      { "key": "*", "action": "Toggle flag/star" },
+      { "key": "M", "action": "Move to mailbox (fuzzy picker)" },
+      { "key": "y", "action": "Copy selector (mp://)" },
+      { "key": "Esc", "action": "Clear selection / return to list" },
+      { "key": "gj / gk", "action": "Next / previous message" },
+      { "key": "fm", "action": "Filter the current list" },
+      { "key": "cr", "action": "Reply" },
+      { "key": "ca", "action": "Reply all" },
+      { "key": "cf", "action": "Forward" },
+      { "key": "tt", "action": "Show conversation (thread)" },
+      { "key": "to", "action": "Open attachment" },
+      { "key": "ts", "action": "Save attachment to disk" },
+      { "key": "tb", "action": "Open HTML in browser" },
+      { "key": "tv", "action": "RSVP to invitation (Accept/Tentative/Decline)" }
     ]
   },
   {
@@ -33,32 +61,11 @@
     "bindings": [
       { "key": "j/k", "action": "Navigate emails" },
       { "key": "gg / G", "action": "Jump to top / bottom" },
-      { "key": "g t", "action": "Jump to date (e.g. last week)" },
+      { "key": "gt", "action": "Jump to date (e.g. last week)" },
       { "key": "v", "action": "Toggle selection" },
       { "key": "Ctrl+a", "action": "Select all visible" },
-      { "key": "Esc", "action": "Clear selection" },
-      { "key": "Enter / e", "action": "Open in editor (mail read-only)" },
-      { "key": "r / R", "action": "Reply / Reply-all" },
-      { "key": "w", "action": "Forward" },
-      { "key": "c", "action": "Edit recipients (Drafts only)" },
-      { "key": "a", "action": "Archive" },
-      { "key": "d", "action": "Delete" },
-      { "key": "m", "action": "Toggle read/unread" },
-      { "key": "*", "action": "Toggle flag/star" },
-      { "key": "F", "action": "Show flagged only (toggle)" },
-      { "key": "M", "action": "Move to mailbox (fuzzy picker)" },
-      { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
-      { "key": "T", "action": "Show conversation (thread)" },
-      { "key": "A", "action": "Approve draft" },
-      { "key": "D", "action": "Mark approved as draft (reverse A)" },
-      { "key": "x / X", "action": "Send / Send all approved" },
-      { "key": "y", "action": "Copy selector (mp://)" },
-      { "key": "o", "action": "Open attachment" },
-      { "key": "O", "action": "Save attachment to disk" },
-      { "key": "b", "action": "Open HTML in browser" },
-      { "key": "n", "action": "New draft" },
-      { "key": "s / S", "action": "Quick sync / Full sync" },
-      { "key": "f", "action": "Search (IMAP)" }
+      { "key": "ce", "action": "Edit recipients (Drafts only)" },
+      { "key": "fF", "action": "Show flagged only (toggle)" }
     ]
   },
   {
@@ -111,9 +118,7 @@
     "title": "BODY",
     "bindings": [
       { "key": "j/k", "action": "Scroll line by line" },
-      { "key": "d/u", "action": "Half-page down / up" },
-      { "key": "V", "action": "RSVP to invitation (Accept/Tentative/Decline)" },
-      { "key": "Esc", "action": "Return to list" }
+      { "key": "Ctrl+d / Ctrl+u", "action": "Half-page down / up" }
     ]
   },
   {

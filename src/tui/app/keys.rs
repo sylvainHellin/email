@@ -83,7 +83,12 @@ impl App {
             // key resolves but is swallowed so it cannot fire (#0033) -- UNLESS
             // the active view's pane context rebinds that key (e.g. Contacts
             // rebinds `/` to fuzzy search), in which case the pane binding wins.
-            if self.view != super::View::Mail && !action.is_view_agnostic() {
+            // A family leader stays live iff its family carries a view-agnostic
+            // continuation (today `s`: config/log/activity, #0092 review fix),
+            // so those utilities remain reachable from Contacts and Calendar.
+            let agnostic_leader = matches!(action, super::KeyAction::ArmPrefix)
+                && matches!(key.code, KeyCode::Char(l) if super::leader_is_view_agnostic(l));
+            if self.view != super::View::Mail && !action.is_view_agnostic() && !agnostic_leader {
                 let pane_rebinds = pane_ctx
                     .and_then(|ctx| super::resolve(ctx, key, pending, &guard_ok))
                     .is_some();
@@ -101,8 +106,20 @@ impl App {
                 return self.execute(action, key);
             }
         }
+        // Then the shared MESSAGE context (#0092): a message action resolves
+        // identically in the List, Headers and Body panes, so acting on what
+        // you are reading never needs a focus hop. Tried after the focused
+        // pane so a pane keeps its own scroll keys (`j`/`k`).
+        if let Some(action) = self
+            .message_ctx()
+            .and_then(|ctx| super::resolve(ctx, key, pending, &guard_ok))
+        {
+            return self.execute(action, key);
+        }
         // No live binding matched: clear any pending leader (an unrecognised
-        // key aborts the chord), matching the old `_ => { g_pending = false }`.
+        // key aborts the chord). Under strict prefix mode a key that is not a
+        // continuation of the pending family cancels the chord here without
+        // firing a flat binding (which-key semantics).
         self.pending_prefix = None;
         None
     }
@@ -115,6 +132,20 @@ impl App {
             Focus::Headers => Some(super::KeyCtx::Headers),
             Focus::Preview => Some(super::KeyCtx::Preview),
             Focus::Search | Focus::ComposeWizard => None,
+        }
+    }
+
+    /// The shared MESSAGE context, live whenever a reading pane (List, Headers,
+    /// Body) holds focus in the Mail view (#0092). `None` off Mail or in the
+    /// sidebar / input panes, so a message action never fires where there is
+    /// no cursor message to act on.
+    fn message_ctx(&self) -> Option<super::KeyCtx> {
+        if self.view != super::View::Mail {
+            return None;
+        }
+        match self.focus {
+            Focus::List | Focus::Headers | Focus::Preview => Some(super::KeyCtx::Message),
+            Focus::Sidebar | Focus::Search | Focus::ComposeWizard => None,
         }
     }
 
@@ -212,16 +243,30 @@ impl App {
                     }
                 }
             }
+            A::ArmPrefix => {
+                // A mnemonic family leader (`f`/`c`/`g`/`t`/`s`) was pressed
+                // with nothing pending: arm it so the next key is resolved as
+                // a continuation and the which-key popup shows the family.
+                if let KeyCode::Char(leader) = key.code {
+                    self.pending_prefix = Some(leader);
+                }
+            }
+            A::GoMailbox => {
+                // `gm`: go to the mailbox sidebar (navigate with j/k, Enter).
+                self.pending_prefix = None;
+                self.focus = Focus::Sidebar;
+            }
             A::FocusForward => {
                 self.pending_prefix = None;
                 if self.focus == Focus::Sidebar {
                     self.switch_mailbox(self.sidebar_index);
                 }
+                // Reading order (#0092): Sidebar, List, Headers, Body.
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::List,
-                    Focus::List => Focus::Preview,
-                    Focus::Preview => Focus::Headers,
-                    Focus::Headers => Focus::Sidebar,
+                    Focus::List => Focus::Headers,
+                    Focus::Headers => Focus::Preview,
+                    Focus::Preview => Focus::Sidebar,
                     Focus::Search => Focus::List,
                     Focus::ComposeWizard => Focus::ComposeWizard,
                 };
@@ -229,9 +274,9 @@ impl App {
             A::FocusBackward => {
                 self.pending_prefix = None;
                 self.focus = match self.focus {
-                    Focus::Sidebar => Focus::Headers,
-                    Focus::Headers => Focus::Preview,
-                    Focus::Preview => Focus::List,
+                    Focus::Sidebar => Focus::Preview,
+                    Focus::Preview => Focus::Headers,
+                    Focus::Headers => Focus::List,
                     Focus::List => Focus::Sidebar,
                     Focus::Search => Focus::List,
                     Focus::ComposeWizard => Focus::ComposeWizard,
@@ -426,6 +471,29 @@ impl App {
             A::ListUp => {
                 self.pending_prefix = None;
                 self.list_index = self.list_index.saturating_sub(1);
+            }
+            // Next / previous message from any reading pane (`J`/`K`, `gj`/`gk`,
+            // #0092): move the list cursor without changing focus, so the
+            // preview follows while the body pane keeps the keyboard.
+            A::NextMessage => {
+                self.pending_prefix = None;
+                if self.list_index < self.visible.len().saturating_sub(1) {
+                    self.list_index += 1;
+                }
+            }
+            A::PrevMessage => {
+                self.pending_prefix = None;
+                self.list_index = self.list_index.saturating_sub(1);
+            }
+            // Esc in any reading pane: clear a live selection first, else
+            // return focus to the list (#0092, symmetric across the panes).
+            A::EscMessage => {
+                self.pending_prefix = None;
+                if !self.selection.is_empty() {
+                    self.selection.clear();
+                } else if self.focus != Focus::List {
+                    self.focus = Focus::List;
+                }
             }
             A::ListTop => {
                 // Reached only with `g` pending (the leader continuation).
@@ -2722,62 +2790,14 @@ mod tests {
         assert_eq!(app.selection.len(), 2);
     }
 
-    /// `A` over a Drafts selection confirms, then queues the batch by draft
-    /// id: approving is a write to a file, and a draft has no `MessageRef`
-    /// to name it by.
+    // The batch approve / mark-draft keys (`A` / `D`) were removed by the
+    // #0092 keymap redesign: sending a single draft with `x` approves it, and
+    // batch approve / send-all now live on the CLI (`mp mark-approved`,
+    // `mp send-approved`). The batch-approve confirm path is therefore no
+    // longer reachable from the TUI; the batch delete over `d` is, and still
+    // takes only the messages half of a mixed selection.
     #[test]
-    fn confirming_a_drafts_selection_queues_the_batch_by_id() {
-        let mut app = app_with_emails(vec![draft_entry("aaa", "One"), draft_entry("bbb", "Two")]);
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-
-        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
-        assert!(matches!(app.overlay, Overlay::Confirm(_)));
-        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
-
-        match app.pending_actions.pop_front() {
-            Some(Action::BatchApprove(mut ids)) => {
-                ids.sort();
-                assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
-            }
-            other => panic!("expected BatchApprove, got {other:?}"),
-        }
-        assert!(app.selection.is_empty(), "the confirm drained the selection");
-    }
-
-    /// `A` and `D` over a received-mail selection ask nothing: the batch takes
-    /// the drafts half of the set, so a selection with no draft in it would
-    /// have confirmed "Approve 4 drafts?" and then reported "Approved 0
-    /// drafts".
-    #[test]
-    fn a_selection_without_drafts_never_opens_the_draft_confirmation() {
-        let mut app = app_with_emails(sample());
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert_eq!(app.selection.len(), 4, "the received rows are selected");
-
-        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
-        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Approve needs drafts; the selection has no draft in it")
-        );
-        assert!(app.pending_actions.is_empty(), "and nothing is queued");
-
-        app.handle_key(KeyEvent::from(KeyCode::Char('D')));
-        assert!(matches!(app.overlay, Overlay::None), "no dialog opens");
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Mark as draft needs drafts; the selection has no draft in it")
-        );
-        assert!(app.pending_actions.is_empty(), "and nothing is queued");
-        assert_eq!(app.selection.len(), 4, "the selection is left alone");
-    }
-
-    /// A selection cannot mix the two namespaces in practice -- a mailbox
-    /// lists one kind of row and switching mailboxes clears the set -- but
-    /// each batch filters rather than assumes, so neither can act on the
-    /// other's rows.
-    #[test]
-    fn each_batch_takes_only_its_own_half_of_a_mixed_selection() {
+    fn batch_delete_takes_only_the_messages_half_of_a_mixed_selection() {
         let mut app = app_with_emails(sample());
         let msg = app.emails[0].msg.unwrap();
         app.selection = std::collections::HashSet::from([
@@ -2785,17 +2805,6 @@ mod tests {
             EntryKey::Draft("aaa".to_string()),
         ]);
 
-        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
-        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
-        match app.pending_actions.pop_front() {
-            Some(Action::BatchApprove(ids)) => assert_eq!(ids, vec!["aaa".to_string()]),
-            other => panic!("expected BatchApprove, got {other:?}"),
-        }
-
-        app.selection = std::collections::HashSet::from([
-            EntryKey::Msg(msg),
-            EntryKey::Draft("aaa".to_string()),
-        ]);
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         app.handle_key(KeyEvent::from(KeyCode::Char('y')));
         match app.pending_actions.pop_front() {
@@ -3246,12 +3255,15 @@ mod tests {
         app.rebuild_visible();
         app.list_index = 1;
 
+        // `fF` (the find family's flagged-only filter, #0092).
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
 
         assert!(app.flagged_only);
         assert_eq!(app.visible, vec![1]);
         assert_eq!(app.list_index, 0, "cursor followed its row");
 
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
 
         assert!(!app.flagged_only);
@@ -3273,6 +3285,7 @@ mod tests {
         app.email_cache = vec![Some(std::sync::Arc::clone(&app.emails))];
         app.rebuild_visible();
 
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
         assert_eq!(app.visible, vec![0, 1, 2]);
 
@@ -3281,6 +3294,7 @@ mod tests {
         app.apply_search_filter(false);
         assert!(app.visible.is_empty(), "flagged view still applies");
 
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
         assert_eq!(app.visible, vec![3], "search alone again");
     }
@@ -3291,9 +3305,11 @@ mod tests {
     fn the_flagged_view_can_be_left_when_it_shows_nothing() {
         let mut app = app_with_emails(sample());
 
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
         assert!(app.visible.is_empty(), "no flagged rows in the fixture");
 
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
         app.handle_key(KeyEvent::from(KeyCode::Char('F')));
         assert!(!app.flagged_only);
         assert_eq!(app.visible, vec![0, 1, 2, 3]);
@@ -3532,6 +3548,42 @@ mod tests {
         assert_eq!(app.pending_prefix, Some(' '));
         app.handle_key(KeyEvent::from(KeyCode::Char('c')));
         assert_eq!(app.view, View::Contacts);
+    }
+
+    /// `Tab` follows reading order — Sidebar, List, Headers, Body — and
+    /// `Shift+Tab` mirrors it (#0092 review fix).
+    #[test]
+    fn tab_cycles_focus_in_reading_order() {
+        let mut app = app_with_mailboxes();
+        app.focus = Focus::List;
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Headers);
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Preview);
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Preview);
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Headers);
+    }
+
+    /// The `s` system family carries view-agnostic utilities, so its leader
+    /// arms in the content views and `sl` opens the activity overlay there;
+    /// the other four families stay Mail-only (#0092 review fix).
+    #[test]
+    fn the_system_leader_arms_in_non_mail_views() {
+        for view in [View::Contacts, View::Calendar] {
+            let mut app = app_with_mailboxes();
+            app.switch_view(view);
+            app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+            assert_eq!(app.pending_prefix, Some('s'), "`s` must arm in {view:?}");
+            app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+            assert!(
+                matches!(app.overlay, Overlay::Activity),
+                "`sl` must open the activity overlay in {view:?}"
+            );
+        }
     }
 
     /// Switching to Mail restores the parked focus (the `MailView` proxy),
@@ -4213,8 +4265,8 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('z')));
         assert_eq!(app.zoomed_pane(), Some(Focus::List));
         app.handle_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Preview);
-        assert_eq!(app.zoomed_pane(), Some(Focus::Preview));
+        assert_eq!(app.focus, Focus::Headers);
+        assert_eq!(app.zoomed_pane(), Some(Focus::Headers));
     }
 
     #[test]
