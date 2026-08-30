@@ -555,7 +555,9 @@ fn write_draft_and_edit(
 ) -> Result<()> {
     let account = app.account_config.name.clone();
     let from = default_from(app);
-    let (path, selector) = match create_draft_from_source(&account, &from, source, kind, None) {
+    let signature = app.signature_content.clone();
+    let (path, selector) =
+        match create_draft_from_source(&account, &from, source, kind, None, signature.as_deref()) {
         Ok(pair) => pair,
         Err(e) => {
             app.set_status_level(format!("{what} failed: {e:#}"), StatusLevel::Error);
@@ -1137,7 +1139,10 @@ pub(super) fn handle_action(
             // The IMAP config that resolver also hands back is not used here:
             // the sent copy is an APPEND the outbox owns and drives (#0037),
             // not something this path does after the fact.
-            let (acct_idx, smtp, _imap, graph, account_config, signature) =
+            // The signature now lives in the draft body (#0099), appended at
+            // creation, so the send-time injection is off here: passing it
+            // again would double it.
+            let (acct_idx, smtp, _imap, graph, account_config, _signature) =
                 super::helpers::resolve_send_account(app, &path);
             // The account's `auth_method` decides the transport, not which
             // config happened to load: a Graph account sends over Graph or not
@@ -1155,7 +1160,7 @@ pub(super) fn handle_action(
                 smtp,
                 account: account_config,
                 email_settings: app.global_config.email.clone(),
-                signature,
+                signature: None,
             };
 
             app.bg_count += 1;
@@ -1275,7 +1280,8 @@ pub(super) fn handle_action(
                 smtp,
                 account: app.account_config.clone(),
                 email_settings: app.global_config.email.clone(),
-                signature: app.signature_content.clone(),
+                // Signature is in the draft body (#0099); no send-time inject.
+                signature: None,
             };
 
             app.bg_count += 1;
@@ -1346,7 +1352,7 @@ pub(super) fn handle_action(
                     .map(|s| s.default_from.clone())
                     .unwrap_or_else(|| app.account_config.default_from.clone());
                 let from = default_from.as_str();
-                let skeleton = new_draft_skeleton(from, &now);
+                let skeleton = new_draft_skeleton(from, &now, app.signature_content.as_deref());
                 match std::fs::write(&path, skeleton) {
                     Ok(()) => {
                         suspend_terminal(terminal)?;
@@ -2329,12 +2335,14 @@ fn submit_compose_wizard(
         };
         let account = app.account_config.name.clone();
         let from = default_from(app);
+        let signature = app.signature_content.clone();
         let (path, selector) = match create_draft_from_source(
             &account,
             &from,
             &source,
             DraftFromSource::Forward,
             Some(&edit),
+            signature.as_deref(),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -2456,6 +2464,21 @@ fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<Path
     if !body.is_empty() {
         fm.push_str(body);
         fm.push('\n');
+    }
+
+    // Per-account signature (#0099): appended to the body at creation so it is
+    // visible and editable, below the inline body when there is one. An empty
+    // body still opens `$EDITOR` (that decision reads `wizard.body`, not the
+    // file), so the user edits a draft that already carries the signature.
+    if let Some(sig) = app.signature_content.as_deref() {
+        let sig = sig.trim_end();
+        if !sig.is_empty() {
+            if !body.is_empty() {
+                fm.push('\n');
+            }
+            fm.push_str(sig);
+            fm.push('\n');
+        }
     }
 
     std::fs::write(&path, fm)?;
@@ -3232,6 +3255,7 @@ mod store_backed_drafts {
             &source,
             DraftFromSource::Reply { all: false },
             None,
+            None,
         )
         .unwrap();
 
@@ -3277,6 +3301,7 @@ mod store_backed_drafts {
             &source,
             DraftFromSource::Reply { all: true },
             None,
+            None,
         )
         .unwrap();
 
@@ -3319,6 +3344,7 @@ mod store_backed_drafts {
             "me@example.com",
             &source,
             DraftFromSource::Forward,
+            None,
             None,
         )
         .unwrap();
@@ -3366,6 +3392,7 @@ mod store_backed_drafts {
                 bcc: String::new(),
                 subject: "Fwd: Report (for review)".to_string(),
             }),
+            None,
         )
         .unwrap();
 
@@ -3398,6 +3425,7 @@ mod store_backed_drafts {
             "me@example.com",
             &source,
             DraftFromSource::Reply { all: false },
+            None,
             None,
         )
         .unwrap();
@@ -3452,6 +3480,7 @@ mod store_backed_drafts {
             "me@example.com",
             &source,
             DraftFromSource::Forward,
+            None,
             None,
         )
         .unwrap();
@@ -3571,6 +3600,7 @@ mod store_backed_mutations {
             "me@example.com",
             &source,
             DraftFromSource::Reply { all: false },
+            None,
             None,
         )
         .unwrap();

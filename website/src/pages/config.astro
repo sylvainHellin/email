@@ -69,11 +69,15 @@ default = "work"            # Which signature to use by default
 
 [signatures.work]
 name = "Work Signature"
-path = "~/notes/email/signatures/work.html"
+text = """
+-- 
+Sylvain Hellin
+Managing Director
+"""
 
 [signatures.personal]
 name = "Personal"
-path = "~/notes/email/signatures/personal.html"`} />
+path = "~/notes/email/signatures/personal.md"`} />
     </section>
 
     <!-- Section Breakdown -->
@@ -124,7 +128,7 @@ path = "~/notes/email/signatures/personal.html"`} />
       <p>
         Controls the HTML rendering of sent emails. The font family and size are applied
         to the generated HTML when Markdown is converted for sending. <code>include_signature</code>
-        determines whether a signature is appended to outgoing mail.
+        determines whether the account signature is appended to a draft body on compose, reply, and forward.
       </p>
       <ConfigExample code={`[email]
 font_family = "Helvetica, Arial, sans-serif"
@@ -227,24 +231,30 @@ server = "Newsletters"`} />
       <h3 id="signatures-section">[signatures]</h3>
       <p>
         Named signature definitions. Set <code>default</code> to the name of the signature
-        to use by default. Each signature entry has a <code>path</code> pointing to an HTML
-        snippet file. Paths support <code>~</code> expansion.
+        to use by default. A signature is a Markdown snippet, given inline with
+        <code>text</code> or by a <code>path</code> to a Markdown file (<code>text</code> wins
+        when both are set). Paths support <code>~</code> expansion.
       </p>
       <p>
-        Signature files are plain HTML snippets appended after the email body. In reply
-        drafts, a <code>{"{{SIGNATURE}}"}</code> placeholder is inserted between the reply
-        area and quoted text, and the signature replaces it on send.
+        The signature is appended to the draft body when you compose, reply, or forward,
+        so it is visible and editable in the draft rather than added on send. An account
+        with no configured signature adds nothing. Use <code>-s &lt;name&gt;</code> to pick a
+        named signature or <code>--no-signature</code> to skip it for one draft.
       </p>
       <ConfigExample code={`[signatures]
 default = "work"
 
 [signatures.work]
 name = "Work Signature"
-path = "~/notes/email/signatures/work.html"
+text = """
+-- 
+Sylvain Hellin
+Managing Director
+"""
 
 [signatures.personal]
 name = "Personal"
-path = "~/notes/email/signatures/personal.html"`} />
+path = "~/notes/email/signatures/personal.md"`} />
     </section>
 
     <!-- Multi-Account Setup -->

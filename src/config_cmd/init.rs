@@ -1210,12 +1210,34 @@ pub(crate) fn build_init_toml(
             if let Some(ref default) = existing_acct.signatures.default {
                 out.push_str(&format!("default = \"{}\"\n", default));
             }
+            // Emit a TOML basic string so a multi-line inline signature
+            // round-trips (a bare "..." cannot hold literal newlines) (#0099).
+            fn toml_basic_string(s: &str) -> String {
+                let mut out = String::from("\"");
+                for c in s.chars() {
+                    match c {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        _ => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
             for (key, entry) in &existing_acct.signatures.entries {
                 out.push_str(&format!("\n[accounts.signatures.{}]\n", key));
                 if let Some(ref name) = entry.name {
                     out.push_str(&format!("name = \"{}\"\n", name));
                 }
-                out.push_str(&format!("path = \"{}\"\n", entry.path));
+                if let Some(ref text) = entry.text {
+                    out.push_str(&format!("text = {}\n", toml_basic_string(text)));
+                }
+                if let Some(ref path) = entry.path {
+                    out.push_str(&format!("path = \"{}\"\n", path));
+                }
             }
         }
     }

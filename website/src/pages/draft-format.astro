@@ -42,6 +42,9 @@ in_reply_to: "<message-id@example.com>"
 
 Your reply goes here.
 
+-- 
+Your Name
+
 {{SIGNATURE}}
 
 > On 2026-01-15, sender wrote:
@@ -59,6 +62,9 @@ attachments:
 
 Your note to the recipient.
 
+-- 
+Your Name
+
 {{SIGNATURE}}
 
 ---------- Forwarded message ----------
@@ -69,13 +75,17 @@ To: you@example.com
 
 Original message body here.`;
 
-const signatureExample = `<div style="font-family: Helvetica, Arial, sans-serif; font-size: 12pt;">
-<p style="margin: 0;">
-<b>Your Name</b><br>
-Title | Organization<br>
+const signatureExample = `[signatures]
+default = "work"
+
+[signatures.work]
+name = "Work Signature"
+text = """
+-- 
+**Your Name**
+Title | Organization
 your.name@example.com
-</p>
-</div>`;
+"""`;
 
 const attachmentStructure = `accounts/<name>/attachments/<message-id>/
   document.pdf
@@ -169,9 +179,9 @@ Email body here.`;
       <h2 id="reply-drafts">Reply Drafts</h2>
       <p>
         Reply drafts are created with <code>mp reply</code> (or <code>r</code> to reply,
-        <code>ca</code> to reply-all, in the TUI). They record the source message in <code>in_reply_to</code> and carry a
-        <code>{"{{SIGNATURE}}"}</code> placeholder between the reply area and the quoted original
-        message.
+        <code>ca</code> to reply-all, in the TUI). They record the source message in <code>in_reply_to</code>. The account signature
+        (if configured) is appended to the reply area, above a <code>{"{{SIGNATURE}}"}</code>
+        placeholder that marks the boundary with the quoted original message.
       </p>
       <p>
         When the reply is sent, the message it answers is marked as answered, locally and
@@ -179,8 +189,10 @@ Email body here.`;
         read marker.
       </p>
       <p>
-        When sent, the placeholder is replaced with the configured signature HTML.
-        If the placeholder is removed, the signature falls back to being appended at the end.
+        The signature is part of the draft body, so it is visible and editable before you
+        send. The <code>{"{{SIGNATURE}}"}</code> placeholder carries no signature text of its
+        own; the send path uses it to place the quoted original below your reply. If it is
+        removed, the quote falls back to the end of the body.
       </p>
       <Code code={replyExample} lang="markdown" theme="catppuccin-mocha" />
     </section>
@@ -201,17 +213,18 @@ Email body here.`;
     <section>
       <h2 id="signatures">Signatures</h2>
       <p>
-        Signatures are HTML snippet files referenced in <code>config.toml</code> under
-        the <code>[signatures]</code> section. A default signature name is set with
-        <code>signatures.default</code>, and each named entry has a <code>path</code>
-        to the HTML file (supports <code>~</code> expansion).
+        Signatures are Markdown, defined per account in <code>config.toml</code> under the
+        <code>[signatures]</code> section. A default signature name is set with
+        <code>signatures.default</code>; each named entry supplies the snippet inline with
+        <code>text</code> or by a <code>path</code> to a Markdown file (<code>~</code> expansion
+        supported, <code>text</code> wins when both are present).
       </p>
       <p>
-        For regular drafts, the signature is appended after the email body.
-        For reply and forward drafts, the <code>{"{{SIGNATURE}}"}</code> placeholder controls
-        placement -- the signature appears between your message and the quoted/forwarded content.
+        The signature is appended to the draft body when the draft is created: after the
+        body for a new message, in the reply area above the quoted content for a reply or
+        forward. An account with no configured signature adds nothing.
       </p>
-      <Code code={signatureExample} lang="html" theme="catppuccin-mocha" />
+      <Code code={signatureExample} lang="toml" theme="catppuccin-mocha" />
       <p>
         Use <code>-s &lt;name&gt;</code> to select a specific signature, or
         <code>--no-signature</code> to skip it entirely.

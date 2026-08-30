@@ -1262,6 +1262,26 @@ fn ensure_selector_account_matches(selector: &str, bound: &AccountConfig) -> Res
     Ok(())
 }
 
+/// The account's Markdown signature for a draft body (#0099), honouring the
+/// global `--no-signature` / `--signature <name>` flags and the
+/// `include_signature` config. Returns `None` (no signature block) when the
+/// user opted out or nothing is configured.
+fn resolve_body_signature(
+    account: &AccountConfig,
+    no_signature: bool,
+    signature_name: Option<&str>,
+    email: &EmailSettings,
+) -> Option<String> {
+    if no_signature {
+        None
+    } else if email.include_signature {
+        resolve_signature_markdown(account, signature_name)
+    } else {
+        // include_signature is off, but an explicit --signature still selects one.
+        signature_name.and_then(|s| resolve_signature_markdown(account, Some(s)))
+    }
+}
+
 /// The mailboxes an account is configured for, as a human-readable list for
 /// the error a `--mailbox` typo produces.
 fn configured_mailbox_names(account: &AccountConfig) -> String {
@@ -1644,17 +1664,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Determine signature to use
-    let signature_content: Option<String> = if cli.no_signature {
-        None
-    } else if global_config.email.include_signature {
-        load_signature(&account_config, cli.signature.as_deref())
-    } else {
-        // include_signature is false, but user can override with --signature
-        cli.signature
-            .as_deref()
-            .and_then(|s| load_signature(&account_config, Some(s)))
-    };
+    // Signature for direct sends and invites, which have no editable draft to
+    // carry it in the body (#0099). Draft sends (`mp send`) take None: their
+    // signature was appended to the body at `mp reply`/`mp forward`/`mp new`
+    // time.
+    let signature_content: Option<String> = resolve_body_signature(
+        &account_config,
+        cli.no_signature,
+        cli.signature.as_deref(),
+        &global_config.email,
+    );
 
     match cli.command {
         Some(Commands::Send {
@@ -1733,13 +1752,10 @@ async fn main() -> Result<()> {
                 println!("  {} {}", "Subject:".yellow(), draft.frontmatter.subject);
                 println!("{}", "---".dimmed());
             } else {
-                preview_draft(
-                    &draft,
-                    &smtp_config,
-                    &global_config.email,
-                    signature_content.as_deref(),
-                    false,
-                )?;
+                // The signature lives in the draft body since #0099; a
+                // send-time signature line would advertise an injection that
+                // no longer happens.
+                preview_draft(&draft, &smtp_config, &global_config.email, None, false)?;
             }
 
             if !yes && !prompt_confirmation("Send this email?") {
@@ -1758,7 +1774,8 @@ async fn main() -> Result<()> {
                 smtp: (!is_graph).then(|| smtp_config.clone()),
                 account: account_config.clone(),
                 email_settings: global_config.email.clone(),
-                signature: signature_content.clone(),
+                // The signature is already in the draft body (#0099).
+                signature: None,
             };
             let sent = mailypoppins::send::send_draft(&draft, &ctx).await?;
             let report = &sent.report;
@@ -1868,15 +1885,6 @@ async fn main() -> Result<()> {
                 eprintln!("{} Could not load SMTP config: {}", "\u{26a0}".yellow(), e);
                 smtp_config.clone()
             });
-            let signature_content: Option<String> = if cli.no_signature {
-                None
-            } else if global_config.email.include_signature {
-                load_signature(&account_config, cli.signature.as_deref())
-            } else {
-                cli.signature
-                    .as_deref()
-                    .and_then(|s| load_signature(&account_config, Some(s)))
-            };
             let store = drafts_store(&account_config.name)?;
             let rows =
                 mailypoppins::store::drafts::list(&store, &account_config.name, Some("approved"))?;
@@ -1937,7 +1945,8 @@ async fn main() -> Result<()> {
                 smtp: (!is_graph).then(|| smtp_config.clone()),
                 account: account_config.clone(),
                 email_settings: global_config.email.clone(),
-                signature: signature_content.clone(),
+                // Signatures live in the draft body now (#0099).
+                signature: None,
             };
 
             for draft in drafts {
@@ -2162,8 +2171,12 @@ async fn main() -> Result<()> {
             // printed below is the one in the file from the first byte.
             let id = mailypoppins::store::drafts::new_id();
             let now = chrono::Utc::now().to_rfc2822();
-            let skeleton =
-                new_draft_skeleton_with_id(&smtp_config.default_from, &now, &id);
+            let skeleton = new_draft_skeleton_with_id(
+                &smtp_config.default_from,
+                &now,
+                &id,
+                signature_content.as_deref(),
+            );
             fs::write(&path, skeleton)?;
             reindex_drafts(&account_config.name);
             println!(
@@ -2212,6 +2225,13 @@ async fn main() -> Result<()> {
                 &source,
                 mailypoppins::draft::DraftFromSource::Reply { all },
                 None,
+                resolve_body_signature(
+                    &account_config,
+                    cli.no_signature,
+                    cli.signature.as_deref(),
+                    &global_config.email,
+                )
+                .as_deref(),
             )?;
             println!("{} reply to {}", "\u{2713}".green(), canonical);
             println!("{}", draft);
@@ -2232,6 +2252,13 @@ async fn main() -> Result<()> {
                 &source,
                 mailypoppins::draft::DraftFromSource::Forward,
                 None,
+                resolve_body_signature(
+                    &account_config,
+                    cli.no_signature,
+                    cli.signature.as_deref(),
+                    &global_config.email,
+                )
+                .as_deref(),
             )?;
             println!("{} forward of {}", "\u{2713}".green(), canonical);
             println!("{}", draft);
@@ -2956,13 +2983,9 @@ async fn main() -> Result<()> {
                     resolve_draft_arg(&store, selector, &account_config.name)?;
                 drop(store);
                 let draft = parse_email_draft(&row.path)?;
-                preview_draft(
-                    &draft,
-                    &smtp_config,
-                    &global_config.email,
-                    signature_content.as_deref(),
-                    true,
-                )?;
+                // Same as the single-send preview: the body already carries
+                // the signature (#0099).
+                preview_draft(&draft, &smtp_config, &global_config.email, None, true)?;
             } else {
                 // No file, no subcommand -> launch TUI
                 mailypoppins::tui::run()?;

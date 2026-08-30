@@ -755,8 +755,11 @@ impl AccountState {
         let smtp_config = crate::config::SmtpConfig::load(&account_config).ok();
         let graph_config = crate::config::GraphConfig::load(&account_config).ok();
 
+        // The account's Markdown signature, appended to the draft body at
+        // compose/reply/forward time (#0099). `None` when the account has none
+        // or the user turned signatures off.
         let signature_content = if email_settings.include_signature {
-            crate::config::load_signature(&account_config, None)
+            crate::config::resolve_signature_markdown(&account_config, None)
         } else {
             None
         };

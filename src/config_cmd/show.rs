@@ -197,7 +197,13 @@ pub fn cmd_config_show() -> Result<()> {
             if let Some(ref name) = entry.name {
                 println!("      name = {}", name);
             }
-            println!("      path = {}", entry.path);
+            if let Some(ref text) = entry.text {
+                let preview: String = text.lines().next().unwrap_or_default().chars().take(60).collect();
+                println!("      text = {preview} ...");
+            }
+            if let Some(ref path) = entry.path {
+                println!("      path = {}", path);
+            }
         }
     }
 

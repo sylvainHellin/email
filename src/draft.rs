@@ -23,8 +23,8 @@ use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus};
 /// the selector `mp new` printed (#0050). The parser tolerates the bare form
 /// too (see [`crate::types::EmailFrontmatter`]), so an agent's draft still
 /// indexes; the file we write does not lean on that tolerance.
-pub fn new_draft_skeleton(from: &str, date: &str) -> String {
-    new_draft_skeleton_with_id(from, date, &crate::store::drafts::new_id())
+pub fn new_draft_skeleton(from: &str, date: &str, signature: Option<&str>) -> String {
+    new_draft_skeleton_with_id(from, date, &crate::store::drafts::new_id(), signature)
 }
 
 /// [`new_draft_skeleton`] with the `id:` chosen by the caller, which is what
@@ -34,8 +34,29 @@ pub fn new_draft_skeleton(from: &str, date: &str) -> String {
 /// `id:` is first so it survives an editor session that reorders nothing and a
 /// human eye that reads the top of the file; it is the draft's identity under
 /// #0050, and the whole point is that it is preserved rather than regenerated.
-pub fn new_draft_skeleton_with_id(from: &str, date: &str, id: &str) -> String {
-    format!("---\nid: {id}\nto:\ncc:\nbcc:\nsubject: \"\"\nstatus: draft\nfrom: {from}\ndate: {date}\nreply_to:\nattachments:\n---\n\n")
+pub fn new_draft_skeleton_with_id(
+    from: &str,
+    date: &str,
+    id: &str,
+    signature: Option<&str>,
+) -> String {
+    // The signature (#0099) is appended to the body at creation so it is
+    // visible and editable; a blank line separates it from the empty body the
+    // user types into. No configured signature leaves the body empty, exactly
+    // as before.
+    let body = signature_block(signature).unwrap_or_default();
+    format!("---\nid: {id}\nto:\ncc:\nbcc:\nsubject: \"\"\nstatus: draft\nfrom: {from}\ndate: {date}\nreply_to:\nattachments:\n---\n\n{body}")
+}
+
+/// The signature as it is spliced into a draft body: the trimmed Markdown
+/// followed by one trailing newline, or `None` when nothing is configured
+/// (#0099). Callers control the leading blank line.
+fn signature_block(signature: Option<&str>) -> Option<String> {
+    let sig = signature?.trim_end();
+    if sig.is_empty() {
+        return None;
+    }
+    Some(format!("{sig}\n"))
 }
 
 /// Write an `id:` into an existing draft's frontmatter, in place, preserving
@@ -216,6 +237,7 @@ pub fn create_reply_draft_from(
     reply_all: bool,
     default_from: &str,
     drafts_dir: Option<&Path>,
+    signature: Option<&str>,
 ) -> Result<PathBuf> {
     let inbox = source;
     let original_body = inbox.body.trim();
@@ -296,13 +318,31 @@ pub fn create_reply_draft_from(
     }
     fm.push_str("---\n");
 
-    // Compose full content with {{SIGNATURE}} placeholder between reply area and quoted text
-    let full_content = format!(
-        "{}\n\n\n{{{{SIGNATURE}}}}\n\n{}\n{}\n",
-        fm.trim_end(),
-        attribution,
-        quoted_body
-    );
+    // Compose full content with the {{SIGNATURE}} placeholder between the
+    // reply area and the quoted text. The placeholder is load-bearing: the
+    // send path splits on it to splice the companion rich-HTML quote, so it
+    // stays even when the account has a signature. The per-account signature
+    // (#0099) is appended to the reply area above the placeholder, so it is
+    // visible and editable in the draft; the send-time signature injection is
+    // then off (empty), which is why there is no double signature.
+    let sig = signature
+        .map(str::trim_end)
+        .filter(|s| !s.is_empty());
+    let full_content = match sig {
+        Some(sig) => format!(
+            "{}\n\n\n{}\n\n{{{{SIGNATURE}}}}\n\n{}\n{}\n",
+            fm.trim_end(),
+            sig,
+            attribution,
+            quoted_body
+        ),
+        None => format!(
+            "{}\n\n\n{{{{SIGNATURE}}}}\n\n{}\n{}\n",
+            fm.trim_end(),
+            attribution,
+            quoted_body
+        ),
+    };
 
     // Determine output path
     let output_dir = drafts_dir.unwrap_or_else(|| Path::new("."));
@@ -365,6 +405,7 @@ pub fn create_forward_draft_from(
     source: &SourceMessage,
     default_from: &str,
     drafts_dir: Option<&Path>,
+    signature: Option<&str>,
 ) -> Result<PathBuf> {
     let inbox = source;
     let original_body = inbox.body.trim();
@@ -417,12 +458,26 @@ pub fn create_forward_draft_from(
     // text/plain or the result of html_to_plain() at fetch time). Use as-is.
     let clean_body = original_body.to_string();
 
-    let full_content = format!(
-        "{}\n\n\n{{{{SIGNATURE}}}}\n\n{}\n\n{}\n",
-        fm.trim_end(),
-        fwd_header,
-        clean_body.trim()
-    );
+    // See create_reply_draft_from: the placeholder stays for quote splicing,
+    // the per-account signature (#0099) goes above it in the reply area.
+    let sig = signature
+        .map(str::trim_end)
+        .filter(|s| !s.is_empty());
+    let full_content = match sig {
+        Some(sig) => format!(
+            "{}\n\n\n{}\n\n{{{{SIGNATURE}}}}\n\n{}\n\n{}\n",
+            fm.trim_end(),
+            sig,
+            fwd_header,
+            clean_body.trim()
+        ),
+        None => format!(
+            "{}\n\n\n{{{{SIGNATURE}}}}\n\n{}\n\n{}\n",
+            fm.trim_end(),
+            fwd_header,
+            clean_body.trim()
+        ),
+    };
 
     // Determine output path
     let output_dir = drafts_dir.unwrap_or_else(|| Path::new("."));
@@ -505,19 +560,26 @@ pub enum DraftFromSource {
 /// `headers` is the compose wizard's recipient/subject block, applied to the
 /// file before the id is minted so the index holds the final content. `None`
 /// is the direct reply/forward, which takes the builder's own headers.
+///
+/// `signature` is the account's Markdown signature (#0099), appended to the
+/// reply area above the quoted text so it is visible and editable; `None`
+/// leaves no signature block.
 pub fn create_draft_from_source(
     account: &str,
     default_from: &str,
     source: &SourceMessage,
     kind: DraftFromSource,
     headers: Option<&DraftRecipientEdit>,
+    signature: Option<&str>,
 ) -> Result<(PathBuf, crate::selector::Selector)> {
     let dir = crate::config::drafts_dir(account);
     let path = match kind {
         DraftFromSource::Reply { all } => {
-            create_reply_draft_from(source, all, default_from, Some(&dir))?
+            create_reply_draft_from(source, all, default_from, Some(&dir), signature)?
         }
-        DraftFromSource::Forward => create_forward_draft_from(source, default_from, Some(&dir))?,
+        DraftFromSource::Forward => {
+            create_forward_draft_from(source, default_from, Some(&dir), signature)?
+        }
     };
     if let Some(edit) = headers {
         rewrite_draft_recipients(&path, edit)?;
@@ -2140,7 +2202,8 @@ mod tests {
 
     #[test]
     fn test_new_draft_skeleton_attachments_none() {
-        let skeleton = new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000");
+        let skeleton =
+            new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000", None);
         let matter = Matter::<YAML>::new();
         let parsed = matter.parse(&skeleton);
         let fm: EmailFrontmatter = parsed.data.unwrap().deserialize().unwrap();
@@ -2160,7 +2223,7 @@ mod tests {
         let path = tmp.path().join("fresh.md");
         fs::write(
             &path,
-            new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000"),
+            new_draft_skeleton("me@example.com", "Thu, 10 Jul 2026 08:00:00 +0000", None),
         )
         .unwrap();
 

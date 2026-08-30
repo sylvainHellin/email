@@ -241,11 +241,21 @@ pub struct SignaturesConfig {
     pub entries: HashMap<String, SignatureEntry>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// One named signature. A signature is a Markdown snippet, given either
+/// inline via `text` or by a `path` to a Markdown/text file; `text` wins when
+/// both are present. Both optional so a bare `[accounts.signatures.<name>]`
+/// table degrades to "no signature" rather than failing the whole config parse
+/// (#0099).
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct SignatureEntry {
     #[serde(default)]
     pub name: Option<String>,
-    pub path: String,
+    /// Inline Markdown signature text.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Path to a Markdown/text file holding the signature.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -644,15 +654,15 @@ pub fn migrate_legacy_config_dir() -> Result<()> {
 ///
 /// `fs::rename` moves the file but not the strings inside it, and a config may
 /// well reference its own directory: a signature at
-/// `~/.config/email/signatures/robin.html` resolves to nothing afterwards, and
-/// [`load_signature`] answers a missing signature file with one stderr line and
-/// an unsigned message. From the TUI that line goes nowhere, so the break is
-/// silent, which is the only reason this warning is worth its lines.
+/// `~/.config/email/signatures/robin.md` resolves to nothing afterwards, and
+/// [`resolve_signature_markdown`] answers a missing signature file with one
+/// stderr line and an unsigned message. From the TUI that line goes nowhere, so
+/// the break is silent, which is the only reason this warning is worth its lines.
 ///
 /// It warns and rewrites nothing. `config.toml` is user-edited, and editing it
 /// would turn a location change into a content migration of a file the user is
 /// entitled to own. Warned once, here, at move time: the steady-state signal
-/// stays [`load_signature`]'s own missing-file message.
+/// stays [`resolve_signature_markdown`]'s own missing-file message.
 fn warn_about_self_references(config_file: &Path, old_dir: &Path, new_dir: &Path) {
     let Ok(content) = fs::read_to_string(config_file) else {
         return;
@@ -2221,24 +2231,111 @@ body_horizon_days = -1
         assert!(err.to_string().contains("imap.example.com"));
     }
 
+    // -----------------------------------------------------------------------
+    // resolve_signature_markdown (#0099)
+    // -----------------------------------------------------------------------
+
+    fn account_with_signature(entry: SignatureEntry) -> AccountConfig {
+        let mut entries = HashMap::new();
+        entries.insert("default".to_string(), entry);
+        AccountConfig {
+            signatures: SignaturesConfig {
+                default: Some("default".to_string()),
+                entries,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// An inline Markdown snippet is the signature, and it wins over a `path`.
+    #[test]
+    fn resolve_signature_prefers_inline_text_over_path() {
+        let account = account_with_signature(SignatureEntry {
+            name: None,
+            text: Some("-- \nAlice".to_string()),
+            path: Some("/no/such/file.md".to_string()),
+        });
+        assert_eq!(
+            resolve_signature_markdown(&account, None).as_deref(),
+            Some("-- \nAlice")
+        );
+    }
+
+    /// With no inline text, the `path` file is read as Markdown and its
+    /// trailing whitespace trimmed so the caller owns the spacing.
+    #[test]
+    fn resolve_signature_reads_the_path_file_and_trims_trailing_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sig.md");
+        fs::write(&file, "-- \nBob from a file\n\n").unwrap();
+        let account = account_with_signature(SignatureEntry {
+            name: None,
+            text: None,
+            path: Some(file.to_string_lossy().into_owned()),
+        });
+        assert_eq!(
+            resolve_signature_markdown(&account, None).as_deref(),
+            Some("-- \nBob from a file")
+        );
+    }
+
+    /// An account with no signature configured resolves to `None` (no block).
+    #[test]
+    fn resolve_signature_is_none_when_unconfigured() {
+        let account = AccountConfig::default();
+        assert!(resolve_signature_markdown(&account, None).is_none());
+    }
+
+    /// A named entry with neither `text` nor a readable `path` resolves to
+    /// `None` rather than an empty signature.
+    #[test]
+    fn resolve_signature_is_none_for_an_empty_entry() {
+        let account = account_with_signature(SignatureEntry::default());
+        assert!(resolve_signature_markdown(&account, None).is_none());
+    }
 }
 
-/// Load signature HTML content
-pub fn load_signature(account: &AccountConfig, signature_name: Option<&str>) -> Option<String> {
+/// Resolve an account's signature to Markdown text (#0099).
+///
+/// The signature is a Markdown snippet appended to the draft body at
+/// creation (compose, reply, forward), so it is visible and editable rather
+/// than injected at send time. `signature_name` picks a named entry;
+/// `None` uses the account's `default` entry. Inline `text` wins over a
+/// `path` file. Trailing whitespace is trimmed so the caller controls the
+/// spacing around the block.
+///
+/// Returns `None` (no signature block) when nothing is configured, when the
+/// named entry has neither `text` nor `path`, or when the `path` file is
+/// missing (which warns, mirroring the pre-#0099 behaviour).
+pub fn resolve_signature_markdown(
+    account: &AccountConfig,
+    signature_name: Option<&str>,
+) -> Option<String> {
     let sig_name = signature_name
         .map(|s| s.to_string())
         .or_else(|| account.signatures.default.clone())?;
 
     let entry = account.signatures.entries.get(&sig_name)?;
 
+    if let Some(text) = entry.text.as_ref() {
+        let text = text.trim_end();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    let path_str = entry.path.as_ref()?;
     // Expand ~ in signature path
-    let expanded = shellexpand::tilde(&entry.path).into_owned();
+    let expanded = shellexpand::tilde(path_str).into_owned();
     let path = Path::new(&expanded);
 
     if path.exists() {
-        fs::read_to_string(path).ok()
+        fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.is_empty())
     } else {
-        eprintln!("{} Signature file not found: {}", "⚠".yellow(), entry.path);
+        eprintln!("{} Signature file not found: {}", "⚠".yellow(), path_str);
         None
     }
 }

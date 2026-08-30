@@ -24,9 +24,9 @@ The "no migration paths until v1.0" invariant blocked the `~/.config/email` -> `
 
 Incoming HTML bodies are saved as raw bytes from the server. Browsers default to latin-1 when no charset is declared, breaking umlauts and other non-ASCII characters. Always inject `<meta charset="UTF-8">` before writing to disk -- see `ensure_utf8_charset()` in `parse.rs`.
 
-## Signature placement uses a placeholder, not a trailing append
+## The `{{SIGNATURE}}` placeholder is the quote boundary, not the signature (post-#0099)
 
-Reply and forward drafts contain a `{{SIGNATURE}}` placeholder between the reply area and the quoted conversation. `markdown_to_html` replaces it at send time so the signature lands between reply and quote. If the placeholder is removed, the signature falls back to end-of-body. Do not "simplify" by always appending -- it will land below the quoted thread.
+Reply and forward drafts still contain a `{{SIGNATURE}}` placeholder between the reply area and the quoted conversation, and `markdown_to_html` still splits on it at send time so the companion rich-HTML quote is spliced below the reply. Do not remove it: without it the quote falls to end-of-body and the rich companion HTML is dropped. What changed in #0099 is that the placeholder no longer carries the signature. The signature is a per-account Markdown snippet (`config::resolve_signature_markdown`) appended to the draft body *at creation*, above the placeholder for reply/forward and after the body for a new draft, so it is visible and editable. To avoid a double signature, `SendContext.signature` is `None` for draft sends; direct sends and invites keep the send-time append because they have no editable draft. Do not re-populate `SendContext.signature` from config for a draft send.
 
 ## Send account is resolved by `from:` address, not active TUI account
 

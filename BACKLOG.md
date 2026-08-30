@@ -15,6 +15,8 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Data-access-layer redesign (DECIDED 2026-07-14, decisions settled 2026-07-31): server-as-truth SQLite mirror + content-addressed blob store; drafts local-only, received read-only. Greenfield rebuild on a branch, no dual-write, safety net is `mp-legacy` + the `pre-dal-nuke` tag. Plan: [docs/plans/data-access-layer.md](docs/plans/data-access-layer.md). Stage 0 (#0049, the pre-nuke oracle capture and the `pre-dal-nuke` freeze) is done. Order below is the build order; the stop-gate sits after the #0038 + #0050 + #0052 triple, because the product is only half usable between them. #0038, #0050 and #0052 have all shipped, so the stop-gate is reached and the stages below it are the work after the pause.
 
+- [#0102 The literal {{SIGNATURE}} marker rides along in the text/plain MIME part](docs/tickets/0102-signature-marker-leaks-into-plain-text-part.md) -- bug
+
 ## Later
 
 > TUI multi-view roadmap: [docs/plans/tui-restructure-views.md](docs/plans/tui-restructure-views.md). All three views have shipped: foundation (#0032), view switcher + Contacts (#0033), local calendar (#0034).
@@ -23,7 +25,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 - [#0085 On-open re-fetch of an evicted body](docs/tickets/0085-on-open-body-refetch.md) -- feature _(the missing half of #0060, whose eviction sweep shipped; required before lowering a cap below the working set)_
 - [#0090 Undo-send hold window before SMTP hand-off](docs/tickets/0090-undo-send-hold-window.md) -- feature _(configurable, default 20 s; sequence after #0089)_
 - [#0091 HTML-to-text rendering through an external tool](docs/tickets/0091-html-to-text-rendering.md) -- feature _(evaluate w3m / lynx / pandoc)_
-- [#0099 Per-account signatures appended on compose and reply](docs/tickets/0099-per-account-signatures.md) -- feature
 - [#0101 Conversation-view collapse and inline navigation on top of the thread view](docs/tickets/0101-conversation-view-collapse-inline-nav.md) -- feature _(cross-ref #0008)_
 - [#0084 iMIP send-side updates and cancellations](docs/tickets/0084-imip-send-cancel-and-update.md) -- feature _(the split-out send half of #0031, whose receive half shipped)_
 
