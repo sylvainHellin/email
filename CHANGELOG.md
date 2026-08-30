@@ -54,6 +54,13 @@ All notable changes to this project are documented in this file.
   runtime inside another.
 
 ### Changed
+- **Send approves and sends the current draft in one confirmed step (#0089).**
+  `x` acts on the selected draft wherever it is selected; an unapproved draft
+  gets one warning dialog ("Draft is not approved. Approve and send?") whose
+  confirmation approves and sends together, and an approved draft keeps the
+  plain send confirm. The approved flag is persisted only after the draft
+  parses and validates, so a refused send no longer leaves an approved marker
+  behind (the old confirm-then-error dead end is gone).
 - **BREAKING: the TUI keymap moved to an nvim-style mnemonic prefix scheme (#0092).**
   The old flat single-key map, whose meaning changed with pane focus, is gone; there is no
   compatibility layer. High-frequency triage stays flat in every reading pane (List, Headers,

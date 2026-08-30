@@ -3,7 +3,7 @@ id: 0089
 title: Send the current draft in place, approve and send in one confirmed step
 type: feature
 priority: now
-status: open
+status: done
 created: 2026-08-14
 ---
 
@@ -29,6 +29,14 @@ This closes open question 4 of the audit synthesis (does approve-and-send bypass
 2. Send on an already-approved draft keeps today's confirm dialog and send.
 3. Send on an unapproved draft shows one warning dialog that, on confirm, approves and sends in the same step rather than confirming and then failing at build time.
 4. Remove the confirm-then-error dead end at `src/tui/actions.rs:1067`; the approval pre-check happens before, not after, the confirm.
+
+## Resolution (2026-08-30)
+
+Mostly delivered by #0092, closed out here.
+The keybinding redesign merged approve+send onto the Global `x` (`src/tui/app/keymap.rs`), acting on the current draft from any focus with one confirm dialog, which removed the separate `A` approve step.
+This ticket added the rest: the confirm dialog warns "Draft is not approved. Approve and send?" on an unapproved draft and keeps the plain "Send this email?" on an approved one (`src/tui/app/keys.rs`, `A::Send`); the send preamble was reordered so parse and validate run before `mark_as_approved` persists anything (`src/tui/actions.rs::validate_then_approve`), closing the dead end where a refused send left an approved flag behind.
+Regression test: `a_draft_that_fails_validation_is_not_marked_approved`.
+The send-refusal invariant is unchanged (`send_refuses_an_unapproved_draft_before_it_reaches_the_outbox`).
 
 ## Cross-references
 

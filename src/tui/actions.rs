@@ -374,6 +374,21 @@ pub(super) fn readonly_view_for_row(app: &mut App, row_id: i64) -> Option<PathBu
     }
 }
 
+/// Parse and validate a draft, and only then persist its approved status.
+///
+/// `x` merges approve + send (#0092): the redesign dropped the separate
+/// approve key, so an unapproved draft is approved as part of the send.
+/// Approval runs strictly after the draft parses and validates (#0089): a
+/// draft that fails validation keeps its `draft` status instead of carrying an
+/// approved flag from a send that never happened. `mark_as_approved` is
+/// idempotent, so a draft approved out of band passes through unchanged.
+fn validate_then_approve(path: &Path) -> Result<crate::types::EmailDraft> {
+    let draft = crate::draft::parse_email_draft(path)?;
+    crate::draft::validate_draft(&draft)?;
+    crate::draft::mark_as_approved(path)?;
+    Ok(draft)
+}
+
 /// Hand the read-only view of a stored row to `$EDITOR` and discard it on the
 /// way back (#0075).
 ///
@@ -1078,27 +1093,13 @@ pub(super) fn handle_action(
                 return Ok(());
             };
 
-            // `x` merges approve + send (#0092): the redesign dropped the
-            // separate approve key, so an unapproved draft is approved as part
-            // of the send. `mark_as_approved` is idempotent (an already-
-            // approved draft is left as is), so this is a no-op on a draft that
-            // was approved out of band.
-            if let Err(e) = crate::draft::mark_as_approved(&path) {
-                app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
-                return Ok(());
-            }
-
-            let draft = match crate::draft::parse_email_draft(&path) {
+            let draft = match validate_then_approve(&path) {
                 Ok(draft) => draft,
                 Err(e) => {
                     app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
                     return Ok(());
                 }
             };
-            if let Err(e) = crate::draft::validate_draft(&draft) {
-                app.set_status_level(format!("Send failed: {e:#}"), StatusLevel::Error);
-                return Ok(());
-            }
 
             // Which account sends it is the draft's own `from:`, not the open
             // mailbox: a draft written for another configured account is sent
@@ -3378,6 +3379,33 @@ mod store_backed_mutations {
 
     fn outbox_counts(fx: &Fixture) -> crate::outbox::OutboxCounts {
         crate::outbox::counts(&fx.store(), "alice").unwrap()
+    }
+
+    /// The TUI send preamble (#0089): a draft that fails validation keeps its
+    /// `draft` status. Approval must never persist off a send that was
+    /// refused, or a later send would skip the approve-and-send warning the
+    /// confirm dialog shows for an unapproved draft.
+    #[test]
+    fn a_draft_that_fails_validation_is_not_marked_approved() {
+        let fx = Fixture::new();
+        let (path, _selector, _id) = a_draft(&fx);
+        // Blank the recipients: validate_draft refuses a draft whose to, cc
+        // and bcc are all empty.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let unaddressed = text.replacen("\nto:", "\nto: \"\"\nx-to:", 1);
+        std::fs::write(&path, &unaddressed).unwrap();
+
+        let err = validate_then_approve(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("No recipients"), "{err:#}");
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("status: draft"),
+            "a refused send must not persist an approved flag"
+        );
+
+        // With the recipients restored the same preamble approves the draft.
+        std::fs::write(&path, &text).unwrap();
+        validate_then_approve(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("status: approved"));
     }
 
     /// The approved-status requirement is `mp send`'s, and it lives in

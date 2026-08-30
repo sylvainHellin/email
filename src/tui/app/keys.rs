@@ -616,8 +616,16 @@ impl App {
             A::Send => {
                 self.pending_prefix = None;
                 if let Some(email) = self.selected_email() {
+                    // One dialog either way (#0089): an unapproved draft warns
+                    // that confirming approves and sends in the same step; an
+                    // approved draft keeps the plain send confirm.
+                    let title = if email.status == "draft" {
+                        "Draft is not approved. Approve and send?"
+                    } else {
+                        "Send this email?"
+                    };
                     self.overlay = Overlay::Confirm(ConfirmDialog {
-                        title: "Send this email?".to_string(),
+                        title: title.to_string(),
                         detail: format!("To: {} - {}", email.to, email.subject),
                         action: ConfirmAction::Send,
                     });
