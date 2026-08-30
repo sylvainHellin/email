@@ -298,6 +298,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             dirty = true;
         }
 
+        // Undo-send hold window (#0090): once a parked send's window has
+        // elapsed, hand it to the background send thread. The 250 ms idle poll
+        // is the coarsest this can lag, which is imperceptible against a
+        // multi-second window. `u` (dispatch_normal_mode) clears the slot
+        // first, which is the undo.
+        if app.held_send.as_ref().is_some_and(|h| h.is_ready()) {
+            if let Some(held) = app.held_send.take() {
+                actions::fire_held_send(&mut app, held, &bg_tx);
+                dirty = true;
+            }
+        }
+
         // Auto-mark the message shown in the preview as read (#0087). This runs
         // after events, background results and actions have settled the
         // selection, and fires once per open: a scroll or an idle tick over the

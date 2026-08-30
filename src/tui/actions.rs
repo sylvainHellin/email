@@ -8,7 +8,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
     mailbox_key, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus,
-    MailboxKind, MessageRef, Overlay, StatusLevel, View,
+    HeldSend, MailboxKind, MessageRef, Overlay, StatusLevel, View,
 };
 use super::helpers::{
     edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
@@ -942,6 +942,32 @@ fn send_one_draft(
     Ok(sent.report)
 }
 
+/// Hand a parked send to the background send thread (#0090).
+///
+/// The tail of the send key: whatever the undo window was, this is where the
+/// draft finally leaves for SMTP. Shared by the zero-window opt-out (fired
+/// straight from `Action::Send`) and the event-loop tick that fires a held
+/// send once its window elapses, so both take the identical path the send key
+/// always took.
+pub(super) fn fire_held_send(
+    app: &mut App,
+    held: HeldSend,
+    bg_tx: &mpsc::Sender<BgResult>,
+) {
+    let HeldSend { draft, ctx, account_index, .. } = held;
+    app.bg_count += 1;
+    app.set_status_level("Sending...".to_string(), StatusLevel::Progress);
+    let tx = bg_tx.clone();
+    std::thread::spawn(move || {
+        let rt = super::runtime::shared();
+        let result = send_one_draft(rt, &draft, &ctx).and_then(|r| send_status_line(&r));
+        let _ = tx.send(BgResult::Send {
+            account_index,
+            result: result.map_err(|e| format!("{e:#}")),
+        });
+    });
+}
+
 /// The status line one finished send shows, which is the CLI's own report:
 /// how many recipients took it, and where the message actually is (#0037).
 fn send_status_line(report: &SendReport) -> Result<String> {
@@ -1163,17 +1189,35 @@ pub(super) fn handle_action(
                 signature: None,
             };
 
-            app.bg_count += 1;
-            app.set_status_level("Sending...".to_string(), StatusLevel::Progress);
-            let tx = bg_tx.clone();
-            std::thread::spawn(move || {
-                let rt = super::runtime::shared();
-                let result = send_one_draft(rt, &draft, &ctx).and_then(|r| send_status_line(&r));
-                let _ = tx.send(BgResult::Send {
-                    account_index: acct_idx,
-                    result: result.map_err(|e| format!("{e:#}")),
-                });
-            });
+            // Undo-send hold (#0090): park the send behind the configured
+            // window instead of handing it to SMTP at once. A zero window is
+            // the opt-out and fires immediately; a non-zero one waits, so `u`
+            // can cancel it (see `dispatch_normal_mode` and the event loop).
+            let hold = std::time::Duration::from_secs(app.global_config.email.send_hold_secs);
+            let held = HeldSend {
+                draft,
+                ctx,
+                account_index: acct_idx,
+                fire_at: std::time::Instant::now() + hold,
+            };
+            if hold.is_zero() {
+                fire_held_send(app, held, bg_tx);
+            } else {
+                // Only one send waits at a time: a second arm flushes the first
+                // rather than dropping it, so pressing send twice never loses a
+                // message.
+                if let Some(prev) = app.held_send.take() {
+                    fire_held_send(app, prev, bg_tx);
+                }
+                app.set_status_level(
+                    format!(
+                        "Sending in {}s (press u to undo)",
+                        app.global_config.email.send_hold_secs
+                    ),
+                    StatusLevel::Progress,
+                );
+                app.held_send = Some(held);
+            }
         }
         Action::Rsvp { msg, choice } => {
             // The invitation's own iMIP payload is the source of truth for the

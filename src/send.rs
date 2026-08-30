@@ -319,6 +319,7 @@ mod tests {
             font_family: "Georgia, serif".to_string(),
             font_size: "14px".to_string(),
             include_signature: true,
+            send_hold_secs: 20,
         };
         let html = markdown_to_html("Hello", &settings, None, None);
         assert!(html.contains("Georgia, serif"));

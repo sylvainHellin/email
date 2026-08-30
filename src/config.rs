@@ -145,6 +145,10 @@ pub struct EmailSettings {
     pub font_size: String,
     #[serde(default = "default_true")]
     pub include_signature: bool,
+    /// Seconds a send is held before it is handed to SMTP, so it can be
+    /// undone in the TUI (#0090). Default 20; `0` sends immediately (opt-out).
+    #[serde(default = "default_send_hold_secs")]
+    pub send_hold_secs: u64,
 }
 
 impl Default for EmailSettings {
@@ -153,6 +157,7 @@ impl Default for EmailSettings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             include_signature: true,
+            send_hold_secs: default_send_hold_secs(),
         }
     }
 }
@@ -167,6 +172,12 @@ fn default_font_size() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// Default undo-send hold window (#0090): 20 seconds, the ticket's owner
+/// decision. `0` in config opts out and sends immediately.
+fn default_send_hold_secs() -> u64 {
+    20
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -1587,6 +1598,24 @@ name = "test"
         assert_eq!(settings.font_family, "Helvetica, Arial, sans-serif");
         assert_eq!(settings.font_size, "12pt");
         assert!(settings.include_signature);
+        // The undo-send window defaults to the ticket's 20 seconds (#0090).
+        assert_eq!(settings.send_hold_secs, 20);
+    }
+
+    /// The undo-send window is read from `[email]`, and a `0` there is a
+    /// legal opt-out that sends immediately (#0090).
+    #[test]
+    fn test_send_hold_secs_reads_from_config_and_accepts_zero() {
+        let unset: GlobalConfig = toml::from_str("[email]\n").unwrap();
+        assert_eq!(unset.email.send_hold_secs, 20, "unset falls back to 20s");
+
+        let set: GlobalConfig =
+            toml::from_str("[email]\nsend_hold_secs = 5\n").unwrap();
+        assert_eq!(set.email.send_hold_secs, 5);
+
+        let opt_out: GlobalConfig =
+            toml::from_str("[email]\nsend_hold_secs = 0\n").unwrap();
+        assert_eq!(opt_out.email.send_hold_secs, 0, "zero is send-immediately");
     }
 
     // -----------------------------------------------------------------------

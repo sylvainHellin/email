@@ -72,6 +72,24 @@ impl App {
     /// Table-driven dispatch for the no-overlay surface. Returns the `Message`
     /// (only `Quit` today) or `None`.
     fn dispatch_normal_mode(&mut self, key: KeyEvent) -> Option<Message> {
+        // Undo-send hold window (#0090): while a send is parked behind the undo
+        // window, `u` cancels it before it reaches SMTP -- the draft is
+        // untouched and recoverable. Hand-dispatched as a transient prompt (the
+        // status line advertises it), not a KEYMAP row, so it neither collides
+        // with the Message-context `u` (toggle read) once the window has fired
+        // nor needs a website key-table entry.
+        if self.held_send.is_some()
+            && key.code == KeyCode::Char('u')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.held_send = None;
+            self.set_status_level(
+                "Send cancelled; the draft is untouched".to_string(),
+                super::StatusLevel::Info,
+            );
+            return None;
+        }
+
         let pending = self.pending_prefix;
         let guard_ok = |g: super::Guard| self.guard_satisfied(g);
 

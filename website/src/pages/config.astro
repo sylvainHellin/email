@@ -36,6 +36,7 @@ notifications = false       # Desktop notifications for new mail (see Notificati
 font_family = "Helvetica, Arial, sans-serif"  # HTML email font
 font_size = "12pt"                             # HTML email font size
 include_signature = true                       # Append signature to outgoing mail
+send_hold_secs = 20                            # Undo-send window before hand-off (0 = send now)
 
 [smtp]
 host = "postout.lrz.de"
@@ -129,11 +130,15 @@ path = "~/notes/email/signatures/personal.md"`} />
         Controls the HTML rendering of sent emails. The font family and size are applied
         to the generated HTML when Markdown is converted for sending. <code>include_signature</code>
         determines whether the account signature is appended to a draft body on compose, reply, and forward.
+        <code>send_hold_secs</code> is the undo-send window: in the TUI a send is held for that many
+        seconds before it is handed to SMTP, and <code>u</code> cancels it in the meantime, leaving the
+        draft untouched. It defaults to 20 seconds; set it to <code>0</code> to send immediately.
       </p>
       <ConfigExample code={`[email]
 font_family = "Helvetica, Arial, sans-serif"
 font_size = "12pt"
-include_signature = true`} />
+include_signature = true
+send_hold_secs = 20`} />
 
       <!-- [smtp] -->
       <h3 id="smtp-section">[smtp]</h3>
