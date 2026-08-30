@@ -128,6 +128,14 @@ pub(super) fn render_sidebar(app: &App, frame: &mut Frame, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    // While the active account's store is still opening in the background
+    // (#0003 two-phase startup) the counts are all zero and meaningless, so the
+    // count column shows a loading marker rather than a wrong `0`.
+    let opening = app
+        .accounts
+        .get(app.active_account)
+        .is_some_and(|a| a.opening);
+
     for (i, mb) in app.mailboxes.iter().enumerate() {
         let is_selected = i == app.active_mailbox;
         let is_highlighted = app.focus == Focus::Sidebar && i == app.sidebar_index;
@@ -135,7 +143,12 @@ pub(super) fn render_sidebar(app: &App, frame: &mut Frame, area: Rect) {
 
         let marker = if is_selected { ">" } else { " " };
 
-        let label = format!("{} {} {} {:>2}", marker, mb.icon, mb.label, count);
+        let count_col = if opening {
+            "··".to_string()
+        } else {
+            format!("{count:>2}")
+        };
+        let label = format!("{} {} {} {}", marker, mb.icon, mb.label, count_col);
 
         let style = if is_highlighted {
             Style::default()
@@ -256,6 +269,7 @@ mod tests {
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
+            opening: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
             sync_health,

@@ -772,6 +772,14 @@ pub struct AccountState {
     pub search_includes_body: bool,
     pub watcher_active: bool,
     pub has_unseen: bool,
+    /// Whether this account's store has not yet been opened in the background
+    /// (#0003 two-phase startup). `AccountState::new` no longer opens the
+    /// store -- the per-account `PRAGMA integrity_check` (~240 ms on a 44 MB
+    /// store) used to sum serially before the first paint. It starts `true`,
+    /// with `mailbox_counts` all-zero and `outbox` empty, and is cleared by
+    /// `BgResult::AccountOpened` once the background open has read the real
+    /// counts. The sidebar shows a loading marker while it is set.
+    pub opening: bool,
     /// Non-`done` outbox rows for this account (#0037 item 5). Refreshed at
     /// startup and after every send or sync; rendered as a status-bar badge so
     /// a message stuck between SMTP and its Sent copy is visible rather than
@@ -807,22 +815,24 @@ impl AccountState {
             .unwrap_or("Archive")
             .to_string();
         let drafts_dir = Some(crate::config::drafts_dir(&account_config.name));
-        // Read once at startup so a message left mid-send by the last run is
-        // visible in the badge before any sync runs (#0037 item 5).
-        let outbox = crate::outbox::counts_for_account(&account_config.name);
 
         let mut span = crate::timing::TimingSpan::with_context(
             "AccountState::new",
             account_config.name.clone(),
         );
+        // No store is opened here (#0003 two-phase startup). The grouped count
+        // query and the outbox read both open `store.sqlite3`, and the first
+        // open of each file runs the full `PRAGMA integrity_check` (~240 ms on
+        // a 44 MB store); summed serially across accounts that was ~1.2 s of
+        // blank terminal before the first paint. `build_mailboxes` is
+        // config-only and cheap, so the sidebar shape is known immediately;
+        // the counts start at zero, the outbox empty, and `opening` marks the
+        // account as not-yet-read. `run_loop` spawns one background open per
+        // account after the first `terminal.draw`, and `BgResult::AccountOpened`
+        // fills the real counts, refreshes the outbox and clears `opening`.
         let mailboxes = build_mailboxes(&account_config);
         let n = mailboxes.len();
-        // One grouped query, no directory walk. The startup Message-ID scan
-        // that used to run beside it is gone outright (#0038): identity is the
-        // row, and a cross-mailbox lookup is an indexed query at the moment it
-        // is asked, not a map built over every file at launch.
-        let counts = count_all_emails(&account_config.name, &mailboxes);
-        span.mark(&format!("built {} mailbox(es)", n));
+        span.mark(&format!("built {} mailbox(es), store open deferred", n));
 
         Self {
             account_config,
@@ -833,7 +843,7 @@ impl AccountState {
             archive_server_name,
             drafts_dir,
             mailboxes,
-            mailbox_counts: counts,
+            mailbox_counts: vec![0; n],
             email_cache: vec![None; n],
             sidebar_index: 0,
             active_mailbox: 0,
@@ -846,7 +856,8 @@ impl AccountState {
             search_includes_body: false,
             watcher_active: false,
             has_unseen: false,
-            outbox,
+            opening: true,
+            outbox: crate::outbox::OutboxCounts::default(),
             sync_health: crate::sync_health::SyncHealth::default(),
         }
     }
@@ -903,6 +914,22 @@ pub enum BgResult {
         mailbox_idx: usize,
         generation: u64,
         entries: Vec<EmailEntry>,
+    },
+    /// One account's store has been opened in the background and its real
+    /// counts read (#0003 two-phase startup). `AccountState::new` defers the
+    /// per-account store open (and its `PRAGMA integrity_check`) off the
+    /// first-paint path; `run_loop` spawns one open per account after the
+    /// first `terminal.draw`, and this carries the grouped mailbox counts and
+    /// the outbox badge back so the sidebar fills in. The handler clears
+    /// `AccountState::opening`, loads the active account's open mailbox, and
+    /// kicks the startup auto-fetch for that account (once the store is known
+    /// good, not before). The store open runs the integrity check and, on
+    /// failure, the drop-and-rebuild path (#0066) exactly as a foreground open
+    /// would -- only the thread it runs on changed.
+    AccountOpened {
+        account_index: usize,
+        counts: Vec<usize>,
+        outbox: crate::outbox::OutboxCounts,
     },
 }
 

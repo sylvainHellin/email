@@ -308,6 +308,41 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                 }
             }
         }
+
+        BgResult::AccountOpened { account_index, counts, outbox } => {
+            // Phase two of startup (#0003): this account's store opened on a
+            // background thread, ran its integrity check (and, on failure, the
+            // drop-and-rebuild path of #0066) and read the real counts. Fill
+            // them in and drop the loading marker.
+            let is_remote = if let Some(acct) = app.accounts.get_mut(account_index) {
+                acct.mailbox_counts = counts.clone();
+                acct.outbox = outbox;
+                acct.opening = false;
+                acct.imap_config.is_some() || acct.graph_config.is_some()
+            } else {
+                false
+            };
+
+            if account_index == app.active_account {
+                // Mirror the counts into the live view and load the open
+                // mailbox now -- `App::new` deliberately left it empty rather
+                // than pay the store open before the first paint. The load
+                // runs off the UI thread via `BgResult::MailboxLoaded`, and
+                // the store it opens is already validated, so no second
+                // integrity check.
+                app.mailbox_counts = counts;
+                app.reload_current_mailbox();
+            }
+
+            // Startup auto-fetch (#0001), sequenced *after* the open: one quick
+            // sync per account with a remote source. `FetchAccount` is ungated,
+            // so accounts still sync concurrently; deferring it to here (rather
+            // than queueing it before the store existed) avoids a sync racing
+            // the first open of the same file and a redundant integrity check.
+            if is_remote {
+                app.push_action(super::app::Action::FetchAccount(account_index));
+            }
+        }
     }
 }
 
@@ -440,6 +475,7 @@ mod tests {
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
+            opening: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
             sync_health: crate::sync_health::SyncHealth::default(),
@@ -622,5 +658,109 @@ mod tests {
             .unwrap()
             .0
             .contains("x3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-phase startup: BgResult::AccountOpened (#0003)
+    // -----------------------------------------------------------------------
+
+    /// A background account's store finishes opening: its real counts land,
+    /// its outbox badge refreshes and the loading marker clears, while the
+    /// active account and its on-screen list are left untouched. A local-only
+    /// account (no IMAP/Graph) queues no auto-fetch.
+    #[test]
+    fn account_opened_fills_a_background_account_and_clears_its_loading_marker() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+        app.accounts = vec![background_account("alice"), background_account("bob")];
+        app.active_account = 0;
+        app.accounts[0].opening = true;
+        app.accounts[1].opening = true;
+
+        handle_bg_result(
+            &mut app,
+            BgResult::AccountOpened {
+                account_index: 1,
+                counts: vec![42],
+                outbox: crate::outbox::OutboxCounts::default(),
+            },
+        );
+
+        assert!(!app.accounts[1].opening, "the opened account drops its loading marker");
+        assert_eq!(app.accounts[1].mailbox_counts, vec![42]);
+        assert!(
+            app.accounts[0].opening,
+            "opening one account does not touch the others"
+        );
+        assert_eq!(
+            app.mailbox_counts,
+            vec![3, 4],
+            "a background open never rewrites the active account's live counts"
+        );
+        assert!(
+            app.pending_actions
+                .iter()
+                .all(|a| !matches!(a, crate::tui::app::Action::FetchAccount(_))),
+            "a local-only account has no remote source to auto-fetch"
+        );
+    }
+
+    /// The active account's store finishing opening adopts its counts into the
+    /// live view and queues the open mailbox's load off the UI thread (the
+    /// first paint deliberately left it empty). A remote account also queues
+    /// its startup auto-fetch, but only now that the store is validated.
+    #[test]
+    fn account_opened_for_the_active_account_loads_its_mailbox_and_auto_fetches() {
+        let _data = DataDir::new();
+        let mut app = app_with_warm_caches();
+        let mut acct = background_account("alice");
+        // Give the active account a remote source so the auto-fetch fires.
+        acct.imap_config = Some(crate::config::ImapConfig {
+            host: "imap.example.com".to_string(),
+            port: 993,
+            username: "alice".to_string(),
+            password: String::new(),
+            accept_invalid_certs: false,
+            auth_method: crate::config::AuthMethod::Password,
+            fetch_concurrency: 4,
+        });
+        app.accounts = vec![acct];
+        app.active_account = 0;
+        app.accounts[0].opening = true;
+
+        handle_bg_result(
+            &mut app,
+            BgResult::AccountOpened {
+                account_index: 0,
+                counts: vec![5, 9],
+                outbox: crate::outbox::OutboxCounts::default(),
+            },
+        );
+
+        assert!(!app.accounts[0].opening);
+        assert_eq!(
+            app.mailbox_counts,
+            vec![5, 9],
+            "the live view adopts the opened active account's counts"
+        );
+        let loads: Vec<usize> = app
+            .pending_actions
+            .iter()
+            .filter_map(|a| match a {
+                crate::tui::app::Action::LoadMailbox { mailbox_idx, .. } => Some(*mailbox_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loads,
+            vec![1],
+            "the active account's open mailbox loads once the store is validated"
+        );
+        assert!(
+            app.pending_actions
+                .iter()
+                .any(|a| matches!(a, crate::tui::app::Action::FetchAccount(0))),
+            "a remote active account kicks its startup auto-fetch after the open"
+        );
     }
 }

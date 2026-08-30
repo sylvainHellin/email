@@ -60,3 +60,53 @@ That is the two-phase startup the perf audit still asks for beyond the index sca
 The remaining piece is the per-account `PRAGMA integrity_check` and the redundant serial store opens that still gate the first paint (performance audit finding 1, §b.1 / S1, ~240 ms per 44 MB store, ~1.2 s for five accounts).
 Scope is unchanged; this note records the confirmed direction so the follow-up work lands under the same ticket.
 Priority stays now.
+
+## Resolution (2026-08-30)
+
+The two-phase startup this ticket asked for shipped. The first `terminal.draw`
+no longer waits behind any per-account store work.
+
+- `AccountState::new` no longer opens the store. The grouped count query and
+  the outbox read both opened `store.sqlite3` (the first open per file runs the
+  ~240 ms `PRAGMA integrity_check`); summed serially across accounts that was
+  the ~1.2 s of blank terminal §b.1 / S1 measured. It now builds only the
+  config-derived mailbox list, starts `mailbox_counts` at zero, the outbox
+  empty, and a new `AccountState::opening` flag at `true`.
+- `App::new` no longer loads the active mailbox synchronously either (that open
+  was the third integrity-checked open on the critical path). The list starts
+  empty.
+- `tui::run_loop` spawns one background thread per account after the first
+  frame (mirroring the watcher fan-out), each bumping `bg_count` so the existing
+  spinner shows. The thread opens the store (integrity check and, on failure,
+  the #0066 drop-and-rebuild path run here, off the critical path), reads the
+  grouped counts and the outbox, and reports a new
+  `BgResult::AccountOpened { account_index, counts, outbox }`.
+- `tui/bg.rs` handles `AccountOpened`: it fills the account's counts and
+  outbox, clears `opening`, and for the active account mirrors the counts into
+  the live view and reloads the open mailbox against the now-validated store
+  (via the existing async `BgResult::MailboxLoaded` path and the #0093
+  dirty-flag, which the event loop sets on every drained bg result). It then
+  queues the startup auto-fetch (#0001) for that account, *sequenced after the
+  open* rather than queued up front, so a sync never races the first open of
+  the same file (which would double the integrity check).
+- The sidebar shows a `··` marker in the count column while the active
+  account is `opening`, instead of a misleading `0`.
+- `switch_account` copes with a store that has not opened yet: it shows an
+  `Opening <account>...` status and an empty list, and lets the pending
+  `AccountOpened` load the mailbox, rather than racing a second open or
+  crashing.
+
+Lock / rebuild interaction: the engine advisory lock (#0061) is taken only by
+the `pending_ops` drain, never by these read-only opens or by
+`count_all_emails`, so moving the opens to background threads does not touch it.
+The store rebuild / salvage (#0066) lives inside `Store::open` and is unchanged;
+it now simply runs on the background open thread. The process-global
+`INTEGRITY_CHECKED` amortisation means the first background open validates the
+file and every later open in the process (counts, mailbox load, sync) trusts
+that verdict, so the check is paid once, off the first-paint path.
+
+Tests: two new unit tests in `tui/bg.rs` cover the `AccountOpened` handler (a
+background account filling its counts and clearing its marker without touching
+the active view or queueing a fetch; the active account adopting its counts,
+queueing its mailbox load and its auto-fetch). Full suite green
+(`cargo test`), `cargo install --path .` clean.

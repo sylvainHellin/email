@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Performance
+- **The TUI paints before it opens any store (#0003).** Startup used to build
+  every account's state up front, and each `AccountState::new` opened that
+  account's `store.sqlite3` to read its counts and outbox; the first open of a
+  file runs a full `PRAGMA integrity_check` (~240 ms on a 44 MB store), so five
+  accounts meant ~1.2 s of blank terminal before the first frame. The shell now
+  paints immediately with zeroed counts and a `··` loading marker, and the
+  per-account store opens (with their integrity checks and, on failure, the
+  drop-and-rebuild path) run on background threads after the first frame. Each
+  account fills in its counts, outbox badge and, for the active account, its
+  open mailbox as its store finishes opening; the startup auto-fetch is
+  sequenced after the open so a sync never races the first open of the same
+  file. Switching to an account whose store is still opening shows an
+  `Opening …` status instead of a wrong empty list, and never blocks the UI.
 - **The preview body is wrapped once, not every frame (#0093).** Parsing the
   inline markdown and word-wrapping the whole message into styled lines used to
   run on every render, so every scroll keystroke and every idle tick redid work

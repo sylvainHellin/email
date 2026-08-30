@@ -351,6 +351,7 @@ mod tests {
             search_query: String::new(),
             search_includes_body: false,
             watcher_active: false,
+            opening: false,
             outbox: crate::outbox::OutboxCounts::default(),
             has_unseen: false,
             sync_health,

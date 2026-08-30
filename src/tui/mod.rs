@@ -106,26 +106,43 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
     let mut drafts_fingerprint = drafts::fingerprint(&crate::config::drafts_dir(&drafts_account));
     let mut last_drafts_poll = Instant::now();
 
-    // The per-account message-ID index scan that used to run here is gone
-    // (#0038): identity is the `messages` row and a cross-mailbox lookup is
-    // an indexed query at the moment it is asked, so there is nothing to
-    // build at launch and no "Indexing..." phase to wait through.
+    // Two-phase startup (#0003). `App::new` built every `AccountState` cheaply
+    // -- config only, no store opened -- so the shell above painted with
+    // zeroed counts and an empty list. Now, after the first frame is on its
+    // way, open each account's store off the UI thread. The first open of a
+    // store file runs `PRAGMA integrity_check` (~240 ms on a 44 MB store) and,
+    // on failure, the drop-and-rebuild path (#0066); summed serially across
+    // accounts inside `App::new` that was ~1.2 s of blank terminal. Here the
+    // opens overlap and none of them gate the paint.
     //
-    // The startup auto-fetch (#0001) used to ride on that scan finishing
-    // (`BgResult::IndexReady` pushed one `Action::FetchAccount` per
-    // account). With no scan to wait for it is queued directly, one action
-    // per account with a remote source; local-only accounts have nothing to
-    // fetch. The actions still run one at a time through the normal queue,
-    // so the staggering the old path got for free is preserved.
-    let auto_fetch: Vec<usize> = app
-        .accounts
-        .iter()
-        .enumerate()
-        .filter(|(_, acct)| acct.imap_config.is_some() || acct.graph_config.is_some())
-        .map(|(i, _)| i)
-        .collect();
-    for i in auto_fetch {
-        app.push_action(app::Action::FetchAccount(i));
+    // Each thread reads the grouped mailbox counts and the outbox badge and
+    // reports `BgResult::AccountOpened`. Its handler (in `tui/bg.rs`) fills
+    // those in, clears `AccountState::opening`, loads the active account's
+    // open mailbox against the now-validated store, and kicks the startup
+    // auto-fetch (#0001) for that account. Deferring the fetch until the store
+    // is known good is deliberate: it avoids a sync racing the very first open
+    // of the same file and a redundant second integrity check.
+    //
+    // `bg_count` is bumped per account so the existing spinner shows "working"
+    // until every store is open; the message-ID index scan that used to run
+    // here is gone outright (#0038).
+    for (i, acct) in app.accounts.iter().enumerate() {
+        let account_name = acct.account_config.name.clone();
+        let mailboxes = acct.mailboxes.clone();
+        let tx = bg_tx.clone();
+        app.bg_count += 1;
+        std::thread::spawn(move || {
+            // `count_all_emails` opens the store (running the integrity check /
+            // rebuild on the first open) and returns the grouped per-mailbox
+            // counts; the outbox read reuses the now-open, validated file.
+            let counts = app::count_all_emails(&account_name, &mailboxes);
+            let outbox = crate::outbox::counts_for_account(&account_name);
+            let _ = tx.send(BgResult::AccountOpened {
+                account_index: i,
+                counts,
+                outbox,
+            });
+        });
     }
 
     // Redraw only when something changed (#0093 §b.7). The loop used to call

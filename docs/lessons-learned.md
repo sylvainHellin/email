@@ -954,3 +954,22 @@ genuinely nested cases themselves with `Handle::try_current()`. The runtime is a
 `static LazyLock` and is never dropped: nothing relied on per-op runtime teardown
 for cleanup (IMAP sockets live on async-std's global reactor and the pooled
 session cache; SMTP/Graph close when their futures complete).
+
+Two-phase startup (#0003) rests on one non-obvious detail of the store's
+`INTEGRITY_CHECKED` amortisation: the expensive `PRAGMA integrity_check` (~240
+ms on a 44 MB file) is what any *first* open of a store file in the process
+pays, and `count_all_emails` / `outbox::counts_for_account` are ordinary read
+opens that trigger it. So the win is not "skip the check" but "do the first open
+off the first-paint path": move the counts read to a background thread and the
+integrity check moves with it. The registry is keyed by canonical path and
+counts per file, so once the background open validates a file, every later open
+in that process (the active mailbox load, a sync, a mutation) trusts the verdict
+and skips the walk. The corollary is a sequencing rule: the startup auto-fetch
+must be queued *after* `BgResult::AccountOpened`, not up front. Two threads
+opening the same never-yet-validated file concurrently both see a registry count
+of 0 and both run the full check; sequencing the sync behind the open makes the
+first open the only one that walks the file. The engine advisory lock (#0061) is
+untouched by any of this: it is taken only by the `pending_ops` drain, never by a
+read open, so which thread the open runs on is irrelevant to it. The rebuild /
+salvage path (#0066) lives inside `Store::open` and simply runs on whichever
+thread opened the store, foreground or background.

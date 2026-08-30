@@ -284,16 +284,14 @@ impl App {
         };
 
         app.load_from_account(0);
-        if !app.mailboxes.is_empty() {
-            let account_name = app.account_config.name.clone();
-            let loaded = Arc::new(load_emails(
-                &account_name,
-                &mailbox_key(&app.mailboxes[0]),
-            ));
-            app.email_cache[0] = Some(Arc::clone(&loaded));
-            app.emails = loaded;
-            app.rebuild_visible();
-        }
+        // The active mailbox is NOT loaded here (#0003 two-phase startup):
+        // `load_emails` opens the store, and the first open runs the full
+        // `PRAGMA integrity_check`, which is exactly the ~240 ms this ticket
+        // moves off the first-paint path. `run_loop` opens every account's
+        // store on a background thread after the first `terminal.draw`;
+        // `BgResult::AccountOpened` for the active account then triggers this
+        // load against the already-validated store. The list starts empty and
+        // fills in a beat later, which is the whole point.
 
         if let Some(warning) = theme_warning {
             app.push_status(warning, StatusLevel::Warning);
@@ -861,8 +859,23 @@ impl App {
             .get(idx)
             .and_then(|acct| acct.cursor_ref);
         let am = self.active_mailbox;
+        let target_opening = self.accounts.get(idx).is_some_and(|a| a.opening);
         if let Some(cached) = self.email_cache.get(am).and_then(|c| c.as_ref()) {
             self.emails = Arc::clone(cached);
+        } else if target_opening {
+            // The destination account's store has not opened yet (#0003
+            // two-phase startup): its background open is still in flight and
+            // its counts are zero. Show an empty list with a clear status and
+            // let the pending `BgResult::AccountOpened` load this mailbox once
+            // the store is validated -- racing it with a second open here
+            // would run the integrity check twice on the same file.
+            let name = self
+                .accounts
+                .get(idx)
+                .map(|a| a.account_config.name.clone())
+                .unwrap_or_default();
+            self.emails = Arc::new(Vec::new());
+            self.set_status_level(format!("Opening {name}..."), StatusLevel::Progress);
         } else if let Some(mb) = self.mailboxes.get(am) {
             // Cache miss: same off-thread load as `switch_mailbox` (P1
             // step 2) -- show an empty list + loading status until the
