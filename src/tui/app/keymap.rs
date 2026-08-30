@@ -230,6 +230,10 @@ pub enum KeyAction {
     // -- Global -----------------------------------------------------------
     Quit,
     ToggleHelp,
+    /// Open the command palette (`:` / `Ctrl+p`, #0100): a fuzzy finder over
+    /// the runnable `KeyAction` catalogue, so an action can be run by name
+    /// without recalling its chord.
+    OpenPalette,
     ToggleActivityLog,
     OpenActivityOverlay,
     OpenLogFile,
@@ -354,6 +358,32 @@ impl KeyAction {
                 | KeyAction::OpenConfigFile
                 | KeyAction::SwitchView
                 | KeyAction::Manual
+        )
+    }
+
+    /// Whether this action can be run straight from the command palette (#0100).
+    ///
+    /// The palette runs an action against the current context by handing it to
+    /// the same executor a keypress would. Most actions run cleanly, but a few
+    /// are meaningless without the physical key that armed them or would just
+    /// re-open the palette, so they are held back:
+    ///
+    /// - [`KeyAction::Manual`] is hand-dispatched overlay-internal input, not a
+    ///   runnable Normal-mode action at all.
+    /// - [`KeyAction::ArmPrefix`] only arms a leader; there is nothing to run.
+    /// - [`KeyAction::SwitchView`], [`KeyAction::JumpMailbox`] and
+    ///   [`KeyAction::JumpAccount`] read the continuation / digit key off the
+    ///   live event, which the palette cannot supply.
+    /// - [`KeyAction::OpenPalette`] would just reopen the palette.
+    pub fn palette_runnable(self) -> bool {
+        !matches!(
+            self,
+            KeyAction::Manual
+                | KeyAction::ArmPrefix
+                | KeyAction::SwitchView
+                | KeyAction::JumpMailbox
+                | KeyAction::JumpAccount
+                | KeyAction::OpenPalette
         )
     }
 }
@@ -522,6 +552,10 @@ pub static KEYMAP: &[KeyBinding] = &[
     b("Tab", Chord::Code(SpecialCode::Tab), KeyCtx::Global, KeyAction::FocusForward, "Cycle focus forward", false),
     b("Shift+Tab", Chord::Code(SpecialCode::BackTab), KeyCtx::Global, KeyAction::FocusBackward, "Cycle focus backward", false),
     b("?", Chord::Char('?'), KeyCtx::Global, KeyAction::ToggleHelp, "Toggle this help", true),
+    // Command palette (#0100): `:` or `Ctrl+p` opens a fuzzy finder over the
+    // runnable KeyAction catalogue, the recall path for a forgotten chord.
+    short(b(":", Chord::Char(':'), KeyCtx::Global, KeyAction::OpenPalette, "Command palette (run an action by name)", true), "Palette"),
+    b("Ctrl+p", Chord::CtrlChar('p'), KeyCtx::Global, KeyAction::OpenPalette, "Command palette (run an action by name)", false),
     // Zoom is Global by context but Mail-only by action: `is_view_agnostic`
     // leaves it out, so the dispatcher swallows `z` in Contacts and Calendar,
     // where a two-pane split the user can zoom does not exist (#TKT-0044).
@@ -765,6 +799,29 @@ pub fn prefix_continuations(
     KEYMAP
         .iter()
         .filter(move |kb| kb.ctx == ctx && kb.prefix == Some(prefix))
+}
+
+/// The command-palette catalogue, derived from `KEYMAP` (#0100).
+///
+/// One `(action, label)` per runnable [`KeyAction`], deduplicated across the
+/// several rows that can share an action (e.g. `Reply` is both the flat `r` and
+/// the `cr` compose chord). Table order is preserved and the first row wins, so
+/// the flat binding's description is the one shown. Rows the palette cannot run
+/// ([`KeyAction::palette_runnable`] is false) and the display-only synonym rows
+/// (empty `desc`) are skipped. This is the only place the palette gets its
+/// entries, so it cannot drift from the keymap the help/hint surfaces read.
+pub fn palette_actions() -> Vec<(KeyAction, &'static str)> {
+    let mut out: Vec<(KeyAction, &'static str)> = Vec::new();
+    for kb in KEYMAP {
+        if kb.desc.is_empty() || !kb.action.palette_runnable() {
+            continue;
+        }
+        if out.iter().any(|(a, _)| *a == kb.action) {
+            continue;
+        }
+        out.push((kb.action, kb.desc));
+    }
+    out
 }
 
 /// Machine-readable dump of `KEYMAP` for regenerating the website key table
@@ -1159,6 +1216,62 @@ mod tests {
             resolve(KeyCtx::Message, key('t'), Some('t'), &allow),
             Some(KeyAction::OpenThread)
         );
+    }
+
+    /// The command palette opens on `:` and `Ctrl+p` from the Normal-mode
+    /// surface (#0100).
+    #[test]
+    fn command_palette_opens_on_colon_and_ctrl_p() {
+        assert_eq!(
+            resolve(KeyCtx::Global, key(':'), None, &allow),
+            Some(KeyAction::OpenPalette)
+        );
+        assert_eq!(
+            resolve(KeyCtx::Global, ctrl('p'), None, &allow),
+            Some(KeyAction::OpenPalette)
+        );
+    }
+
+    /// The palette catalogue derives from `KEYMAP` (#0100): every entry is a
+    /// runnable action, no action appears twice, and the non-runnable rows
+    /// (leaders, view/digit jumps, the palette opener, hand-dispatched Manual)
+    /// are held back.
+    #[test]
+    fn palette_actions_derive_from_the_keymap_without_duplicates() {
+        let actions = palette_actions();
+        assert!(!actions.is_empty(), "the palette must expose some actions");
+
+        let mut seen: Vec<KeyAction> = Vec::new();
+        for (action, label) in &actions {
+            assert!(
+                action.palette_runnable(),
+                "{action:?} is not palette-runnable but was catalogued"
+            );
+            assert!(!label.is_empty(), "{action:?} has an empty palette label");
+            assert!(!seen.contains(action), "{action:?} appears twice in the palette");
+            seen.push(*action);
+        }
+
+        // The held-back actions never leak into the catalogue.
+        for excluded in [
+            KeyAction::Manual,
+            KeyAction::ArmPrefix,
+            KeyAction::SwitchView,
+            KeyAction::JumpMailbox,
+            KeyAction::JumpAccount,
+            KeyAction::OpenPalette,
+        ] {
+            assert!(
+                !actions.iter().any(|(a, _)| *a == excluded),
+                "{excluded:?} must not be palette-runnable"
+            );
+        }
+
+        // A representative message action is present exactly once, labelled by
+        // its flat row (not the `cr` compose chord).
+        let reply: Vec<_> = actions.iter().filter(|(a, _)| *a == KeyAction::Reply).collect();
+        assert_eq!(reply.len(), 1, "Reply must be catalogued once");
+        assert_eq!(reply[0].1, "Reply");
     }
 
     /// Guarded rows respect the live guard evaluation.

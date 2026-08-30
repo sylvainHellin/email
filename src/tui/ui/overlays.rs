@@ -5,8 +5,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::super::app::{
-    App, AttachmentPicker, AttachmentPickerMode, ConfirmDialog, DirPicker, DirPickerMode,
-    MailboxPicker, PersistentError, RsvpOverlay, ThreadEntry, ThreadOverlay,
+    App, AttachmentPicker, AttachmentPickerMode, CommandPalette, ConfirmDialog, DirPicker,
+    DirPickerMode, MailboxPicker, PersistentError, RsvpOverlay, ThreadEntry, ThreadOverlay,
 };
 use super::super::theme;
 use super::util::truncate;
@@ -472,6 +472,98 @@ pub(super) fn render_mailbox_picker(picker: &MailboxPicker, frame: &mut Frame, a
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "type filter  \u{2191}/\u{2193} nav  Enter move  Esc cancel",
+            Style::default().fg(theme::active().text_muted),
+        ))),
+        chunks[2],
+    );
+}
+
+/// Render the command palette (`:` / `Ctrl+p`, #0100): a centred fuzzy finder
+/// over the runnable `KeyAction` catalogue. A query input line on top, the
+/// matching action labels below (cursor row highlighted), and a footer with the
+/// key hints. Modelled on [`render_mailbox_picker`], wider to fit action names.
+pub(super) fn render_command_palette(
+    palette: &CommandPalette,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let dialog_width = 60u16.min(area.width.saturating_sub(4));
+    let list_len = palette.filtered.len().max(1) as u16;
+    // Cap the list height so a long catalogue does not overflow a short frame.
+    let list_h = list_len.min(15);
+    let dialog_height = (list_h + 5).min(area.height.saturating_sub(2));
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(dialog_width)])
+        .flex(Flex::Center)
+        .split(area);
+
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(dialog_height)])
+        .flex(Flex::Center)
+        .split(horizontal[0]);
+
+    let dialog_area = vertical[0];
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .title(" Command palette ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::active().border_focused))
+        .style(Style::default().bg(theme::active().bg));
+
+    let block_inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // query input
+            Constraint::Min(0),    // action list
+            Constraint::Length(1), // footer
+        ])
+        .split(block_inner);
+
+    // Query input.
+    let avail = (chunks[0].width as usize).saturating_sub(3); // "> " + cursor
+    let value = super::util::scrolled_input_value(&palette.query, avail);
+    let input_spans = vec![
+        Span::styled("> ", Style::default().fg(theme::active().border_focused)),
+        Span::styled(value, Style::default().fg(theme::active().text)),
+        Span::styled("\u{2588}", Style::default().fg(theme::active().border_focused)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(input_spans)), chunks[0]);
+
+    // Action list, scrolled so the cursor row stays visible.
+    let inner_width = block_inner.width.saturating_sub(2) as usize;
+    let rows = chunks[1].height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if palette.filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching action",
+            Style::default().fg(theme::active().text_faint),
+        )));
+    } else {
+        let start = palette.selected.saturating_sub(rows.saturating_sub(1));
+        for (pos, &idx) in palette.filtered.iter().enumerate().skip(start).take(rows) {
+            let label = palette.entries[idx].label;
+            let style = if pos == palette.selected {
+                Style::default().fg(theme::active().heading).bg(theme::active().surface)
+            } else {
+                Style::default().fg(theme::active().text)
+            };
+            lines.push(Line::from(Span::styled(truncate(label, inner_width), style)));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    // Footer.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "type filter  \u{2191}/\u{2193} nav  Enter run  Esc cancel",
             Style::default().fg(theme::active().text_muted),
         ))),
         chunks[2],

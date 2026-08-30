@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    Action, App, AttachmentPicker, AttachmentPickerMode, ComposeField, ComposeMode,
-    ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker, DirPickerMode,
-    EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay, RsvpChoice,
-    RsvpOverlay, SearchField, SearchOverlayFocus, SearchScope, ThreadEntry,
+    Action, App, AttachmentPicker, AttachmentPickerMode, CommandPalette, ComposeField,
+    ComposeMode, ComposeSuggestion, ComposeWizard, ConfirmAction, ConfirmDialog, DirPicker,
+    DirPickerMode, EmailEntry, Focus, MailboxKind, MailboxPicker, Message, MessageRef, Overlay,
+    RsvpChoice, RsvpOverlay, SearchField, SearchOverlayFocus, SearchScope, ThreadEntry,
     ThreadOverlay,
 };
 
@@ -26,6 +26,7 @@ impl App {
             Overlay::Mailbox(_) => return self.handle_mailbox_picker_key(key),
             Overlay::Rsvp(_) => return self.handle_rsvp_overlay_key(key),
             Overlay::Thread(_) => return self.handle_thread_overlay_key(key),
+            Overlay::Palette(_) => return self.handle_command_palette_key(key),
             Overlay::Attachment(_) => return self.handle_attachment_picker_key(key),
             Overlay::Help => return self.handle_help_key(key),
             Overlay::Activity => return self.handle_activity_overlay_key(key),
@@ -179,6 +180,12 @@ impl App {
                 self.help_filter.clear();
                 self.help_filter_active = false;
                 self.overlay = Overlay::Help;
+            }
+            A::OpenPalette => {
+                // `:` / `Ctrl+p` (#0100): open the command palette, a fuzzy
+                // finder over the runnable KeyAction catalogue.
+                self.pending_prefix = None;
+                self.overlay = Overlay::Palette(CommandPalette::new());
             }
             A::ToggleZoom => {
                 self.pending_prefix = None;
@@ -456,7 +463,11 @@ impl App {
         match action {
             A::ListDown => {
                 self.pending_prefix = None;
-                if self.list_index < self.visible.len() - 1 {
+                // Saturating like `NextMessage` below: key dispatch never gets
+                // here on an empty list (`Guard::NonEmptyList`), but the
+                // command palette (#0100) runs executors directly, and
+                // `0 - 1` on an empty `visible` underflows.
+                if self.list_index < self.visible.len().saturating_sub(1) {
                     self.list_index += 1;
                 }
             }
@@ -1935,6 +1946,54 @@ impl App {
         None
     }
 
+    /// Command-palette input (`:` / `Ctrl+p`, #0100): a text-input fuzzy finder
+    /// over the runnable `KeyAction` catalogue, modelled on the mailbox picker.
+    /// Typed characters filter (family leaders are literal here); Up/Down (and
+    /// Tab/BackTab) move the cursor; Enter closes the palette and runs the
+    /// selected action against the current context through the same executor a
+    /// keypress uses; Esc closes.
+    fn handle_command_palette_key(&mut self, key: KeyEvent) -> Option<Message> {
+        let palette = match &mut self.overlay {
+            Overlay::Palette(p) => p,
+            _ => return None,
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Tab => {
+                if !palette.filtered.is_empty()
+                    && palette.selected < palette.filtered.len() - 1
+                {
+                    palette.selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(action) = palette.selected_action() {
+                    // Consume-and-close, then run the action in the context the
+                    // palette floated over. `execute` reads no digit/leader key
+                    // for any palette-runnable action, so the Enter event is a
+                    // fine stand-in for the key that would have armed it.
+                    self.close_overlay();
+                    return self.execute(action, key);
+                }
+            }
+            KeyCode::Esc => {
+                self.close_overlay();
+            }
+            KeyCode::Backspace => {
+                palette.query.pop();
+                refresh_palette_filter(palette);
+            }
+            KeyCode::Char(c) => {
+                palette.query.push(c);
+                refresh_palette_filter(palette);
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Helper to open the attachment picker in the given mode.
     ///
     /// The files come out of `message_blobs` (#0052 scope item 8): the row
@@ -2421,6 +2480,19 @@ pub(super) fn refresh_mailbox_picker_filter(picker: &mut MailboxPicker) {
         .map(|(i, _)| i)
         .collect();
     picker.selected = 0;
+}
+
+/// Recompute `palette.filtered` from `palette.query` and reset the cursor
+/// (#0100). Fuzzy-matches the same way the mailbox picker filters its labels.
+pub(super) fn refresh_palette_filter(palette: &mut CommandPalette) {
+    palette.filtered = palette
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| fuzzy_match(&palette.query, entry.label))
+        .map(|(i, _)| i)
+        .collect();
+    palette.selected = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -3256,6 +3328,110 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         // No match highlighted: picker stays open, nothing queued.
         assert!(matches!(app.overlay, Overlay::Mailbox(_)));
+        assert!(app.pending_actions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Command palette (#0100)
+    // -----------------------------------------------------------------------
+
+    /// `:` and `Ctrl+p` both open the command palette over the runnable
+    /// KeyAction catalogue, and Esc closes it without side effects.
+    #[test]
+    fn command_palette_opens_on_colon_and_ctrl_p() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        let Overlay::Palette(palette) = &app.overlay else {
+            panic!("`:` should open the palette");
+        };
+        assert!(!palette.entries.is_empty(), "the catalogue is non-empty");
+        assert_eq!(
+            palette.filtered.len(),
+            palette.entries.len(),
+            "an empty query matches every entry"
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.pending_actions.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(app.overlay, Overlay::Palette(_)),
+            "Ctrl+p opens it too"
+        );
+    }
+
+    /// A family leader typed into the palette is literal text (it filters, it
+    /// does not arm the leader), consistent with the search prompt.
+    #[test]
+    fn command_palette_treats_family_leaders_as_literal_text() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(app.pending_prefix.is_none(), "`f` must not arm a leader here");
+        let Overlay::Palette(palette) = &app.overlay else {
+            panic!("palette should still be open");
+        };
+        assert_eq!(palette.query, "f");
+    }
+
+    /// The palette runs executors without the key dispatch's guard checks
+    /// (#0100 review finding): running a `Guard::NonEmptyList` action by name
+    /// on an empty mailbox must not underflow the cursor arithmetic.
+    #[test]
+    fn command_palette_runs_a_list_action_on_an_empty_list_without_panicking() {
+        let mut app = app_with_emails(Vec::new());
+        assert!(app.visible.is_empty(), "the mailbox must start empty");
+        app.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        for c in "navigate emails".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(matches!(app.overlay, Overlay::None), "the palette closed");
+        assert_eq!(app.list_index, 0, "the cursor stays put on an empty list");
+    }
+
+    /// Typing filters the catalogue, and Enter closes the palette and runs the
+    /// selected action against the current context.
+    #[test]
+    fn command_palette_filters_and_runs_the_selected_action() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        for c in "toggle this help".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let Overlay::Palette(palette) = &app.overlay else {
+            panic!("palette should be open");
+        };
+        assert_eq!(
+            palette.selected_action(),
+            Some(crate::tui::app::KeyAction::ToggleHelp),
+            "the query narrowed to the one help action"
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        // The palette closed and the action ran in the current context: the
+        // help overlay is now up.
+        assert!(matches!(app.overlay, Overlay::Help));
+    }
+
+    /// Enter with no match (an over-narrow query) is a no-op: nothing runs and
+    /// the palette stays open.
+    #[test]
+    fn command_palette_enter_on_no_match_is_noop() {
+        let mut app = app_with_emails(sample());
+        app.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        for c in "zzzznope".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let Overlay::Palette(palette) = &app.overlay else {
+            panic!("palette should be open");
+        };
+        assert!(palette.filtered.is_empty());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::Palette(_)), "stays open");
         assert!(app.pending_actions.is_empty());
     }
 

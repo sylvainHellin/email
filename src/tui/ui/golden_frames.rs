@@ -34,8 +34,8 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
 use crate::tui::app::{
-    App, CalendarEvent, EmailEntry, EntryKey, MailboxInfo, MailboxKind, MessageRef, Overlay,
-    SearchField, SearchOverlayFocus, View,
+    App, CalendarEvent, CommandPalette, EmailEntry, EntryKey, MailboxInfo, MailboxKind,
+    MessageRef, Overlay, SearchField, SearchOverlayFocus, View,
 };
 use crate::tui::theme::{self, Theme};
 use crate::types::EventFrontmatter;
@@ -695,6 +695,17 @@ fn golden_drafts_view_with_a_parse_skip() {
 fn golden_help_overlay() {
     let mut app = mail_fixture();
     app.overlay = Overlay::Help;
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// The command palette (`:` / `Ctrl+p`, #0100) floating over the dimmed mail
+/// view, freshly opened with an empty query so the full runnable catalogue
+/// shows from the top, its first entry highlighted. Pins the palette chrome
+/// (query line, action list, footer) and proves it derives from `KEYMAP`.
+#[test]
+fn golden_command_palette() {
+    let mut app = mail_fixture();
+    app.overlay = Overlay::Palette(CommandPalette::new());
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 

@@ -7,7 +7,8 @@ mod types;
 pub use calendar_view::load_events_for_account;
 pub use keymap::{
     dump_json, dump_markdown, help_sections, hint_bindings, leader_is_view_agnostic,
-    prefix_continuations, resolve, Guard, KeyAction, KeyBinding, KeyCtx, KEYMAP,
+    palette_actions, prefix_continuations, resolve, Guard, KeyAction, KeyBinding, KeyCtx,
+    KEYMAP,
 };
 pub use types::*;
 
@@ -708,6 +709,7 @@ impl App {
             | Overlay::Mailbox(_)
             | Overlay::Rsvp(_)
             | Overlay::Thread(_)
+            | Overlay::Palette(_)
             | Overlay::Error(_) => None,
             // Contacts view (#0033): the list pane owns the hint bar (unless the
             // fuzzy-search input is armed, which is free-text — no hint row).

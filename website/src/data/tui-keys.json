@@ -7,6 +7,8 @@
       { "key": "Tab", "action": "Cycle focus forward" },
       { "key": "Shift+Tab", "action": "Cycle focus backward" },
       { "key": "?", "action": "Toggle this help" },
+      { "key": ":", "action": "Command palette (run an action by name)" },
+      { "key": "Ctrl+p", "action": "Command palette (run an action by name)" },
       { "key": "z", "action": "Zoom / unzoom the focused pane" },
       { "key": "!", "action": "Toggle activity log" },
       { "key": "x", "action": "Send current draft (approve + send)" },

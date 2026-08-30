@@ -1643,6 +1643,68 @@ pub struct ConfirmDialog {
     pub action: ConfirmAction,
 }
 
+/// One selectable row of the command palette (#0100): a runnable action and
+/// the label the fuzzy filter matches against and the list renders.
+#[derive(Debug, Clone, Copy)]
+pub struct PaletteEntry {
+    pub action: super::KeyAction,
+    pub label: &'static str,
+}
+
+/// Scratch state for the command palette overlay (`:` / `Ctrl+p`, #0100).
+///
+/// A text-input fuzzy finder over the runnable `KeyAction` catalogue
+/// ([`super::palette_actions`]): the user types part of an action name and runs
+/// it with Enter, without recalling its chord. It is the recall path the
+/// mnemonic families' fast path complements, not a second action list — the
+/// entries derive from the same `KEYMAP` the help/hint surfaces read.
+///
+/// Modelled on [`MailboxPicker`]: `entries` is the full catalogue captured when
+/// the overlay opens, `filtered` holds the indices that match `query` (in
+/// catalogue order), and `selected` is the cursor into `filtered`.
+pub struct CommandPalette {
+    /// The full runnable catalogue, snapshotted on open.
+    pub entries: Vec<PaletteEntry>,
+    /// Type-to-filter query (family leaders typed here are literal).
+    pub query: String,
+    /// Indices into `entries` whose label fuzzy-matches `query`.
+    pub filtered: Vec<usize>,
+    /// Cursor into `filtered`.
+    pub selected: usize,
+}
+
+impl CommandPalette {
+    /// Build the palette from the current [`super::palette_actions`] catalogue,
+    /// with an empty query (so every entry is visible) and the cursor at the
+    /// top.
+    pub fn new() -> Self {
+        let entries = super::palette_actions()
+            .into_iter()
+            .map(|(action, label)| PaletteEntry { action, label })
+            .collect::<Vec<_>>();
+        let filtered = (0..entries.len()).collect();
+        Self {
+            entries,
+            query: String::new(),
+            filtered,
+            selected: 0,
+        }
+    }
+
+    /// The action under the cursor, if any.
+    pub fn selected_action(&self) -> Option<super::KeyAction> {
+        self.filtered
+            .get(self.selected)
+            .map(|&i| self.entries[i].action)
+    }
+}
+
+impl Default for CommandPalette {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The single active modal overlay, if any (#0032).
 ///
 /// Replaces the former set of independent `Option`/`bool` overlay fields on
@@ -1682,6 +1744,9 @@ pub enum Overlay {
     Rsvp(RsvpOverlay),
     /// Conversation / threading overlay (`T`, #0008).
     Thread(ThreadOverlay),
+    /// Command palette (`:` / `Ctrl+p`, #0100): a fuzzy finder over the
+    /// runnable `KeyAction` catalogue.
+    Palette(CommandPalette),
     /// Persistent error requiring explicit dismissal.
     Error(PersistentError),
 }

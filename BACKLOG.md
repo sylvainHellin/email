@@ -17,7 +17,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 - [#0097 Type a short body in the compose wizard without opening $EDITOR](docs/tickets/0097-compose-wizard-body-field.md) -- feature
 - [#0098 Attach a file to an existing draft from the TUI](docs/tickets/0098-attach-file-to-existing-draft.md) -- feature _(cross-ref #0016)_
-- [#0100 Command palette (fuzzy finder over the KeyAction catalogue)](docs/tickets/0100-command-palette.md) -- feature _(depends on #0092)_
 
 ## Later
 
