@@ -985,3 +985,24 @@ per open by remembering the last message in `App::auto_read_opened`. Firing from
 render was rejected: `refresh_preview_body` runs under `&mut App` at frame top
 but a store mutation there mixes read-path and write-path concerns, and the loop
 already owns the post-event settling point where the selection is final.
+
+HTML-to-text in the preview (#0091) needed no external tool and no new crate:
+`html2text` was already a direct dependency, used at ingest by
+`parse::html_to_plain` (`config::plain()`) to flatten HTML for the stored body.
+The ticket's "evaluate w3m / lynx / pandoc" premise predated that fact. The real
+defect was a double conversion (HTML flattened to plain at ingest, then
+re-parsed as Markdown by `wrap_and_style_body` in `preview.rs`), not a missing
+renderer. The fix uses the crate's *rich* interface: `html2text::config::rich()`
+`.lines_from_read(html, width)` returns `Vec<TaggedLine<Vec<RichAnnotation>>>`
+already wrapped to a width, with per-span annotations (`Strong`, `Emphasis`,
+`Link`, `Code`, CSS `Colour`) that map one-to-one onto ratatui `Style` in
+`style_for_annotations`. The "outer" annotation comes first in the Vec, so
+folding left-to-right layers inner over outer (a `<strong>` inside a link keeps
+the underline and adds bold). `config::rich()` defaults `include_link_footnotes`
+to false, so links render as their visible text (no `[1]` markers); the `b`/`tb`
+browser hatch stays the full-fidelity path. Sourcing the HTML at preview time
+reuses `store::read::load_html`, which parses the raw RFC822 on the IMAP path
+(no `html` blob there, unlike Graph), so it costs one MIME parse per selection
+change; it is memoised in `PreviewHtml` (paid on cursor moves, never per frame).
+A per-row `has_html` flag would let it skip plain-only mail the way the
+inline-image refresh skips attachment-less rows.

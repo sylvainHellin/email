@@ -82,6 +82,11 @@ pub struct App {
     /// selection and memoised (#0038 scope item 5). Refreshed by
     /// [`App::refresh_preview_body`] at the top of the render pass.
     pub preview_body: PreviewBody,
+    /// The HTML rendition behind the preview pane, memoised the same way
+    /// (#0091). `Some` only for a message that carries an HTML part; the
+    /// preview then renders it through html2text's rich interface instead of
+    /// the plain body. See [`PreviewHtml`].
+    pub preview_html: PreviewHtml,
     /// The parsed invite behind the preview pane's event card, memoised the
     /// same way (#0038 scope item 6). See [`PreviewInvite`].
     pub preview_invite: PreviewInvite,
@@ -253,6 +258,7 @@ impl App {
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
+            preview_html: PreviewHtml::default(),
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
             preview_lines: Default::default(),
@@ -348,6 +354,7 @@ impl App {
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
+            preview_html: PreviewHtml::default(),
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
             preview_lines: Default::default(),
@@ -1291,6 +1298,44 @@ impl App {
             None => String::new(),
         };
         self.preview_body.fill(key, text);
+    }
+
+    /// Refresh the preview HTML memo (#0091), reading the selected message's
+    /// HTML part once per cursor move.
+    ///
+    /// Runs beside [`Self::refresh_preview_body`] at the top of the render
+    /// pass and is memoised on the same key, so an unchanged selection costs a
+    /// key comparison. Only a received message can carry HTML: a draft, a skip
+    /// row, or a server-search hit with no store row yields `None`, and the
+    /// preview falls back to the plain body. A message with no HTML part (a
+    /// mailing-list post, a `git send-email`) also yields `None` after the
+    /// load, so those still render exactly as before.
+    pub(crate) fn refresh_preview_html(&mut self) {
+        let key = self.preview_body_key();
+        if self.preview_html.holds(&key) {
+            return;
+        }
+        let html = match &key {
+            Some((_, EntryKey::Msg(msg), _)) => self
+                .load_message_html(*msg)
+                .filter(|h| !h.trim().is_empty()),
+            _ => None,
+        };
+        self.preview_html.fill(key, html);
+    }
+
+    /// Read one message's HTML part from the store, or `None` when it has none.
+    ///
+    /// Delegates to [`crate::store::read::load_html`], the same reader reply,
+    /// forward and the inline-image scan use: it prefers the `html` blob (the
+    /// Graph path) and parses the raw RFC822 only when there is no blob (the
+    /// IMAP path). A message that has never synced, or an account with no
+    /// store, degrades to `None` and the plain body.
+    fn load_message_html(&self, msg: MessageRef) -> Option<String> {
+        let account = &self.account_config.name;
+        let store = open_store(account)?;
+        let blobs = crate::store::BlobStore::for_account(account);
+        crate::store::read::load_html(&store, &blobs, msg.row_id())
     }
 
     /// Refresh the inline-image memo of the preview pane (#0010).

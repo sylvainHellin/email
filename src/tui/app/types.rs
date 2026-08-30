@@ -615,6 +615,43 @@ impl PreviewInvite {
     }
 }
 
+/// One-slot memo of the HTML rendition behind the preview pane (#0091).
+///
+/// The sibling of [`PreviewBody`] and [`PreviewInvite`], keyed the same way and
+/// refreshed in the same place: the preview shows one message, so its HTML part
+/// is read once per cursor move, not once per mailbox row.
+///
+/// `Some` only when the selected message actually carries an HTML part; a
+/// plain-only message, a draft, or a server-search hit with no local row leaves
+/// it `None`, and the preview renders the plain body instead. The cost is one
+/// HTML extraction per selection change (a blob read on the Graph path, a raw
+/// MIME parse on the IMAP path -- the same `load_html` that reply, forward and
+/// the inline-image scan already use), paid only when the cursor moves, never
+/// per frame.
+#[derive(Debug, Default, Clone)]
+pub struct PreviewHtml {
+    key: Option<BodyKey>,
+    html: Option<String>,
+}
+
+impl PreviewHtml {
+    /// The memoised HTML, `None` when the selected message has no HTML part.
+    pub(crate) fn rendered(&self) -> Option<&str> {
+        self.html.as_deref()
+    }
+
+    /// True when the memo already answers for `key`.
+    pub(crate) fn holds(&self, key: &Option<BodyKey>) -> bool {
+        &self.key == key
+    }
+
+    /// Park `html` as the rendition for `key`.
+    pub(crate) fn fill(&mut self, key: Option<BodyKey>, html: Option<String>) {
+        self.key = key;
+        self.html = html;
+    }
+}
+
 /// Extract a short display name from an email address.
 pub fn extract_display_name(addr: &str) -> String {
     let addr = addr.trim().trim_matches('"');

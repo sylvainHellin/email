@@ -160,9 +160,11 @@ import AccordionItem from '../components/AccordionItem.astro';
         <AccordionItem question="Does it support HTML emails?">
           <p>
             Outgoing emails are written in Markdown and converted to HTML for sending, with a
-            plaintext fallback. For incoming mail both parts are kept: the text the TUI shows and
-            the original HTML, each as a blob beside the message row. Press <code>tb</code> in the
-            TUI to open the HTML version in your browser.
+            plaintext fallback. For incoming mail both parts are kept as blobs beside the message
+            row. HTML-dominant messages are rendered to readable styled text in the preview pane,
+            so headings, lists, links, tables and emphasis survive rather than collapsing to a flat
+            wrap. Press <code>tb</code> in the TUI to open the original HTML in your browser when
+            you want the full layout.
           </p>
         </AccordionItem>
       </div>

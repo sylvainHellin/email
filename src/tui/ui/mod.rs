@@ -77,6 +77,10 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     // key comparison. The invite behind the event card is memoised beside it
     // (#0038 scope item 6) and costs nothing for a message that is not one.
     app.refresh_preview_body();
+    // The HTML rendition behind the preview, on the same memo discipline
+    // (#0091). `None` for plain-only mail and drafts, where the plain body is
+    // rendered instead; loaded once per selection change, never per frame.
+    app.refresh_preview_html();
     app.refresh_preview_invite();
     // The inline images of the previewed message, on the same memo discipline
     // (#0010). Free for a row with no attachments, and free on every terminal

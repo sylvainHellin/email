@@ -1,3 +1,4 @@
+use html2text::render::RichAnnotation;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -61,11 +62,22 @@ pub(super) fn render_body(app: &mut App, frame: &mut Frame, area: Rect) {
     let epoch = app.preview_body.epoch();
     let images_key = app.preview_images.key().clone();
     if !app.preview_lines.holds(epoch, inner_width, &images_key) {
-        let body = app
-            .preview_body
-            .text()
-            .replace("{{SIGNATURE}}", "[signature]");
-        let mut lines = wrap_and_style_body(&body, inner_width as usize);
+        // HTML-dominant mail (#0091): render the sender's own markup through
+        // html2text's rich interface. The plain body for HTML mail is a lossy
+        // flatten (html2text plain) re-parsed here as Markdown; rendering the
+        // HTML directly keeps tables, lists, links and blockquotes structured.
+        // Plain-only mail, drafts, and a render failure fall back to
+        // `wrap_and_style_body` over the stored plain body, which is exactly
+        // today's output -- the graceful degradation the ticket asks for.
+        let mut lines = if let Some(html) = app.preview_html.rendered() {
+            render_html_body(html, inner_width as usize)
+        } else {
+            let body = app
+                .preview_body
+                .text()
+                .replace("{{SIGNATURE}}", "[signature]");
+            wrap_and_style_body(&body, inner_width as usize)
+        };
         // Inline images (#0010) are appended to the text flow rather than
         // spliced into it: html2text gives no stable anchor for the `<img>` it
         // dropped, so the honest placement is a labelled block at the end of
@@ -645,6 +657,89 @@ fn parse_list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
+/// Render a message's HTML part into styled preview lines through html2text's
+/// rich interface (#0091, Option B: no new dependency, html2text is already in
+/// the tree).
+///
+/// This replaces the round-trip the plain path takes for HTML mail -- HTML
+/// flattened to plain text at ingest, then re-parsed here as Markdown -- with a
+/// single structured pass: html2text wraps the HTML to `width` and returns
+/// per-span [`RichAnnotation`]s (emphasis, strong, links, code, CSS colours),
+/// which [`style_for_annotations`] turns straight into ratatui styles. Tables,
+/// nested lists, blockquotes and links come out as the sender laid them, not
+/// reconstructed from guesswork.
+///
+/// Link footnotes are left off (the rich default), so links render as their
+/// visible text, underlined; the full URL stays one keypress away behind the
+/// `b`/`tb` open-in-browser escape hatch, unchanged by this ticket.
+///
+/// A render error (HTML html2text refuses) falls back to the plain pipeline
+/// over [`crate::parse::html_to_plain`], so a bad message degrades to today's
+/// output rather than blanking the pane.
+fn render_html_body(html: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let rich = match html2text::config::rich()
+        .use_doc_css()
+        .no_table_borders()
+        .no_link_wrapping()
+        .lines_from_read(html.as_bytes(), width)
+    {
+        Ok(lines) => lines,
+        Err(_) => return wrap_and_style_body(&crate::parse::html_to_plain(html), width),
+    };
+
+    let mut result: Vec<Line<'static>> = Vec::new();
+    for tagged in &rich {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for ts in tagged.tagged_strings() {
+            if ts.s.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(ts.s.clone(), style_for_annotations(&ts.tag)));
+        }
+        // An empty span vector is a blank line html2text emitted between
+        // blocks; keep it so paragraphs stay separated.
+        result.push(Line::from(spans));
+    }
+    if result.is_empty() {
+        result.push(Line::from(String::new()));
+    }
+    result
+}
+
+/// Fold html2text's rich annotations for one span into a ratatui [`Style`]
+/// (#0091).
+///
+/// The "outer" annotation comes first in the slice, so inner ones layer on
+/// top: a `<strong>` inside a link keeps the link's underline and adds bold.
+/// Sender CSS colours (`Colour`/`BgColour`) are deliberately ignored (review
+/// finding): they are authored against the sender's background, not the
+/// terminal theme's, so a dark-mode email on a light terminal (or one that
+/// sets only a background) can drop below readable contrast. Structure,
+/// emphasis and links carry the meaning; the `b`/`tb` browser hatch shows the
+/// sender's full styling. The enum is `#[non_exhaustive]`, hence the
+/// catch-all arm.
+fn style_for_annotations(tags: &[RichAnnotation]) -> Style {
+    let mut style = Style::default().fg(theme::active().text);
+    for tag in tags {
+        style = match tag {
+            RichAnnotation::Emphasis => style.add_modifier(Modifier::ITALIC),
+            RichAnnotation::Strong => style.add_modifier(Modifier::BOLD),
+            RichAnnotation::Strikeout => style.add_modifier(Modifier::CROSSED_OUT),
+            RichAnnotation::Link(_) => style
+                .fg(theme::active().accent)
+                .add_modifier(Modifier::UNDERLINED),
+            RichAnnotation::Code | RichAnnotation::Preformat(_) => {
+                style.fg(theme::active().code).bg(theme::active().surface)
+            }
+            RichAnnotation::Image(_) => style.fg(theme::active().text_muted),
+            RichAnnotation::Colour(_) | RichAnnotation::BgColour(_) => style,
+            _ => style,
+        };
+    }
+    style
+}
+
 fn wrap_and_style_body(body: &str, width: usize) -> Vec<Line<'static>> {
     let mut result: Vec<Line> = Vec::new();
     let mut in_code_block = false;
@@ -1197,5 +1292,119 @@ mod preview_cache_tests {
         assert!(cache.visible_slice(50, 5).is_empty());
         // A window taller than what remains is clamped to the remainder.
         assert_eq!(cache.visible_slice(8, 10).len(), 2);
+    }
+}
+
+/// HTML-to-text rendering (#0091): the preview renders a message's own HTML
+/// through html2text's rich interface instead of the lossy plain flatten, and
+/// falls back to the plain pipeline when the HTML is absent or unparseable.
+/// What is testable offline is the styled-line product and the annotation
+/// mapping; both are here.
+#[cfg(test)]
+mod html_body_tests {
+    use super::event_card_tests::line_text;
+    use super::*;
+
+    /// A borrow of every span across every rendered line, for style probing.
+    fn all_spans<'a>(lines: &'a [Line<'static>]) -> Vec<&'a Span<'static>> {
+        lines.iter().flat_map(|l| l.spans.iter()).collect()
+    }
+
+    #[test]
+    fn html_structure_survives_where_the_markdown_wrap_would_flatten_it() {
+        let html = "<h1>Title</h1><p>Hello <strong>bold</strong> and \
+            <em>italic</em>.</p><ul><li>first</li><li>second</li></ul>";
+        let text: String = render_html_body(html, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Title"), "text=\n{text}");
+        assert!(text.contains("bold"));
+        assert!(text.contains("italic"));
+        // The list items keep their own lines rather than running together.
+        assert!(text.contains("first"), "text=\n{text}");
+        assert!(text.contains("second"));
+        assert!(text.contains('*'), "bullets are drawn, not stripped:\n{text}");
+    }
+
+    #[test]
+    fn strong_and_emphasis_carry_their_modifiers() {
+        let lines = render_html_body("<p><strong>b</strong> <em>i</em> plain</p>", 40);
+        let spans = all_spans(&lines);
+        let bold = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "b")
+            .expect("a span for the <strong> text");
+        assert!(
+            bold.style.add_modifier.contains(Modifier::BOLD),
+            "strong is bold"
+        );
+        let ital = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "i")
+            .expect("a span for the <em> text");
+        assert!(
+            ital.style.add_modifier.contains(Modifier::ITALIC),
+            "em is italic"
+        );
+    }
+
+    #[test]
+    fn a_link_is_underlined_accent() {
+        let html = r#"<p>see <a href="https://example.com">the site</a></p>"#;
+        let lines = render_html_body(html, 40);
+        let link = all_spans(&lines)
+            .into_iter()
+            .find(|s| s.content.as_ref().contains("the site"))
+            .expect("a span for the link text");
+        assert!(
+            link.style.add_modifier.contains(Modifier::UNDERLINED),
+            "a link is underlined"
+        );
+        assert_eq!(link.style.fg, Some(theme::active().accent), "in the accent colour");
+    }
+
+    #[test]
+    fn every_rendered_row_fits_the_pane_width() {
+        let html = "<p>the quick brown fox jumps over the lazy dog again and \
+            again and again</p>";
+        let lines = render_html_body(html, 20);
+        assert!(lines.len() > 1, "a long paragraph wraps to several rows");
+        for line in &lines {
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(width <= 20, "row wider than the pane: {width}");
+        }
+    }
+
+    #[test]
+    fn a_blank_line_between_paragraphs_is_kept() {
+        let lines = render_html_body("<p>one</p><p>two</p>", 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|t| t == "one"));
+        assert!(texts.iter().any(|t| t == "two"));
+        assert!(
+            texts.iter().any(|t| t.is_empty()),
+            "paragraphs stay separated: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn pathological_input_returns_lines_and_never_panics() {
+        // html2text is lenient, and the error arm falls back to the plain
+        // pipeline; either way the pane gets lines rather than a panic.
+        assert!(!render_html_body("<<<not really html<<<", 30).is_empty());
+        assert!(!render_html_body("", 30).is_empty());
+    }
+
+    #[test]
+    fn annotation_folding_layers_inner_over_outer() {
+        // A strong link keeps the link's underline and adds the strong bold.
+        let style = style_for_annotations(&[
+            RichAnnotation::Link("https://x".to_string()),
+            RichAnnotation::Strong,
+        ]);
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 }
