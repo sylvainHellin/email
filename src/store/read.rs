@@ -20,8 +20,9 @@
 //! A row carries a `body_blob` hash, not the body, and the listing functions
 //! never resolve one: a mailbox load is rows only (#0038 scope item 5). The
 //! body is fetched when something actually needs it, by [`load_body`] for the
-//! previewed message and by [`load_bodies`] for the one batch that needs the
-//! whole mailbox at once (the body-search index).
+//! previewed message. The batch reader that once fed the in-list body-search
+//! index (`load_bodies`) left with that index (#0088): body search is the FTS
+//! path now, so nothing reads a whole mailbox of blobs at once anymore.
 //!
 //! Both degrade an unreadable blob to an empty body rather than an error: the
 //! retention sweep is allowed to evict a body, and an evicted body must not
@@ -646,38 +647,6 @@ pub fn load_raw(store: &Store, blobs: &BlobStore, message_row: i64) -> Option<Ve
     read_blob(blobs, message_row, hash.as_deref()?)
 }
 
-/// Resolve the body blobs of a batch of messages, keyed by `messages.id`.
-///
-/// One prepared statement, one blob read per id: the batch shape exists for
-/// the body-search index, which needs every body of a mailbox at once and is
-/// built once per list generation rather than per keystroke. An id with no row
-/// is absent from the map; an unreadable blob maps to an empty body.
-pub fn load_bodies(store: &Store, blobs: &BlobStore, ids: &[i64]) -> HashMap<i64, String> {
-    let mut out = HashMap::with_capacity(ids.len());
-    let mut stmt = match store
-        .conn()
-        .prepare("SELECT body_blob FROM messages WHERE id = ?1")
-    {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            warn!("[store] preparing the body-blob query: {e:#}");
-            return out;
-        }
-    };
-    for &id in ids {
-        let hash: Option<Option<String>> = stmt
-            .query_row([id], |row| row.get::<_, Option<String>>(0))
-            .optional()
-            .unwrap_or_else(|e| {
-                warn!("[store] reading the body hash of message {id}: {e:#}");
-                None
-            });
-        let Some(hash) = hash else { continue };
-        out.insert(id, blob_text(blobs, id, hash.as_deref()));
-    }
-    out
-}
-
 /// Read one body blob as text, degrading to the empty string.
 ///
 /// A blob that cannot be read is reported as an empty body and logged, not
@@ -975,16 +944,10 @@ mod tests {
         let rows = list_mailbox(&fx.store, "alice", "inbox").unwrap();
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
 
-        let bodies = load_bodies(&fx.store, &fx.blobs, &ids);
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(ids.len(), 2);
         for row in &rows {
             let expected = format!("body of {}", row.subject.as_deref().unwrap());
-            assert_eq!(bodies.get(&row.id).unwrap(), &expected);
-            assert_eq!(
-                load_body(&fx.store, &fx.blobs, row.id).unwrap(),
-                expected,
-                "the single read must agree with the batch"
-            );
+            assert_eq!(load_body(&fx.store, &fx.blobs, row.id).unwrap(), expected);
         }
     }
 
@@ -1037,7 +1000,6 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
         let fx = fixture();
         let id = ingest(&fx, "inbox", 1, &email("x", "Mon, 01 Jan 2024 09:00:00 +0000"));
         assert_eq!(load_body(&fx.store, &fx.blobs, id + 999), None);
-        assert!(load_bodies(&fx.store, &fx.blobs, &[id + 999]).is_empty());
     }
 
     /// An unreadable body blob yields an empty body for that one row instead
@@ -1052,7 +1014,6 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
             .unwrap();
 
         assert_eq!(load_body(&fx.store, &fx.blobs, id).unwrap(), "");
-        assert_eq!(load_bodies(&fx.store, &fx.blobs, &[id]).get(&id).unwrap(), "");
         assert_eq!(
             list_mailbox(&fx.store, "alice", "inbox").unwrap().len(),
             1,

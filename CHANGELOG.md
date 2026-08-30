@@ -91,6 +91,17 @@ All notable changes to this project are documented in this file.
   removed; batch approve and send-all remain on the CLI (`mp mark-approved`, `mp send-approved`).
   The help overlay and the website key table are both generated from the one `KEYMAP` table, so
   they moved with it.
+- **Search is one entry point, and the in-list filter no longer reads bodies on the UI thread
+  (#0088).** The three former search gestures are collapsed: `ff` opens the unified search over
+  sender, subject and body that reaches the server and every mailbox (built on the #0086
+  grammar, run off the UI thread with a visible searching state), and `fm` narrows the loaded
+  list by metadata, including the sender, which the old `/` could not match. The retired `\`
+  content search is gone at the code level too: its `SearchContent` action and the
+  `sync_search_bodies` bulk blob read that decoded and lowercased every message body inline on
+  the first keystroke (the freeze on a large mailbox, performance audit §b.3) were removed, so
+  the in-list filter now only touches the rows already loaded. Body search keeps the FTS
+  whole-token semantics of the unified entry rather than the old `\` substring scan (a
+  deliberate change flagged in #0043).
 
 ### Added
 - **Folder entries in `attachments:`.**

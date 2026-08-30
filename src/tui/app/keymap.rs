@@ -235,7 +235,6 @@ pub enum KeyAction {
     OpenLogFile,
     OpenConfigFile,
     FilterMetadata,
-    SearchContent,
     SwitchAccount,
     JumpAccount,
     JumpMailbox,

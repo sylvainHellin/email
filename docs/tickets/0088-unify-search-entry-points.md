@@ -3,7 +3,7 @@ id: 0088
 title: Collapse the three search entry points into one, body search off the UI thread
 type: feature
 priority: next
-status: open
+status: done
 created: 2026-08-14
 ---
 
@@ -48,3 +48,41 @@ This ticket consolidates the TUI entry points on top of that grammar rather than
 - A body search on a large mailbox does not freeze the UI; it is served by FTS or runs off-thread with a visible searching state.
 - Searching by sender returns the expected hits, which `/` could not do.
 - `\` is gone and no workflow relies on it.
+
+## Resolution
+
+Done. The collapse landed across three tickets; this one closed the code-level
+unification and removed the freeze hazard.
+
+Key mapping onto the #0092 nvim-style scheme (this ticket predates it and named
+the old flat keys `/`, `\`, `f`):
+
+- The unified entry is `ff` (find family), opening the off-thread server search
+  form over the #0086 grammar: sender (`From`), subject, body (`Keywords`) and
+  scope (server + other mailboxes). This is the old flat `f`, subsuming `\`.
+- The in-list metadata filter is `fm`, the old `/`. It now matches the sender
+  (`EmailEntry::from`) even where the mailbox displays the recipient, which the
+  old `/` could not do (acceptance criterion 3).
+- `\` (its `KeyAction::SearchContent` binding) was already dropped from the
+  keymap by #0092.
+
+What this ticket removed (the retired `\`'s content-search machinery, the
+source of the performance audit §b.3 freeze):
+
+- `KeyAction::SearchContent` and its executor arm (`src/tui/app/keys.rs`).
+- The `App::sync_search_bodies` synchronous bulk blob read, the `SearchBodies`
+  index type, and the `search_bodies` / `search_includes_body` state on `App`
+  and `AccountState`. The in-list filter (`email_matches` / `filter_visible` /
+  `narrow_visible`) no longer takes a `bodies` argument and only touches loaded
+  rows.
+- The list-title "content search" narrowing and the `\` input prefix
+  (`src/tui/ui/list.rs`).
+
+Body-search semantics (per the #0043 cross-reference): the unified entry serves
+body search from FTS5 whole-token matching, deliberately dropping the old `\`
+case-insensitive substring scan. Recorded as an intended change, not a silent
+regression.
+
+Tests pinning the new behaviour: `filter_matches_the_sender_even_when_the_
+recipient_is_shown` and `the_in_list_filter_matches_the_sender_but_no_longer_
+the_body` (a body-only token no longer narrows the list; the sender does).

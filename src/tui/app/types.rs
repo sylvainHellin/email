@@ -603,63 +603,6 @@ impl PreviewInvite {
     }
 }
 
-/// The lowercased bodies of one mailbox, for body search (`\` mode).
-///
-/// Body search is a case-insensitive *substring* match, so it cannot be served
-/// by `messages_fts`: FTS5 matches whole tokens (and prefixes), which would
-/// change the visible result set for exactly the queries the mode exists for
-/// (a fragment inside a word, punctuation, a partial address). It is also
-/// OR-ed with the header fields and narrowed incrementally per keystroke,
-/// neither of which survives a translation to a MATCH expression. So the
-/// bodies are read in one batch from the blob store, once per list generation,
-/// and lowercased once instead of once per keystroke.
-#[derive(Debug, Default, Clone)]
-pub struct SearchBodies {
-    key: Option<(usize, usize, u64)>,
-    bodies: std::collections::HashMap<MessageRef, String>,
-}
-
-impl SearchBodies {
-    /// The lowercased body of one message, when the index holds it.
-    pub fn get(&self, msg: MessageRef) -> Option<&str> {
-        self.bodies.get(&msg).map(|s| s.as_str())
-    }
-
-    /// True when the index already covers `key`.
-    pub(crate) fn holds(&self, key: (usize, usize, u64)) -> bool {
-        self.key == Some(key)
-    }
-
-    /// Replace the index wholesale for `key`.
-    pub(crate) fn fill(
-        &mut self,
-        key: (usize, usize, u64),
-        bodies: std::collections::HashMap<MessageRef, String>,
-    ) {
-        self.key = Some(key);
-        self.bodies = bodies;
-    }
-
-    /// Build an index directly, for tests whose entries have no store behind
-    /// them. Bodies are lowercased on the way in, as the real build does.
-    #[cfg(test)]
-    pub(crate) fn for_tests(bodies: impl IntoIterator<Item = (MessageRef, String)>) -> Self {
-        Self {
-            key: None,
-            bodies: bodies
-                .into_iter()
-                .map(|(msg, body)| (msg, body.to_lowercase()))
-                .collect(),
-        }
-    }
-
-    /// Drop the index, e.g. when body search is switched off.
-    pub(crate) fn clear(&mut self) {
-        self.key = None;
-        self.bodies.clear();
-    }
-}
-
 /// Extract a short display name from an email address.
 pub fn extract_display_name(addr: &str) -> String {
     let addr = addr.trim().trim_matches('"');
@@ -769,7 +712,6 @@ pub struct AccountState {
     pub preview_scroll: u16,
     pub selection: std::collections::HashSet<EntryKey>,
     pub search_query: String,
-    pub search_includes_body: bool,
     pub watcher_active: bool,
     pub has_unseen: bool,
     /// Whether this account's store has not yet been opened in the background
@@ -853,7 +795,6 @@ impl AccountState {
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
             search_query: String::new(),
-            search_includes_body: false,
             watcher_active: false,
             has_unseen: false,
             opening: true,
@@ -2762,98 +2703,43 @@ mod tests {
         assert_eq!(app.preview_body.text(), "");
     }
 
-    /// Body search (`\`) reads the mailbox's bodies from the blob store and
-    /// keeps the substring semantics it had when the body sat in the entry:
-    /// case-insensitive, matching inside a word, OR-ed with the header fields.
-    /// That is why it is a batch blob read and not an FTS query, which would
-    /// match tokens and silently drop the fragment matches below.
+    /// #0088: the in-list metadata filter (the old `/`, now `fm`) is served
+    /// from the loaded rows only. Body search is retired from this path (the
+    /// old `\`, whose synchronous bulk blob read froze the UI); a body-only
+    /// token no longer narrows the list, while the sender does, which the old
+    /// `/` could not answer (UX audit §b.5). The unified `ff` entry is where
+    /// body search now lives, served off the UI thread.
     #[test]
-    fn body_search_matches_come_from_the_store() {
+    fn the_in_list_filter_matches_the_sender_but_no_longer_the_body() {
         let _data = DataDir::new();
-        let corpus = [
-            ("Invoice March", "please pay"),
-            ("Invoice April", "reminder"),
-            ("Weekly report", "invoice attached"),
-            ("Holiday plans", "beach"),
-        ];
-        for (uid, (subject, body)) in corpus.iter().enumerate() {
-            let mut email = fixture_email(subject, "Mon, 01 Jan 2024 09:00:00 +0000", false);
-            email.body_text = body.to_string();
-            ingest_fixture("inbox", uid as i64 + 1, &email);
-        }
+        // A token that lives only in the body, in no header field.
+        let mut buried = fixture_email("Trip", "Mon, 01 Jan 2024 09:00:00 +0000", false);
+        buried.body_text = "let us go kayaking".to_string();
+        buried.from = "trips@example.com".to_string();
+        ingest_fixture("inbox", 1, &buried);
+        // A distinctive sender.
+        let mut outbound = fixture_email("Numbers", "Mon, 01 Jan 2024 10:00:00 +0000", false);
+        outbound.from = "cfo@acme.example".to_string();
+        ingest_fixture("inbox", 2, &outbound);
 
         let mut app = app_on_inbox();
         let subjects = |app: &crate::tui::app::App| -> Vec<String> {
             app.visible_emails().map(|e| e.subject.clone()).collect()
         };
 
-        // Header-only search: the body is not consulted.
-        app.search_query = "beach".to_string();
-        app.search_includes_body = false;
+        // The retired `\` body search is gone: a body-only token does not
+        // narrow the list.
+        app.search_query = "kayaking".to_string();
         app.apply_search_filter(false);
-        assert!(subjects(&app).is_empty());
-
-        // Body search: the same query now hits the body.
-        app.search_includes_body = true;
-        app.apply_search_filter(false);
-        assert_eq!(subjects(&app), vec!["Holiday plans"]);
-
-        // Subject and body matches are OR-ed, in list order (the corpus shares
-        // one timestamp, so the newest row id leads).
-        app.search_query = "invoice".to_string();
-        app.apply_search_filter(false);
-        assert_eq!(
-            subjects(&app),
-            vec!["Weekly report", "Invoice April", "Invoice March"]
+        assert!(
+            subjects(&app).is_empty(),
+            "body substrings no longer match in the in-list filter"
         );
 
-        // A fragment inside a word matches, which is exactly what an FTS
-        // token match would not do.
-        app.search_query = "each".to_string();
+        // Searching by sender lands.
+        app.search_query = "cfo".to_string();
         app.apply_search_filter(false);
-        assert_eq!(subjects(&app), vec!["Holiday plans"]);
-
-        // And the index is dropped when the mode goes off again.
-        app.search_query = String::new();
-        app.search_includes_body = false;
-        app.rebuild_visible();
-        assert_eq!(subjects(&app).len(), 4);
-    }
-
-    /// A body the retention sweep evicted costs that one message its body
-    /// match; the search still runs and every other match still lands.
-    #[test]
-    fn body_search_survives_an_evicted_body() {
-        let _data = DataDir::new();
-        // Distinct bodies, because the blob store is content-addressed: two
-        // identical bodies would be one file, and evicting it would take both.
-        let mut kept = fixture_email("kept", "Mon, 01 Jan 2024 12:00:00 +0000", false);
-        kept.body_text = "a kept needle".to_string();
-        ingest_fixture("inbox", 1, &kept);
-        let mut evicted = fixture_email("evicted", "Mon, 01 Jan 2024 09:00:00 +0000", false);
-        evicted.body_text = "an evicted needle".to_string();
-        ingest_fixture("inbox", 2, &evicted);
-
-        let store = crate::store::Store::open(crate::config::store_path("alice")).unwrap();
-        let hash: String = store
-            .conn()
-            .query_row(
-                "SELECT body_blob FROM messages WHERE subject = 'evicted'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(store);
-        let blobs = BlobStore::for_account("alice");
-        std::fs::remove_file(blobs.path_for(&crate::store::BlobHash::parse(&hash).unwrap()))
-            .unwrap();
-
-        let mut app = app_on_inbox();
-        app.search_query = "needle".to_string();
-        app.search_includes_body = true;
-        app.apply_search_filter(false);
-        let subjects: Vec<String> = app.visible_emails().map(|e| e.subject.clone()).collect();
-        assert_eq!(subjects, vec!["kept"]);
+        assert_eq!(subjects(&app), vec!["Numbers"]);
     }
 
     /// The key the sidebar queries the store with is the key the sync path

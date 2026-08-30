@@ -155,11 +155,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
     // Two independent narrowings, so the title names whichever are on (#0079).
     let mut narrowings: Vec<&str> = Vec::new();
     if !app.search_query.is_empty() && app.focus != Focus::Search {
-        narrowings.push(if app.search_includes_body {
-            "content search"
-        } else {
-            "filtered"
-        });
+        narrowings.push("filtered");
     }
     if app.flagged_only {
         narrowings.push("flagged");
@@ -198,11 +194,7 @@ pub(super) fn render_email_list(app: &App, frame: &mut Frame, area: Rect) {
 
     if let Some(search_rect) = search_area {
         let jumping = app.jump_date_input.as_deref();
-        let prefix = match (jumping, app.search_includes_body) {
-            (Some(_), _) => "date: ",
-            (None, true) => "\\",
-            (None, false) => "/",
-        };
+        let prefix = if jumping.is_some() { "date: " } else { "/" };
         let typed = jumping.unwrap_or(app.search_query.as_str());
         let cursor_reserve = if app.focus == Focus::Search || jumping.is_some() { 1 } else { 0 };
         let avail = (search_rect.width as usize)

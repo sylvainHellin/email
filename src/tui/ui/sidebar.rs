@@ -267,7 +267,6 @@ mod tests {
             preview_scroll: 0,
             selection: std::collections::HashSet::new(),
             search_query: String::new(),
-            search_includes_body: false,
             watcher_active: false,
             opening: false,
             outbox: crate::outbox::OutboxCounts::default(),

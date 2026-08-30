@@ -96,12 +96,7 @@ pub struct App {
     /// inside [`crate::tui::ui::preview::render_body`], the one place that
     /// knows the pane's width.
     pub(crate) preview_lines: crate::tui::ui::preview::PreviewLinesCache,
-    /// Lowercased bodies of the active mailbox, built only while body search
-    /// is on. See [`SearchBodies`] for why this is a blob batch read rather
-    /// than an FTS query.
-    pub search_bodies: SearchBodies,
     pub search_query: String,
-    pub search_includes_body: bool,
     /// Zoom the focused pane to the whole content area (#TKT-0044).
     ///
     /// A bool rather than a `Focus`: what is zoomed is always *the focused
@@ -247,9 +242,7 @@ impl App {
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
             preview_lines: Default::default(),
-            search_bodies: SearchBodies::default(),
             search_query: String::new(),
-            search_includes_body: false,
             flagged_only: false,
             zoomed: false,
             jump_date_input: None,
@@ -342,9 +335,7 @@ impl App {
             preview_invite: PreviewInvite::default(),
             preview_images: Default::default(),
             preview_lines: Default::default(),
-            search_bodies: SearchBodies::default(),
             search_query: String::new(),
-            search_includes_body: false,
             flagged_only: false,
             zoomed: false,
             jump_date_input: None,
@@ -405,7 +396,6 @@ impl App {
             acct.selection = self.selection.clone();
             acct.email_cache = self.email_cache.clone();
             acct.search_query = self.search_query.clone();
-            acct.search_includes_body = self.search_includes_body;
             acct.watcher_active = self.watcher_active;
         }
     }
@@ -422,7 +412,6 @@ impl App {
             self.selection = acct.selection.clone();
             self.email_cache = acct.email_cache.clone();
             self.search_query = acct.search_query.clone();
-            self.search_includes_body = acct.search_includes_body;
             self.watcher_active = acct.watcher_active;
             self.imap_config = acct.imap_config.clone();
             self.smtp_config = acct.smtp_config.clone();
@@ -1196,10 +1185,8 @@ impl App {
     /// or structural mutation of `self.emails` so the view never holds
     /// dangling indices.
     pub(crate) fn rebuild_visible(&mut self) {
-        self.sync_search_bodies();
         let kind = self.active_kind();
-        let bodies = self.search_includes_body.then_some(&self.search_bodies);
-        self.visible = keys::filter_visible(&self.emails, &self.search_query, kind, bodies);
+        self.visible = keys::filter_visible(&self.emails, &self.search_query, kind);
         self.apply_flagged_filter();
     }
 
@@ -1491,63 +1478,6 @@ impl App {
             })
             .collect();
         self.preview_images.fill(key, images);
-    }
-
-    /// Make the body-search index match the mode: built and current for the
-    /// active mailbox while `\` search is on, empty while it is off.
-    ///
-    /// Building it is one batch of blob reads for the whole mailbox, paid once
-    /// per list generation rather than once per keystroke. It is the only
-    /// place the read path still loads bodies in bulk, and it only runs when
-    /// the user asked for a content search.
-    fn sync_search_bodies(&mut self) {
-        if !self.search_includes_body {
-            self.search_bodies.clear();
-            return;
-        }
-        let key = (
-            self.active_account,
-            self.active_mailbox,
-            self.mailbox_load_generation,
-        );
-        if self.search_bodies.holds(key) {
-            return;
-        }
-
-        let account = self.account_config.name.clone();
-        let ids: Vec<i64> = self
-            .emails
-            .iter()
-            .filter_map(|e| e.msg)
-            .map(|m| m.row_id())
-            .collect();
-        let mut bodies = std::collections::HashMap::with_capacity(ids.len());
-        if let Some(store) = open_store(&account) {
-            let blobs = crate::store::BlobStore::for_account(&account);
-            for (id, body) in crate::store::read::load_bodies(&store, &blobs, &ids) {
-                bodies.insert(MessageRef::new(id), body.to_lowercase());
-            }
-        }
-        self.search_bodies.fill(key, bodies);
-    }
-
-    /// Prime the body-search index for the current mailbox, for fixtures that
-    /// have no store behind them.
-    #[cfg(test)]
-    pub(crate) fn prime_search_bodies(
-        &mut self,
-        bodies: impl IntoIterator<Item = (MessageRef, String)>,
-    ) {
-        let key = (
-            self.active_account,
-            self.active_mailbox,
-            self.mailbox_load_generation,
-        );
-        let lowered = bodies
-            .into_iter()
-            .map(|(msg, body)| (msg, body.to_lowercase()))
-            .collect();
-        self.search_bodies.fill(key, lowered);
     }
 
     /// Run a mutation against the full entry list of the active mailbox,
@@ -1885,7 +1815,6 @@ impl App {
         if changing {
             self.selection.clear();
             self.search_query.clear();
-            self.search_includes_body = false;
         }
 
         if let Some(cached) = self.email_cache.get(idx).and_then(|c| c.as_ref()) {
