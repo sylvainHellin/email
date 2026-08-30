@@ -54,6 +54,15 @@ All notable changes to this project are documented in this file.
   runtime inside another.
 
 ### Changed
+- **Opening a message in the preview marks it read (#0087).** Reading a message
+  used to leave its read bit untouched, so triaging a full inbox meant pressing
+  `u` on every row; the read state now converges on open. Showing a message in
+  the preview pane sets its read bit through the same durable path the manual
+  toggle uses (#0039), so the local write and the owed `\Seen` op commit
+  together and the change survives the next sync round-trip (#0004). It fires
+  once per open, not on every scroll or idle tick; draft rows and already-read
+  rows are no-ops; and `u` still toggles either way, so a message can be marked
+  unread again.
 - **Send approves and sends the current draft in one confirmed step (#0089).**
   `x` acts on the selected draft wherever it is selected; an unapproved draft
   gets one warning dialog ("Draft is not approved. Approve and send?") whose

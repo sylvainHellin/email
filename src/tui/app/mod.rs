@@ -67,6 +67,14 @@ pub struct App {
     pub pending_prefix: Option<char>,
     pub headers_scroll: u16,
     pub preview_scroll: u16,
+    /// The message the preview has already auto-marked read on open (#0087).
+    ///
+    /// Opening a message into the preview marks it read (owner decision,
+    /// 2026-08-14). This remembers the last message that trigger fired for, so
+    /// it fires once per open: a scroll, an idle tick, or any redraw over the
+    /// same selection is a no-op, and only a cursor move to a different message
+    /// re-arms it.
+    pub(crate) auto_read_opened: Option<MessageRef>,
     pub selection: HashSet<EntryKey>,
     pub email_cache: Vec<Option<Arc<Vec<EmailEntry>>>>,
     /// The body behind the preview pane, loaded from the blob store on
@@ -232,6 +240,7 @@ impl App {
             pending_prefix: None,
             headers_scroll: 0,
             preview_scroll: 0,
+            auto_read_opened: None,
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
@@ -326,6 +335,7 @@ impl App {
             pending_prefix: None,
             headers_scroll: 0,
             preview_scroll: 0,
+            auto_read_opened: None,
             selection: HashSet::new(),
             email_cache: Vec::new(),
             preview_body: PreviewBody::default(),
@@ -1114,6 +1124,30 @@ impl App {
         self.visible
             .get(self.list_index)
             .and_then(|&i| self.emails.get(i))
+    }
+
+    /// The message an "open in preview" should auto-mark read (#0087), or
+    /// `None` when there is nothing to do.
+    ///
+    /// Fires once per open: the last message it returned (or skipped) is
+    /// remembered in [`Self::auto_read_opened`], so a scroll, an idle tick, or
+    /// any redraw over the same selection yields `None`; only a cursor move to
+    /// a different message re-arms it. A draft row (no store message behind it)
+    /// and an already-read row are no-ops, and the manual `m` toggle keeps its
+    /// own path, so a message the user marked unread again while it stays open
+    /// is not re-marked until the cursor leaves and returns to it.
+    pub(crate) fn take_message_to_auto_mark_read(&mut self) -> Option<MessageRef> {
+        // A draft row carries no `MessageRef`, so it can never be marked read.
+        let msg = self.selected_email()?.msg?;
+        if self.auto_read_opened == Some(msg) {
+            return None;
+        }
+        self.auto_read_opened = Some(msg);
+        // Record the open either way, but only unread rows need the mutation.
+        if self.selected_email()?.read {
+            return None;
+        }
+        Some(msg)
     }
 
     /// Iterate the entries of the current (filtered) view in display

@@ -2856,6 +2856,62 @@ mod tests {
         );
     }
 
+    /// Opening an unread message into the preview yields it once (#0087): the
+    /// first call over a new selection returns the message, and a second call
+    /// over the same selection -- a scroll, an idle tick, any redraw -- is a
+    /// no-op, so the mutation and its `\Seen` write fire once per open.
+    #[test]
+    fn opening_an_unread_message_yields_it_once() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 0;
+        let opened = app.selected_email().unwrap().msg;
+
+        assert_eq!(app.take_message_to_auto_mark_read(), opened);
+        // A preview scroll does not move the list cursor, so re-checking is a
+        // no-op: the message is not re-marked.
+        app.preview_scroll = 5;
+        assert_eq!(app.take_message_to_auto_mark_read(), None);
+    }
+
+    /// Moving the cursor to another message re-arms the auto-mark (#0087): each
+    /// distinct open fires once.
+    #[test]
+    fn moving_to_another_message_re_arms_the_auto_mark() {
+        let mut app = app_with_emails(sample());
+        app.list_index = 0;
+        let first = app.selected_email().unwrap().msg;
+        assert_eq!(app.take_message_to_auto_mark_read(), first);
+
+        app.list_index = 1;
+        let second = app.selected_email().unwrap().msg;
+        assert_ne!(first, second);
+        assert_eq!(app.take_message_to_auto_mark_read(), second);
+    }
+
+    /// A Drafts row has no `messages` row behind it, so it can never be marked
+    /// read on open (#0087, scope item 3).
+    #[test]
+    fn a_draft_row_is_never_auto_marked() {
+        let mut app = app_with_emails(vec![draft_entry("aaa", "One")]);
+        app.list_index = 0;
+        assert_eq!(app.take_message_to_auto_mark_read(), None);
+    }
+
+    /// An already-read message is a no-op on open (#0087, scope item 3), and
+    /// opening it still records the open, so it is not re-considered while it
+    /// stays under the cursor.
+    #[test]
+    fn an_already_read_message_is_not_auto_marked() {
+        let mut read_row = entry("Read already", "Alice");
+        read_row.read = true;
+        let mut app = app_with_emails(vec![read_row]);
+        app.list_index = 0;
+        assert_eq!(app.take_message_to_auto_mark_read(), None);
+        // The open was recorded, so a manual `m`-to-unread that follows is not
+        // undone by a re-check over the same selection.
+        assert_eq!(app.take_message_to_auto_mark_read(), None);
+    }
+
     #[test]
     fn selected_email_resolves_through_visible_indices() {
         let mut app = app_with_emails(sample());

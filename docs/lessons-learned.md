@@ -973,3 +973,15 @@ untouched by any of this: it is taken only by the `pending_ops` drain, never by 
 read open, so which thread the open runs on is irrelevant to it. The rebuild /
 salvage path (#0066) lives inside `Store::open` and simply runs on whichever
 thread opened the store, foreground or background.
+
+Auto-mark-read on open (#0087) needed no new mutation path: the `MarkAsRead`
+action arm and its `set_read_flag` -> `queue_read_flag` -> `apply_set_read` route
+already existed in `actions.rs`, fully wired to the durable queue, but nothing
+ever dispatched the action. The whole ticket was the *trigger*, not the write.
+The trigger lives in the `run_loop` iteration (not in the render pass): the
+preview always shows `selected_email()`, so "opening a message" is just the list
+cursor landing on a new row, and `App::take_message_to_auto_mark_read` fires once
+per open by remembering the last message in `App::auto_read_opened`. Firing from
+render was rejected: `refresh_preview_body` runs under `&mut App` at frame top
+but a store mutation there mixes read-path and write-path concerns, and the loop
+already owns the post-event settling point where the selection is final.

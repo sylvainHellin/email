@@ -8,7 +8,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
     mailbox_key, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus,
-    MailboxKind, MessageRef, Overlay, StatusLevel,
+    MailboxKind, MessageRef, Overlay, StatusLevel, View,
 };
 use super::helpers::{
     edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
@@ -2709,6 +2709,40 @@ fn set_read_flag(app: &mut App, msgs: Vec<MessageRef>, read: bool) -> bool {
     true
 }
 
+/// Auto-mark the message shown in the preview pane as read (#0087).
+///
+/// The trigger is opening a message into the preview, with no dwell timer
+/// (owner decision, 2026-08-14). [`App::take_message_to_auto_mark_read`] yields
+/// the message once per open and skips drafts and already-read rows, and this
+/// reuses the manual [`set_read_flag`] path, so the local write and the owed
+/// `\Seen` op commit together (#0039) and converge on the next sync (#0004)
+/// rather than opening a second write path. Returns whether a row was marked,
+/// so the caller can force a repaint.
+///
+/// Only the plain mail view shows a message in the preview pane: a calendar or
+/// contacts cursor, or any modal overlay, is not an open, so this is a no-op
+/// there and does not disturb the once-per-open tracker. An input-owning focus
+/// is not an open either: while `/` filters the list, every keystroke narrows
+/// `visible` and resets the cursor to the new top row, and marking each
+/// transient top result read would commit `\Seen` ops for messages the user
+/// only filtered past. The row the cursor lands on when the input is left
+/// counts as the open instead.
+pub(crate) fn auto_mark_open_read(app: &mut App) -> bool {
+    if app.view != View::Mail
+        || app.overlay.is_active()
+        || matches!(
+            app.focus,
+            crate::tui::app::Focus::Search | crate::tui::app::Focus::ComposeWizard
+        )
+    {
+        return false;
+    }
+    let Some(msg) = app.take_message_to_auto_mark_read() else {
+        return false;
+    };
+    set_read_flag(app, vec![msg], true)
+}
+
 /// Set the `\Flagged` star on one or many messages (#0007): the store row and
 /// the owed server op commit together (#0039). Modelled on [`set_read_flag`].
 fn set_flag(app: &mut App, msgs: Vec<MessageRef>, flagged: bool) -> bool {
@@ -2769,6 +2803,52 @@ mod tests {
         assert!(any_invite(&app, &[MessageRef::new(2), MessageRef::new(1)]));
         assert!(!any_invite(&app, &[MessageRef::new(2)]));
         assert!(!any_invite(&app, &[MessageRef::new(404)]));
+    }
+
+    /// Auto-mark-read (#0087) only fires in the plain mail view: a Calendar or
+    /// Contacts cursor does not show a message in the preview pane, so opening
+    /// nothing there neither marks a row nor arms the once-per-open tracker.
+    #[test]
+    fn auto_mark_open_read_is_a_no_op_outside_the_mail_view() {
+        let mut app = App::default_for_tests();
+        app.emails = std::sync::Arc::new(vec![entry("Unread", 1, false)]);
+        app.visible = vec![0];
+        app.list_index = 0;
+        app.view = View::Calendar;
+
+        assert!(!auto_mark_open_read(&mut app));
+        assert!(app.auto_read_opened.is_none(), "the tracker was not armed");
+    }
+
+    /// Auto-mark-read (#0087) does not fire while a modal overlay is up: an
+    /// open thread, search or help overlay is what the user is reading, not the
+    /// preview beneath it.
+    #[test]
+    fn auto_mark_open_read_is_a_no_op_under_an_overlay() {
+        let mut app = App::default_for_tests();
+        app.emails = std::sync::Arc::new(vec![entry("Unread", 1, false)]);
+        app.visible = vec![0];
+        app.list_index = 0;
+        app.overlay = Overlay::Help;
+
+        assert!(!auto_mark_open_read(&mut app));
+        assert!(app.auto_read_opened.is_none(), "the tracker was not armed");
+    }
+
+    /// Auto-mark-read (#0087) does not fire while the inline filter owns the
+    /// input: each `/` keystroke narrows `visible` and resets the cursor to
+    /// the new top row, and marking those transient top results read would
+    /// commit `\Seen` ops for messages the user only filtered past.
+    #[test]
+    fn auto_mark_open_read_is_a_no_op_while_the_filter_owns_the_input() {
+        let mut app = App::default_for_tests();
+        app.emails = std::sync::Arc::new(vec![entry("Unread", 1, false)]);
+        app.visible = vec![0];
+        app.list_index = 0;
+        app.focus = crate::tui::app::Focus::Search;
+
+        assert!(!auto_mark_open_read(&mut app));
+        assert!(app.auto_read_opened.is_none(), "the tracker was not armed");
     }
 
     // -----------------------------------------------------------------------

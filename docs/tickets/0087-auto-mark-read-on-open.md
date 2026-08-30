@@ -3,7 +3,7 @@ id: 0087
 title: Opening a message in the preview marks it read
 type: feature
 priority: next
-status: open
+status: done
 created: 2026-08-14
 ---
 
@@ -33,3 +33,33 @@ This ticket only adds a new trigger for the same mutation; it must reuse #0004's
 - Opening an unread message in the preview marks it read locally, and the change survives a sync round-trip.
 - Scrolling within an already-open message does not re-issue the mutation.
 - `m` on a read message still marks it unread.
+
+## Resolution
+
+The existing `MarkAsRead` action arm (`src/tui/actions.rs`) already routed to
+`set_read_flag` -> `queue_read_flag` -> `apply_set_read`, but nothing dispatched
+it. The trigger is now wired in.
+
+- `App::take_message_to_auto_mark_read` (`src/tui/app/mod.rs`) yields the
+  message the preview should mark read, tracked by a new `App::auto_read_opened`
+  field so it fires once per open. Draft rows (no `MessageRef`) and already-read
+  rows are no-ops; a preview scroll leaves the list cursor put, so it never
+  re-issues.
+- `actions::auto_mark_open_read` (`src/tui/actions.rs`) reuses the manual
+  `set_read_flag` path (#0039 durable local write + owed `\Seen` op, converging
+  on the next sync per #0004), guarded to the plain mail view with no overlay
+  and no input-owning focus (post-review fix: while `/` filters the list, each
+  keystroke resets the cursor to the narrowed set's top row, and marking those
+  transient top results read would commit `\Seen` ops for messages the user
+  only filtered past; the row the cursor lands on when the filter is left
+  counts as the open instead).
+- `run_loop` (`src/tui/mod.rs`) calls it once per iteration after events,
+  background results and actions have settled the selection.
+
+Manual `m`/`u` still toggles either way: after an open marks a message read, the
+once-per-open tracker holds that message, so a follow-up mark-unread is not
+undone until the cursor leaves and returns.
+
+Note: the message shown in the preview on startup (the top row of the active
+mailbox) is treated as an open and marked read, matching scope item 1's "when a
+message is shown in the preview pane".
