@@ -1216,13 +1216,13 @@ impl App {
                 return None;
             }
             KeyCode::Tab => {
-                wizard.focus = wizard.focus.next();
+                wizard.focus = wizard.next_field();
                 wizard.suggestion_idx = 0;
                 self.recompute_compose_suggestions();
                 return None;
             }
             KeyCode::BackTab => {
-                wizard.focus = wizard.focus.prev();
+                wizard.focus = wizard.prev_field();
                 wizard.suggestion_idx = 0;
                 self.recompute_compose_suggestions();
                 return None;
@@ -1285,13 +1285,21 @@ impl App {
                     wizard.suggestion_idx = 0;
                     return None;
                 }
-                // On subject (or an empty-suggestion address field), submit.
-                if wizard.focus == ComposeField::Subject || !wizard.subject.trim().is_empty() {
+                // The body is multi-line (#0097): Enter inserts a newline, and
+                // Ctrl+g is the submit key.
+                if wizard.focus == ComposeField::Body {
+                    wizard.body.push('\n');
+                    return None;
+                }
+                // Subject is the last field only when there is no body field
+                // (Forward / EditDraft): Enter there submits. In a New compose
+                // Enter advances to the body instead.
+                if wizard.focus == ComposeField::Subject && !wizard.has_body_field() {
                     self.push_action(Action::ComposeWizardSubmit);
                     return None;
                 }
                 // Otherwise cycle to the next field.
-                wizard.focus = wizard.focus.next();
+                wizard.focus = wizard.next_field();
                 wizard.suggestion_idx = 0;
                 self.recompute_compose_suggestions();
                 return None;
@@ -1336,7 +1344,7 @@ impl App {
             ComposeField::To => &wizard.to,
             ComposeField::Cc => &wizard.cc,
             ComposeField::Bcc => &wizard.bcc,
-            ComposeField::Subject => {
+            ComposeField::Subject | ComposeField::Body => {
                 wizard.suggestions.clear();
                 return;
             }
@@ -2424,6 +2432,7 @@ fn current_field_mut(wizard: &mut ComposeWizard) -> &mut String {
         ComposeField::Cc => &mut wizard.cc,
         ComposeField::Bcc => &mut wizard.bcc,
         ComposeField::Subject => &mut wizard.subject,
+        ComposeField::Body => &mut wizard.body,
     }
 }
 
@@ -3542,6 +3551,7 @@ mod tests {
             cc: String::new(),
             bcc: String::new(),
             subject: "draft in progress".to_string(),
+            body: String::new(),
             focus: ComposeField::To,
             suggestions: Vec::new(),
             suggestion_idx: 0,
@@ -3590,6 +3600,68 @@ mod tests {
         // not re-open anything.
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    /// Tab order in a New compose reaches the inline body field (#0097) right
+    /// after Subject, and BackTab from To lands back on it.
+    #[test]
+    fn compose_wizard_tab_reaches_the_body_field() {
+        let mut app = app_with_emails(sample());
+        open_compose_wizard_for_test(&mut app);
+        app.compose_wizard_mut().unwrap().focus = ComposeField::Subject;
+
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.compose_wizard().unwrap().focus, ComposeField::Body);
+
+        // One more Tab wraps back to the first field.
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.compose_wizard().unwrap().focus, ComposeField::To);
+
+        // BackTab from To lands on Body (the last field).
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.compose_wizard().unwrap().focus, ComposeField::Body);
+    }
+
+    /// On the multi-line body field Enter inserts a newline rather than
+    /// submitting (#0097); typed characters accumulate into the body.
+    #[test]
+    fn compose_wizard_enter_on_body_inserts_a_newline() {
+        let mut app = app_with_emails(sample());
+        open_compose_wizard_for_test(&mut app);
+        app.compose_wizard_mut().unwrap().focus = ComposeField::Body;
+
+        for c in "hi".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+
+        assert_eq!(app.compose_wizard().unwrap().body, "hi\nx");
+        // Enter did not queue a submit and the wizard is still open.
+        assert!(matches!(app.overlay, Overlay::Compose(_)));
+        assert!(
+            !app.pending_actions
+                .iter()
+                .any(|a| matches!(a, Action::ComposeWizardSubmit)),
+            "Enter on the body must not submit"
+        );
+    }
+
+    /// Ctrl+g is the submit key from the body field (#0097): it queues the
+    /// submit action from anywhere in the wizard.
+    #[test]
+    fn compose_wizard_ctrl_g_submits_from_the_body() {
+        let mut app = app_with_emails(sample());
+        open_compose_wizard_for_test(&mut app);
+        app.compose_wizard_mut().unwrap().focus = ComposeField::Body;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(
+            app.pending_actions
+                .iter()
+                .any(|a| matches!(a, Action::ComposeWizardSubmit)),
+            "Ctrl+g must submit from the body field"
+        );
     }
 
     /// A background failure while the mailbox picker is open preserves the

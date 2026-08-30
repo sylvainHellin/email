@@ -5,7 +5,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -51,8 +51,14 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
         ComposeMode::EditDraft { .. } => " Edit recipients ".to_string(),
     };
 
-    let hint = if wizard.focus == ComposeField::Subject {
-        " Enter: submit | Tab: prev field | Esc: cancel ".to_string()
+    let hint = if wizard.focus == ComposeField::Body {
+        " Enter: newline | Ctrl+g: submit | Tab: next field | Esc: cancel ".to_string()
+    } else if wizard.focus == ComposeField::Subject {
+        if wizard.has_body_field() {
+            " Enter: next field | Ctrl+g: submit | Tab: next field | Esc: cancel ".to_string()
+        } else {
+            " Enter: submit | Ctrl+g: submit | Tab: next field | Esc: cancel ".to_string()
+        }
     } else if !wizard.suggestions.is_empty() {
         " ↑↓/Ctrl+p/Ctrl+n: pick | Enter: accept | Tab: next field | Esc: cancel ".to_string()
     } else {
@@ -95,7 +101,64 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
     ));
     frame.render_widget(Paragraph::new(sep), chunks[4]);
 
-    render_suggestions(wizard, frame, chunks[5]);
+    // The bottom area shows contact suggestions while an address field is
+    // focused; otherwise, in a New compose, it hosts the inline body editor
+    // (#0097). Forward / EditDraft keep the old Subject placeholder.
+    if !wizard.focus.is_address() && wizard.has_body_field() {
+        render_body(wizard, frame, chunks[5]);
+    } else {
+        render_suggestions(wizard, frame, chunks[5]);
+    }
+}
+
+/// Render the multi-line inline body field (#0097) in the bottom area: a
+/// `Body:` label, then the typed text wrapped to the pane width, with a cursor
+/// block on the last line while focused. An empty body shows a faint hint that
+/// submitting will open `$EDITOR`.
+fn render_body(wizard: &ComposeWizard, frame: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let is_focused = wizard.focus == ComposeField::Body;
+    let label_style = if is_focused {
+        Style::default()
+            .fg(theme::active().emphasis)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::active().text_muted)
+    };
+    let cursor_style = Style::default().fg(theme::active().accent_alt);
+    let text_style = Style::default().fg(theme::active().text);
+    let faint = Style::default().fg(theme::active().text_faint);
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!("{:>7}: ", "Body"),
+        label_style,
+    ))];
+
+    if wizard.body.is_empty() {
+        let mut spans = Vec::new();
+        if is_focused {
+            spans.push(Span::styled("\u{2588}", cursor_style));
+        }
+        spans.push(Span::styled(
+            "  Type a short message, or leave empty to open $EDITOR",
+            faint,
+        ));
+        lines.push(Line::from(spans));
+    } else {
+        let body_lines: Vec<&str> = wizard.body.split('\n').collect();
+        let last = body_lines.len().saturating_sub(1);
+        for (i, bl) in body_lines.iter().enumerate() {
+            let mut spans = vec![Span::styled((*bl).to_string(), text_style)];
+            if is_focused && i == last {
+                spans.push(Span::styled("\u{2588}", cursor_style));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_field(wizard: &ComposeWizard, frame: &mut Frame, area: Rect, field: ComposeField) {
@@ -113,6 +176,7 @@ fn render_field(wizard: &ComposeWizard, frame: &mut Frame, area: Rect, field: Co
         ComposeField::Cc => &wizard.cc,
         ComposeField::Bcc => &wizard.bcc,
         ComposeField::Subject => &wizard.subject,
+        ComposeField::Body => &wizard.body,
     };
 
     let label = format!("{:>7}: ", field.label());

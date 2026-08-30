@@ -1138,6 +1138,10 @@ pub enum ComposeField {
     Cc,
     Bcc,
     Subject,
+    /// The optional inline body (#0097). Multi-line and the last field before
+    /// submit: a non-empty body is written straight into the draft, an empty
+    /// one falls back to opening `$EDITOR` on the draft.
+    Body,
 }
 
 impl ComposeField {
@@ -1147,6 +1151,7 @@ impl ComposeField {
             ComposeField::Cc => "Cc",
             ComposeField::Bcc => "Bcc",
             ComposeField::Subject => "Subject",
+            ComposeField::Body => "Body",
         }
     }
 
@@ -1162,16 +1167,18 @@ impl ComposeField {
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
             ComposeField::Bcc => ComposeField::Subject,
-            ComposeField::Subject => ComposeField::To,
+            ComposeField::Subject => ComposeField::Body,
+            ComposeField::Body => ComposeField::To,
         }
     }
 
     pub fn prev(&self) -> Self {
         match self {
-            ComposeField::To => ComposeField::Subject,
+            ComposeField::To => ComposeField::Body,
             ComposeField::Cc => ComposeField::To,
             ComposeField::Bcc => ComposeField::Cc,
             ComposeField::Subject => ComposeField::Bcc,
+            ComposeField::Body => ComposeField::Subject,
         }
     }
 }
@@ -1208,14 +1215,53 @@ pub struct ComposeWizard {
     pub cc: String,
     pub bcc: String,
     pub subject: String,
+    /// The inline body typed in the wizard (#0097). Multi-line: `Enter` on the
+    /// Body field inserts a newline rather than submitting. Only a `New`
+    /// compose exposes it (see [`ComposeWizard::has_body_field`]); a non-empty
+    /// value is written into the draft body and skips the `$EDITOR` round-trip.
+    pub body: String,
     pub focus: ComposeField,
     /// Fuzzy-matched suggestions for the currently-focused field
-    /// (empty for Subject or when no cache exists).
+    /// (empty for Subject/Body or when no cache exists).
     pub suggestions: Vec<ComposeSuggestion>,
     pub suggestion_idx: usize,
     /// The contact index for the active account, loaded once when the
     /// wizard opens. `None` means "no cache yet — run rebuild first".
     pub contacts: Option<crate::contacts::ContactIndex>,
+}
+
+impl ComposeWizard {
+    /// Whether the inline body field participates in this wizard (#0097).
+    ///
+    /// Only a brand-new draft can take an inline body: `Forward` always opens
+    /// `$EDITOR` on the quoted draft, and `EditDraft` only rewrites the header
+    /// fields in place. Field navigation skips `Body` when this is false, so
+    /// the field never receives focus outside a `New` compose.
+    pub fn has_body_field(&self) -> bool {
+        matches!(self.mode, ComposeMode::New)
+    }
+
+    /// The field after `focus` in Tab order, skipping `Body` when this wizard
+    /// has no body field.
+    pub fn next_field(&self) -> ComposeField {
+        let next = self.focus.next();
+        if next == ComposeField::Body && !self.has_body_field() {
+            next.next()
+        } else {
+            next
+        }
+    }
+
+    /// The field before `focus` in Tab order, skipping `Body` when this wizard
+    /// has no body field.
+    pub fn prev_field(&self) -> ComposeField {
+        let prev = self.focus.prev();
+        if prev == ComposeField::Body && !self.has_body_field() {
+            prev.prev()
+        } else {
+            prev
+        }
+    }
 }
 
 /// Which pane currently has focus.

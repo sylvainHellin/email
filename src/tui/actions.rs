@@ -2050,6 +2050,7 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
         cc,
         bcc,
         subject,
+        body: String::new(),
         focus: ComposeField::To,
         suggestions: Vec::new(),
         suggestion_idx: 0,
@@ -2075,6 +2076,7 @@ fn open_compose_wizard_seeded(app: &mut App, to: String) {
         cc: String::new(),
         bcc: String::new(),
         subject: String::new(),
+        body: String::new(),
         focus: ComposeField::Subject,
         suggestions: Vec::new(),
         suggestion_idx: 0,
@@ -2331,6 +2333,20 @@ fn submit_compose_wizard(
         app.invalidate_cache_idx(idx);
     }
 
+    // A non-empty inline body (#0097) means the draft is complete: it was
+    // written into the file by `write_new_draft_from_wizard`, so skip the
+    // `$EDITOR` round-trip and land in Drafts directly. An empty body keeps
+    // the original behaviour and hands off to `$EDITOR` below.
+    if !wizard.body.trim().is_empty() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        app.set_status(format!("Created: {}", name));
+        app.reload_current_mailbox();
+        return Ok(());
+    }
+
     // Hand off to $EDITOR.
     suspend_terminal(terminal)?;
     let edit_result = edit_file(&path);
@@ -2400,6 +2416,15 @@ fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<Path
     fm.push_str("reply_to:\n");
     fm.push_str("attachments:\n");
     fm.push_str("---\n\n");
+
+    // An inline body (#0097) is written straight into the draft so a short
+    // message never needs `$EDITOR`. Empty leaves the body blank, which is the
+    // signal `submit_compose_wizard` uses to open `$EDITOR` instead.
+    let body = wizard.body.trim();
+    if !body.is_empty() {
+        fm.push_str(body);
+        fm.push('\n');
+    }
 
     std::fs::write(&path, fm)?;
     Ok(path)
@@ -3002,6 +3027,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline compose body (#0097)
+    // -----------------------------------------------------------------------
+
+    /// A `New` wizard with the given inline body, pointed at a tempdir so the
+    /// draft lands inside the fixture instead of the real Drafts folder.
+    fn wizard_with_body(body: &str) -> ComposeWizard {
+        ComposeWizard {
+            mode: ComposeMode::New,
+            to: "alice@example.com".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Quick note".to_string(),
+            body: body.to_string(),
+            focus: ComposeField::Body,
+            suggestions: Vec::new(),
+            suggestion_idx: 0,
+            contacts: None,
+        }
+    }
+
+    /// A non-empty inline body is written straight into the draft `.md`, after
+    /// the frontmatter fence, so a short message never needs `$EDITOR`.
+    #[test]
+    fn wizard_body_is_written_into_the_draft_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::default_for_tests();
+        app.drafts_dir = Some(dir.path().to_path_buf());
+
+        let wizard = wizard_with_body("Thanks, see you Tuesday.");
+        let path = write_new_draft_from_wizard(&app, &wizard).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("subject: \"Quick note\""), "{content}");
+        // Body follows the closing frontmatter fence, not the opening one.
+        let after_fence = content
+            .rsplit_once("---\n\n")
+            .map(|(_, tail)| tail)
+            .unwrap_or_default();
+        assert_eq!(after_fence, "Thanks, see you Tuesday.\n", "{content}");
+    }
+
+    /// An empty inline body leaves the draft body blank: the file ends at the
+    /// closing fence, which is the signal `submit_compose_wizard` uses to open
+    /// `$EDITOR` instead.
+    #[test]
+    fn wizard_empty_body_leaves_the_draft_body_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::default_for_tests();
+        app.drafts_dir = Some(dir.path().to_path_buf());
+
+        let wizard = wizard_with_body("   ");
+        let path = write_new_draft_from_wizard(&app, &wizard).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.ends_with("---\n\n"), "{content:?}");
     }
 }
 

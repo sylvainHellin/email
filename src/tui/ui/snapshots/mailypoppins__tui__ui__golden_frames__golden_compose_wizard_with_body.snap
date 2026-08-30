@@ -1,0 +1,47 @@
+---
+source: src/tui/ui/golden_frames.rs
+expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
+---
+== text 120x40 (trailing spaces trimmed) ==
+00 |
+01 |
+02 |
+03 |
+04 |                  ╭ Compose ─────────────────────────────────────────────────────────────────────────╮
+05 |                  │     To: alice@example.com                                                        │
+06 |                  │                                                                                  │
+07 |                  │     Cc:                                                                          │
+08 |                  │                                                                                  │
+09 |                  │    Bcc:                                                                          │
+10 |                  │                                                                                  │
+11 |                  │Subject: Lunch Thursday                                                           │
+12 |                  │                                                                                  │
+13 |                  │──────────────────────────────────────────────────────────────────────────────────│
+14 |                  │   Body:                                                                          │
+15 |                  │Works for me.                                                                     │
+16 |                  │See you at noon.█                                                                 │
+17 |                  │                                                                                  │
+18 |                  │                                                                                  │
+19 |                  │                                                                                  │
+20 |                  │                                                                                  │
+21 |                  │                                                                                  │
+22 |                  │                                                                                  │
+23 |                  │                                                                                  │
+24 |                  │                                                                                  │
+25 |                  │                                                                                  │
+26 |                  │                                                                                  │
+27 |                  │                                                                                  │
+28 |                  │                                                                                  │
+29 |                  │                                                                                  │
+30 |                  │                                                                                  │
+31 |                  │                                                                                  │
+32 |                  │                                                                                  │
+33 |                  │                                                                                  │
+34 |                  │                                                                                  │
+35 |                  ╰──────── Enter: newline | Ctrl+g: submit | Tab: next field | Esc: cancel ─────────╯
+36 |
+37 |
+38 |
+39 |
+== style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
+14 |bold@19..28

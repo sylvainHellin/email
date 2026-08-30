@@ -34,8 +34,8 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
 use crate::tui::app::{
-    App, CalendarEvent, CommandPalette, EmailEntry, EntryKey, MailboxInfo, MailboxKind,
-    MessageRef, Overlay, SearchField, SearchOverlayFocus, View,
+    App, CalendarEvent, CommandPalette, ComposeField, ComposeMode, ComposeWizard, EmailEntry,
+    EntryKey, MailboxInfo, MailboxKind, MessageRef, Overlay, SearchField, SearchOverlayFocus, View,
 };
 use crate::tui::theme::{self, Theme};
 use crate::types::EventFrontmatter;
@@ -740,6 +740,29 @@ fn golden_search_form_filled() {
         attachment: true,
         advanced: String::new(),
     };
+    assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
+}
+
+/// A New compose wizard with the inline body field focused and a short
+/// multi-line message typed into it (#0097). Pins the body label, the wrapped
+/// body text with its cursor block, and the Ctrl+g submit hint that replaced
+/// the old Subject-is-last layout.
+#[test]
+fn golden_compose_wizard_with_body() {
+    let mut app = mail_fixture();
+    app.overlay = Overlay::Compose(ComposeWizard {
+        mode: ComposeMode::New,
+        to: "alice@example.com".to_string(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Lunch Thursday".to_string(),
+        body: "Works for me.\nSee you at noon.".to_string(),
+        focus: ComposeField::Body,
+        suggestions: Vec::new(),
+        suggestion_idx: 0,
+        contacts: None,
+    });
+    app.focus = crate::tui::app::Focus::ComposeWizard;
     assert_snapshot!(frame_snapshot(&mut app, WIDTH, HEIGHT));
 }
 
