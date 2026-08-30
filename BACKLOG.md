@@ -19,7 +19,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 - [#0087 Opening a message in the preview marks it read](docs/tickets/0087-auto-mark-read-on-open.md) -- feature _(cross-ref #0004)_
 - [#0088 Collapse the three search entry points into one, body search off the UI thread](docs/tickets/0088-unify-search-entry-points.md) -- feature _(cross-ref #0043, #0086)_
-- [#0094 Index the mailbox listing sort and drop the correlated per-row subquery](docs/tickets/0094-mailbox-list-index.md) -- perf
 - [#0096 Expand the header pane with Bcc/Reply-To, an attachment indicator, and bounded scroll](docs/tickets/0096-header-pane-expansion.md) -- feature
 - [#0097 Type a short body in the compose wizard without opening $EDITOR](docs/tickets/0097-compose-wizard-body-field.md) -- feature
 - [#0098 Attach a file to an existing draft from the TUI](docs/tickets/0098-attach-file-to-existing-draft.md) -- feature _(cross-ref #0016)_

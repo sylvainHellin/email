@@ -20,6 +20,16 @@ All notable changes to this project are documented in this file.
   results and drafts changes all mark the frame dirty, and the busy spinner
   keeps its own slow tick, so idle CPU drops toward zero without stalling any
   background update.
+- **The mailbox listing is served by an index, not a sort (#0094).** Loading a
+  mailbox filtered by `(account, mailbox)` and sorted by `date_sort DESC, id
+  DESC` with no index behind the sort, so SQLite built a temp B-tree on every
+  load, and each row paid a correlated `EXISTS` subquery for its invite badge.
+  A new `messages_list` index on `(account, mailbox, date_sort DESC, id DESC)`
+  lets the listing walk straight off the index, and the invite flag now comes
+  from a deduplicated `LEFT JOIN` rather than a per-row subquery, so a mailbox
+  switch or a reload is one index scan with no temp sort. The listing content
+  is unchanged; the schema version bumps to 7, which rebuilds existing stores
+  from their cache on the next open.
 
 ### Added
 - **Folder entries in `attachments:`.**

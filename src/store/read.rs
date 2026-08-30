@@ -167,12 +167,21 @@ pub(super) fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageR
 /// mailbox that was never synced returns an empty list, not an error: it is a
 /// mailbox with no mail yet.
 pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<MessageRow>> {
-    let columns = row_columns();
-    let sql = format!(
-        "SELECT {columns} FROM messages
-         WHERE account = ?1 AND mailbox = ?2
-         ORDER BY date_sort DESC, id DESC"
-    );
+    // This listing is the hot read path (every mailbox switch and every reload
+    // after a mutation runs it), so it does not go through `row_columns`:
+    // that helper answers `is_invite` with a correlated `EXISTS` subquery that
+    // runs once per row, and here the whole mailbox is materialised with no
+    // LIMIT. Two changes make it one index walk (#0094): the columns are
+    // spelled out with the invite predicate sourced from a `LEFT JOIN` on
+    // `message_blobs` rather than a per-row subquery, and the
+    // `WHERE (account, mailbox) ORDER BY date_sort DESC, id DESC` is served by
+    // the `messages_list` index instead of a temp-B-tree sort. The join is
+    // one-to-at-most-one: ingest writes a single iMIP sidecar per message
+    // (`CALENDAR_SIDECAR_NAME`, chosen precisely to not collide with real
+    // attachment names), so the LEFT JOIN never multiplies a row and the
+    // result is byte-identical to the `row_columns` form. The invite boolean
+    // stays column 13 so [`row_from_sql`] reads it unchanged.
+    let sql = list_mailbox_sql();
     let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt.query_map((account, mailbox), row_from_sql)?;
     let mut out = Vec::new();
@@ -180,6 +189,26 @@ pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<M
         out.push(row.context("reading a message row")?);
     }
     Ok(out)
+}
+
+/// The SQL [`list_mailbox`] runs, factored out so the query-plan regression
+/// test (`the_listing_is_served_by_the_messages_list_index`) checks the exact
+/// statement rather than a copy that could drift from it.
+fn list_mailbox_sql() -> String {
+    format!(
+        "SELECT messages.id, messages.mailbox, messages.uid, messages.message_id, \
+         messages.from_, messages.to_, messages.cc, messages.subject, \
+         messages.date_display, messages.flags, messages.has_attachments, \
+         messages.body_blob, messages.thread_id, \
+         (invite.message_row IS NOT NULL) \
+         FROM messages \
+         LEFT JOIN (SELECT DISTINCT message_row FROM message_blobs \
+                     WHERE kind = 'attachment' \
+                       AND filename = '{CALENDAR_SIDECAR_NAME}') invite \
+           ON invite.message_row = messages.id \
+         WHERE messages.account = ?1 AND messages.mailbox = ?2 \
+         ORDER BY messages.date_sort DESC, messages.id DESC"
+    )
 }
 
 /// Every message of one account, newest first within each mailbox.
@@ -1094,6 +1123,37 @@ Content-Type: text/html; charset=utf-8\r\n\r\n<p>html inside the raw</p>\r\n";
         assert_eq!(std::fs::read(&files[0]).unwrap(), b"hostile");
         assert_eq!(std::fs::read(&files[1]).unwrap(), b"first");
         assert_eq!(std::fs::read(&files[2]).unwrap(), b"second");
+    }
+
+    /// The listing is served by an index scan, not a temp-B-tree sort, and
+    /// pays no correlated subquery per row (#0094). Asserted against the exact
+    /// SQL `list_mailbox` runs, via EXPLAIN QUERY PLAN.
+    #[test]
+    fn the_listing_is_served_by_the_messages_list_index() {
+        let fx = fixture();
+        ingest(&fx, "inbox", 1, &email("a", "Mon, 01 Jan 2024 09:00:00 +0000"));
+
+        let sql = super::list_mailbox_sql();
+        let mut stmt = fx.store.conn().prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(("alice", "inbox"), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+
+        assert!(
+            plan.contains("messages_list"),
+            "the listing must be served by the messages_list index, got:\n{plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "the ORDER BY must not fall back to a temp-B-tree sort, got:\n{plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("CORRELATED"),
+            "no correlated subquery may run per row, got:\n{plan}"
+        );
     }
 
     /// The invite flag rides on the listing itself, so the badge costs no

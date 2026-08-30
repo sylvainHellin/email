@@ -28,8 +28,11 @@ use rusqlite::Connection;
 /// `mailboxes.unread_count`) come out. v5 adds `sync_cursors.arrival_mark`, the
 /// one piece of sync state a pass has to hand to the next one (#0072). v6 adds
 /// `ingest_failures`, the per-UID retry counter that bounds how long a message
-/// the store cannot write may hold the prune gate shut (#0074).
-pub const SCHEMA_VERSION: i64 = 6;
+/// the store cannot write may hold the prune gate shut (#0074). v7 adds
+/// `messages_list`, the composite index that serves the mailbox listing's
+/// `WHERE account = ? AND mailbox = ?  ORDER BY date_sort DESC, id DESC` from
+/// an index scan rather than a temp-B-tree sort (#0094).
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -222,6 +225,14 @@ CREATE TABLE messages (
 );
 
 CREATE INDEX messages_message_id ON messages (message_id);
+
+-- Serves the mailbox listing (`read::list_mailbox`): the WHERE filters on
+-- (account, mailbox) and the ORDER BY is date_sort DESC, id DESC, so this
+-- column order plus the DESC sort direction lets SQLite walk the listing
+-- straight off the index instead of filtering by the unique index and then
+-- sorting into a temp B-tree (#0094). The trailing `id DESC` keeps the
+-- row-id tiebreak covered so it needs no extra pass.
+CREATE INDEX messages_list ON messages (account, mailbox, date_sort DESC, id DESC);
 
 CREATE TABLE message_blobs (
     message_row INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
