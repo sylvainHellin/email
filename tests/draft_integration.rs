@@ -46,7 +46,7 @@ fn test_create_reply_draft() {
 
     let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     assert!(draft_path.exists());
     let content = fs::read_to_string(&draft_path).unwrap();
@@ -63,6 +63,77 @@ fn test_create_reply_draft() {
     assert!(content.contains("alice@example.com wrote:"));
 }
 
+/// A per-account signature (#0099) is spliced into the reply body above the
+/// quoted text, so it is visible and editable in the draft rather than
+/// injected at send time. The `{{SIGNATURE}}` placeholder is kept for the
+/// send-time quote splicing.
+#[test]
+fn a_reply_draft_carries_the_account_signature_above_the_quote() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
+    let draft_path = create_reply_draft_from(
+        &source,
+        false,
+        "me@example.com",
+        Some(drafts.as_path()),
+        Some("-- \nSylvain"),
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    assert!(content.contains("-- \nSylvain"), "{content}");
+    // Placeholder retained for the send path's quote splicing.
+    assert!(content.contains("{{SIGNATURE}}"), "{content}");
+    // Signature sits above the quoted attribution, not below the thread.
+    let sig_pos = content.find("-- \nSylvain").unwrap();
+    let quote_pos = content.find("wrote:").unwrap();
+    assert!(sig_pos < quote_pos, "signature must precede the quote: {content}");
+}
+
+/// A forward carries the signature the same way, above the forwarded block.
+#[test]
+fn a_forward_draft_carries_the_account_signature_above_the_forwarded_block() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
+    let draft_path = create_forward_draft_from(
+        &source,
+        "me@example.com",
+        Some(drafts.as_path()),
+        Some("-- \nSylvain"),
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    assert!(content.contains("-- \nSylvain"), "{content}");
+    assert!(content.contains("{{SIGNATURE}}"), "{content}");
+    let sig_pos = content.find("-- \nSylvain").unwrap();
+    let fwd_pos = content.find("Forwarded message").unwrap();
+    assert!(sig_pos < fwd_pos, "signature must precede the forward: {content}");
+}
+
+/// No configured signature produces no signature block: the reply body is the
+/// pre-#0099 shape, the placeholder its only signature anchor.
+#[test]
+fn a_reply_draft_without_a_signature_has_no_signature_block() {
+    let tmp = tempdir().unwrap();
+    let drafts = tmp.path().join("drafts");
+
+    let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
+    let draft_path =
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None)
+            .unwrap();
+
+    let content = fs::read_to_string(&draft_path).unwrap();
+    // Only the placeholder anchors the (absent) signature; the body is the
+    // reply area, the placeholder, then the quote.
+    assert!(content.contains("{{SIGNATURE}}"), "{content}");
+    assert!(content.contains("> Original body"), "{content}");
+}
+
 /// A reply names the message it answers, and the value survives the parse
 /// (#TKT-0051). This is what the post-send hook reads to put `\Answered` on
 /// the source; a draft that never goes out therefore claims nothing.
@@ -73,7 +144,7 @@ fn a_reply_draft_records_the_message_it_answers() {
 
     let source = source("alice@example.com", "me@example.com", "Hello", "Original body");
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     assert!(content.contains("in_reply_to: \"<source@example.com>\""));
@@ -95,7 +166,7 @@ fn a_forward_draft_records_the_message_it_forwards() {
 
     let source = source("alice@example.com", "me@example.com", "Hello", "Forward me");
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let draft = parse_email_draft(&draft_path).unwrap();
     assert_eq!(
@@ -115,7 +186,7 @@ fn a_source_without_a_message_id_leaves_the_key_out() {
     let mut source = source("alice@example.com", "me@example.com", "Hello", "Body");
     source.message_id = None;
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     assert!(!content.contains("in_reply_to:"));
@@ -136,7 +207,7 @@ fn a_message_id_with_a_backslash_leaves_the_key_out() {
     let mut source = source("alice@example.com", "me@example.com", "Hello", "Body");
     source.message_id = Some("<a\\qb@example.com>".to_string());
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     assert!(!content.contains("in_reply_to:"), "{content}");
@@ -153,7 +224,7 @@ fn test_create_reply_draft_already_re_prefix() {
 
     let source = source("alice@example.com", "me@example.com", "Re: Hello", "Body");
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     // Should not double the Re: prefix
@@ -176,7 +247,7 @@ fn test_create_reply_all_draft() {
     source.cc = Some("carol@example.com".to_string());
 
     let draft_path =
-        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path()), None).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // Reply-all should have CC with bob and carol but not self
@@ -198,7 +269,7 @@ fn test_create_forward_draft() {
 
     let source = source("alice@example.com", "me@example.com", "Hello", "Forward me");
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
 
@@ -231,7 +302,7 @@ fn test_forward_with_attachments() {
     source.attachments = vec![report.clone()];
 
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // Forward should reference the attachment by the path it was given.
@@ -263,7 +334,7 @@ fn test_forward_then_archive_source_keeps_attachment_resolvable() {
     source.attachments = vec![stable.join("report.pdf")];
 
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     // The source's own mailbox goes away; the mirror does not.
     let inbox = account.join("inbox");
@@ -305,7 +376,7 @@ fn test_reply_with_companion_html() {
     source.html = Some("<p>Rich HTML body</p>".to_string());
 
     let draft_path =
-        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, false, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     // Draft should have a companion HTML with quoted content
     let draft_html = draft_path.with_extension("html");
@@ -555,7 +626,7 @@ fn test_forward_draft_already_fwd_prefix() {
 
     let source = source("alice@example.com", "me@example.com", "Fwd: Original", "Body");
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let content = fs::read_to_string(&draft_path).unwrap();
     // Should not double the Fwd: prefix
@@ -572,7 +643,7 @@ fn test_forward_draft_with_companion_html() {
     source.html = Some("<p>Rich content</p>".to_string());
 
     let draft_path =
-        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_forward_draft_from(&source, "me@example.com", Some(drafts.as_path()), None).unwrap();
 
     let draft_html = draft_path.with_extension("html");
     assert!(draft_html.exists());
@@ -594,7 +665,7 @@ fn test_reply_all_excludes_self_from_cc() {
     let source = source("alice@example.com", "me@example.com", "Solo", "Body");
 
     let draft_path =
-        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path()), None).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // No cc line should appear since the only other recipient is self
@@ -616,7 +687,7 @@ fn test_reply_deduplicates_cc_addresses() {
     source.cc = Some("bob@example.com, carol@example.com".to_string());
 
     let draft_path =
-        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path())).unwrap();
+        create_reply_draft_from(&source, true, "me@example.com", Some(drafts.as_path()), None).unwrap();
     let draft_content = fs::read_to_string(&draft_path).unwrap();
 
     // bob should appear only once in cc
