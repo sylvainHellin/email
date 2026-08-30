@@ -72,6 +72,11 @@ pub struct MessageRow {
     pub from: Option<String>,
     pub to: Option<String>,
     pub cc: Option<String>,
+    /// `Reply-To:` header, when the message carried one (#0096).
+    pub reply_to: Option<String>,
+    /// `Bcc:` header, when the message carried one (#0096). Usually absent on
+    /// received mail; present for Sent/self-copies that kept the header.
+    pub bcc: Option<String>,
     pub subject: Option<String>,
     /// The `Date:` header verbatim, as ingest stored it. The display and sort
     /// strings the TUI and the dump use are derived from it by
@@ -136,6 +141,7 @@ pub(super) fn row_columns() -> String {
          messages.from_, messages.to_, messages.cc, messages.subject, \
          messages.date_display, messages.flags, messages.has_attachments, \
          messages.body_blob, messages.thread_id, \
+         messages.reply_to, messages.bcc, \
          EXISTS (SELECT 1 FROM message_blobs b \
                  WHERE b.message_row = messages.id AND b.kind = 'attachment' \
                    AND b.filename = '{CALENDAR_SIDECAR_NAME}')"
@@ -157,7 +163,9 @@ pub(super) fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageR
         has_attachments: row.get::<_, i64>(10)? != 0,
         body_blob: row.get(11)?,
         thread_id: row.get(12)?,
-        is_invite: row.get::<_, i64>(13)? != 0,
+        reply_to: row.get(13)?,
+        bcc: row.get(14)?,
+        is_invite: row.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -181,7 +189,8 @@ pub fn list_mailbox(store: &Store, account: &str, mailbox: &str) -> Result<Vec<M
     // (`CALENDAR_SIDECAR_NAME`, chosen precisely to not collide with real
     // attachment names), so the LEFT JOIN never multiplies a row and the
     // result is byte-identical to the `row_columns` form. The invite boolean
-    // stays column 13 so [`row_from_sql`] reads it unchanged.
+    // stays the last column (index 15, after reply_to/bcc) so [`row_from_sql`]
+    // reads it unchanged.
     let sql = list_mailbox_sql();
     let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt.query_map((account, mailbox), row_from_sql)?;
@@ -201,6 +210,7 @@ fn list_mailbox_sql() -> String {
          messages.from_, messages.to_, messages.cc, messages.subject, \
          messages.date_display, messages.flags, messages.has_attachments, \
          messages.body_blob, messages.thread_id, \
+         messages.reply_to, messages.bcc, \
          (invite.message_row IS NOT NULL) \
          FROM messages \
          LEFT JOIN (SELECT DISTINCT message_row FROM message_blobs \
@@ -432,7 +442,7 @@ pub fn list_invites(store: &Store, account: &str) -> Result<Vec<(MessageRow, Str
     );
     let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt.query_map((account, CALENDAR_SIDECAR_NAME), |row| {
-        Ok((row_from_sql(row)?, row.get::<_, String>(14)?))
+        Ok((row_from_sql(row)?, row.get::<_, String>(16)?))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -778,6 +788,8 @@ mod tests {
             from: "Ada Lovelace <ada@example.com>".into(),
             to: "b@example.com".into(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: subject.into(),
             date: date.into(),
             body_text: format!("body of {subject}"),

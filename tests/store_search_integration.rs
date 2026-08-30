@@ -58,6 +58,8 @@ fn email(message_id: &str, from: &str, subject: &str, body: &str) -> FetchedEmai
         from: from.into(),
         to: "me@example.com".into(),
         cc: None,
+        reply_to: None,
+        bcc: None,
         subject: subject.into(),
         date: "Thu, 7 Aug 2026 10:00:00 +0000".into(),
         body_text: body.into(),

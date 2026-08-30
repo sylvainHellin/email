@@ -836,6 +836,11 @@ fn graph_message_to_fetched_email(msg: &GraphMessage) -> FetchedEmail {
         from,
         to,
         cc,
+        // The Graph message shape this build deserializes carries neither
+        // Reply-To nor Bcc, so the header pane shows them only for IMAP mail
+        // (#0096); wiring the Graph fields is a follow-up if the path returns.
+        reply_to: None,
+        bcc: None,
         subject,
         date,
         body_text,
@@ -2479,6 +2484,8 @@ mod tests {
             from: "a@b.com".into(),
             to: "me@x.com".into(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: "s".into(),
             date: "d".into(),
             body_text: String::new(),

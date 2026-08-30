@@ -295,7 +295,7 @@ fn ingest_in_tx(
                     uid = ?2, message_id = ?3, from_ = ?4, to_ = ?5, cc = ?6, subject = ?7,
                     date_sort = ?8, date_display = ?9, flags = ?10, in_reply_to = ?11,
                     references_ = ?12, thread_id = ?13, snippet = ?14, has_attachments = ?15,
-                    body_blob = ?16, raw_blob = ?17, size = ?18
+                    body_blob = ?16, raw_blob = ?17, size = ?18, reply_to = ?19, bcc = ?20
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -316,6 +316,8 @@ fn ingest_in_tx(
                     body_blob,
                     raw_blob,
                     size,
+                    email.reply_to,
+                    email.bcc,
                 ],
             )
             .context("updating the message row")?;
@@ -326,10 +328,10 @@ fn ingest_in_tx(
                 "INSERT INTO messages (
                     account, mailbox, uid, message_id, from_, to_, cc, subject,
                     date_sort, date_display, flags, in_reply_to, references_, thread_id,
-                    snippet, has_attachments, body_blob, raw_blob, size
+                    snippet, has_attachments, body_blob, raw_blob, size, reply_to, bcc
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19
+                    ?17, ?18, ?19, ?20, ?21
                  )",
                 rusqlite::params![
                     input.account,
@@ -351,6 +353,8 @@ fn ingest_in_tx(
                     body_blob,
                     raw_blob,
                     size,
+                    email.reply_to,
+                    email.bcc,
                 ],
             )
             .context("inserting the message row")?;
@@ -1309,6 +1313,8 @@ mod tests {
             from: "a@example.com".into(),
             to: "b@example.com".into(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: subject.into(),
             date: "Mon, 01 Jan 2024 12:00:00 +0000".into(),
             body_text: "body".into(),

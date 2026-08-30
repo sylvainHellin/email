@@ -214,6 +214,8 @@ mod tests {
             from: from.into(),
             to: account.default_from.clone(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: "Seed".into(),
             date: "Fri, 02 Jan 2026 09:00:00 +0000".into(),
             body_text: "body".into(),

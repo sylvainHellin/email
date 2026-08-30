@@ -8,7 +8,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 02 |│  󰏫 Drafts  2                           ││ To: sylvain@example.org                                                    │
 03 |│  󰑫 Sent 41                             ││ Subj: Einladung: Baustellenübergabe — 会 議  ✓                               │
 04 |│  󰄼 Archive 128                         ││ Date: 2026-07-28  [inbox]                                                  │
-05 |│                                        ││                                                                            │
+05 |│                                        ││ Attach:  yes                                                              │
 06 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
 07 |╭ Inbox ─────────────────────────────────╮╭ 󰃭 Invitation ──────────────────────────────────────────────────────────────╮
 08 |│date: last week█                        ││Bauprojekt Ubergabe                                                         │
@@ -48,6 +48,7 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 02 |bold@43..48
 03 |bold@43..50
 04 |bold@43..50
+05 |bold@43..52
 08 |bold@43..62
 09 |bold@43..49
 10 |bg:surface+fg:selection+bold@1..41 bold@43..50

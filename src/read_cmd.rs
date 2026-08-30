@@ -365,6 +365,8 @@ mod tests {
             from: "Ada Lovelace <ada@example.com>".into(),
             to: "b@example.com".into(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: subject.into(),
             date: "Thu, 7 Aug 2026 10:00:00 +0000".into(),
             body_text: body.into(),

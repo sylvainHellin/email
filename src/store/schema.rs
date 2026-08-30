@@ -31,8 +31,12 @@ use rusqlite::Connection;
 /// the store cannot write may hold the prune gate shut (#0074). v7 adds
 /// `messages_list`, the composite index that serves the mailbox listing's
 /// `WHERE account = ? AND mailbox = ?  ORDER BY date_sort DESC, id DESC` from
-/// an index scan rather than a temp-B-tree sort (#0094).
-pub const SCHEMA_VERSION: i64 = 7;
+/// an index scan rather than a temp-B-tree sort (#0094). v8 adds
+/// `messages.reply_to` and `messages.bcc`, the two header fields the expanded
+/// header pane surfaces when a message carries them (#0096); a version bump
+/// rather than a nullable-column tolerance because the cache is refilled from
+/// the server on the next sync, which is where the new columns get populated.
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// `meta` key holding [`SCHEMA_VERSION`].
 pub const META_SCHEMA_VERSION: &str = "schema_version";
@@ -207,6 +211,8 @@ CREATE TABLE messages (
     from_            TEXT,
     to_              TEXT,
     cc               TEXT,
+    reply_to         TEXT,
+    bcc              TEXT,
     subject          TEXT,
     date_sort        INTEGER,
     date_display     TEXT,

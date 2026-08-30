@@ -2523,6 +2523,8 @@ mod tests {
             from: from.to_string(),
             to: "me@example.com".to_string(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: subject.to_string(),
             status: "inbox".to_string(),
             date_display: "2026-07-01".to_string(),

@@ -30,6 +30,12 @@ pub struct FetchedEmail {
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
+    /// `Reply-To:` header verbatim when present (#0096). Received mail may carry
+    /// it; the header pane surfaces it so a reply's real destination is visible.
+    pub reply_to: Option<String>,
+    /// `Bcc:` header verbatim when present (#0096). Almost always absent on
+    /// received mail (stripped at delivery) but kept for Sent/self-copies.
+    pub bcc: Option<String>,
     pub subject: String,
     pub date: String,
     pub body_text: String,
@@ -536,6 +542,8 @@ pub fn parse_rfc822_to_fetched_email(rfc822_body: &[u8]) -> Option<FetchedEmail>
         .get_first_value("To")
         .unwrap_or_else(|| "(unknown)".to_string());
     let cc = headers.get_first_value("Cc");
+    let reply_to = headers.get_first_value("Reply-To");
+    let bcc = headers.get_first_value("Bcc");
     let subject = headers
         .get_first_value("Subject")
         .unwrap_or_else(|| "(no subject)".to_string());
@@ -559,6 +567,8 @@ pub fn parse_rfc822_to_fetched_email(rfc822_body: &[u8]) -> Option<FetchedEmail>
         from,
         to,
         cc,
+        reply_to,
+        bcc,
         subject,
         date,
         body_text,

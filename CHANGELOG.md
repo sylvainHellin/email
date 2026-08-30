@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **The header pane shows Bcc, Reply-To and an attachment marker, and its scroll is bounded (#0096).** The headers pane was thin: it showed From, To, Cc, Subject and Date, and hid the rest. It now adds a Reply-To row and a Bcc row whenever the message carries those headers (blank values draw no row), and a paperclip `Attach:` line whenever the message has attachments, so the `t o` / `t s` open- and save-attachment actions that already work from the pane have a matching affordance. The `j`/`k` scroll is now clamped to the wrapped content height, so it can no longer run past the last header into an empty void. Reply-To and Bcc are captured at ingest and reach the pane for stored (IMAP) mail; the schema bump refills the cache from the server on the next sync.
+
 ### Performance
 - **The TUI paints before it opens any store (#0003).** Startup used to build
   every account's state up front, and each `AccountState::new` opened that

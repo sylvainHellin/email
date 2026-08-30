@@ -508,6 +508,8 @@ pub(crate) mod tests {
                 from: "Organizer <me@example.com>".into(),
                 to: "a@example.com".into(),
                 cc: None,
+                reply_to: None,
+                bcc: None,
                 subject: subject.into(),
                 date: "Mon, 20 Jul 2026 09:00:00 +0000".into(),
                 body_text: "You are invited.".into(),

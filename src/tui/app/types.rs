@@ -146,6 +146,10 @@ pub struct EmailEntry {
     pub from: String,
     pub to: String,
     pub cc: Option<String>,
+    /// `Reply-To:` header, surfaced in the header pane when present (#0096).
+    pub reply_to: Option<String>,
+    /// `Bcc:` header, surfaced in the header pane when present (#0096).
+    pub bcc: Option<String>,
     pub subject: String,
     pub status: String,
     pub date_display: String,
@@ -399,6 +403,8 @@ fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
         from: extract_display_name(row.from.as_deref().unwrap_or_default()),
         to: extract_display_name(row.to.as_deref().unwrap_or_default()),
         cc: row.cc,
+        reply_to: row.reply_to,
+        bcc: row.bcc,
         subject: row
             .subject
             .filter(|s| !s.is_empty())
@@ -434,6 +440,10 @@ fn entry_from_draft(row: crate::store::drafts::DraftRow) -> EmailEntry {
         from: String::new(),
         to: extract_display_name(row.to.as_deref().unwrap_or_default()),
         cc: row.cc,
+        // Drafts index carries no reply_to/bcc column yet; the header pane
+        // shows them for stored messages (#0096).
+        reply_to: None,
+        bcc: None,
         subject: row
             .subject
             .filter(|s| !s.is_empty())
@@ -475,6 +485,8 @@ fn entry_from_skip(skip: crate::store::drafts::SkippedDraft) -> EmailEntry {
         from: String::new(),
         to: String::new(),
         cc: None,
+        reply_to: None,
+        bcc: None,
         subject: filename,
         status: "error".to_string(),
         date_display,
@@ -2153,6 +2165,8 @@ mod tests {
             from: format!("Sender {subject} <s@example.com>"),
             to: "me@example.com".into(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: subject.into(),
             date: date.into(),
             body_text: format!("body of {subject}"),

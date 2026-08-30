@@ -391,6 +391,7 @@ mod badge_tests {
             draft_id: None,
             skip: None,
             from: "a".into(), to: "b".into(), cc: None,
+            reply_to: None, bcc: None,
             subject: "S".into(), status: "inbox".into(),
             date_display: "2026-07-01".into(), date_sort: "2026-07-01T00:00:00".into(),
             has_attachments: has_att, read: false, answered: false, forwarded: false,

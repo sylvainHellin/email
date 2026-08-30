@@ -332,6 +332,8 @@ mod tests {
             from: String::new(),
             to: String::new(),
             cc: None,
+            reply_to: None,
+            bcc: None,
             subject: String::new(),
             date: String::new(),
             body_text: String::new(),

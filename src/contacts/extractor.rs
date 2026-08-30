@@ -274,6 +274,8 @@ mod tests {
             from: from.into(),
             to: to.into(),
             cc: cc.map(|s| s.into()),
+            reply_to: None,
+            bcc: None,
             subject: "Subject".into(),
             date: date.into(),
             body_text: "body".into(),

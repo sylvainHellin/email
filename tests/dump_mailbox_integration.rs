@@ -36,6 +36,8 @@ fn email(from: &str, to: &str, subject: &str, date: &str) -> FetchedEmail {
         from: from.to_string(),
         to: to.to_string(),
         cc: None,
+        reply_to: None,
+        bcc: None,
         subject: subject.to_string(),
         date: date.to_string(),
         body_text: format!("Body of {subject}.\n"),
