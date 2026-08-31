@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **An HTML signature no longer lands as raw HTML in the draft, sends doubled, or renders at the wrong size (#0103).** When an account's signature was an HTML file (a rich signature exported from another client), three things went wrong: the raw HTML was spliced into the Markdown body you edit; the send path then injected the signature a second time at the `{{SIGNATURE}}` marker, so the HTML part carried it twice; and the injected copy kept its own styles while the typed body did not, so signature and body rendered at different sizes. The signature source is now converted to Markdown as it is read (`[text](url)` links and line breaks preserved), so the draft is always Markdown and never raw HTML, and that one spliced Markdown signature is the single source for both the plain-text and HTML parts of the sent mail, rendered through the same converter as the body so it inherits the body font. The send-time HTML injection is gone; the `{{SIGNATURE}}` marker now only marks where the quoted reply begins. The outgoing HTML also carries the font as an inline style on a wrapper `<div>`, not just in a head `<style>` block, so it survives clients (Gmail, Outlook) that strip `<style>` and body and signature stay the same size there too. Markdown and plain-text signatures are unaffected.
+
 ## [0.9.0] - 2026-08-30
 
 ### Added

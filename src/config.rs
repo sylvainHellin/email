@@ -2308,6 +2308,44 @@ body_horizon_days = -1
         );
     }
 
+    /// An HTML signature file is converted to Markdown at resolve time, so the
+    /// editable draft and both MIME parts never see raw HTML (#0102 follow-up).
+    #[test]
+    fn resolve_signature_converts_an_html_file_to_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sig.html");
+        fs::write(
+            &file,
+            "<p>--<br>\nRobin<br>\n<a href=\"mailto:robin@example.com\">robin@example.com</a></p>",
+        )
+        .unwrap();
+        let account = account_with_signature(SignatureEntry {
+            name: None,
+            text: None,
+            path: Some(file.to_string_lossy().into_owned()),
+        });
+        let md = resolve_signature_markdown(&account, None).expect("signature resolves");
+        assert!(!md.contains('<'), "raw HTML leaked into the signature: {md:?}");
+        assert!(
+            md.contains("[robin@example.com](mailto:robin@example.com)"),
+            "link not preserved as Markdown: {md:?}"
+        );
+    }
+
+    /// An inline HTML snippet is converted too, not just files.
+    #[test]
+    fn resolve_signature_converts_inline_html_text() {
+        let account = account_with_signature(SignatureEntry {
+            name: None,
+            text: Some("<b>Alice</b>".to_string()),
+            path: None,
+        });
+        assert_eq!(
+            resolve_signature_markdown(&account, None).as_deref(),
+            Some("**Alice**")
+        );
+    }
+
     /// An account with no signature configured resolves to `None` (no block).
     #[test]
     fn resolve_signature_is_none_when_unconfigured() {
@@ -2349,7 +2387,7 @@ pub fn resolve_signature_markdown(
     if let Some(text) = entry.text.as_ref() {
         let text = text.trim_end();
         if !text.is_empty() {
-            return Some(text.to_string());
+            return Some(signature_source_to_markdown(text));
         }
     }
 
@@ -2363,8 +2401,27 @@ pub fn resolve_signature_markdown(
             .ok()
             .map(|s| s.trim_end().to_string())
             .filter(|s| !s.is_empty())
+            .map(|s| signature_source_to_markdown(&s))
     } else {
         eprintln!("{} Signature file not found: {}", "⚠".yellow(), path_str);
         None
+    }
+}
+
+/// Normalise a signature source to Markdown.
+///
+/// A signature is stored verbatim (inline `text` or a file at `path`) and may be
+/// an HTML fragment (the common case for a rich signature exported from a mail
+/// client) or already Markdown/plain text. The draft body the user edits, and
+/// both outgoing MIME parts, are Markdown, so an HTML source is converted here
+/// (`parse::html_to_markdown`, links preserved as `[text](url)`) and anything
+/// that does not look like HTML is returned unchanged. This is the single point
+/// where the conversion happens, so every caller -- draft creation, direct
+/// sends, invites -- gets Markdown.
+fn signature_source_to_markdown(source: &str) -> String {
+    if crate::parse::looks_like_html(source) {
+        crate::parse::html_to_markdown(source)
+    } else {
+        source.to_string()
     }
 }

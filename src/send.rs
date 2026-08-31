@@ -149,6 +149,23 @@ pub fn markdown_to_html(
     signature: Option<&str>,
     quoted_html: Option<&str>,
 ) -> String {
+    // The signature is Markdown (#0099, resolved by
+    // `config::resolve_signature_markdown`). Draft sends pass `None` because the
+    // signature was already spliced into the draft body at reply/forward/compose
+    // time; only the send-time paths that have no editable draft (invites,
+    // direct sends) pass `Some`. Append it to the body Markdown before rendering
+    // so it goes through the same converter as the body and inherits the body
+    // font, instead of being injected as pre-styled HTML (which rendered the
+    // signature at a different size, and double-injected it on replies).
+    let owned_body;
+    let markdown = match signature {
+        Some(sig) if !sig.trim().is_empty() => {
+            owned_body = format!("{}\n\n{}", markdown.trim_end(), sig.trim());
+            owned_body.as_str()
+        }
+        _ => markdown,
+    };
+
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -157,13 +174,12 @@ pub fn markdown_to_html(
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
 
-    // Handle signature placement:
-    // If {{SIGNATURE}} placeholder is present (reply drafts), split the HTML at the placeholder,
-    // inject the signature, and wrap the quoted content in a styled div.
-    // Replace <blockquote> with styled <div> in the quoted section to prevent email clients
-    // (Apple Mail, Gmail) from collapsing the signature and conversation behind "see more".
-    // Otherwise (regular drafts), append signature at the end.
-    let signature_html = signature.unwrap_or_default();
+    // The `{{SIGNATURE}}` marker (reply/forward drafts) no longer carries the
+    // signature; it is purely the boundary where the quoted section begins.
+    // Split there and wrap the quoted content in a styled <div> so email clients
+    // (Apple Mail, Gmail) do not collapse the reply and signature behind "see
+    // more". Replace <blockquote> with styled <div> in the quoted section for
+    // the same reason. Regular drafts have no marker and render as-is.
     let body = if html_output.contains("{{SIGNATURE}}") {
         // pulldown-cmark wraps the placeholder in <p> tags; match that form first
         let marker = if html_output.contains("<p>{{SIGNATURE}}</p>") {
@@ -177,9 +193,8 @@ pub fn markdown_to_html(
         if let Some(original_html) = quoted_html {
             // Use original HTML instead of Markdown-converted blockquotes
             format!(
-                "{}\n{}\n<div style=\"padding-top:1em\">\n{}\n</div>",
+                "{}\n<div style=\"padding-top:1em\">\n{}\n</div>",
                 reply_part.trim_end(),
-                signature_html,
                 original_html,
             )
         } else {
@@ -189,17 +204,20 @@ pub fn markdown_to_html(
                 .replace("<blockquote>", "<div style=\"margin:0;padding:0 0 0 1em;border-left:2px solid #ccc\">")
                 .replace("</blockquote>", "</div>");
             format!(
-                "{}\n{}\n<div style=\"padding-top:1em\">\n{}\n</div>",
+                "{}\n<div style=\"padding-top:1em\">\n{}\n</div>",
                 reply_part.trim_end(),
-                signature_html,
                 quoted_styled.trim_start()
             )
         }
     } else {
-        format!("{}\n{}", html_output, signature_html)
+        html_output
     };
 
-    // Wrap in basic HTML structure with styling from config
+    // Wrap in basic HTML structure with styling from config. The font is set
+    // both in the head <style> and as an inline style on the content wrapper:
+    // Gmail and Outlook strip <style> blocks, so without the inline copy the
+    // body would fall back to the client default while any inline-styled
+    // fragment (a pasted quote) kept its own size.
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -213,7 +231,9 @@ blockquote {{ margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; 
 </style>
 </head>
 <body>
+<div style="font-family: {font_family}; font-size: {font_size}; line-height: 1.6; color: #000;">
 {body}
+</div>
 </body>
 </html>"#,
         font_family = config.font_family,
@@ -307,26 +327,26 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_with_signature_placeholder() {
-        let md = "My reply\n\n{{SIGNATURE}}\n\n> Original message";
-        let sig = "<p>-- Best, Alice</p>";
-        let html = markdown_to_html(md, &default_settings(), Some(sig), None);
+        // Reply drafts carry the (Markdown) signature spliced into the body at
+        // creation time (#0099); the send-time signature arg is None and the
+        // `{{SIGNATURE}}` marker is only the quote boundary.
+        let md = "My reply\n\n-- Best, Alice\n\n{{SIGNATURE}}\n\n> Original message";
+        let html = markdown_to_html(md, &default_settings(), None, None);
         assert_snapshot!(html);
     }
 
     #[test]
     fn test_markdown_to_html_signature_with_quoted_html() {
-        let md = "My reply\n\n{{SIGNATURE}}\n\n> Quoted text";
-        let sig = "<p>-- Best, Alice</p>";
+        let md = "My reply\n\n-- Best, Alice\n\n{{SIGNATURE}}\n\n> Quoted text";
         let quoted = "<p>Original HTML content</p>";
-        let html = markdown_to_html(md, &default_settings(), Some(sig), Some(quoted));
+        let html = markdown_to_html(md, &default_settings(), None, Some(quoted));
         assert_snapshot!(html);
     }
 
     #[test]
     fn test_markdown_to_html_signature_without_quoted_html() {
-        let md = "My reply\n\n{{SIGNATURE}}\n\n> Quoted text";
-        let sig = "<p>-- Best, Alice</p>";
-        let html = markdown_to_html(md, &default_settings(), Some(sig), None);
+        let md = "My reply\n\n-- Best, Alice\n\n{{SIGNATURE}}\n\n> Quoted text";
+        let html = markdown_to_html(md, &default_settings(), None, None);
         assert_snapshot!(html);
     }
 
@@ -781,6 +801,41 @@ mod tests {
         );
     }
 
+    /// The unified Markdown signature (spliced into the reply body at draft
+    /// creation, #0099) is the single source for both outgoing parts: the
+    /// plain part carries it once (as Markdown link syntax) with no marker, and
+    /// the HTML part carries it once as a rendered anchor. No send-time HTML
+    /// injection, so it can no longer appear twice.
+    #[test]
+    fn a_reply_carries_the_signature_once_in_each_part() {
+        let settings = EmailSettings::default();
+        let body =
+            "My reply\n\n[Robin](mailto:robin@example.com)\n\n{{SIGNATURE}}\n\nOn Mon wrote:\n> Quoted";
+
+        // Plain part: marker gone, signature exactly once.
+        let plain = strip_signature_marker(body);
+        assert!(!plain.contains("{{SIGNATURE}}"), "marker in plain part: {plain:?}");
+        assert_eq!(
+            plain.matches("mailto:robin@example.com").count(),
+            1,
+            "signature not exactly once in plain part: {plain:?}"
+        );
+
+        // HTML part: marker gone, no raw spliced `<` from the source, signature
+        // exactly once as a rendered anchor.
+        let html = markdown_to_html(body, &settings, None, None);
+        assert!(!html.contains("{{SIGNATURE}}"), "marker in HTML part");
+        assert_eq!(
+            html.matches("mailto:robin@example.com").count(),
+            1,
+            "signature not exactly once in HTML part: {html}"
+        );
+        assert!(
+            html.contains(r#"<a href="mailto:robin@example.com">Robin</a>"#),
+            "signature link not rendered as an anchor: {html}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RecipientRole display
     // -----------------------------------------------------------------------
@@ -968,11 +1023,15 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_signature_appended_without_placeholder() {
-        let sig = "<p>-- Best, Alice</p>";
+        // Send-time signature (invites, direct sends) is Markdown; it is
+        // appended to the body Markdown and rendered through the same converter
+        // so it inherits the body font.
+        let sig = "-- Best, Alice";
         let html = markdown_to_html("Hello world", &default_settings(), Some(sig), None);
         // Without placeholder, signature is appended after the body
         assert!(html.contains("<p>Hello world</p>"));
-        assert!(html.contains("-- Best, Alice"));
+        // The signature is rendered from Markdown (its own <p>), not injected raw.
+        assert!(html.contains("<p>-- Best, Alice</p>"));
     }
 
     #[test]
@@ -994,10 +1053,9 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_with_quoted_html_replaces_blockquotes() {
-        let md = "Reply\n\n{{SIGNATURE}}\n\n> original";
-        let sig = "<p>sig</p>";
+        let md = "Reply\n\nsig\n\n{{SIGNATURE}}\n\n> original";
         let quoted = "<p>Original HTML</p>";
-        let html = markdown_to_html(md, &default_settings(), Some(sig), Some(quoted));
+        let html = markdown_to_html(md, &default_settings(), None, Some(quoted));
         // When quoted_html is provided, it should be used instead of markdown blockquotes
         assert!(html.contains("Original HTML"));
         assert!(html.contains("sig"));

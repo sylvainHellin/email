@@ -1006,3 +1006,19 @@ reuses `store::read::load_html`, which parses the raw RFC822 on the IMAP path
 change; it is memoised in `PreviewHtml` (paid on cursor moves, never per frame).
 A per-row `has_html` flag would let it skip plain-only mail the way the
 inline-image refresh skips attachment-less rows.
+
+An HTML signature converted to Markdown must use Markdown *hard* breaks or its
+line structure collapses in the sent HTML (#0103). `parse::html_to_markdown`
+turns `<br>` into `  \n` (two trailing spaces, a CommonMark hard break), not a
+plain `\n`: pulldown-cmark treats a lone newline inside a paragraph as a soft
+break and renders it as a single space, so `Name<br>Title<br>...` would come out
+as one run-on line in the `text/html` part. The two trailing spaces are
+invisible in the `text/plain` part, so the same converted Markdown serves both.
+Related: many clients (Gmail, Outlook) strip a `<head><style>` block, so the
+outgoing wrapper sets `font-family`/`font-size` both there and as an inline
+`style` on a top-level content `<div>`; without the inline copy the body falls
+back to the client default while any inline-styled fragment (a pasted quote)
+keeps its own size, which is what made the signature look larger than the body.
+The signature is Markdown end to end now: `config::resolve_signature_markdown`
+is the single conversion point (`looks_like_html` sniff, then convert), so the
+send path never injects pre-styled signature HTML and can no longer double it.

@@ -237,8 +237,11 @@ server = "Newsletters"`} />
       <p>
         Named signature definitions. Set <code>default</code> to the name of the signature
         to use by default. A signature is a Markdown snippet, given inline with
-        <code>text</code> or by a <code>path</code> to a Markdown file (<code>text</code> wins
-        when both are set). Paths support <code>~</code> expansion.
+        <code>text</code> or by a <code>path</code> to a file (<code>text</code> wins
+        when both are set). Paths support <code>~</code> expansion. An HTML source (a rich
+        signature exported from another mail client, inline or on disk) is converted to
+        Markdown when it is read, links kept as <code>[text](url)</code>, so the draft you
+        edit and both parts of the sent mail are always Markdown, never raw HTML.
       </p>
       <p>
         The signature is appended to the draft body when you compose, reply, or forward,

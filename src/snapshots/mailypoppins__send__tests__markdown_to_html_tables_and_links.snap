@@ -1,5 +1,6 @@
 ---
 source: src/send.rs
+assertion_line: 357
 expression: html
 ---
 <!DOCTYPE html>
@@ -14,12 +15,13 @@ blockquote { margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; w
 </style>
 </head>
 <body>
+<div style="font-family: Helvetica, Arial, sans-serif; font-size: 12pt; line-height: 1.6; color: #000;">
 <table><thead><tr><th>A</th><th>B</th></tr></thead><tbody>
 <tr><td>1</td><td>2</td></tr>
 </tbody></table>
 <p><a href="https://example.com">Link</a></p>
 <p><del>strikethrough</del></p>
 
-
+</div>
 </body>
 </html>

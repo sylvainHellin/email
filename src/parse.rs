@@ -74,6 +74,93 @@ pub fn html_to_plain(html: &str) -> String {
         .unwrap_or_else(|_| html.to_string())
 }
 
+/// Does this string look like HTML rather than Markdown/plain text?
+///
+/// A signature source is stored verbatim in config (#0099); it may be a
+/// Markdown snippet or, as here, an HTML file. The editor must never show raw
+/// HTML (#0102 follow-up), so the resolver converts HTML sources to Markdown
+/// first. Detection is a tag sniff: a `<tag` / `</tag` for a known inline or
+/// block element. Markdown autolinks (`<https://...>`, `<a@b.c>`) do not match
+/// because the first character after `<` is not a letter that names a tag we
+/// recognise, and even if a rare one did the conversion below is a no-op on
+/// text with no real tags.
+pub fn looks_like_html(s: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)<\s*/?\s*(p|br|a|div|span|strong|b|em|i|u|ul|ol|li|table|tr|td|th|h[1-6]|font|img|blockquote|hr|pre|code)(\s|>|/)",
+        )
+        .expect("static signature-HTML detection regex")
+    })
+    .is_match(s)
+}
+
+/// Convert a small snippet of HTML to Markdown, preserving links as
+/// `[text](url)` and line breaks.
+///
+/// This is deliberately narrow: signatures and other short snippets, not
+/// arbitrary documents. It handles anchors, `<br>`, paragraph/`<div>` breaks,
+/// bold (`<strong>`/`<b>`) and italic (`<em>`/`<i>`), strips every other tag,
+/// and decodes the common HTML entities. `<br>` becomes a Markdown hard break
+/// (two trailing spaces) so the line structure survives `markdown_to_html`
+/// rather than collapsing into one soft-wrapped paragraph.
+pub fn html_to_markdown(html: &str) -> String {
+    use std::sync::OnceLock;
+    static ANCHOR: OnceLock<regex::Regex> = OnceLock::new();
+    static BOLD: OnceLock<regex::Regex> = OnceLock::new();
+    static ITALIC: OnceLock<regex::Regex> = OnceLock::new();
+    static BR: OnceLock<regex::Regex> = OnceLock::new();
+    static BLOCK_END: OnceLock<regex::Regex> = OnceLock::new();
+    static TAG: OnceLock<regex::Regex> = OnceLock::new();
+    static BLANKS: OnceLock<regex::Regex> = OnceLock::new();
+
+    let s = html.replace("\r\n", "\n").replace('\r', "\n");
+
+    let anchor = ANCHOR.get_or_init(|| {
+        regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#)
+            .expect("static anchor regex")
+    });
+    let s = anchor.replace_all(&s, "[$2]($1)").into_owned();
+
+    let bold = BOLD.get_or_init(|| {
+        regex::Regex::new(r"(?is)</?(strong|b)\b[^>]*>").expect("static bold regex")
+    });
+    let s = bold.replace_all(&s, "**").into_owned();
+
+    let italic = ITALIC
+        .get_or_init(|| regex::Regex::new(r"(?is)</?(em|i)\b[^>]*>").expect("static italic regex"));
+    let s = italic.replace_all(&s, "*").into_owned();
+
+    // `<br>` -> Markdown hard break; swallow trailing whitespace so the source's
+    // own newline after the tag does not add a blank line.
+    let br = BR.get_or_init(|| regex::Regex::new(r"(?is)<br\s*/?>[ \t]*\n?").expect("static br regex"));
+    let s = br.replace_all(&s, "  \n").into_owned();
+
+    // Paragraph / div close -> blank line.
+    let block_end =
+        BLOCK_END.get_or_init(|| regex::Regex::new(r"(?is)</(p|div)>").expect("static block regex"));
+    let s = block_end.replace_all(&s, "\n\n").into_owned();
+
+    // Drop every remaining tag.
+    let tag = TAG.get_or_init(|| regex::Regex::new(r"(?is)<[^>]+>").expect("static tag regex"));
+    let s = tag.replace_all(&s, "").into_owned();
+
+    let s = s
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+
+    // Collapse runs of 3+ newlines (a hard break's `  \n` counts as one) down to
+    // a single paragraph break, then trim the ends.
+    let blanks = BLANKS.get_or_init(|| regex::Regex::new(r"\n{3,}").expect("static blanks regex"));
+    blanks.replace_all(&s, "\n\n").trim().to_string()
+}
+
 /// Recursively collect the first text/plain and text/html parts from a parsed email.
 pub fn extract_body_parts(parsed: &mailparse::ParsedMail) -> (Option<String>, Option<String>) {
     if parsed.ctype.mimetype == "text/plain" {
@@ -846,6 +933,43 @@ fn collect_inline_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // looks_like_html / html_to_markdown (signature conversion)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn looks_like_html_detects_tags_and_ignores_plain_markdown() {
+        assert!(looks_like_html("<p>Robin</p>"));
+        assert!(looks_like_html("line<br>next"));
+        assert!(looks_like_html(r#"<a href="mailto:x@y.z">x</a>"#));
+        assert!(!looks_like_html("-- \nRobin\n[x](mailto:x@y.z)"));
+        assert!(!looks_like_html("plain text, no tags"));
+    }
+
+    #[test]
+    fn html_to_markdown_converts_a_rich_signature() {
+        let html = "<p>--<br>\nRobin<br>\nAssistant to Sylvain Hellin<br>\n\
+<a href=\"mailto:robin@example.com\">robin@example.com</a></p>";
+        let md = html_to_markdown(html);
+        // No raw tags survive.
+        assert!(!md.contains('<'), "raw HTML leaked: {md:?}");
+        assert!(!md.contains('>'), "raw HTML leaked: {md:?}");
+        // The link is Markdown, not a bare URL or an <a>.
+        assert!(
+            md.contains("[robin@example.com](mailto:robin@example.com)"),
+            "link not preserved: {md:?}"
+        );
+        // Line structure preserved as Markdown hard breaks (two trailing spaces).
+        assert!(md.contains("--  \nRobin"), "line breaks lost: {md:?}");
+        assert!(md.contains("Assistant to Sylvain Hellin"));
+    }
+
+    #[test]
+    fn html_to_markdown_handles_emphasis_and_entities() {
+        let md = html_to_markdown("<strong>Jane &amp; Co</strong><br><em>Team</em>");
+        assert_eq!(md, "**Jane & Co**  \n*Team*");
+    }
 
     // -----------------------------------------------------------------------
     // compress_uid_set

@@ -1,5 +1,6 @@
 ---
 source: src/send.rs
+assertion_line: 343
 expression: html
 ---
 <!DOCTYPE html>
@@ -14,10 +15,12 @@ blockquote { margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; w
 </style>
 </head>
 <body>
+<div style="font-family: Helvetica, Arial, sans-serif; font-size: 12pt; line-height: 1.6; color: #000;">
 <p>My reply</p>
 <p>-- Best, Alice</p>
 <div style="padding-top:1em">
 <p>Original HTML content</p>
+</div>
 </div>
 </body>
 </html>
