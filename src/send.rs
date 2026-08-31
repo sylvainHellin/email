@@ -218,6 +218,12 @@ pub fn markdown_to_html(
     // Gmail and Outlook strip <style> blocks, so without the inline copy the
     // body would fall back to the client default while any inline-styled
     // fragment (a pasted quote) kept its own size.
+    //
+    // The inline copy lands in a double-quoted `style="..."` attribute, so any
+    // literal double quote in the font stack (e.g. `"Times New Roman", serif`)
+    // would prematurely close the attribute. Escape it to `&quot;` for that
+    // context; the <style> block is not an attribute and takes the value raw.
+    let font_family_attr = config.font_family.replace('"', "&quot;");
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -231,12 +237,13 @@ blockquote {{ margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; 
 </style>
 </head>
 <body>
-<div style="font-family: {font_family}; font-size: {font_size}; line-height: 1.6; color: #000;">
+<div style="font-family: {font_family_attr}; font-size: {font_size}; line-height: 1.6; color: #000;">
 {body}
 </div>
 </body>
 </html>"#,
         font_family = config.font_family,
+        font_family_attr = font_family_attr,
         font_size = config.font_size,
         body = body,
     )
@@ -374,6 +381,25 @@ mod tests {
         let html = markdown_to_html("Hello", &settings, None, None);
         assert!(html.contains("Georgia, serif"));
         assert!(html.contains("14px"));
+    }
+
+    #[test]
+    fn test_markdown_to_html_quoted_font_name_escapes_attribute() {
+        let settings = EmailSettings {
+            font_family: "\"Times New Roman\", serif".to_string(),
+            font_size: "12px".to_string(),
+            include_signature: true,
+            send_hold_secs: 20,
+        };
+        let html = markdown_to_html("Hello", &settings, None, None);
+        // The inline wrapper's style attribute must not be broken by the raw
+        // double quotes in the font name; they are escaped to &quot;.
+        assert!(
+            html.contains("font-family: &quot;Times New Roman&quot;, serif;"),
+            "attribute not escaped: {html}"
+        );
+        // The raw form survives in the <style> block (not an attribute context).
+        assert!(html.contains("font-family: \"Times New Roman\", serif;"));
     }
 
     // -----------------------------------------------------------------------

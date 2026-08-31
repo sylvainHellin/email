@@ -112,6 +112,8 @@ pub fn html_to_markdown(html: &str) -> String {
     static ITALIC: OnceLock<regex::Regex> = OnceLock::new();
     static BR: OnceLock<regex::Regex> = OnceLock::new();
     static BLOCK_END: OnceLock<regex::Regex> = OnceLock::new();
+    static IMG: OnceLock<regex::Regex> = OnceLock::new();
+    static IMG_ALT: OnceLock<regex::Regex> = OnceLock::new();
     static TAG: OnceLock<regex::Regex> = OnceLock::new();
     static BLANKS: OnceLock<regex::Regex> = OnceLock::new();
 
@@ -141,6 +143,25 @@ pub fn html_to_markdown(html: &str) -> String {
     let block_end =
         BLOCK_END.get_or_init(|| regex::Regex::new(r"(?is)</(p|div)>").expect("static block regex"));
     let s = block_end.replace_all(&s, "\n\n").into_owned();
+
+    // `<img src="...">` -> Markdown image so logos survive the tag strip.
+    let img = IMG.get_or_init(|| {
+        regex::Regex::new(r#"(?is)<img\b[^>]*?src\s*=\s*["']([^"']*)["'][^>]*/?>"#)
+            .expect("static img regex")
+    });
+    let img_alt = IMG_ALT.get_or_init(|| {
+        regex::Regex::new(r#"(?is)\balt\s*=\s*["']([^"']*)["']"#).expect("static img alt regex")
+    });
+    let s = img
+        .replace_all(&s, |caps: &regex::Captures| {
+            let src = &caps[1];
+            let alt = img_alt
+                .captures(&caps[0])
+                .map(|a| a[1].to_string())
+                .unwrap_or_default();
+            format!("![{alt}]({src})")
+        })
+        .into_owned();
 
     // Drop every remaining tag.
     let tag = TAG.get_or_init(|| regex::Regex::new(r"(?is)<[^>]+>").expect("static tag regex"));
@@ -969,6 +990,24 @@ mod tests {
     fn html_to_markdown_handles_emphasis_and_entities() {
         let md = html_to_markdown("<strong>Jane &amp; Co</strong><br><em>Team</em>");
         assert_eq!(md, "**Jane & Co**  \n*Team*");
+    }
+
+    #[test]
+    fn html_to_markdown_keeps_image_logos() {
+        let html = "<p>Robin<br>\n\
+<img src=\"https://cdn.example.com/logo.png\" alt=\"Acme logo\"></p>";
+        let md = html_to_markdown(html);
+        assert!(!md.contains('<'), "raw HTML leaked: {md:?}");
+        assert!(
+            md.contains("![Acme logo](https://cdn.example.com/logo.png)"),
+            "image dropped: {md:?}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_image_without_alt_uses_empty_alt() {
+        let md = html_to_markdown("<img src=\"https://example.com/x.png\">");
+        assert_eq!(md, "![](https://example.com/x.png)");
     }
 
     // -----------------------------------------------------------------------
