@@ -648,6 +648,16 @@ pub static KEYMAP: &[KeyBinding] = &[
     // `ta` attach-file, Drafts only (the thread/attachment family's list tail,
     // #0098): prompts for a path and appends it to the draft's `attachments:`.
     pg("ta", Chord::Char('a'), 't', KeyCtx::List, Guard::DraftsOnly, KeyAction::AttachFile, "Attach file to draft (Drafts only)", false),
+    // The draft-status trio, restored to the compose family after #0092
+    // dropped the flat `A`/`D`/`X` keys. Uppercase continuations so they stay
+    // clear of the lowercase compose surface (`cn`/`cr`/`ca`/`cf`/`ce`) and
+    // still echo the letters they had before the redesign. All three are
+    // List + DraftsOnly: they act on the cursor draft (or, when a selection is
+    // live, on the batch, via the confirm dialog in `keys.rs`), so they are
+    // meaningless without the Drafts list focused.
+    pg("cA", Chord::Char('A'), 'c', KeyCtx::List, Guard::DraftsOnly, KeyAction::Approve, "Approve draft (Drafts only)", false),
+    pg("cD", Chord::Char('D'), 'c', KeyCtx::List, Guard::DraftsOnly, KeyAction::MarkDraft, "Unapprove, back to draft (Drafts only)", false),
+    pg("cX", Chord::Char('X'), 'c', KeyCtx::List, Guard::DraftsOnly, KeyAction::SendAll, "Send all approved drafts (Drafts only)", false),
     // `fF` flagged-only filter (the find family's list-scoped tail). No
     // NonEmptyList guard: the filter can empty the list and must be able to
     // undo that.

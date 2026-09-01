@@ -411,11 +411,19 @@ pub(super) fn readonly_view_for_row(app: &mut App, row_id: i64) -> Option<PathBu
 /// draft that fails validation keeps its `draft` status instead of carrying an
 /// approved flag from a send that never happened. `mark_as_approved` is
 /// idempotent, so a draft approved out of band passes through unchanged.
+///
+/// The draft is re-parsed after the approval write, and that is load-bearing:
+/// `mark_as_approved` rewrites `status:` in the file, not in the struct this
+/// function already parsed. Returning the pre-approval value handed
+/// [`Action::Send`] a copy still reading `status: draft`, which
+/// [`crate::send::build_draft_message`] then refused with "Email not approved
+/// for sending" even though the file on disk was approved -- the `x`
+/// approve-and-send key could never send an unapproved draft.
 fn validate_then_approve(path: &Path) -> Result<crate::types::EmailDraft> {
     let draft = crate::draft::parse_email_draft(path)?;
     crate::draft::validate_draft(&draft)?;
     crate::draft::mark_as_approved(path)?;
-    Ok(draft)
+    crate::draft::parse_email_draft(path)
 }
 
 /// Hand the read-only view of a stored row to `$EDITOR` and discard it on the
@@ -3681,6 +3689,43 @@ mod store_backed_mutations {
         std::fs::write(&path, &text).unwrap();
         validate_then_approve(&path).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("status: approved"));
+    }
+
+    /// Regression: `validate_then_approve` must hand back the *approved*
+    /// draft, not the copy it parsed before the approval write.
+    ///
+    /// `mark_as_approved` rewrites `status:` in the file only, so returning
+    /// the pre-approval struct gave [`Action::Send`] a value still reading
+    /// `status: draft`; `build_draft_message` reads that in-memory status and
+    /// refused every `x` approve-and-send with "Email not approved for
+    /// sending. Current status: draft", even though the file on disk was
+    /// approved. The two assertions are the two halves of that bug: the
+    /// returned status, and the send actually reaching the outbox.
+    #[test]
+    fn approve_and_send_returns_the_approved_draft_and_reaches_the_outbox() {
+        let fx = Fixture::new();
+        let (path, _selector, _id) = a_draft(&fx);
+
+        let draft = validate_then_approve(&path).unwrap();
+        assert_eq!(
+            draft.frontmatter.status,
+            crate::types::EmailStatus::Approved,
+            "the returned draft must carry the approval that was just written"
+        );
+
+        // The transport is dead, so the send fails at submission -- but it
+        // fails *after* the outbox commit, which is only reachable once
+        // `build_draft_message` accepts the status. A refusal would leave the
+        // outbox empty (see the unapproved-draft test above).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent = rt
+            .block_on(crate::send::send_draft(&draft, &dead_smtp_ctx()))
+            .unwrap();
+        assert!(
+            sent.report.row_id.is_some(),
+            "an approved draft must reach the outbox instead of being refused"
+        );
+        assert_eq!(outbox_counts(&fx).total(), 1);
     }
 
     /// The approved-status requirement is `mp send`'s, and it lives in

@@ -68,6 +68,9 @@
       { "key": "Ctrl+a", "action": "Select all visible" },
       { "key": "ce", "action": "Edit recipients (Drafts only)" },
       { "key": "ta", "action": "Attach file to draft (Drafts only)" },
+      { "key": "cA", "action": "Approve draft (Drafts only)" },
+      { "key": "cD", "action": "Unapprove, back to draft (Drafts only)" },
+      { "key": "cX", "action": "Send all approved drafts (Drafts only)" },
       { "key": "fF", "action": "Show flagged only (toggle)" }
     ]
   },
