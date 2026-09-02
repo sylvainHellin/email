@@ -9,8 +9,8 @@ mod watch;
 
 pub use batch::{add_flag_in_mailboxes, batch_delete_on_server, batch_move_on_server};
 pub use fetch::{
-    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, search_on_session,
-    vanished_uids,
+    fetch_emails, fetch_emails_on_session, fetch_new_raw_on_session, fetch_raw_by_message_id,
+    search_on_session, vanished_uids,
 };
 pub use ops::{
     add_flag_on_server, delete_email_on_server, mark_read_on_server, mark_unread_on_server,

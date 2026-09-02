@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{
-    mailbox_key, Action, App, BgResult, ComposeField, ComposeMode, ComposeWizard, Focus,
-    HeldSend, MailboxKind, MessageRef, Overlay, StatusLevel, View,
+    entry_from_row, mailbox_key, status_for_mailbox, Action, App, BgResult, ComposeField,
+    ComposeMode, ComposeWizard, Focus, HeldSend, MailboxKind, MessageRef, Overlay,
+    SearchOverlayFocus, SearchResultEntry, StatusLevel, View,
 };
 use super::helpers::{
     edit_file, lib_do_multi_search_graph, lib_do_sync_graph, resume_terminal, suspend_terminal,
@@ -1879,12 +1880,49 @@ pub(super) fn handle_action(
             }
         }
 
-        Action::ServerSearch { query, targets } => {
+        Action::ServerSearch { query, targets, local_mailbox } => {
             // The account name travels with the search so each hit can be
             // resolved against that account's store (#0038).
             let account = app.account_config.name.clone();
+            let generation = app.server_search_generation;
+
+            // Local-first pass (#0105): the FTS index answers in milliseconds,
+            // so its hits render before the server round trip starts. A query
+            // the local grammar cannot lower (to:/cc:/filename:, mixed OR
+            // groups) skips the pass silently; the server covers those terms.
+            app.server_search_results.clear();
+            app.server_search_index = 0;
+            app.server_search_scroll = 0;
+            app.server_search_headers_scroll = 0;
+            if let Some(store) = open_store(&account) {
+                if let Ok(hits) = crate::store::search::search_ast(
+                    &store,
+                    &account,
+                    &query,
+                    local_mailbox.as_deref(),
+                    50,
+                ) {
+                    let blobs = BlobStore::for_account(&account);
+                    app.server_search_results = hits
+                        .into_iter()
+                        .map(|hit| local_search_result(&store, &blobs, hit.row))
+                        .collect();
+                }
+            }
+            let local_count = app.server_search_results.len();
+            app.server_search_status = Some(if local_count > 0 {
+                format!(
+                    "{local_count} local hit{}; searching server...",
+                    if local_count == 1 { "" } else { "s" }
+                )
+            } else {
+                "Searching server...".to_string()
+            });
+            if local_count > 0 {
+                app.server_search_focus = SearchOverlayFocus::List;
+            }
+
             app.server_search_loading = true;
-            app.server_search_status = Some("Searching...".to_string());
             app.bg_count += 1;
             let tx = bg_tx.clone();
 
@@ -1900,6 +1938,7 @@ pub(super) fn handle_action(
                         &targets,
                     ));
                     let _ = tx.send(BgResult::ServerSearch {
+                        generation,
                         result: result.map_err(|e| e.to_string()),
                     });
                 });
@@ -1927,6 +1966,7 @@ pub(super) fn handle_action(
                         &targets,
                     ));
                     let _ = tx.send(BgResult::ServerSearch {
+                        generation,
                         result: result.map_err(|e| e.to_string()),
                     });
                 });
@@ -1934,11 +1974,17 @@ pub(super) fn handle_action(
         }
 
         Action::SearchResultOpen
+        | Action::SearchResultJump
+        | Action::SearchResultYankPath
         | Action::SearchResultReply(_)
         | Action::SearchResultForward
         | Action::SearchResultArchive
         | Action::SearchResultOpenInBrowser => {
             handle_search_result_action(app, terminal, action)?;
+        }
+
+        Action::SearchResultFetch => {
+            fetch_search_hit(app, bg_tx);
         }
 
         Action::Sync => {
@@ -2595,14 +2641,72 @@ fn handle_search_result_action(
                 return Ok(());
             };
             let Some(msg) = hit.entry.msg else {
-                app.set_status_level(
-                    "Open in $EDITOR needs a stored message; this hit is not in the local store"
-                        .to_string(),
-                    StatusLevel::Warning,
+                // The overlay covers the status bar, so the decline goes to
+                // the overlay's own footer line (#0104).
+                app.server_search_status = Some(
+                    "Not in the local store; press f to fetch it first".to_string(),
                 );
                 return Ok(());
             };
             open_readonly_view(app, terminal, msg.row_id())?;
+        }
+
+        Action::SearchResultJump => {
+            // Close the overlay and put the list cursor on the hit, the way
+            // Apple Mail / Outlook open a search result (#0104).
+            let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+                return Ok(());
+            };
+            let Some(msg) = hit.entry.msg else {
+                app.server_search_status = Some(
+                    "Not in the local store; press f to fetch it first".to_string(),
+                );
+                return Ok(());
+            };
+            let mailbox = {
+                let Some((store, _blobs)) = store_for_mutation(app, "Open") else {
+                    return Ok(());
+                };
+                match crate::store::read::find_by_id(&store, msg.row_id()) {
+                    Ok(Some(row)) => row.mailbox,
+                    Ok(None) => {
+                        app.server_search_status =
+                            Some("That message is no longer in the store".to_string());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        app.server_search_status = Some(format!("Open failed: {e:#}"));
+                        return Ok(());
+                    }
+                }
+            };
+            app.close_overlay();
+            app.open_message(msg, &mailbox);
+        }
+
+        Action::SearchResultYankPath => {
+            // Materialise the read-only Markdown rendition and copy its path
+            // (#0104): the store keeps no per-message .md file, this scratch
+            // rendition is the file-shaped answer.
+            let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+                return Ok(());
+            };
+            let Some(msg) = hit.entry.msg else {
+                app.server_search_status = Some(
+                    "Not in the local store; press f to fetch it first".to_string(),
+                );
+                return Ok(());
+            };
+            let Some(path) = readonly_view_for_row(app, msg.row_id()) else {
+                app.server_search_status =
+                    Some("Yank failed; see the activity log".to_string());
+                return Ok(());
+            };
+            let shown = path.display().to_string();
+            app.server_search_status = match super::helpers::copy_to_clipboard(&shown) {
+                Ok(()) => Some(format!("Copied {shown}")),
+                Err(e) => Some(format!("Copy failed: {e:#}")),
+            };
         }
 
         Action::SearchResultOpenInBrowser => {
@@ -2648,9 +2752,8 @@ fn handle_search_result_action(
                 .get(app.server_search_index)
                 .and_then(|r| r.entry.msg);
             let Some(msg) = hit else {
-                app.set_status_level(
-                    "Not in the local store yet: sync (F) before archiving this hit".to_string(),
-                    StatusLevel::Error,
+                app.server_search_status = Some(
+                    "Not in the local store; press f to fetch it first".to_string(),
                 );
                 return Ok(());
             };
@@ -2713,6 +2816,152 @@ fn search_result_draft(
         return Ok(());
     };
     write_draft_and_edit(app, terminal, &source, kind, what)
+}
+
+/// One local FTS hit as a search-overlay row (#0105).
+///
+/// The overlay renders a hit's body from its `fetched` payload, so the row's
+/// body blob is loaded here; the entry itself is the same shape the mailbox
+/// list builds, and `source_label` is the mailbox key so the All-scope column
+/// says where the row lives.
+fn local_search_result(
+    store: &crate::store::Store,
+    blobs: &BlobStore,
+    row: crate::store::read::MessageRow,
+) -> SearchResultEntry {
+    let body_text = crate::store::read::load_body(store, blobs, row.id).unwrap_or_default();
+    let fetched = crate::parse::FetchedEmail {
+        from: row.from.clone().unwrap_or_default(),
+        to: row.to.clone().unwrap_or_default(),
+        cc: row.cc.clone(),
+        reply_to: row.reply_to.clone(),
+        bcc: row.bcc.clone(),
+        subject: row.subject.clone().unwrap_or_default(),
+        date: row.date_display.clone().unwrap_or_default(),
+        body_text,
+        html_body: None,
+        has_attachments: row.has_attachments,
+        message_id: Some(row.message_id.clone()),
+        attachments: Vec::new(),
+        flags: row.flags(),
+        calendar_ics: None,
+        event: None,
+    };
+    let source_label = row.mailbox.clone();
+    let status = status_for_mailbox(&row.mailbox);
+    let entry = entry_from_row(row, &status);
+    SearchResultEntry {
+        entry,
+        fetched,
+        source_label,
+    }
+}
+
+/// Ingest one server-only search hit into the store (#0104), returning the
+/// row that now holds it.
+fn ingest_search_hit(
+    account: &str,
+    mailbox: &str,
+    uid: i64,
+    email: &crate::parse::FetchedEmail,
+    raw: Option<&[u8]>,
+) -> anyhow::Result<i64> {
+    let store = open_store(account)
+        .ok_or_else(|| anyhow::anyhow!("no store for {account} yet (sync first)"))?;
+    let blobs = BlobStore::for_account(account);
+    let outcome = crate::ingest::ingest_message(
+        &store,
+        &blobs,
+        &crate::ingest::IngestInput {
+            account,
+            mailbox,
+            uid,
+            email,
+            raw,
+        },
+    )?;
+    Ok(outcome.row_id)
+}
+
+/// The `f` key of the search overlay (#0104): ingest a server-only hit.
+///
+/// Graph already fetched the full payload and its backend ingests under the
+/// synthetic uid derived from the Message-ID, so that path is a local write.
+/// IMAP needs the UID the mailbox holds the message under (a made-up uid
+/// would be pruned or duplicated by the next sync), so a background round
+/// trip asks for it by Message-ID and ingests with the raw bytes it fetched.
+fn fetch_search_hit(app: &mut App, bg_tx: &mpsc::Sender<BgResult>) {
+    let Some(hit) = app.server_search_results.get(app.server_search_index) else {
+        return;
+    };
+    if hit.entry.msg.is_some() {
+        app.server_search_status = Some("Already in the local store".to_string());
+        return;
+    }
+    let Some(message_id) = hit.fetched.message_id.clone() else {
+        app.server_search_status =
+            Some("This hit carries no Message-ID; cannot fetch it".to_string());
+        return;
+    };
+    // The mailbox the hit came from, spelled both ways: the local key ingest
+    // records rows under, and the server name the IMAP round trip selects.
+    let source_label = hit.source_label.clone();
+    let fetched = hit.fetched.clone();
+    let Some((local_key, server_name)) = app
+        .mailboxes
+        .iter()
+        .find(|m| m.label == source_label)
+        .map(|m| (mailbox_key(m), m.server_name.clone()))
+    else {
+        app.server_search_status = Some(format!(
+            "Cannot fetch: mailbox {source_label} is not in the sidebar"
+        ));
+        return;
+    };
+    let account = app.account_config.name.clone();
+    let generation = app.server_search_generation;
+
+    if app.is_graph() {
+        let uid = crate::ingest::graph_uid(&message_id);
+        let result = ingest_search_hit(&account, &local_key, uid, &fetched, None)
+            .map_err(|e| format!("{e:#}"));
+        super::bg::apply_search_hit_fetch(app, &message_id, result);
+        return;
+    }
+
+    let Some(server_name) = server_name else {
+        app.server_search_status =
+            Some(format!("Cannot fetch: {source_label} has no server mailbox"));
+        return;
+    };
+    let Some(imap_config) = app.imap_config.clone() else {
+        app.server_search_status = Some("IMAP not configured".to_string());
+        return;
+    };
+    app.server_search_status = Some("Fetching...".to_string());
+    app.bg_count += 1;
+    let tx = bg_tx.clone();
+    std::thread::spawn(move || {
+        let rt = super::runtime::shared();
+        let result = rt.block_on(async {
+            let mut session = crate::imap_client::open_imap_session(&imap_config).await?;
+            let fetched = crate::imap_client::fetch_raw_by_message_id(
+                &mut session,
+                &server_name,
+                &message_id,
+            )
+            .await;
+            session.logout().await.ok();
+            let (uid, raw, email) = fetched?
+                .ok_or_else(|| anyhow::anyhow!("the server no longer has that message"))?;
+            ingest_search_hit(&account, &local_key, uid as i64, &email, Some(&raw))
+        });
+        let _ = tx.send(BgResult::SearchHitFetched {
+            generation,
+            message_id,
+            result: result.map_err(|e| format!("{e:#}")),
+        });
+    });
 }
 
 /// Archive one or many messages: the store rows move into the archive mailbox

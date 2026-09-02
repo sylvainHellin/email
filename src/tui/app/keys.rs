@@ -1071,8 +1071,20 @@ impl App {
             }
         };
 
+        // Scope for the immediate local FTS pass (#0105): the same mailbox the
+        // server targets cover, spelled as the `messages.mailbox` key.
+        let local_mailbox = if let Some(ref name) = query.in_mailbox {
+            self.local_mailbox_key_by_name(name)
+        } else {
+            match self.search_form.scope.0 {
+                SearchScope::CurrentMailbox => self.current_local_mailbox_key(),
+                SearchScope::CurrentAccount => None,
+            }
+        };
+
         self.server_search_scope_label = scope_label;
-        self.push_action(Action::ServerSearch { query, targets });
+        self.server_search_generation = self.server_search_generation.wrapping_add(1);
+        self.push_action(Action::ServerSearch { query, targets, local_mailbox });
     }
 
     fn handle_search_overlay_list_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -1097,6 +1109,9 @@ impl App {
                     self.server_search_scroll = 0;
                     self.server_search_headers_scroll = 0;
                 }
+                // Navigating means the result-count / decline message has been
+                // seen; clearing it uncovers the list-key hints (#0104).
+                self.server_search_status = None;
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.server_search_index > 0 {
@@ -1104,6 +1119,7 @@ impl App {
                     self.server_search_scroll = 0;
                     self.server_search_headers_scroll = 0;
                 }
+                self.server_search_status = None;
             }
             KeyCode::Char('g') => {
                 if self.pending_prefix == Some('g') {
@@ -1128,8 +1144,17 @@ impl App {
             KeyCode::Char('u') => {
                 self.server_search_scroll = self.server_search_scroll.saturating_sub(10);
             }
-            KeyCode::Enter | KeyCode::Char('e') => {
+            KeyCode::Enter => {
+                self.push_action(Action::SearchResultJump);
+            }
+            KeyCode::Char('e') => {
                 self.push_action(Action::SearchResultOpen);
+            }
+            KeyCode::Char('y') => {
+                self.push_action(Action::SearchResultYankPath);
+            }
+            KeyCode::Char('f') => {
+                self.push_action(Action::SearchResultFetch);
             }
             KeyCode::Char('r') => {
                 self.push_action(Action::SearchResultReply(false));

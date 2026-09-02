@@ -371,7 +371,7 @@ pub fn mailbox_key(mb: &MailboxInfo) -> String {
 /// placement states this returns, and the `kind_to_status` copy that mapped a
 /// `MailboxKind` to the same four strings is gone with the write-only search
 /// fields that were its only reader (#0064).
-fn status_for_mailbox(mailbox: &str) -> String {
+pub(crate) fn status_for_mailbox(mailbox: &str) -> String {
     if mailbox == crate::selector::DRAFTS_MAILBOX {
         return "draft".to_string();
     }
@@ -393,7 +393,7 @@ fn status_for_mailbox(mailbox: &str) -> String {
 /// `is_invite` comes off the listing query, so the badge costs no blob read;
 /// the event card behind it is parsed lazily from the ics blob of the one row
 /// the preview shows (#0038 scope item 6, [`PreviewInvite`]).
-fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
+pub(crate) fn entry_from_row(row: MessageRow, status: &str) -> EmailEntry {
     let (date_display, date_sort) = resolve_date(&row.date_display, &None, Path::new(""));
     let flags = row.flags();
     EmailEntry {
@@ -917,7 +917,20 @@ pub enum BgResult {
     // retires it at the sync/fetch resume point, surfacing failures through
     // the sync result rather than a dedicated BgResult.
     ServerSearch {
+        /// Matched against `App::server_search_generation`: a result from a
+        /// search the user has since re-submitted is stale and dropped, which
+        /// matters now that server hits merge into the local-first list
+        /// (#0105) instead of replacing it wholesale.
+        generation: u64,
         result: Result<Vec<SearchHit>, String>,
+    },
+    /// A server-only search hit was fetched and ingested into the store
+    /// (#0104). `message_id` names the hit (indices shift when another hit is
+    /// archived mid-flight); the result carries the new `messages.id` row.
+    SearchHitFetched {
+        generation: u64,
+        message_id: String,
+        result: Result<i64, String>,
     },
     /// A background `load_emails` query for one mailbox has
     /// finished (P1 step 2: the load blocks for seconds on large
@@ -1607,8 +1620,17 @@ pub enum Action {
         /// so the lowering path renders it without re-parsing (#0086b).
         query: crate::search::Query,
         targets: Vec<SearchTarget>,
+        /// Scope for the immediate local FTS pass (#0105): a `messages.mailbox`
+        /// key to restrict to, or `None` for the whole account.
+        local_mailbox: Option<String>,
     },
     SearchResultOpen,
+    /// Close the overlay and put the list cursor on the hit (#0104).
+    SearchResultJump,
+    /// Copy the path of the hit's read-only Markdown rendition (#0104).
+    SearchResultYankPath,
+    /// Ingest a server-only hit into the local store (#0104).
+    SearchResultFetch,
     SearchResultReply(bool),
     SearchResultForward,
     SearchResultArchive,

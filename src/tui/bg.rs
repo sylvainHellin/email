@@ -1,5 +1,5 @@
 use super::app::{
-    App, BgResult, MailboxKind, SearchOverlayFocus, SearchResultEntry,
+    App, BgResult, MailboxKind, MessageRef, SearchOverlayFocus, SearchResultEntry,
     StatusLevel,
 };
 
@@ -278,20 +278,56 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             }
         }
 
-        BgResult::ServerSearch { result } => {
+        BgResult::ServerSearch { generation, result } => {
+            // A result from a search the user has since re-submitted must not
+            // merge into the newer search's list (#0105).
+            if generation != app.server_search_generation {
+                return;
+            }
             app.server_search_loading = false;
             match result {
                 Ok(hits) => {
-                    let count = hits.len();
-                    app.server_search_results = hits
-                        .into_iter()
-                        .map(|hit| SearchResultEntry {
+                    // Merge into the local-first list (#0105): a server hit
+                    // whose Message-ID a local row already answered is
+                    // dropped, the rest append, and the cursor stays on the
+                    // entry it was on.
+                    let selected_id = app
+                        .server_search_results
+                        .get(app.server_search_index)
+                        .and_then(|r| r.fetched.message_id.clone());
+                    let known: std::collections::HashSet<String> = app
+                        .server_search_results
+                        .iter()
+                        .filter_map(|r| {
+                            r.fetched
+                                .message_id
+                                .as_deref()
+                                .map(crate::store::read::normalize_message_id_key)
+                        })
+                        .collect();
+                    for hit in hits {
+                        let dup = hit.fetched.message_id.as_deref().is_some_and(|m| {
+                            known.contains(&crate::store::read::normalize_message_id_key(m))
+                        });
+                        if dup {
+                            continue;
+                        }
+                        app.server_search_results.push(SearchResultEntry {
                             entry: hit.entry,
                             fetched: hit.fetched,
                             source_label: hit.source_label,
+                        });
+                    }
+                    app.server_search_results
+                        .sort_by(|a, b| b.entry.date_sort.cmp(&a.entry.date_sort));
+                    let count = app.server_search_results.len();
+                    app.server_search_index = selected_id
+                        .and_then(|id| {
+                            app.server_search_results.iter().position(|r| {
+                                r.fetched.message_id.as_deref() == Some(id.as_str())
+                            })
                         })
-                        .collect();
-                    app.server_search_index = 0;
+                        .unwrap_or(0);
                     app.server_search_scroll = 0;
                     app.server_search_headers_scroll = 0;
                     app.server_search_status = Some(format!(
@@ -307,6 +343,17 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
                     app.server_search_status = Some(format!("Error: {}", e));
                 }
             }
+        }
+
+        BgResult::SearchHitFetched {
+            generation,
+            message_id,
+            result,
+        } => {
+            if generation != app.server_search_generation {
+                return;
+            }
+            apply_search_hit_fetch(app, &message_id, result);
         }
 
         BgResult::AccountOpened { account_index, counts, outbox } => {
@@ -342,6 +389,36 @@ pub(super) fn handle_bg_result(app: &mut App, result: BgResult) {
             if is_remote {
                 app.push_action(super::app::Action::FetchAccount(account_index));
             }
+        }
+    }
+}
+
+/// Land a fetch-into-store result on the overlay (#0104): the hit named by
+/// its Message-ID becomes a resolved row, and the mailbox lists pick the new
+/// row up. Shared by the Graph inline path (`actions::fetch_search_hit`) and
+/// the IMAP round trip's [`BgResult::SearchHitFetched`].
+pub(super) fn apply_search_hit_fetch(
+    app: &mut App,
+    message_id: &str,
+    result: Result<i64, String>,
+) {
+    match result {
+        Ok(row_id) => {
+            if let Some(hit) = app
+                .server_search_results
+                .iter_mut()
+                .find(|r| r.fetched.message_id.as_deref() == Some(message_id))
+            {
+                hit.entry.msg = Some(MessageRef::new(row_id));
+            }
+            app.server_search_status = Some("Fetched into the local store".to_string());
+            // The new row must show up in its mailbox's list and count.
+            app.invalidate_all_caches();
+            app.recount_all_mailboxes();
+            app.reload_current_mailbox();
+        }
+        Err(e) => {
+            app.server_search_status = Some(format!("Fetch failed: {e}"));
         }
     }
 }

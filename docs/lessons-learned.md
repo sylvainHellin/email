@@ -1022,3 +1022,15 @@ keeps its own size, which is what made the signature look larger than the body.
 The signature is Markdown end to end now: `config::resolve_signature_markdown`
 is the single conversion point (`looks_like_html` sniff, then convert), so the
 send path never injects pre-styled signature HTML and can no longer double it.
+
+## Overlay-covered status lines (2026-08-20, #0104)
+
+`App::set_status_level` writes to the bottom status bar, but every modal
+overlay (`render_overlays`) clears and repaints the whole frame, so a status
+set while an overlay is open is invisible until the overlay closes. This is
+why the search overlay's declined actions looked like "nothing happened":
+the decline text went to a bar the overlay was covering. An overlay that
+declines or reports must speak through its own chrome (the search overlay
+uses `server_search_status`, rendered in its footer line); reserve
+`set_status_level` for results the user sees after the overlay is gone
+(editor round trips, drafts, sends).

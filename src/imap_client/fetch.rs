@@ -115,6 +115,62 @@ pub async fn search_on_session(
     Ok(emails)
 }
 
+/// Fetch one message's raw RFC822 bytes by Message-ID (#0104).
+///
+/// The search overlay's fetch-into-store action needs the UID the mailbox
+/// holds the message under, which the plain search path discards, and the raw
+/// bytes ingest wants for the `raw` blob and the threading headers. The
+/// server's `HEADER "Message-ID"` match is a substring match, so the hits are
+/// filtered to an exact one, the same guarantee [`search_on_session`] gives.
+pub async fn fetch_raw_by_message_id(
+    session: &mut ImapSession,
+    mailbox: &str,
+    message_id: &str,
+) -> Result<Option<(u32, Vec<u8>, FetchedEmail)>> {
+    session
+        .select(mailbox)
+        .await
+        .map_err(|e| anyhow!("Failed to select mailbox '{}': {}", mailbox, e))?;
+
+    let criteria = FetchCriteria {
+        message_id: Some(message_id.to_string()),
+        ..Default::default()
+    };
+    let query = build_imap_search_query(&criteria);
+    let uids = session
+        .uid_search(&query)
+        .await
+        .map_err(|e| anyhow!("IMAP search failed: {}", e))?;
+
+    let wanted = super::search::normalize_message_id(message_id).to_string();
+    let mut uid_list: Vec<u32> = uids.into_iter().collect();
+    uid_list.sort_unstable();
+    for uid in uid_list {
+        let fetched: Vec<_> = session
+            .uid_fetch(&uid.to_string(), "(BODY.PEEK[] FLAGS)")
+            .await
+            .map_err(|e| anyhow!("Failed to fetch email: {}", e))?
+            .try_collect()
+            .await
+            .map_err(|e| anyhow!("Failed to collect email: {}", e))?;
+        for msg in fetched.iter() {
+            let body_raw = msg.body().unwrap_or_default();
+            let Some(mut email) = parse_rfc822_to_fetched_email(body_raw) else {
+                continue;
+            };
+            let exact = email.message_id.as_deref().is_some_and(|m| {
+                super::search::normalize_message_id(m).eq_ignore_ascii_case(&wanted)
+            });
+            if !exact {
+                continue;
+            }
+            email.flags = flags_of(msg);
+            return Ok(Some((uid, body_raw.to_vec(), email)));
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch emails from an IMAP server. Opens and closes its own session.
 pub async fn fetch_emails(
     imap_config: &ImapConfig,

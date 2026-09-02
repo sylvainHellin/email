@@ -3,7 +3,7 @@ id: 0104
 title: Search overlay results are a dead end
 type: bug
 priority: now
-status: open
+status: done
 created: 2026-08-20
 ---
 

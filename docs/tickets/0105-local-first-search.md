@@ -3,7 +3,7 @@ id: 0105
 title: Local-first search with background server merge
 type: feature
 priority: now
-status: open
+status: done
 created: 2026-08-20
 ---
 

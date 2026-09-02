@@ -10,9 +10,6 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). Tickets #0087 to #0100 all shipped in 0.9.0 and after; #0101 is the only survivor, parked under Later.
 
-- [#0104 Search overlay results are a dead end](docs/tickets/0104-search-results-dead-end.md) -- bug _(reported 2026-08-20; footer hints, yank path, fetch server-only hit, jump to list)_
-- [#0105 Local-first search with background server merge](docs/tickets/0105-local-first-search.md) -- feature _(Apple Mail UX: local FTS hits immediately, spinner while the server pass runs, merge on arrival)_
-
 
 ## Next
 

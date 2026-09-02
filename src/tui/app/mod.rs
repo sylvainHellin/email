@@ -207,6 +207,10 @@ pub struct App {
     pub server_search_loading: bool,
     pub server_search_status: Option<String>,
     pub server_search_scope_label: String,
+    /// Bumped on every submit; a `BgResult::ServerSearch` or
+    /// `BgResult::SearchHitFetched` carrying an older value is stale and
+    /// dropped (#0105).
+    pub server_search_generation: u64,
 
     // Config (loaded once at startup)
     pub global_config: crate::config::GlobalConfig,
@@ -304,6 +308,7 @@ impl App {
             server_search_loading: false,
             server_search_status: None,
             server_search_scope_label: "All".to_string(),
+            server_search_generation: 0,
             global_config,
         };
 
@@ -400,6 +405,7 @@ impl App {
             server_search_loading: false,
             server_search_status: None,
             server_search_scope_label: "All".to_string(),
+            server_search_generation: 0,
             global_config: crate::config::GlobalConfig::default(),
         }
     }
@@ -855,6 +861,27 @@ impl App {
             .iter()
             .position(|acct| lower.contains(&acct.account_config.default_from.to_lowercase()))
             .unwrap_or(self.active_account)
+    }
+
+    /// The `messages.mailbox` key of the focused mailbox, for scoping the
+    /// local FTS pass of a Current-Mailbox search (#0105).
+    pub fn current_local_mailbox_key(&self) -> Option<String> {
+        self.mailboxes.get(self.active_mailbox).map(mailbox_key)
+    }
+
+    /// The `messages.mailbox` key of the mailbox an `in:` clause named,
+    /// matched the way [`Self::search_target_by_name`] matches (#0105).
+    pub fn local_mailbox_key_by_name(&self, name: &str) -> Option<String> {
+        let lower = name.to_lowercase();
+        self.mailboxes
+            .iter()
+            .find(|m| {
+                m.server_name
+                    .as_ref()
+                    .is_some_and(|s| s.to_lowercase() == lower)
+                    || m.label.to_lowercase() == lower
+            })
+            .map(mailbox_key)
     }
 
     pub fn all_search_targets(&self) -> Vec<SearchTarget> {
