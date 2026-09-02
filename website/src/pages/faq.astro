@@ -58,6 +58,18 @@ import AccordionItem from '../components/AccordionItem.astro';
             <code>ls</code> or <code>mp config show</code>.
           </p>
         </AccordionItem>
+
+        <AccordionItem question="I forgot a key binding">
+          <p>
+            Press <code>:</code> or <code>Ctrl+p</code> to open the command palette, type part of
+            an action's name and press <code>Enter</code> to run it against the current context.
+            Keys are grouped in mnemonic families (<code>c</code> compose, <code>t</code> thread
+            and attachments, <code>f</code> find, <code>s</code> sync and settings, <code>g</code>
+            go-to), so pressing a leader alone pops up a which-key list of its continuations.
+            <code>?</code> shows the full catalogue, and <code>mp dump-keys</code> prints the same
+            table outside the TUI.
+          </p>
+        </AccordionItem>
       </div>
     </section>
 
@@ -154,6 +166,17 @@ import AccordionItem from '../components/AccordionItem.astro';
             every file inside it; forwarding a message
             materialises its attachments under the account's
             <code>attachments/</code> directory and lists those paths for you.
+          </p>
+        </AccordionItem>
+
+        <AccordionItem question="Can I take a send back?">
+          <p>
+            A send from the TUI is parked for <code>email.send_hold_secs</code> (default 20
+            seconds) before it reaches the transport. The status line shows the countdown and
+            <code>u</code> cancels it: nothing is transmitted and the approved draft stays in
+            place to edit or send again. Set <code>send_hold_secs = 0</code> under
+            <code>[email]</code> to hand off immediately. The hold covers both SMTP and Graph
+            accounts; <code>mp send</code> and the batch send-approved run are never held.
           </p>
         </AccordionItem>
 

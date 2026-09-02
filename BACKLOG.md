@@ -8,7 +8,7 @@ When a ticket is shipped: set `status: done` in the ticket file, add an entry to
 
 > Architecture review 2026-08-06, follow-ups #0053 to #0064: [synthesis](.agents/handoff/2026-08-06_architecture-review-synthesis.md). Suggested order is #0053, #0054, #0055, #0056, then #0057 and #0058. #0053, #0054, #0055, #0056, #0057, #0058 and #0064 have shipped. Their post-ship reviews all passed and left deferred notes, which are filed as #0065 to #0071; #0065, #0066, #0067, #0068 and #0071 have shipped.
 
-> Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). New tickets #0087 to #0096 spread across Now / Next / Later below.
+> Audit 2026-08-14, owner decisions across performance, UX/workflow and feature-survey: [synthesis](.agents/research/2026-08-14-audit-synthesis.md). Tickets #0087 to #0100 all shipped in 0.9.0 and after; #0101 is the only survivor, parked under Later.
 
 
 ## Next

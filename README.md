@@ -33,6 +33,7 @@ All configuration lives in `~/.config/mailypoppins/config.toml`:
 font_family = "Helvetica, Arial, sans-serif"
 font_size = "12pt"
 include_signature = true
+send_hold_secs = 20          # Undo-send window in the TUI (0 = hand off immediately)
 
 [smtp]
 host = "postout.lrz.de"
@@ -63,11 +64,15 @@ default = "work"
 
 [signatures.work]
 name = "Work Signature"
-path = "~/notes/email/signatures/work.html"
+text = """
+-- 
+Your Name
+Title | Organization
+"""
 
 [signatures.personal]
 name = "Personal"
-path = "~/notes/email/signatures/personal.html"
+path = "~/notes/email/signatures/personal.md"
 ```
 
 Passwords are **never** stored in the config file. They live in the OS keyring under keys `smtp-password` and `imap-password`. IMAP password falls back to SMTP password if not set separately.
@@ -233,41 +238,50 @@ Exit codes: `0` = mailbox changed, `1` = error, `2` = timed out.
 
 ## Signatures
 
-Signature files are HTML snippets appended after the email body:
+A signature is a Markdown snippet, given inline with `text` or by a `path` to a file (`text` wins when both are set).
+It is spliced into the draft body when the draft is created: after the body for a new message, above the quoted content for a reply or forward.
+So it is visible and editable while you write, and the same text feeds both the plain-text and the HTML part of the sent mail.
 
-```html
-<div style="font-family: Helvetica, Arial, sans-serif; font-size: 12pt;">
-<p style="margin: 0;">
-<b>Your Name</b><br>
-Title | Organization
-</p>
-</div>
-```
+An HTML file still works as a `path`: it is converted to Markdown as it is read, keeping links and line breaks.
+An account with no configured signature adds nothing.
+Use `-s <name>` to pick a named signature for one draft, or `--no-signature` to skip it.
 
-Reply drafts include a `{{SIGNATURE}}` placeholder between the reply area and quoted text. When sent, the placeholder is replaced with the signature HTML.
+Reply and forward drafts keep a `{{SIGNATURE}}` placeholder between the reply area and the quoted text.
+It no longer carries signature text; it marks where the send path splits the body to place the quoted original.
 
 ## TUI
 
 Running `mp` with no arguments opens a full-screen terminal interface (built on `ratatui`).
 
-**Layout:** sidebar (mailbox list) | email list | headers + body preview. Adapts to terminal width.
+Layout: sidebar (mailbox list) | email list | headers + body preview. Adapts to terminal width.
 
-**Key bindings (list view):**
+Keys are nvim-style mnemonic families: a leader letter opens a which-key popup listing its continuations, and the second key runs the action.
+`c` is compose, `t` is thread and attachments, `f` is find and filter, `s` is sync and settings, `g` is go-to, `Space` switches view.
+Forget a chord and `:` or `Ctrl+p` opens a command palette over every runnable action by name.
 
 | Key | Action |
 |-----|--------|
 | `j`/`k`, arrows | Navigate |
-| `Enter`/`e` | Open in `$EDITOR` |
-| `r`/`R` | Reply / Reply all |
+| `Enter`/`e` | Open in `$EDITOR` (received mail is read-only) |
+| `cn` | New draft |
+| `cr`/`ca`/`cf` | Reply / Reply all / Forward |
+| `cA`/`cD` | Approve draft / back to draft (Drafts only) |
+| `x`/`cX` | Approve and send / Send all approved |
 | `a`/`d` | Archive / Delete (with confirmation) |
-| `A` | Mark as approved |
-| `x`/`X` | Send / Send all approved |
-| `n` | New draft |
-| `f`/`F`/`S` | Fetch / Sync / Reconcile |
-| `/` or `\` | Search (header-only or full-body) |
+| `ta`/`to`/`ts` | Attach file to draft / Open attachment / Save attachment |
+| `tt`/`tb` | Show conversation / Open HTML in browser |
+| `ff`/`fm` | Search all mail / Filter the current list |
+| `ss`/`sS` | Quick sync / Full sync |
+| `ga`/`gm` | Switch account / Go to the sidebar |
 | `1`-`9` | Jump to mailbox |
+| `:` or `Ctrl+p` | Command palette |
 | `?` | Help |
 | `q` | Quit |
+
+The help overlay (`?`) and `mp dump-keys` print the full catalogue, both generated from the same table the TUI dispatches on.
+
+A send from the TUI is held for `email.send_hold_secs` (default 20) before it reaches the transport: the status line counts down and `u` cancels it, leaving the approved draft in place.
+Set it to `0` to hand off immediately. `mp send` and the batch run are never held.
 
 The TUI calls library functions directly (no subprocess spawning). Background IMAP IDLE watches for new mail and triggers automatic fetches.
 
@@ -313,7 +327,7 @@ Run `mp mark-approved <file>` first.
 Check your credentials with `mp config show` and re-run `mp config set-password smtp` if needed.
 
 ### "Signature file not found"
-Check the path in your config. Paths support `~` expansion.
+Check the `path` in your `[signatures]` config. Paths support `~` expansion.
 
 ## Building
 
