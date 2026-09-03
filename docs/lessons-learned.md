@@ -1047,5 +1047,10 @@ itself, kept working. The rendition now inlines each referenced image part
 as a `data:` URI (`parse::embed_inline_images`), which needs no extracted
 files and keeps the page self-contained. When a legacy path is nuked, grep
 the lessons in this file for behaviours it carried: the charset meta and CSP
-injection entries above describe the same deleted code and are still
-unrestored for the on-demand rendition.
+injection described above went down with the same deletion and were restored
+into `html_temp_file` a commit later. The restored CSP says `img-src data:`
+rather than the old `data: cid: file:`: nothing rewrites to `file://` paths
+anymore, and a surviving `cid:` URL is unloadable in a browser regardless of
+policy. Remote images stay blocked by design, so a newsletter with
+http(s)-hosted images shows placeholders in the browser rendition; that is
+the tracking-pixel stance, not a regression.

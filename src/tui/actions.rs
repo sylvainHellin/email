@@ -290,6 +290,11 @@ fn write_fetched_attachments(
 /// message, the hit's position for one that is not stored.
 fn html_temp_file(html: &str, stem: &str) -> Result<PathBuf> {
     let path = render_temp_file(stem, "message.html")?;
+    // The browser reads the file with no HTTP headers to lean on: without a
+    // charset it guesses latin-1 and breaks umlauts, and without a CSP a
+    // hostile email runs scripts and loads tracking pixels (both pre-#0037
+    // fixes, lost with the legacy save path in the store rebuild).
+    let html = crate::parse::inject_csp_meta(&crate::parse::ensure_utf8_charset(html));
     std::fs::write(&path, html)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
@@ -4451,7 +4456,12 @@ mod store_backed_files {
         let path = html_rendition_for_row(&mut app, row.id).unwrap();
 
         assert_eq!(path.extension().unwrap(), "html");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "<p>Rich body</p>");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.ends_with("<p>Rich body</p>"), "{written}");
+        // The file is served with no HTTP headers, so it carries its own
+        // charset and CSP.
+        assert!(written.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "{written}");
+        assert!(written.contains("<meta charset=\"UTF-8\">"), "{written}");
     }
 
     /// A message whose HTML points at a `cid:` image part: the browser file
@@ -4540,7 +4550,9 @@ Content-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"log
 
         let html = fetched.html_body.clone().unwrap();
         let page = html_rendition(&mut app, &html, "search-7").unwrap();
-        assert_eq!(std::fs::read_to_string(&page).unwrap(), "<p>Rich body</p>");
+        let page_html = std::fs::read_to_string(&page).unwrap();
+        assert!(page_html.ends_with("<p>Rich body</p>"), "{page_html}");
+        assert!(page_html.contains("Content-Security-Policy"), "{page_html}");
     }
 
     /// `e` on a received row writes the store's own rendition of the message

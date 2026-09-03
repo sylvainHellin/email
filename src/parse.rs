@@ -19,6 +19,137 @@ pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     idx
 }
 
+/// Find the first occurrence of `needle` in `haystack`, ignoring ASCII case.
+///
+/// Returns a byte offset valid for `haystack` itself. Never lowercase the
+/// whole string for offset math: `to_lowercase()` can change byte length
+/// (e.g. 'İ' U+0130, 2 bytes, lowercases to "i\u{307}", 3 bytes), so offsets
+/// computed on the lowercased copy misalign in the original -- wrong
+/// insertion point at best, panic on a non-char-boundary slice at worst.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    // The returned offset is a char boundary as long as the needle starts with
+    // an ASCII byte (eq_ignore_ascii_case only matches ASCII against ASCII).
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Insert `tag` at the very start of `html`, after a leading doctype if one is
+/// present. Rationale for skipping the doctype: content before `<!DOCTYPE>`
+/// makes the browser ignore the doctype and render in quirks mode (a cosmetic
+/// degradation -- meta CSP is enforced either way). The doctype ends at its
+/// first `>` in every state of the HTML tokenizer (even inside quoted
+/// public/system identifiers, via the "abrupt-doctype-*" parse errors), so
+/// finding the first `>` matches browser behaviour and cannot be abused to
+/// swallow the tag.
+fn insert_at_document_start(html: &str, tag: &str) -> String {
+    let ws_len = html.len() - html.trim_start_matches(|c: char| c.is_ascii_whitespace()).len();
+    let rest = &html[ws_len..];
+    if rest.len() >= 9 && rest.as_bytes()[..9].eq_ignore_ascii_case(b"<!doctype") {
+        if let Some(gt) = rest.find('>') {
+            let insert = ws_len + gt + 1;
+            return format!("{}{}{}", &html[..insert], tag, &html[insert..]);
+        }
+        // Doctype never closed: the tokenizer consumes the rest of the input
+        // as (bogus) doctype, so nothing renders; prepending is still safe.
+    }
+    format!("{}{}", tag, html)
+}
+
+/// Ensure an HTML string declares UTF-8 charset.
+///
+/// `mailparse` already decodes bodies to UTF-8, but the original HTML may
+/// still carry a different charset declaration (e.g. `charset=iso-8859-1`).
+/// If the browser honours that stale declaration, or defaults to latin-1 when
+/// none is declared, it misrenders non-ASCII characters. This *replaces* any
+/// existing charset with UTF-8, or inserts one if none is present.
+pub(crate) fn ensure_utf8_charset(html: &str) -> String {
+    use regex::Regex;
+
+    let meta = r#"<meta charset="UTF-8">"#;
+
+    // Replace <meta charset="..."> (HTML5 form)
+    let re_meta = Regex::new(r#"(?i)<meta\s+charset\s*=\s*"[^"]*"\s*/?>"#).unwrap();
+    if re_meta.is_match(html) {
+        return re_meta.replace(html, meta).into_owned();
+    }
+
+    // Replace <meta http-equiv="Content-Type" content="text/html; charset=...">
+    let re_http =
+        Regex::new(r#"(?i)<meta\s+http-equiv\s*=\s*"Content-Type"\s+content\s*=\s*"[^"]*"\s*/?>"#)
+            .unwrap();
+    if re_http.is_match(html) {
+        return re_http.replace(html, meta).into_owned();
+    }
+
+    // No charset declaration found -- inject one. Offsets come from
+    // `find_ascii_ci` (valid in `html` itself), never from a lowercased copy.
+    // Note this head-finding is still spoofable via a `<head>` inside a
+    // comment or attribute value; for the charset the worst case is mojibake,
+    // not a security hole, so simplicity wins here (unlike `inject_csp_meta`).
+    if let Some(pos) = find_ascii_ci(html, "<head>") {
+        let insert = pos + "<head>".len();
+        format!("{}{}{}", &html[..insert], meta, &html[insert..])
+    } else if let Some(tag_end) = find_ascii_ci(html, "<html")
+        .and_then(|pos| html[pos..].find('>').map(|i| pos + i + 1))
+    {
+        format!("{}<head>{}</head>{}", &html[..tag_end], meta, &html[tag_end..])
+    } else {
+        // No <head>, and either no <html> or an unclosed one (in which case
+        // the browser consumes the rest as attributes and renders nothing).
+        format!("{}{}", meta, html)
+    }
+}
+
+/// Inject a restrictive Content-Security-Policy `<meta>` tag into the browser
+/// rendition so that opening it via `file://` cannot execute scripts, phone
+/// home, or load remote tracking pixels.
+///
+/// Policy rationale:
+/// - `script-src 'none'` / `connect-src 'none'`: no script execution, no
+///   network requests from script -- neutralizes active content in hostile
+///   emails.
+/// - `img-src data:`: remote (http/https) images -- i.e. tracking pixels --
+///   are blocked by default. `data:` is what [`embed_inline_images`] rewrites
+///   every `cid:` reference to before the file is written; a `cid:` URL that
+///   survives (oversized part, Graph row with no RFC822) is unloadable in a
+///   browser regardless of policy.
+///
+/// Any pre-existing CSP meta tag (e.g. supplied by the sender) is removed and
+/// replaced with ours, so our policy always wins. (Even if a sender CSP
+/// survived stripping, meta CSPs only intersect -- it could not weaken ours.)
+/// Idempotent: re-rendering already-tagged HTML does not duplicate the tag.
+pub(crate) fn inject_csp_meta(html: &str) -> String {
+    use regex::Regex;
+
+    const CSP_META: &str = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'none'; connect-src 'none'; img-src data:">"#;
+
+    // Strip any existing CSP meta tags (ours from a previous render, or
+    // sender-supplied ones), handling case variations and single/double quotes.
+    let re_csp = Regex::new(
+        r#"(?i)<meta\s+http-equiv\s*=\s*["']Content-Security-Policy["']\s+content\s*=\s*(?:"[^"]*"|'[^']*')\s*/?>"#,
+    )
+    .unwrap();
+    let html = re_csp.replace_all(html, "").into_owned();
+
+    // Insertion strategy: PREPEND at the very start of the document (after a
+    // leading doctype), never search for `<head>`/`<html>`. Searching is
+    // spoofable: a crafted email can hide an earlier `<head>` inside a comment
+    // (`<!--<head>-->`) or an attribute value, making a searched-in tag land
+    // where the browser never sees it -- fully neutralizing the CSP.
+    // Prepending is immune: during tree construction the HTML parser hoists a
+    // `<meta>` seen before any `<head>`/`<body>` into the implicitly created
+    // `<head>` (initial -> before-html -> before-head -> in-head reprocessing),
+    // and any later explicit `<head>` start tag is ignored, so our tag is
+    // always the first child of the real head and is always honored -- before
+    // any attacker-controlled content is parsed. This also avoids computing
+    // byte offsets on a lowercased copy (see `find_ascii_ci`).
+    insert_at_document_start(&html, CSP_META)
+}
+
 /// Filename of the iMIP calendar sidecar saved in each invite's attachments
 /// directory. A fixed name (rather than the sender's, which is often just
 /// `invite.ics`/`meeting.ics` anyway) keeps lookup deterministic for later
@@ -1701,5 +1832,120 @@ Content-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"log
         }];
         let out = embed_inline_images("<img src=\"cid:logo2\">", &images);
         assert_eq!(out, "<img src=\"cid:logo2\">");
+    }
+
+    // -----------------------------------------------------------------
+    // ensure_utf8_charset
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_utf8_charset_already_has_charset() {
+        let html = r#"<html><head><meta charset="UTF-8"></head><body>hi</body></html>"#;
+        assert_eq!(ensure_utf8_charset(html), html);
+    }
+
+    #[test]
+    fn test_ensure_utf8_charset_replaces_a_stale_charset() {
+        let html = r#"<html><head><meta charset="iso-8859-1"></head><body>hé</body></html>"#;
+        let result = ensure_utf8_charset(html);
+        assert!(result.contains(r#"<meta charset="UTF-8">"#), "{result}");
+        assert!(!result.contains("iso-8859-1"), "{result}");
+    }
+
+    #[test]
+    fn test_ensure_utf8_charset_injects_after_head() {
+        let html = "<html><head><title>Test</title></head><body>hi</body></html>";
+        let result = ensure_utf8_charset(html);
+        assert!(result.contains("<head><meta charset=\"UTF-8\"><title>"), "{result}");
+    }
+
+    #[test]
+    fn test_ensure_utf8_charset_html_without_head() {
+        let html = "<html><body>hi</body></html>";
+        let result = ensure_utf8_charset(html);
+        assert!(result.contains(r#"<meta charset="UTF-8">"#), "{result}");
+        assert!(result.contains("<head>"), "{result}");
+    }
+
+    #[test]
+    fn test_ensure_utf8_charset_bare_fragment() {
+        let result = ensure_utf8_charset("<div>hello</div>");
+        assert!(result.starts_with(r#"<meta charset="UTF-8">"#), "{result}");
+    }
+
+    // -----------------------------------------------------------------
+    // inject_csp_meta
+    // -----------------------------------------------------------------
+
+    const CSP_META: &str = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'none'; connect-src 'none'; img-src data:">"#;
+
+    #[test]
+    fn test_inject_csp_meta_normal_html() {
+        let html = "<html><head><title>Test</title></head><body>hi</body></html>";
+        let result = inject_csp_meta(html);
+        // Prepended before everything: the parser hoists it into <head> and
+        // no earlier attacker-controlled bytes can hide it.
+        assert!(result.starts_with(CSP_META), "{result}");
+        assert!(result.ends_with(html), "{result}");
+    }
+
+    #[test]
+    fn test_inject_csp_meta_after_doctype() {
+        let html = "<!DOCTYPE html><html><head></head><body>hi</body></html>";
+        let result = inject_csp_meta(html);
+        // After the doctype (so standards mode is preserved), before all else.
+        assert!(result.starts_with(&format!("<!DOCTYPE html>{CSP_META}<html>")), "{result}");
+    }
+
+    #[test]
+    fn test_inject_csp_meta_comment_fake_head() {
+        // A <head> hidden in a comment must not lure the tag into the comment
+        // (where the browser would never see it).
+        let html = "<html><!--<head>--><head><script>alert(1)</script></head><body>hi</body></html>";
+        let result = inject_csp_meta(html);
+        assert!(result.find(CSP_META).unwrap() < result.find("<!--").unwrap(), "{result}");
+    }
+
+    #[test]
+    fn test_inject_csp_meta_attribute_fake_head() {
+        // A <head> hidden in an attribute value must not attract the tag into
+        // the attribute (where it would be inert text).
+        let html = r#"<html data-x="<head>"><head><script>alert(1)</script></head></html>"#;
+        let result = inject_csp_meta(html);
+        assert!(result.find(CSP_META).unwrap() < result.find("data-x").unwrap(), "{result}");
+    }
+
+    #[test]
+    fn test_inject_csp_meta_unicode_lowercase_expansion() {
+        // 'İ' (U+0130, 2 bytes) lowercases to "i\u{307}" (3 bytes), so byte
+        // offsets computed on a lowercased copy misalign in the original --
+        // an implementation slicing there panics on a non-char-boundary.
+        let html = "<html title=\"İİİİİİİİ\"><head></head><body>hi</body></html>";
+        let result = inject_csp_meta(html);
+        assert!(result.starts_with(CSP_META), "{result}");
+        assert!(result.ends_with(html), "{result}");
+    }
+
+    #[test]
+    fn test_inject_csp_meta_idempotent() {
+        let html = "<html><head><title>t</title></head><body>hi</body></html>";
+        let once = inject_csp_meta(html);
+        let twice = inject_csp_meta(&once);
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("Content-Security-Policy").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_csp_meta_replaces_existing_csp() {
+        // A sender-supplied (permissive) CSP must be replaced by ours, even
+        // with case variations and single quotes.
+        let html = r#"<html><head><META HTTP-EQUIV='content-security-policy' CONTENT='default-src *'></head><body>hi</body></html>"#;
+        let result = inject_csp_meta(html);
+        assert!(!result.contains("default-src *"), "{result}");
+        assert!(result.contains(CSP_META), "{result}");
+        assert_eq!(
+            result.to_lowercase().matches("content-security-policy").count(),
+            1
+        );
     }
 }
