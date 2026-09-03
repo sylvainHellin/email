@@ -304,6 +304,21 @@ pub(super) fn html_rendition_for_row(app: &mut App, row_id: i64) -> Option<PathB
         app.set_status("No HTML version available".to_string());
         return None;
     };
+    // A browser opening the file has no message to resolve `cid:` URLs
+    // against, so the referenced image parts are inlined as `data:` URIs
+    // (the pre-#0037 rewrite, lost in the store rebuild). The raw blob is
+    // only read when the markup actually carries a reference.
+    let html = if html.to_ascii_lowercase().contains("cid:") {
+        match crate::store::read::load_raw(&store, &blobs, row_id) {
+            Some(raw) => {
+                let images = crate::parse::inline_images(&raw, &html);
+                crate::parse::embed_inline_images(&html, &images)
+            }
+            None => html,
+        }
+    } else {
+        html
+    };
     html_rendition(app, &html, &row_id.to_string())
 }
 
@@ -4437,6 +4452,50 @@ mod store_backed_files {
 
         assert_eq!(path.extension().unwrap(), "html");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "<p>Rich body</p>");
+    }
+
+    /// A message whose HTML points at a `cid:` image part: the browser file
+    /// carries the image as a `data:` URI, because a browser opening a file
+    /// from disk has no message to resolve `cid:` URLs against.
+    #[test]
+    fn the_browser_rendition_inlines_cid_images_as_data_uris() {
+        let fx = Fixture::new();
+        let html = "<p><img src=\"cid:logo@x\"></p>";
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let raw = format!(
+            "From: a@example.com\r\nSubject: hi\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n\
+--B\r\nContent-Type: image/png; name=\"logo.png\"\r\nContent-ID: <logo@x>\r\n\
+Content-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"logo.png\"\r\n\r\n{png_b64}\r\n--B--\r\n"
+        );
+        let mut email = fixture_email("Logo");
+        email.html_body = Some(html.to_string());
+        email.has_attachments = true;
+        let store = fx.store();
+        let blobs = BlobStore::for_account("alice");
+        let outcome = crate::ingest::ingest_message(
+            &store,
+            &blobs,
+            &crate::ingest::IngestInput {
+                account: "alice",
+                mailbox: "inbox",
+                uid: 1,
+                email: &email,
+                raw: Some(raw.as_bytes()),
+            },
+        )
+        .unwrap();
+        let row = crate::store::read::find_by_id(&store, outcome.row_id)
+            .unwrap()
+            .unwrap();
+        let mut app = app_on_row(&row);
+
+        let path = html_rendition_for_row(&mut app, row.id).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.to_ascii_lowercase().contains("cid:"), "{written}");
+        assert!(written.contains("data:image/png;base64,"), "{written}");
     }
 
     /// A sender who wrote no markup has no rendition, which is a status line

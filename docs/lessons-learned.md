@@ -1034,3 +1034,18 @@ declines or reports must speak through its own chrome (the search overlay
 uses `server_search_status`, rendered in its footer line); reserve
 `set_status_level` for results the user sees after the overlay is gone
 (editor round trips, drafts, sends).
+
+## The browser rendition lost its cid rewrite in the store rebuild (2026-08-25)
+
+The pre-#0037 build wrote a `.html` beside every received `.md` and
+`rewrite_cid_references` replaced `cid:` URLs with `file://` paths at save
+time (see the CSP entry above). The #0037 store-only ingest deleted that
+whole path, and the on-demand browser rendition (`html_rendition_for_row`)
+wrote the html blob verbatim -- so inline images silently regressed to broken
+icons in the browser while the TUI preview, which decodes `cid:` parts
+itself, kept working. The rendition now inlines each referenced image part
+as a `data:` URI (`parse::embed_inline_images`), which needs no extracted
+files and keeps the page self-contained. When a legacy path is nuked, grep
+the lessons in this file for behaviours it carried: the charset meta and CSP
+injection entries above describe the same deleted code and are still
+unrestored for the on-demand rendition.

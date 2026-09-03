@@ -893,6 +893,51 @@ fn html_references_cid(html_lower: &str, cid: &str) -> bool {
     false
 }
 
+/// `html` with every `cid:` reference to one of `images` replaced by a
+/// `data:` URI carrying the decoded bytes.
+///
+/// A browser opening the rendition from disk has no message to resolve a
+/// `cid:` URL against, so each one is inlined before the file is written.
+/// The pre-#0037 build rewrote them to `file://` paths beside the saved
+/// `.html`; the on-demand rendition has no extracted files to point at, and
+/// a `data:` URI keeps the page self-contained. Matching mirrors
+/// [`html_references_cid`]: case-insensitive, and a match must end at an id
+/// boundary so `cid:logo` leaves `cid:logo2` alone.
+pub fn embed_inline_images(html: &str, images: &[InlineImage]) -> String {
+    use base64::Engine as _;
+    let mut out = html.to_string();
+    for img in images {
+        if img.content_id.is_empty() {
+            continue;
+        }
+        let needle = format!("cid:{}", img.content_id);
+        let data_uri = format!(
+            "data:{};base64,{}",
+            img.media_type,
+            base64::engine::general_purpose::STANDARD.encode(&img.content)
+        );
+        // Byte offsets in the lowered copy line up with `out`:
+        // `to_ascii_lowercase` maps byte to byte.
+        let lower = out.to_ascii_lowercase();
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(&needle) {
+            let start = from + at;
+            let end = start + needle.len();
+            let boundary = !matches!(
+                lower[end..].chars().next(),
+                Some(c) if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+            );
+            rebuilt.push_str(&out[from..start]);
+            rebuilt.push_str(if boundary { &data_uri } else { &out[start..end] });
+            from = end;
+        }
+        rebuilt.push_str(&out[from..]);
+        out = rebuilt;
+    }
+    out
+}
+
 /// The image parts of `raw` that `html` references by `cid:` URL, decoded.
 ///
 /// Only matching parts are decoded: a message whose HTML points at one 20 kB
@@ -1632,5 +1677,29 @@ Content-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"log
     #[test]
     fn unparseable_bytes_yield_no_inline_images() {
         assert!(inline_images(b"", "<img src=\"cid:x\">").is_empty());
+    }
+
+    #[test]
+    fn embed_inline_images_turns_cid_urls_into_data_uris() {
+        let raw = related_message("<img src=\"cid:logo@x\">", "logo@x", "");
+        let html = "<img src=\"cid:logo@x\"> and <img src=\"CID:Logo@X\">";
+        let images = inline_images(raw.as_bytes(), html);
+        let out = embed_inline_images(html, &images);
+        // Both spellings are replaced, the bytes are the decoded PNG re-encoded.
+        assert!(!out.to_ascii_lowercase().contains("cid:"), "{out}");
+        assert_eq!(out.matches("data:image/png;base64,").count(), 2, "{out}");
+        assert!(out.contains(TINY_PNG_B64), "{out}");
+    }
+
+    #[test]
+    fn embed_inline_images_respects_the_id_boundary() {
+        let images = vec![InlineImage {
+            filename: "logo.png".into(),
+            content_id: "logo".into(),
+            media_type: "image/png".into(),
+            content: vec![1, 2, 3],
+        }];
+        let out = embed_inline_images("<img src=\"cid:logo2\">", &images);
+        assert_eq!(out, "<img src=\"cid:logo2\">");
     }
 }
