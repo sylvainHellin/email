@@ -21,7 +21,7 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
         .max(50)
         .min(area.width.saturating_sub(4));
     let overlay_height = (area.height * 80 / 100)
-        .max(18)
+        .max(20)
         .min(area.height.saturating_sub(2));
 
     let horizontal = Layout::default()
@@ -51,7 +51,9 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
         ComposeMode::EditDraft { .. } => " Edit recipients ".to_string(),
     };
 
-    let hint = if wizard.focus == ComposeField::Body {
+    let hint = if wizard.focus == ComposeField::Signature {
+        " ↑↓/Ctrl+n/Ctrl+p: pick signature | e: edit in $EDITOR | Tab: next field | Esc: cancel ".to_string()
+    } else if wizard.focus == ComposeField::Body {
         " Enter: newline | Ctrl+g: submit | Tab: next field | Esc: cancel ".to_string()
     } else if wizard.focus == ComposeField::Subject {
         if wizard.has_body_field() {
@@ -76,10 +78,11 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
     let inner = block.inner(overlay_area);
     frame.render_widget(block, overlay_area);
 
-    // Layout: four field rows (2 lines each = label + input) then suggestions list.
+    // Layout: five field rows (2 lines each = label + input) then suggestions list.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -93,21 +96,25 @@ pub(super) fn render_compose_wizard(app: &mut App, frame: &mut Frame, area: Rect
     render_field(wizard, frame, chunks[1], ComposeField::Cc);
     render_field(wizard, frame, chunks[2], ComposeField::Bcc);
     render_field(wizard, frame, chunks[3], ComposeField::Subject);
+    render_field(wizard, frame, chunks[4], ComposeField::Signature);
 
     // Separator line.
     let sep = Line::from(Span::styled(
-        "─".repeat(chunks[4].width as usize),
+        "─".repeat(chunks[5].width as usize),
         Style::default().fg(theme::active().text_faint),
     ));
-    frame.render_widget(Paragraph::new(sep), chunks[4]);
+    frame.render_widget(Paragraph::new(sep), chunks[5]);
 
     // The bottom area shows contact suggestions while an address field is
     // focused; otherwise, in a New compose, it hosts the inline body editor
     // (#0097). Forward / EditDraft keep the old Subject placeholder.
-    if !wizard.focus.is_address() && wizard.has_body_field() {
-        render_body(wizard, frame, chunks[5]);
+    if !wizard.focus.is_address()
+        && wizard.focus != ComposeField::Signature
+        && wizard.has_body_field()
+    {
+        render_body(wizard, frame, chunks[6]);
     } else {
-        render_suggestions(wizard, frame, chunks[5]);
+        render_suggestions(wizard, frame, chunks[6]);
     }
 }
 
@@ -171,11 +178,19 @@ fn render_field(wizard: &ComposeWizard, frame: &mut Frame, area: Rect, field: Co
         Style::default().fg(theme::active().text_muted)
     };
 
+    // The Signature field is a selector, not a text input: render the selected
+    // name (or "(none)") without a cursor block (#0106).
+    if field == ComposeField::Signature {
+        render_signature_field(wizard, frame, area, label_style, is_focused);
+        return;
+    }
+
     let value = match field {
         ComposeField::To => &wizard.to,
         ComposeField::Cc => &wizard.cc,
         ComposeField::Bcc => &wizard.bcc,
         ComposeField::Subject => &wizard.subject,
+        ComposeField::Signature => unreachable!("signature handled above"),
         ComposeField::Body => &wizard.body,
     };
 
@@ -207,6 +222,42 @@ fn render_field(wizard: &ComposeWizard, frame: &mut Frame, area: Rect, field: Co
     frame.render_widget(Paragraph::new(Line::from(spans)), label_row);
 }
 
+/// Render the Signature selector row (#0106): the label plus the selected
+/// signature name framed as `< name >`, or `(none)` when the account has no
+/// signatures or none is selected. No cursor block: this field is cycled, not
+/// typed into.
+fn render_signature_field(
+    wizard: &ComposeWizard,
+    frame: &mut Frame,
+    area: Rect,
+    label_style: Style,
+    is_focused: bool,
+) {
+    let label = format!("{:>7}: ", "Signature");
+    let selector_style = if is_focused {
+        Style::default().fg(theme::active().accent_alt)
+    } else {
+        Style::default().fg(theme::active().text)
+    };
+    let faint = Style::default().fg(theme::active().text_faint);
+
+    let mut spans = vec![Span::styled(label, label_style)];
+    match wizard.signature_name.as_deref() {
+        Some(name) if !wizard.available_signatures.is_empty() => {
+            spans.push(Span::styled(format!("< {name} >"), selector_style));
+            if wizard.signature_override.is_some() {
+                spans.push(Span::styled("  (edited for this draft)", faint));
+            }
+        }
+        _ => {
+            spans.push(Span::styled("(none)", faint));
+        }
+    }
+
+    let label_row = Rect { height: 1, ..area };
+    frame.render_widget(Paragraph::new(Line::from(spans)), label_row);
+}
+
 fn render_suggestions(wizard: &ComposeWizard, frame: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
@@ -216,6 +267,21 @@ fn render_suggestions(wizard: &ComposeWizard, frame: &mut Frame, area: Rect) {
     if wizard.focus == ComposeField::Subject {
         let msg = Paragraph::new("  Press Enter to submit the draft (or Tab to go back)")
             .style(Style::default().fg(theme::active().text_muted));
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    if wizard.focus == ComposeField::Signature {
+        let text = if wizard.available_signatures.is_empty() {
+            "  No signatures configured for this account (add [accounts.signatures.<name>])"
+                .to_string()
+        } else {
+            format!(
+                "  ↑↓ to pick among {} signature(s), e to edit the selected one in $EDITOR",
+                wizard.available_signatures.len()
+            )
+        };
+        let msg = Paragraph::new(text).style(Style::default().fg(theme::active().text_muted));
         frame.render_widget(msg, area);
         return;
     }

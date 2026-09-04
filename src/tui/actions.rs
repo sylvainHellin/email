@@ -2147,6 +2147,10 @@ pub(super) fn handle_action(
             app.set_status("Compose cancelled".to_string());
         }
 
+        Action::ComposeEditSignature => {
+            edit_compose_signature(app, terminal)?;
+        }
+
         Action::ComposeWizardSubmit => {
             submit_compose_wizard(app, terminal)?;
             // Consume-and-close: `submit_compose_wizard` takes the wizard via
@@ -2171,13 +2175,37 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
         crate::contacts::load_cache(&root).ok().flatten()
     };
 
-    let (to, cc, bcc, subject) = match &mode {
-        ComposeMode::New => (String::new(), String::new(), String::new(), String::new()),
+    // The account's signature names for the Signature field selector (#0106).
+    let available_signatures = app.account_config.signature_names();
+    // Only auto-select the default when signatures are globally on, so a New
+    // draft with `include_signature = false` keeps carrying none (#0099 parity).
+    let default_signature = if app.global_config.email.include_signature {
+        app.account_config
+            .default_signature_name()
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let (to, cc, bcc, subject, signature_name) = match &mode {
+        ComposeMode::New => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            default_signature.clone(),
+        ),
         // The forward's subject is shown before its draft exists, so it is
         // built by the same rule the draft will use.
         ComposeMode::Forward { msg } => {
             let subject = forward_subject(app, *msg);
-            (String::new(), String::new(), String::new(), subject)
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                subject,
+                default_signature.clone(),
+            )
         }
         ComposeMode::EditDraft { id } => {
             let Some(path) = indexed_draft_path(app, id) else {
@@ -2185,12 +2213,21 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
                 return;
             };
             match crate::draft::parse_email_draft(&path) {
-                Ok(draft) => (
-                    draft.frontmatter.to.unwrap_or_default(),
-                    draft.frontmatter.cc.unwrap_or_default(),
-                    draft.frontmatter.bcc.unwrap_or_default(),
-                    draft.frontmatter.subject,
-                ),
+                Ok(draft) => {
+                    // Absent `signature:` frontmatter means the account default.
+                    let sig = draft
+                        .frontmatter
+                        .signature
+                        .clone()
+                        .or_else(|| default_signature.clone());
+                    (
+                        draft.frontmatter.to.unwrap_or_default(),
+                        draft.frontmatter.cc.unwrap_or_default(),
+                        draft.frontmatter.bcc.unwrap_or_default(),
+                        draft.frontmatter.subject,
+                        sig,
+                    )
+                }
                 Err(e) => {
                     app.set_status_level(format!("Cannot edit draft: {e}"), StatusLevel::Error);
                     app.focus = Focus::List;
@@ -2200,6 +2237,10 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
         }
     };
 
+    // Keep the selection inside the available set; if a draft names a signature
+    // no longer configured, fall back to the default (or "(none)").
+    let signature_name = signature_name.filter(|n| available_signatures.contains(n));
+
     app.overlay = Overlay::Compose(ComposeWizard {
         mode,
         to,
@@ -2208,6 +2249,10 @@ fn open_compose_wizard(app: &mut App, mode: ComposeMode) {
         subject,
         body: String::new(),
         focus: ComposeField::To,
+        signature_initial: signature_name.clone(),
+        signature_name,
+        available_signatures,
+        signature_override: None,
         suggestions: Vec::new(),
         suggestion_idx: 0,
         contacts,
@@ -2226,6 +2271,15 @@ fn open_compose_wizard_seeded(app: &mut App, to: String) {
         let root = crate::config::account_dir(&app.account_config.name);
         crate::contacts::load_cache(&root).ok().flatten()
     };
+    let available_signatures = app.account_config.signature_names();
+    let signature_name = if app.global_config.email.include_signature {
+        app.account_config
+            .default_signature_name()
+            .map(|s| s.to_string())
+            .filter(|n| available_signatures.contains(n))
+    } else {
+        None
+    };
     app.overlay = Overlay::Compose(ComposeWizard {
         mode: ComposeMode::New,
         to,
@@ -2234,6 +2288,10 @@ fn open_compose_wizard_seeded(app: &mut App, to: String) {
         subject: String::new(),
         body: String::new(),
         focus: ComposeField::Subject,
+        signature_initial: signature_name.clone(),
+        signature_name,
+        available_signatures,
+        signature_override: None,
         suggestions: Vec::new(),
         suggestion_idx: 0,
         contacts,
@@ -2374,6 +2432,92 @@ fn write_vcard_draft(
     Ok(path)
 }
 
+/// Edit the compose wizard's selected signature in `$EDITOR` (#0106).
+///
+/// A `path` signature is opened and edited in place (persistent), then
+/// re-resolved so the wizard splices the new content on submit. An inline
+/// `text` signature is copied to a temp file, edited there, and applied to this
+/// draft only via `signature_override`; `config.toml` is never rewritten.
+fn edit_compose_signature(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    let Some(wizard) = app.compose_wizard() else {
+        return Ok(());
+    };
+    let Some(name) = wizard.signature_name.clone() else {
+        app.set_status("No signature selected to edit".to_string());
+        return Ok(());
+    };
+    if wizard.available_signatures.is_empty() {
+        app.set_status("No signatures configured for this account".to_string());
+        return Ok(());
+    }
+
+    // A `path` entry is edited in place; otherwise fall back to the inline
+    // `text` on a temp copy.
+    if let Some(path) = app.account_config.signature_path(&name) {
+        suspend_terminal(terminal)?;
+        let edit_result = edit_file(&path);
+        resume_terminal(terminal)?;
+        match edit_result {
+            Ok(()) => {
+                if let Some(wizard) = app.compose_wizard_mut() {
+                    wizard.signature_override = None;
+                }
+                app.set_status(format!("Signature '{name}' edited"));
+            }
+            Err(e) => app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error),
+        }
+        return Ok(());
+    }
+
+    let inline = app
+        .account_config
+        .signature_inline_text(&name)
+        .unwrap_or_default()
+        .to_string();
+
+    // Write the inline text to a temp file the user edits; the edited content
+    // is applied to this draft only (never written back to config.toml).
+    let tmp = std::env::temp_dir().join(format!(
+        "mp-signature-{}-{}.md",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    ));
+    if let Err(e) = std::fs::write(&tmp, &inline) {
+        app.set_status_level(format!("Cannot open signature: {e}"), StatusLevel::Error);
+        return Ok(());
+    }
+
+    suspend_terminal(terminal)?;
+    let edit_result = edit_file(&tmp);
+    resume_terminal(terminal)?;
+
+    match edit_result {
+        Ok(()) => {
+            let edited = std::fs::read_to_string(&tmp).unwrap_or_default();
+            let _ = std::fs::remove_file(&tmp);
+            let markdown = crate::config::signature_source_to_markdown(edited.trim_end());
+            if let Some(wizard) = app.compose_wizard_mut() {
+                wizard.signature_override = if markdown.trim().is_empty() {
+                    None
+                } else {
+                    Some(markdown)
+                };
+            }
+            app.set_status(format!(
+                "Inline signature '{name}' edited for this draft (not saved to config)"
+            ));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            app.set_status_level(format!("Edit failed: {e}"), StatusLevel::Error);
+        }
+    }
+    Ok(())
+}
+
 fn submit_compose_wizard(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2423,6 +2567,24 @@ fn submit_compose_wizard(
         };
         match crate::draft::rewrite_draft_recipients(&path, &edit) {
             Ok(()) => {
+                // Re-splice the signature block only when the selection changed
+                // from what the wizard opened with (#0106), so a plain recipient
+                // edit leaves the body untouched.
+                let sig_changed = wizard.signature_override.is_some()
+                    || wizard.signature_name != wizard.signature_initial;
+                if sig_changed {
+                    let (sig_md, sig_name) = wizard_signature(app, &wizard);
+                    if let Err(e) = crate::draft::rewrite_draft_signature(
+                        &path,
+                        sig_md.as_deref(),
+                        sig_name.as_deref(),
+                    ) {
+                        app.set_status_level(
+                            format!("Signature update failed: {e}"),
+                            StatusLevel::Error,
+                        );
+                    }
+                }
                 let account = app.account_config.name.clone();
                 // The file changed, so the row the index holds for it is
                 // stale; the selector is the draft's own id either way.
@@ -2433,10 +2595,15 @@ fn submit_compose_wizard(
                     app.invalidate_cache_idx(idx);
                 }
                 app.reload_current_mailbox();
-                app.set_status(format!(
-                    "Recipients updated: {}",
-                    Selector::for_draft(&account, &id)
-                ));
+                let msg = if sig_changed {
+                    format!(
+                        "Recipients and signature updated: {}",
+                        Selector::for_draft(&account, &id)
+                    )
+                } else {
+                    format!("Recipients updated: {}", Selector::for_draft(&account, &id))
+                };
+                app.set_status(msg);
             }
             Err(e) => {
                 app.set_status_level(format!("Recipient update failed: {e}"), StatusLevel::Error);
@@ -2572,6 +2739,11 @@ fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<Path
     fm.push_str(&format!("from: \"{from}\"\n"));
     fm.push_str(&format!("date: {now}\n"));
     fm.push_str("reply_to:\n");
+    // The selected signature name (#0106); absent means the account default.
+    let (sig_md, sig_name) = wizard_signature(app, wizard);
+    if let Some(name) = &sig_name {
+        fm.push_str(&format!("signature: {}\n", yaml_escape(name)));
+    }
     fm.push_str("attachments:\n");
     fm.push_str("---\n\n");
 
@@ -2584,23 +2756,35 @@ fn write_new_draft_from_wizard(app: &App, wizard: &ComposeWizard) -> Result<Path
         fm.push('\n');
     }
 
-    // Per-account signature (#0099): appended to the body at creation so it is
-    // visible and editable, below the inline body when there is one. An empty
-    // body still opens `$EDITOR` (that decision reads `wizard.body`, not the
-    // file), so the user edits a draft that already carries the signature.
-    if let Some(sig) = app.signature_content.as_deref() {
-        let sig = sig.trim_end();
-        if !sig.is_empty() {
-            if !body.is_empty() {
-                fm.push('\n');
-            }
-            fm.push_str(sig);
+    // The selected signature (#0099, #0106): spliced into the body at creation
+    // wrapped in the sentinel comments so a later re-splice can find it, below
+    // the inline body when there is one. An empty body still opens `$EDITOR`
+    // (that decision reads `wizard.body`, not the file), so the user edits a
+    // draft that already carries the signature.
+    if let Some(block) = sig_md.as_deref().and_then(crate::draft::wrap_signature_block) {
+        if !body.is_empty() {
             fm.push('\n');
         }
+        fm.push_str(&block);
     }
 
     std::fs::write(&path, fm)?;
     Ok(path)
+}
+
+/// The effective signature Markdown and name for a compose wizard (#0106):
+/// an inline edit override wins, otherwise the selected named signature is
+/// resolved from config. Honours the global `include_signature` toggle so a
+/// New draft written with signatures turned off carries none, as before.
+fn wizard_signature(app: &App, wizard: &ComposeWizard) -> (Option<String>, Option<String>) {
+    if !app.global_config.email.include_signature {
+        return (None, None);
+    }
+    let name = wizard.signature_name.clone();
+    let md = wizard.signature_override.clone().or_else(|| {
+        crate::config::resolve_signature_markdown(&app.account_config, name.as_deref())
+    });
+    (md, name)
 }
 
 /// Normalize a recipient-list field on wizard submit:
@@ -3420,6 +3604,10 @@ mod tests {
             subject: "Quick note".to_string(),
             body: body.to_string(),
             focus: ComposeField::Body,
+            signature_name: None,
+            signature_initial: None,
+            available_signatures: Vec::new(),
+            signature_override: None,
             suggestions: Vec::new(),
             suggestion_idx: 0,
             contacts: None,

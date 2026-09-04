@@ -16,12 +16,12 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 10 |                  │                                                                                  │
 11 |                  │Subject: Lunch Thursday                                                           │
 12 |                  │                                                                                  │
-13 |                  │──────────────────────────────────────────────────────────────────────────────────│
-14 |                  │   Body:                                                                          │
-15 |                  │Works for me.                                                                     │
-16 |                  │See you at noon.█                                                                 │
-17 |                  │                                                                                  │
-18 |                  │                                                                                  │
+13 |                  │Signature: (none)                                                                 │
+14 |                  │                                                                                  │
+15 |                  │──────────────────────────────────────────────────────────────────────────────────│
+16 |                  │   Body:                                                                          │
+17 |                  │Works for me.                                                                     │
+18 |                  │See you at noon.█                                                                 │
 19 |                  │                                                                                  │
 20 |                  │                                                                                  │
 21 |                  │                                                                                  │
@@ -44,4 +44,4 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 38 |
 39 |
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
-14 |bold@19..28
+16 |bold@19..28
