@@ -3,7 +3,7 @@ id: 0106
 title: Markdown-native signatures with hard-break rendering and TUI editing
 type: feature
 priority: now
-status: in-progress
+status: done
 created: 2026-08-16
 ---
 
@@ -36,3 +36,18 @@ Changing the signature on an existing draft re-splices the signature block in `b
 A multi-line signature keeps its line breaks in the HTML part.
 The delimiter's trailing space survives into the plain part.
 The signature can be selected and edited from the TUI, on a new and on an existing draft.
+
+## Done (2026-08-30)
+
+Both parts shipped.
+Part 1 was the hard-break normaliser in `signature_source_to_markdown` (`config.rs`).
+
+Part 2 adds a `Signature` field to `ComposeField`, between Subject and Body, always in the navigation order (`src/tui/app/types.rs`).
+The wizard carries `signature_name`, `signature_initial`, `available_signatures`, and a per-draft `signature_override` for an edited inline signature.
+Cycling reuses Up/Down and Ctrl+n/Ctrl+p; `e` (or Ctrl+e) opens the selected signature in `$EDITOR` (`Action::ComposeEditSignature`, handled in `src/tui/actions.rs`).
+A `path` signature is edited in place; an inline `text` signature is edited on a temp copy and applied to the draft only, never written to `config.toml`.
+
+The spliced signature block is wrapped in `<!-- mp:sig-start -->` / `<!-- mp:sig-end -->` sentinel comments at draft creation (New, Reply, Forward), so `set_signature_block` (`draft.rs`) can find and replace it when the selection changes.
+Both send paths (`markdown_to_html` and the plain part via `plain_text_body`) and the TUI preview strip the sentinels via `draft::strip_signature_sentinels`.
+The active selection is recorded in the draft's `signature:` frontmatter field (absent means account default).
+Existing drafts reach signature selection through the existing EditDraft flow (`ce` in Drafts): the new field rides along and a changed selection re-splices via `draft::rewrite_draft_signature`.

@@ -1054,3 +1054,19 @@ anymore, and a surviving `cid:` URL is unloadable in a browser regardless of
 policy. Remote images stay blocked by design, so a newsletter with
 http(s)-hosted images shows placeholders in the browser rendition; that is
 the tracking-pixel stance, not a regression.
+
+## HTML comment sentinels pass straight through pulldown-cmark (2026-08-30)
+
+#0106 Part 2 wraps a draft's spliced signature block in
+`<!-- mp:sig-start -->` / `<!-- mp:sig-end -->` comment lines so a re-splice can
+find it. CommonMark treats a comment on its own line as a raw HTML block and
+`pulldown-cmark` emits it verbatim, so the sentinels would otherwise land in the
+sent HTML part. The fix is to strip the sentinel lines from the Markdown
+*before* conversion (`draft::strip_signature_sentinels`), on both the HTML path
+(`markdown_to_html`) and the plain path (`plain_text_body`), plus the TUI
+preview. Stripping the resulting `<!-- ... -->` from `html_output` would also
+work, but stripping the source lines keeps the signature content and its
+surrounding blank lines intact in one place for every consumer. An `EditDraft`
+re-splice only rewrites the body when the wizard's `signature_name` actually
+changed from `signature_initial`, so a plain recipient edit never disturbs the
+block (and never spuriously adds one to a legacy draft that has no sentinels).
