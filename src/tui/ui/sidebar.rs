@@ -188,7 +188,10 @@ pub(super) fn render_activity_log(app: &App, frame: &mut Frame, area: Rect) {
         .title(" Activity ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::active().accent_alt))
+        // The plain unfocused pane border, not `accent_alt`: in the terminal
+        // theme `accent_alt` and `border_focused` are both Cyan, so the log
+        // panel used to read as the focused pane.
+        .border_style(Style::default().fg(theme::active().border))
         .style(Style::default().bg(theme::active().bg));
 
     let inner = block.inner(area);

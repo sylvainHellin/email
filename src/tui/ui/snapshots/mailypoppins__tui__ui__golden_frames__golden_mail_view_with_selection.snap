@@ -30,19 +30,19 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 24 |│                                        ││                                                                            │
 25 |│                                        ││                                                                            │
 26 |│                                        ││                                                                            │
-27 |│                                        ││                                                                            │
-28 |╰────────────────────────────────────────╯│                                                                            │
-29 |╭ Activity ──────────────────────────────╮│                                                                            │
-30 |│  No activity yet                       ││                                                                            │
+27 |╰────────────────────────────────────────╯│                                                                            │
+28 |╭ Activity ──────────────────────────────╮│                                                                            │
+29 |│  No activity yet                       ││                                                                            │
+30 |│                                        ││                                                                            │
 31 |│                                        ││                                                                            │
 32 |│                                        ││                                                                            │
-33 |│                                        ││                                                                            │
-34 |╰────────────────────────────────────────╯│                                                                            │
-35 |╭ View ──────────────────────────────────╮│                                                                            │
-36 |│     mail  |  contacts  |  calendar     ││                                                                            │
-37 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
-38 | 2 SELECTED   j/k Navigate  v Select  J / K Next/prev  Enter / e Open (read-only)  r Reply  a Archive  d Delete …
-39 | ? help                                                                                    2 sel | 2 unread | Inbox 2/5
+33 |╰────────────────────────────────────────╯│                                                                            │
+34 |╭ View ──────────────────────────────────╮│                                                                            │
+35 |│     mail  |  contacts  |  calendar     ││                                                                            │
+36 |╰────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────╯
+37 |╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+38 |│ 2 SELECTED   j/k Navigate  v Select  J / K Next/prev  Enter / e Open (read-only)  r Reply  a Archive  d Delete …     │
+39 |╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 == style runs (col ranges are half-open; rows with no meaning-carrying style are omitted) ==
 01 |bold@43..50
 02 |bold@43..48
@@ -51,6 +51,5 @@ expression: "frame_snapshot(&mut app, WIDTH, HEIGHT)"
 09 |fg:selection+bold@1..4 bold@4..5 fg:selection+bold@5..41
 10 |bg:surface+fg:selection+bold@1..41 bg:surface@71..77
 11 |fg:selection+bold@1..4 bold@4..5 fg:selection+bold@5..41
-36 |bold@5..11
-38 |bold@0..12 bg:surface@12..14 bg:surface+bold@14..17 bg:surface@17..28 bg:surface+bold@28..29 bg:surface@29..38 bg:surface+bold@38..43 bg:surface@43..55 bg:surface+bold@55..64 bg:surface@64..83 bg:surface+bold@83..84 bg:surface@84..92 bg:surface+bold@92..93 bg:surface@93..103 bg:surface+bold@103..104 bg:surface@104..120
-39 |bg:surface@0..120
+35 |bold@5..11
+38 |bold@1..13 bold@15..18 bold@29..30 bold@39..44 bold@56..65 bold@84..85 bold@93..94 bold@104..105

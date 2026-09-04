@@ -87,29 +87,30 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     // that cannot draw pixels beyond the names the placeholder lines carry.
     app.refresh_preview_images();
 
-    // Bottom rows: a herdr-style mode/hint bar (#0032) above the status bar.
+    // Bottom row: the herdr-style mode/hint bar (#0032), drawn as a bordered
+    // pane like every other pane. The former status bar is gone: its outbox
+    // and sync badges were sticky by construction (a `failed` outbox row only
+    // leaves on an explicit retry/discard) and the activity log already
+    // carries the same events as they happen.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(1), // hint bar
-            Constraint::Length(1), // status bar
+            Constraint::Length(status::HINT_BAR_HEIGHT),
         ])
         .split(area);
 
     let main_area = outer[0];
     let hint_area = outer[1];
-    let status_area = outer[2];
 
     // Pane zoom (#TKT-0044): one pane owns the whole content area, the view
-    // switcher and the other panes step aside, and the hint and status bars
-    // stay put -- a zoom must not cost the user the row that says how to
-    // leave it. Every width tier collapses to the same single pane, so the
-    // narrow tier gets zoom for free.
+    // switcher and the other panes step aside, and the hint bar stays put --
+    // a zoom must not cost the user the row that says how to leave it. Every
+    // width tier collapses to the same single pane, so the narrow tier gets
+    // zoom for free.
     if let Some(pane) = app.zoomed_pane() {
         render_zoomed_pane(app, frame, main_area, pane);
         status::render_hint_bar(app, frame, hint_area);
-        status::render_status_bar(app, frame, status_area);
         render_overlays(app, frame, area);
         return;
     }
@@ -200,7 +201,6 @@ pub fn view(app: &mut App, frame: &mut Frame) {
     }
 
     status::render_hint_bar(app, frame, hint_area);
-    status::render_status_bar(app, frame, status_area);
 
     render_overlays(app, frame, area);
 }

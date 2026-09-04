@@ -1,5 +1,4 @@
 use ratatui::style::Style;
-use ratatui::text::Span;
 use unicode_width::UnicodeWidthChar;
 
 use super::super::app::Focus;
@@ -14,13 +13,7 @@ pub(super) fn pane_border_style(current_focus: Focus, pane: Focus) -> Style {
     }
 }
 
-pub(super) fn hint_span(key: &str) -> Span<'_> {
-    Span::styled(key, Style::default().fg(theme::active().accent))
-}
 
-pub(super) fn desc_span(desc: &str) -> Span<'_> {
-    Span::styled(desc, Style::default().fg(theme::active().text_muted))
-}
 
 /// Cut `s` to at most `max_width` display cells, ellipsising when it does not
 /// fit. Callers pass column counts, so the measure is display width and not a
