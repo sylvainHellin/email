@@ -2290,6 +2290,48 @@ body_horizon_days = -1
         );
     }
 
+    /// A line-oriented block keeps its breaks: each non-blank line followed by
+    /// another non-blank line gets a hard break, blank lines stay as they are,
+    /// and the last line of a block is not padded (#0106).
+    #[test]
+    fn to_hard_breaks_forces_line_breaks_within_a_block() {
+        let sig = "Sylvain Hellin\nManaging Director\n\nTUM\nArcisstrasse 21";
+        assert_eq!(
+            to_hard_breaks(sig),
+            "Sylvain Hellin  \nManaging Director\n\nTUM  \nArcisstrasse 21"
+        );
+    }
+
+    /// Running it twice changes nothing (a padded line already ends in a space),
+    /// and the paragraph break between blocks is preserved.
+    #[test]
+    fn to_hard_breaks_is_idempotent_and_keeps_blank_lines() {
+        let once = to_hard_breaks("a\nb\n\nc");
+        assert_eq!(to_hard_breaks(&once), once);
+        assert!(once.contains("\n\n"), "paragraph break lost: {once:?}");
+    }
+
+    /// The RFC 3676 delimiter line ends in one space already, so it is left
+    /// exactly as authored rather than padded to a two-space hard break.
+    #[test]
+    fn to_hard_breaks_preserves_the_signature_delimiter() {
+        assert_eq!(to_hard_breaks("-- \nAlice"), "-- \nAlice");
+    }
+
+    /// End to end: a multi-line inline signature comes back hard-broken.
+    #[test]
+    fn resolve_signature_markdown_hard_breaks_a_multiline_inline_sig() {
+        let account = account_with_signature(SignatureEntry {
+            name: None,
+            text: Some("Sylvain Hellin\nManaging Director".to_string()),
+            path: None,
+        });
+        assert_eq!(
+            resolve_signature_markdown(&account, None).as_deref(),
+            Some("Sylvain Hellin  \nManaging Director")
+        );
+    }
+
     /// With no inline text, the `path` file is read as Markdown and its
     /// trailing whitespace trimmed so the caller owns the spacing.
     #[test]
@@ -2408,20 +2450,54 @@ pub fn resolve_signature_markdown(
     }
 }
 
-/// Normalise a signature source to Markdown.
+/// Normalise a signature source to Markdown with hard line breaks.
 ///
 /// A signature is stored verbatim (inline `text` or a file at `path`) and may be
 /// an HTML fragment (the common case for a rich signature exported from a mail
 /// client) or already Markdown/plain text. The draft body the user edits, and
 /// both outgoing MIME parts, are Markdown, so an HTML source is converted here
 /// (`parse::html_to_markdown`, links preserved as `[text](url)`) and anything
-/// that does not look like HTML is returned unchanged. This is the single point
-/// where the conversion happens, so every caller -- draft creation, direct
-/// sends, invites -- gets Markdown.
+/// else is taken as-is. This is the single point where every caller (draft
+/// creation, direct sends, invites) gets its Markdown.
+///
+/// The result is then run through [`to_hard_breaks`]: a signature is
+/// line-oriented, but CommonMark collapses a run of single-`\n` lines into one
+/// wrapped paragraph (#0106), so without this the name, title, address and link
+/// lines render as one blob. Forcing hard breaks keeps the authored layout in
+/// the HTML part.
 fn signature_source_to_markdown(source: &str) -> String {
-    if crate::parse::looks_like_html(source) {
+    let markdown = if crate::parse::looks_like_html(source) {
         crate::parse::html_to_markdown(source)
     } else {
         source.to_string()
+    };
+    to_hard_breaks(&markdown)
+}
+
+/// Append the two trailing spaces that make a CommonMark hard break to every
+/// non-blank line followed by another non-blank line, so a line-oriented block
+/// survives Markdown rendering as separate lines rather than one wrapped
+/// paragraph (#0106).
+///
+/// Blank lines are paragraph breaks and are left alone, so the spacing between
+/// signature blocks is preserved. A line that already ends in a space is left
+/// untouched: that covers a line already carrying a hard break and the RFC 3676
+/// signature delimiter (two hyphens and a space), whose trailing space must
+/// stay exactly one. The padding is meaningful only in the HTML part; the
+/// `text/plain` part carries it as invisible trailing whitespace.
+fn to_hard_breaks(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.split('\n').collect();
+    let mut out = String::with_capacity(markdown.len() + lines.len() * 2);
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        let this_nonblank = !line.trim().is_empty();
+        let next_nonblank = lines.get(i + 1).map_or(false, |n| !n.trim().is_empty());
+        if this_nonblank && next_nonblank && !line.ends_with(' ') {
+            out.push_str("  ");
+        }
+        if i + 1 < lines.len() {
+            out.push('\n');
+        }
     }
+    out
 }
