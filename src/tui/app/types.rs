@@ -1214,6 +1214,10 @@ pub enum ComposeField {
     Cc,
     Bcc,
     Subject,
+    /// The signature selector (#0106). Not a text input: cycling picks among
+    /// the account's named signatures, and `e` edits the selected one in
+    /// `$EDITOR`. Always participates in field navigation.
+    Signature,
     /// The optional inline body (#0097). Multi-line and the last field before
     /// submit: a non-empty body is written straight into the draft, an empty
     /// one falls back to opening `$EDITOR` on the draft.
@@ -1227,6 +1231,7 @@ impl ComposeField {
             ComposeField::Cc => "Cc",
             ComposeField::Bcc => "Bcc",
             ComposeField::Subject => "Subject",
+            ComposeField::Signature => "Signature",
             ComposeField::Body => "Body",
         }
     }
@@ -1243,7 +1248,8 @@ impl ComposeField {
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
             ComposeField::Bcc => ComposeField::Subject,
-            ComposeField::Subject => ComposeField::Body,
+            ComposeField::Subject => ComposeField::Signature,
+            ComposeField::Signature => ComposeField::Body,
             ComposeField::Body => ComposeField::To,
         }
     }
@@ -1254,7 +1260,8 @@ impl ComposeField {
             ComposeField::Cc => ComposeField::To,
             ComposeField::Bcc => ComposeField::Cc,
             ComposeField::Subject => ComposeField::Bcc,
-            ComposeField::Body => ComposeField::Subject,
+            ComposeField::Signature => ComposeField::Subject,
+            ComposeField::Body => ComposeField::Signature,
         }
     }
 }
@@ -1297,6 +1304,22 @@ pub struct ComposeWizard {
     /// value is written into the draft body and skips the `$EDITOR` round-trip.
     pub body: String,
     pub focus: ComposeField,
+    /// The currently selected signature name (#0106), or `None` for the account
+    /// default / no signature. Shown on the Signature field and resolved to
+    /// Markdown when the draft is written or re-spliced.
+    pub signature_name: Option<String>,
+    /// The signature name the wizard opened with (#0106). An `EditDraft` submit
+    /// only re-splices the body when the selection changed from this, so a plain
+    /// recipient edit never disturbs the signature block.
+    pub signature_initial: Option<String>,
+    /// The account's signature names, loaded when the wizard opens (#0106).
+    /// Empty when the account configures none; the field then shows "(none)"
+    /// and cycling/edit are no-ops.
+    pub available_signatures: Vec<String>,
+    /// An inline signature edited in `$EDITOR` for this draft only (#0106).
+    /// Set when the user edits a `text`-only signature: the edited Markdown is
+    /// spliced into the draft without being written back to `config.toml`.
+    pub signature_override: Option<String>,
     /// Fuzzy-matched suggestions for the currently-focused field
     /// (empty for Subject/Body or when no cache exists).
     pub suggestions: Vec<ComposeSuggestion>,
@@ -1642,6 +1665,10 @@ pub enum Action {
     ComposeWizardSubmit,
     /// Close the wizard without writing anything.
     ComposeWizardCancel,
+    /// Edit the compose wizard's selected signature in `$EDITOR` (#0106): a
+    /// `path` signature is edited in place, an inline `text` one on a temp copy
+    /// applied to this draft only.
+    ComposeEditSignature,
     /// RSVP to a received invite (#0029): send a METHOD:REPLY to the
     /// organizer on a background thread and flip local `event.rsvp`.
     Rsvp {
@@ -2038,6 +2065,66 @@ pub fn build_mailboxes(config: &crate::config::AccountConfig) -> Vec<MailboxInfo
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // ComposeField navigation order (#0106)
+    // -----------------------------------------------------------------------
+
+    /// The Signature field sits between Subject and Body, and the cycle wraps
+    /// Body -> To, so its Enter/Ctrl+g behaviour on Body is unchanged.
+    #[test]
+    fn compose_field_order_puts_signature_before_body() {
+        use ComposeField::*;
+        let forward: Vec<ComposeField> = {
+            let mut v = vec![To];
+            let mut f = To;
+            for _ in 0..5 {
+                f = f.next();
+                v.push(f);
+            }
+            v
+        };
+        assert_eq!(forward, vec![To, Cc, Bcc, Subject, Signature, Body]);
+        assert_eq!(Body.next(), To, "the cycle wraps back to To");
+        // prev is the exact inverse.
+        assert_eq!(Signature.prev(), Subject);
+        assert_eq!(Body.prev(), Signature);
+        assert_eq!(To.prev(), Body);
+        // Signature is not an address field, so autocomplete never runs on it.
+        assert!(!Signature.is_address());
+        assert_eq!(Signature.label(), "Signature");
+    }
+
+    /// With no inline body field (Forward / EditDraft), navigation skips Body
+    /// but never Signature: Subject -> Signature -> To.
+    #[test]
+    fn signature_participates_even_without_a_body_field() {
+        let wizard = ComposeWizard {
+            mode: ComposeMode::EditDraft { id: "x".to_string() },
+            to: String::new(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            focus: ComposeField::Signature,
+            signature_name: None,
+            signature_initial: None,
+            available_signatures: Vec::new(),
+            signature_override: None,
+            suggestions: Vec::new(),
+            suggestion_idx: 0,
+            contacts: None,
+        };
+        assert!(!wizard.has_body_field());
+        assert_eq!(wizard.next_field(), ComposeField::To, "Body is skipped");
+        let mut at_subject = ComposeWizard {
+            focus: ComposeField::Subject,
+            ..wizard
+        };
+        assert_eq!(at_subject.next_field(), ComposeField::Signature);
+        at_subject.focus = ComposeField::To;
+        assert_eq!(at_subject.prev_field(), ComposeField::Signature);
+    }
 
     // -----------------------------------------------------------------------
     // Undo-send hold window (#0090)

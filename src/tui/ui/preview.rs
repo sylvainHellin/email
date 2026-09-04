@@ -72,9 +72,9 @@ pub(super) fn render_body(app: &mut App, frame: &mut Frame, area: Rect) {
         let mut lines = if let Some(html) = app.preview_html.rendered() {
             render_html_body(html, inner_width as usize)
         } else {
-            let body = app
-                .preview_body
-                .text()
+            // Drop the signature sentinel comments (#0106) so they never show
+            // in the preview, then substitute the quote marker for display.
+            let body = crate::draft::strip_signature_sentinels(app.preview_body.text())
                 .replace("{{SIGNATURE}}", "[signature]");
             wrap_and_style_body(&body, inner_width as usize)
         };

@@ -157,6 +157,14 @@ pub fn markdown_to_html(
     // so it goes through the same converter as the body and inherits the body
     // font, instead of being injected as pre-styled HTML (which rendered the
     // signature at a different size, and double-injected it on replies).
+    // Drop the signature sentinel comment lines (#0106) before rendering. They
+    // wrap the spliced block in the draft body so a re-splice can find it;
+    // CommonMark would otherwise pass them through as raw HTML comments into the
+    // sent message. Stripping the lines keeps the signature content and its
+    // surrounding blank lines intact.
+    let sanitized = crate::draft::strip_signature_sentinels(markdown);
+    let markdown = sanitized.as_str();
+
     let owned_body;
     let markdown = match signature {
         Some(sig) if !sig.trim().is_empty() => {
@@ -260,6 +268,13 @@ blockquote {{ margin: 0.5em 0; padding: 0 0 0 1em; border-left: 2px solid #ccc; 
 /// literal `{{SIGNATURE}}` mid-message. Drop the marker and collapse the blank
 /// lines it padded down to a single paragraph break so the plain text reads
 /// naturally and no double blank line is left where it stood.
+/// The plain-text body of a draft: the Markdown with the signature sentinel
+/// comments (#0106) and the `{{SIGNATURE}}` quote marker (#0102) removed, so a
+/// recipient reading the `text/plain` alternative sees neither.
+fn plain_text_body(body_markdown: &str) -> String {
+    strip_signature_marker(&crate::draft::strip_signature_sentinels(body_markdown))
+}
+
 fn strip_signature_marker(body: &str) -> String {
     const MARKER: &str = "{{SIGNATURE}}";
     let mut out = body.to_string();
@@ -535,6 +550,7 @@ mod tests {
                 message_id: None,
                 in_reply_to: None,
                 forwarded_from: None,
+                signature: None,
                 event: None,
             },
             body_markdown: String::new(),
@@ -777,6 +793,26 @@ mod tests {
             "My reply\n\n-- \nBest, Alice\n\nOn Mon wrote:\n> Quoted"
         );
         assert!(!plain.contains("\n\n\n"), "double blank line left behind: {plain:?}");
+    }
+
+    /// The signature sentinels (#0106) never reach a recipient: the plain part
+    /// drops the marker lines and keeps the signature content, and the HTML
+    /// part carries no raw `<!-- mp:sig-... -->` comment.
+    #[test]
+    fn signature_sentinels_are_stripped_from_both_send_parts() {
+        let body =
+            "My note\n\n<!-- mp:sig-start -->\nBest,\nAlice\n<!-- mp:sig-end -->\n";
+        let plain = plain_text_body(body);
+        assert!(!plain.contains("mp:sig-start"), "sentinel in plain: {plain:?}");
+        assert!(!plain.contains("mp:sig-end"), "sentinel in plain: {plain:?}");
+        assert!(plain.contains("Best,"), "signature dropped from plain: {plain:?}");
+        assert!(plain.contains("Alice"), "signature dropped from plain: {plain:?}");
+
+        let html = markdown_to_html(body, &default_settings(), None, None);
+        assert!(!html.contains("mp:sig-start"), "sentinel in html: {html}");
+        assert!(!html.contains("mp:sig-end"), "sentinel in html: {html}");
+        // The signature content still renders, on its own line (hard break).
+        assert!(html.contains("Alice"), "signature dropped from html: {html}");
     }
 
     /// A body with no marker is returned untouched, so the non-reply send
@@ -2559,7 +2595,7 @@ pub fn build_draft_message(
         .singlepart(
             SinglePart::builder()
                 .header(ContentType::TEXT_PLAIN)
-                .body(strip_signature_marker(&draft.body_markdown)),
+                .body(plain_text_body(&draft.body_markdown)),
         )
         .singlepart(
             SinglePart::builder()
@@ -2572,7 +2608,7 @@ pub fn build_draft_message(
         // Invite path: multipart/mixed [ alternative(plain, html, calendar),
         // application/ics ]; regular file attachments (if any) follow.
         let mut mixed =
-            build_invite_mime_body(&strip_signature_marker(&draft.body_markdown), body_html, ics);
+            build_invite_mime_body(&plain_text_body(&draft.body_markdown), body_html, ics);
         if let Some(attachments) = &draft.frontmatter.attachments {
             for path in resolve_attachment_paths(attachments)? {
                 let (filename, file_content, content_type) = read_attachment(&path)?;

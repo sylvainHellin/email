@@ -49,14 +49,201 @@ pub fn new_draft_skeleton_with_id(
 }
 
 /// The signature as it is spliced into a draft body: the trimmed Markdown
-/// followed by one trailing newline, or `None` when nothing is configured
-/// (#0099). Callers control the leading blank line.
+/// wrapped in the sentinel comments, or `None` when nothing is configured
+/// (#0099, #0106). Callers control the leading blank line.
 fn signature_block(signature: Option<&str>) -> Option<String> {
-    let sig = signature?.trim_end();
-    if sig.is_empty() {
+    signature.and_then(wrap_signature_block)
+}
+
+/// The sentinel comment that marks the first line of a spliced signature block
+/// (#0106). HTML comments are passed through by CommonMark, so both send paths
+/// and the TUI preview strip these lines before the recipient or the user ever
+/// sees them.
+pub const SIG_START: &str = "<!-- mp:sig-start -->";
+/// The sentinel comment closing a spliced signature block (#0106).
+pub const SIG_END: &str = "<!-- mp:sig-end -->";
+
+/// Wrap a resolved signature Markdown snippet in the sentinel comments so the
+/// block can be located and re-spliced when the user picks a different
+/// signature (#0106). Returns `None` for empty input, matching the old
+/// `signature_block` contract. The result ends in one trailing newline; the
+/// caller owns the leading blank line.
+pub fn wrap_signature_block(signature: &str) -> Option<String> {
+    let sig = signature.trim_end();
+    if sig.trim().is_empty() {
         return None;
     }
-    Some(format!("{sig}\n"))
+    Some(format!("{SIG_START}\n{sig}\n{SIG_END}\n"))
+}
+
+/// Remove the signature sentinel comment lines (`SIG_START` / `SIG_END`) from
+/// `body`, keeping the signature content between them (#0106). Called on both
+/// send paths (plain and HTML) and in the TUI preview so the sentinels never
+/// reach a recipient or the screen. A line is dropped only when, once trimmed,
+/// it equals a sentinel exactly.
+pub fn strip_signature_sentinels(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut first = true;
+    for line in body.split('\n') {
+        let t = line.trim();
+        if t == SIG_START || t == SIG_END {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(line);
+        first = false;
+    }
+    out
+}
+
+/// Replace (or remove) the sentinel-wrapped signature block inside
+/// `body_markdown` with `new_sig_markdown`, re-splicing when the user picks a
+/// different signature on a draft (#0106).
+///
+/// - With sentinels present, the inclusive `SIG_START..=SIG_END` region is
+///   swapped for the new wrapped block, or dropped entirely when
+///   `new_sig_markdown` is `None`/empty.
+/// - Without sentinels (a legacy draft, or one whose block was hand-deleted),
+///   a new block is inserted just before the `{{SIGNATURE}}` quote marker when
+///   there is one, else appended at the end of the body.
+///
+/// One blank line separates the block from the surrounding text.
+pub fn set_signature_block(body_markdown: &str, new_sig_markdown: Option<&str>) -> String {
+    let new_block = new_sig_markdown.and_then(wrap_signature_block);
+
+    // An existing sentinel-wrapped block: swap it out in place.
+    if let (Some(start), Some(end)) = (body_markdown.find(SIG_START), body_markdown.rfind(SIG_END))
+    {
+        if end >= start {
+            let end = end + SIG_END.len();
+            let before = &body_markdown[..start];
+            let after = &body_markdown[end..];
+            return splice_block(before, new_block.as_deref(), after);
+        }
+    }
+
+    // No sentinels. Nothing to remove; a `None` leaves the body untouched.
+    let Some(block) = new_block else {
+        return body_markdown.to_string();
+    };
+
+    // Insert before the quote marker when this is a reply/forward draft.
+    if let Some(marker) = body_markdown.find("{{SIGNATURE}}") {
+        let before = &body_markdown[..marker];
+        let after = &body_markdown[marker..];
+        return splice_block(before, Some(&block), after);
+    }
+
+    // Plain draft: append at the end.
+    splice_block(body_markdown, Some(&block), "")
+}
+
+/// Join `before`, an optional signature `block`, and `after`, keeping one blank
+/// line on either side of the block and collapsing the gap when the block is
+/// removed. `block`, when present, is the sentinel-wrapped form ending in a
+/// newline.
+fn splice_block(before: &str, block: Option<&str>, after: &str) -> String {
+    let before = before.trim_end_matches('\n');
+    let after = after.trim_start_matches('\n');
+    let mut out = String::new();
+    out.push_str(before);
+    match block {
+        Some(block) => {
+            let block = block.trim_matches('\n');
+            if !before.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(block);
+            if !after.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(after);
+            } else {
+                out.push('\n');
+            }
+        }
+        None => {
+            if !before.is_empty() && !after.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(after);
+            } else if !after.is_empty() {
+                out.push_str(after);
+            } else if !before.is_empty() {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Re-splice the signature block of an existing draft in place and record the
+/// selected signature name in frontmatter (#0106).
+///
+/// The body is rewritten via [`set_signature_block`] and the `signature:`
+/// frontmatter key is set to `sig_name` (or cleared when `None`, meaning the
+/// account default). The `.md`'s other frontmatter fields are preserved
+/// byte-for-byte the way [`rewrite_draft_recipients`] preserves them, and the
+/// file is only written on the success path.
+pub fn rewrite_draft_signature(
+    path: &Path,
+    new_sig_markdown: Option<&str>,
+    sig_name: Option<&str>,
+) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let after_open = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow!("No frontmatter found (file does not start with '---')"))?;
+
+    // Split the frontmatter (kept verbatim) from the body at the closing fence.
+    let mut header_end: Option<usize> = None;
+    let mut body = String::new();
+    let mut cursor = 0usize;
+    while cursor < after_open.len() {
+        let rest = &after_open[cursor..];
+        let (line, advance) = match rest.find('\n') {
+            Some(nl) => (&rest[..nl], nl + 1),
+            None => (rest, rest.len()),
+        };
+        if line.trim_end_matches('\r') == "---" {
+            header_end = Some(cursor);
+            body = after_open[cursor + advance..].to_string();
+            break;
+        }
+        cursor += advance;
+    }
+    let header_end =
+        header_end.ok_or_else(|| anyhow!("Malformed frontmatter: no closing '---' fence"))?;
+    let header = &after_open[..header_end];
+
+    let new_body = set_signature_block(body.trim(), new_sig_markdown);
+
+    // Reassemble the document with the frontmatter intact and one blank line
+    // between the fence and the body, the shape the draft builders emit.
+    let mut rebuilt = String::new();
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    rebuilt.push_str(header);
+    rebuilt.push_str("---");
+    rebuilt.push_str(newline);
+    rebuilt.push_str(newline);
+    rebuilt.push_str(&new_body);
+    if !new_body.ends_with('\n') {
+        rebuilt.push_str(newline);
+    }
+
+    let updates = match sig_name {
+        Some(name) => vec![("signature", FieldWrite::Set(yaml_dq_escape(name)))],
+        None => vec![("signature", FieldWrite::ClearIfPresent)],
+    };
+    let final_content = rewrite_frontmatter_scalars(&rebuilt, &updates)?;
+
+    write_atomic(path, final_content.as_bytes())
+        .with_context(|| format!("Failed to write file: {}", path.display()))
 }
 
 /// Write an `id:` into an existing draft's frontmatter, in place, preserving
@@ -325,14 +512,12 @@ pub fn create_reply_draft_from(
     // (#0099) is appended to the reply area above the placeholder, so it is
     // visible and editable in the draft; the send-time signature injection is
     // then off (empty), which is why there is no double signature.
-    let sig = signature
-        .map(str::trim_end)
-        .filter(|s| !s.is_empty());
-    let full_content = match sig {
-        Some(sig) => format!(
-            "{}\n\n\n{}\n\n{{{{SIGNATURE}}}}\n\n{}\n{}\n",
+    let sig_block = signature.and_then(wrap_signature_block);
+    let full_content = match sig_block {
+        Some(block) => format!(
+            "{}\n\n\n{}\n{{{{SIGNATURE}}}}\n\n{}\n{}\n",
             fm.trim_end(),
-            sig,
+            block,
             attribution,
             quoted_body
         ),
@@ -460,14 +645,12 @@ pub fn create_forward_draft_from(
 
     // See create_reply_draft_from: the placeholder stays for quote splicing,
     // the per-account signature (#0099) goes above it in the reply area.
-    let sig = signature
-        .map(str::trim_end)
-        .filter(|s| !s.is_empty());
-    let full_content = match sig {
-        Some(sig) => format!(
-            "{}\n\n\n{}\n\n{{{{SIGNATURE}}}}\n\n{}\n\n{}\n",
+    let sig_block = signature.and_then(wrap_signature_block);
+    let full_content = match sig_block {
+        Some(block) => format!(
+            "{}\n\n\n{}\n{{{{SIGNATURE}}}}\n\n{}\n\n{}\n",
             fm.trim_end(),
-            sig,
+            block,
             fwd_header,
             clean_body.trim()
         ),
@@ -1579,6 +1762,77 @@ mod tests {
     use crate::types::{EmailDraft, EmailFrontmatter, EmailStatus};
     use std::path::PathBuf;
 
+    // -----------------------------------------------------------------------
+    // Signature sentinels + set_signature_block (#0106)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrap_signature_block_wraps_and_rejects_empty() {
+        assert_eq!(
+            wrap_signature_block("Best,\nAlice").as_deref(),
+            Some("<!-- mp:sig-start -->\nBest,\nAlice\n<!-- mp:sig-end -->\n")
+        );
+        assert_eq!(wrap_signature_block("   \n  ").as_deref(), None);
+        assert_eq!(wrap_signature_block("").as_deref(), None);
+    }
+
+    #[test]
+    fn strip_signature_sentinels_removes_only_the_marker_lines() {
+        let body = "Hi\n\n<!-- mp:sig-start -->\nBest,\nAlice\n<!-- mp:sig-end -->\n";
+        assert_eq!(strip_signature_sentinels(body), "Hi\n\nBest,\nAlice\n");
+        // A body with no sentinels is returned unchanged.
+        let plain = "Just a note.\n\nSecond paragraph.";
+        assert_eq!(strip_signature_sentinels(plain), plain);
+    }
+
+    #[test]
+    fn set_signature_block_replaces_an_existing_block() {
+        let body = "Hello\n\n<!-- mp:sig-start -->\nOld sig\n<!-- mp:sig-end -->\n";
+        let out = set_signature_block(body, Some("New sig line 1\nNew sig line 2"));
+        assert_eq!(
+            out,
+            "Hello\n\n<!-- mp:sig-start -->\nNew sig line 1\nNew sig line 2\n<!-- mp:sig-end -->\n"
+        );
+        // Round-trips: replacing again keeps a single block.
+        assert_eq!(out.matches(SIG_START).count(), 1);
+        assert_eq!(out.matches(SIG_END).count(), 1);
+    }
+
+    #[test]
+    fn set_signature_block_removes_a_block_when_new_is_none() {
+        let body = "Hello\n\n<!-- mp:sig-start -->\nOld sig\n<!-- mp:sig-end -->\n\nTrailer";
+        let out = set_signature_block(body, None);
+        assert_eq!(out, "Hello\n\nTrailer");
+        assert!(!out.contains(SIG_START) && !out.contains(SIG_END));
+    }
+
+    #[test]
+    fn set_signature_block_inserts_before_the_quote_marker_when_no_sentinels() {
+        // A legacy reply draft: no sentinels, a `{{SIGNATURE}}` quote marker.
+        let body = "My reply\n\n{{SIGNATURE}}\n\nOn Mon wrote:\n> Quoted";
+        let out = set_signature_block(body, Some("Best,\nAlice"));
+        assert_eq!(
+            out,
+            "My reply\n\n<!-- mp:sig-start -->\nBest,\nAlice\n<!-- mp:sig-end -->\n\n{{SIGNATURE}}\n\nOn Mon wrote:\n> Quoted"
+        );
+    }
+
+    #[test]
+    fn set_signature_block_appends_when_no_sentinels_and_no_marker() {
+        let body = "A plain draft body.";
+        let out = set_signature_block(body, Some("Best,\nAlice"));
+        assert_eq!(
+            out,
+            "A plain draft body.\n\n<!-- mp:sig-start -->\nBest,\nAlice\n<!-- mp:sig-end -->\n"
+        );
+    }
+
+    #[test]
+    fn set_signature_block_none_without_sentinels_is_a_noop() {
+        let body = "A plain draft body.\n";
+        assert_eq!(set_signature_block(body, None), body);
+    }
+
     fn make_draft(to: &str, subject: &str, body: &str, status: EmailStatus) -> EmailDraft {
         let to_opt = if to.is_empty() { None } else { Some(to.to_string()) };
         EmailDraft {
@@ -1599,6 +1853,7 @@ mod tests {
                 message_id: None,
                 in_reply_to: None,
                 forwarded_from: None,
+                signature: None,
                 event: None,
             },
             body_markdown: body.to_string(),

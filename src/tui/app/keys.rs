@@ -1298,7 +1298,9 @@ impl App {
                 return None;
             }
             KeyCode::Up => {
-                if wizard.focus.is_address()
+                if wizard.focus == ComposeField::Signature {
+                    cycle_signature(wizard, false);
+                } else if wizard.focus.is_address()
                     && !wizard.suggestions.is_empty()
                     && wizard.suggestion_idx > 0
                 {
@@ -1307,7 +1309,9 @@ impl App {
                 return None;
             }
             KeyCode::Down => {
-                if wizard.focus.is_address()
+                if wizard.focus == ComposeField::Signature {
+                    cycle_signature(wizard, true);
+                } else if wizard.focus.is_address()
                     && !wizard.suggestions.is_empty()
                     && wizard.suggestion_idx + 1 < wizard.suggestions.len()
                 {
@@ -1320,8 +1324,16 @@ impl App {
                 self.push_action(Action::ComposeWizardSubmit);
                 return None;
             }
+            KeyCode::Char('e') if ctrl => {
+                if wizard.focus == ComposeField::Signature {
+                    self.push_action(Action::ComposeEditSignature);
+                }
+                return None;
+            }
             KeyCode::Char('n') if ctrl => {
-                if wizard.focus.is_address()
+                if wizard.focus == ComposeField::Signature {
+                    cycle_signature(wizard, true);
+                } else if wizard.focus.is_address()
                     && !wizard.suggestions.is_empty()
                     && wizard.suggestion_idx + 1 < wizard.suggestions.len()
                 {
@@ -1330,7 +1342,9 @@ impl App {
                 return None;
             }
             KeyCode::Char('p') if ctrl => {
-                if wizard.focus.is_address()
+                if wizard.focus == ComposeField::Signature {
+                    cycle_signature(wizard, false);
+                } else if wizard.focus.is_address()
                     && !wizard.suggestions.is_empty()
                     && wizard.suggestion_idx > 0
                 {
@@ -1339,12 +1353,24 @@ impl App {
                 return None;
             }
             KeyCode::Char('u') if ctrl => {
+                // The Signature field is a selector, not a buffer to clear.
+                if wizard.focus == ComposeField::Signature {
+                    return None;
+                }
                 // Clear the current field.
                 current_field_mut(wizard).clear();
                 self.recompute_compose_suggestions();
                 return None;
             }
             KeyCode::Enter => {
+                // The Signature field submits from Enter like any non-last
+                // field: advance to the next field (Body / To).
+                if wizard.focus == ComposeField::Signature {
+                    wizard.focus = wizard.next_field();
+                    wizard.suggestion_idx = 0;
+                    self.recompute_compose_suggestions();
+                    return None;
+                }
                 // On an address field with a highlighted suggestion, accept it.
                 if wizard.focus.is_address() && !wizard.suggestions.is_empty() {
                     let sug = wizard.suggestions[wizard.suggestion_idx].clone();
@@ -1375,6 +1401,9 @@ impl App {
                 return None;
             }
             KeyCode::Backspace => {
+                if wizard.focus == ComposeField::Signature {
+                    return None;
+                }
                 current_field_mut(wizard).pop();
                 if wizard.focus.is_address() {
                     wizard.suggestion_idx = 0;
@@ -1385,6 +1414,14 @@ impl App {
             KeyCode::Char(c) => {
                 // Ctrl-prefixed chars not handled above are ignored.
                 if ctrl {
+                    return None;
+                }
+                // The Signature field is cycled, not typed into; `e` opens the
+                // selected signature in `$EDITOR`, everything else is a no-op.
+                if wizard.focus == ComposeField::Signature {
+                    if c == 'e' {
+                        self.push_action(Action::ComposeEditSignature);
+                    }
                     return None;
                 }
                 let _ = shift; // Shift+letter is just the uppercase char.
@@ -1414,7 +1451,7 @@ impl App {
             ComposeField::To => &wizard.to,
             ComposeField::Cc => &wizard.cc,
             ComposeField::Bcc => &wizard.bcc,
-            ComposeField::Subject | ComposeField::Body => {
+            ComposeField::Subject | ComposeField::Signature | ComposeField::Body => {
                 wizard.suggestions.clear();
                 return;
             }
@@ -2556,8 +2593,33 @@ fn current_field_mut(wizard: &mut ComposeWizard) -> &mut String {
         ComposeField::Cc => &mut wizard.cc,
         ComposeField::Bcc => &mut wizard.bcc,
         ComposeField::Subject => &mut wizard.subject,
+        // The Signature field has no editable buffer; the key handler never
+        // routes text-editing keys here when it is focused (#0106).
+        ComposeField::Signature => unreachable!("signature field has no text buffer"),
         ComposeField::Body => &mut wizard.body,
     }
+}
+
+/// Move the compose wizard's signature selection one step through the account's
+/// available signatures (#0106). `forward` cycles To -> next; wraps around. A
+/// change drops any per-draft inline edit override. No-op when the account has
+/// no signatures.
+fn cycle_signature(wizard: &mut ComposeWizard, forward: bool) {
+    let n = wizard.available_signatures.len();
+    if n == 0 {
+        return;
+    }
+    let cur = wizard
+        .signature_name
+        .as_ref()
+        .and_then(|name| wizard.available_signatures.iter().position(|x| x == name));
+    let next = match cur {
+        Some(i) if forward => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None => 0,
+    };
+    wizard.signature_name = Some(wizard.available_signatures[next].clone());
+    wizard.signature_override = None;
 }
 
 /// Aerc-style suggestion acceptance: replace the trailing partial
@@ -3677,6 +3739,10 @@ mod tests {
             subject: "draft in progress".to_string(),
             body: String::new(),
             focus: ComposeField::To,
+            signature_name: None,
+            signature_initial: None,
+            available_signatures: Vec::new(),
+            signature_override: None,
             suggestions: Vec::new(),
             suggestion_idx: 0,
             contacts: None,
@@ -3734,6 +3800,9 @@ mod tests {
         open_compose_wizard_for_test(&mut app);
         app.compose_wizard_mut().unwrap().focus = ComposeField::Subject;
 
+        // Subject -> Signature -> Body (#0106 inserts the Signature field).
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.compose_wizard().unwrap().focus, ComposeField::Signature);
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.compose_wizard().unwrap().focus, ComposeField::Body);
 

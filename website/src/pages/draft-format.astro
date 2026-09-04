@@ -229,6 +229,19 @@ Email body here.`;
         Use <code>-s &lt;name&gt;</code> to select a specific signature, or
         <code>--no-signature</code> to skip it entirely.
       </p>
+      <p>
+        In the TUI compose wizard the <strong>Signature</strong> field selects which named
+        signature the draft uses: cycle it with <code>Up</code>/<code>Down</code> (or
+        <code>Ctrl+n</code>/<code>Ctrl+p</code>), and press <code>e</code> to edit the
+        selected signature in <code>$EDITOR</code>. A <code>path</code> signature is edited
+        in place; an inline <code>text</code> signature is edited for that draft only and is
+        never written back to <code>config.toml</code>. The same field appears when you edit
+        an existing draft's recipients (<code>ce</code> in Drafts): changing the selection
+        re-splices the signature block in the draft body. The active selection is recorded in
+        the draft's <code>signature</code> frontmatter field; the spliced block is wrapped in
+        <code>&lt;!-- mp:sig-start --&gt;</code> / <code>&lt;!-- mp:sig-end --&gt;</code>
+        comment markers, which are stripped from every sent copy and from the preview.
+      </p>
     </section>
 
     <section>

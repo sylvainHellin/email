@@ -424,6 +424,13 @@ pub struct EmailFrontmatter {
     /// can list it; nothing in the send path reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
+    /// The name of the signature spliced into this draft's body (#0106).
+    /// Written when the compose wizard's Signature field selects a specific
+    /// entry; absent means the account default. Read when re-opening a draft so
+    /// the Signature field shows the current selection, and when a re-splice
+    /// needs to know which block is in the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<EventFrontmatter>,
 }
@@ -590,6 +597,7 @@ mod tests {
             message_id: Some("<test@example.com>".to_string()),
             in_reply_to: None,
             forwarded_from: None,
+            signature: None,
             event: None,
         };
         let yaml = serde_yaml::to_string(&fm).unwrap();

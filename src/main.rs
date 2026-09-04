@@ -903,6 +903,7 @@ async fn run_send_invite(
             message_id: None,
             in_reply_to: None,
             forwarded_from: None,
+            signature: None,
             event,
         },
         body_markdown: body,
