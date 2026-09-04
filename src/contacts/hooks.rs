@@ -265,6 +265,7 @@ mod tests {
                 message_id: None,
                 in_reply_to: None,
                 forwarded_from: None,
+                signature: None,
                 event: None,
             },
             body_markdown: String::new(),

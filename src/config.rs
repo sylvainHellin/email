@@ -115,6 +115,40 @@ impl AccountConfig {
             && self.imap.host.trim().is_empty()
             && self.smtp.host.trim().is_empty()
     }
+
+    /// The account's configured signature names, sorted (#0106). Drives the
+    /// compose wizard's Signature-field selector; empty when the account has
+    /// no `[accounts.signatures.<name>]` tables.
+    pub fn signature_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.signatures.entries.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The default signature name for this account, if one is configured
+    /// (`[accounts.signatures] default = "..."`).
+    pub fn default_signature_name(&self) -> Option<&str> {
+        self.signatures.default.as_deref()
+    }
+
+    /// The filesystem `path` of a named signature entry, `~`-expanded (#0106).
+    /// `None` for an unknown name or an entry that only carries inline `text`.
+    /// Used by the TUI to open the signature in `$EDITOR`.
+    pub fn signature_path(&self, name: &str) -> Option<PathBuf> {
+        let entry = self.signatures.entries.get(name)?;
+        let path_str = entry.path.as_ref()?;
+        Some(PathBuf::from(shellexpand::tilde(path_str).into_owned()))
+    }
+
+    /// The inline `text` of a named signature entry, if it has one (#0106). An
+    /// inline signature is edited on a temp copy and applied to the draft only,
+    /// never written back to `config.toml`.
+    pub fn signature_inline_text(&self, name: &str) -> Option<&str> {
+        self.signatures
+            .entries
+            .get(name)
+            .and_then(|e| e.text.as_deref())
+    }
 }
 
 /// Whether the client APPENDs its own copy of a sent message to the Sent
@@ -2465,7 +2499,7 @@ pub fn resolve_signature_markdown(
 /// wrapped paragraph (#0106), so without this the name, title, address and link
 /// lines render as one blob. Forcing hard breaks keeps the authored layout in
 /// the HTML part.
-fn signature_source_to_markdown(source: &str) -> String {
+pub fn signature_source_to_markdown(source: &str) -> String {
     let markdown = if crate::parse::looks_like_html(source) {
         crate::parse::html_to_markdown(source)
     } else {
